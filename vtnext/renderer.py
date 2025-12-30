@@ -5,13 +5,15 @@ VTNext Renderer - Displays graphics from VTNext protocol over serial/stdin
 Protocol: ESC ] vtn ; <command> ; <params> BEL
 
 Usage:
+    ./boot_vm.sh                    # Recommended - handles bidirectional I/O
+    # or manual:
     ./build.sh --run 2>&1 | python3 vtnext/renderer.py
-    # or with QEMU:
-    qemu-system-arm ... -serial stdio | python3 vtnext/renderer.py
 """
 
 import sys
-import re
+import os
+import argparse
+import select
 try:
     import pygame
     PYGAME_AVAILABLE = True
@@ -138,6 +140,19 @@ class VTNextRenderer:
                     text = params[0]
                     x, y = int(params[1]), int(params[2])
                     self.text(text, x, y, 1, 255, 255, 255, 255)
+            elif name == 'textline':
+                # Format: x;y;r;g;b;"text"
+                if len(params) >= 6:
+                    x, y = int(params[0]), int(params[1])
+                    r, g, b = int(params[2]), int(params[3]), int(params[4])
+                    text = params[5].strip('"')
+                    self.text(text, x, y, 1, r, g, b, 255)
+            elif name == 'fillrect':
+                # Format: x;y;w;h;r;g;b
+                if len(params) >= 7:
+                    x, y, w, h = int(params[0]), int(params[1]), int(params[2]), int(params[3])
+                    r, g, b = int(params[4]), int(params[5]), int(params[6])
+                    self.rect(x, y, w, h, r, g, b, 255)
             elif name == 'present':
                 self.present()
             elif name == 'viewport':
@@ -174,47 +189,132 @@ class VTNextRenderer:
         self.screen = pygame.display.set_mode((w, h))
 
     def process_events(self):
+        """Process pygame events, returns (running, keys_pressed)."""
+        keys = []
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                return False
-        return True
+                return False, keys
+            elif event.type == pygame.KEYDOWN:
+                # Convert pygame key to character
+                char = self.key_to_char(event)
+                if char:
+                    keys.append(char)
+        return True, keys
+
+    def key_to_char(self, event):
+        """Convert pygame key event to character for UART."""
+        key = event.key
+        mods = event.mod
+
+        # Regular printable characters first (most common case)
+        # Check unicode before special keys to avoid conflicts
+        if event.unicode and len(event.unicode) == 1:
+            c = event.unicode
+            # Only return if it's a normal printable ASCII character
+            if 32 <= ord(c) <= 126:
+                return c
+
+        # Handle special keys
+        if key == pygame.K_RETURN or key == pygame.K_KP_ENTER:
+            return '\r'
+        elif key == pygame.K_BACKSPACE:
+            return '\x7f'  # DEL character
+        elif key == pygame.K_DELETE:
+            return '\x7f'
+        elif key == pygame.K_ESCAPE:
+            return '\x1b'
+        elif key == pygame.K_TAB:
+            return '\t'
+
+        # Ctrl combinations (only when Ctrl is actually held)
+        ctrl_only = (mods & pygame.KMOD_CTRL) and not (mods & (pygame.KMOD_ALT | pygame.KMOD_META))
+        if ctrl_only:
+            if key == pygame.K_c:
+                return '\x03'  # Ctrl+C (interrupt)
+            elif key == pygame.K_d:
+                return '\x04'  # Ctrl+D (EOF)
+            elif key == pygame.K_l:
+                return '\x0c'  # Ctrl+L (clear)
+
+        return None
 
 
 def main():
+    arg_parser = argparse.ArgumentParser(description='VTNext Renderer')
+    arg_parser.add_argument('--fifo-in', help='FIFO to read graphics commands from')
+    arg_parser.add_argument('--fifo-out', help='FIFO to write keyboard input to')
+    args = arg_parser.parse_args()
+
     parser = VTNextParser()
     renderer = VTNextRenderer(WIDTH, HEIGHT)
 
-    print("VTNext Renderer - waiting for graphics commands...")
-    print("(Reading from stdin, Ctrl+C to exit)")
+    # Set up input/output streams
+    if args.fifo_in:
+        print(f"Opening FIFO for input: {args.fifo_in}", file=sys.stderr)
+        input_fd = os.open(args.fifo_in, os.O_RDONLY | os.O_NONBLOCK)
+        input_file = os.fdopen(input_fd, 'rb')
+    else:
+        input_file = sys.stdin.buffer if hasattr(sys.stdin, 'buffer') else sys.stdin
 
-    stdin_eof = False
+    output_file = None
+    if args.fifo_out:
+        print(f"Opening FIFO for output: {args.fifo_out}", file=sys.stderr)
+        output_fd = os.open(args.fifo_out, os.O_WRONLY)
+        output_file = os.fdopen(output_fd, 'wb', buffering=0)
+
+    print("VTNext Renderer - waiting for graphics commands...", file=sys.stderr)
+    if output_file:
+        print("Keyboard input enabled", file=sys.stderr)
+
+    input_eof = False
     try:
         while True:
-            # Check pygame events
-            if PYGAME_AVAILABLE and not renderer.process_events():
-                break
+            # Check pygame events and get key presses
+            if PYGAME_AVAILABLE:
+                running, keys = renderer.process_events()
+                if not running:
+                    break
+
+                # Send key presses to output
+                if output_file and keys:
+                    for key in keys:
+                        try:
+                            output_file.write(key.encode('latin-1'))
+                            output_file.flush()
+                        except (BrokenPipeError, OSError):
+                            pass
 
             # Read available input (non-blocking)
-            import select
-            if not stdin_eof and select.select([sys.stdin], [], [], 0.01)[0]:
-                # Read multiple characters at once for efficiency
-                data = sys.stdin.read(1024)
-                if not data:
-                    stdin_eof = True
-                    print("Input complete. Close window to exit.", file=sys.stderr)
-                    continue
-                commands = parser.feed(data)
-                for cmd in commands:
-                    renderer.handle_command(cmd)
-                # Process events after handling commands to update display
-                if PYGAME_AVAILABLE:
-                    renderer.process_events()
+            try:
+                if hasattr(input_file, 'fileno'):
+                    fd = input_file.fileno()
+                    if not input_eof and select.select([fd], [], [], 0.01)[0]:
+                        data = input_file.read(4096)
+                        if not data:
+                            input_eof = True
+                            print("Input complete. Close window to exit.", file=sys.stderr)
+                            continue
+                        # Decode bytes to string
+                        if isinstance(data, bytes):
+                            data = data.decode('latin-1', errors='replace')
+                        commands = parser.feed(data)
+                        for cmd in commands:
+                            renderer.handle_command(cmd)
+            except (ValueError, OSError):
+                # File closed
+                input_eof = True
 
     except KeyboardInterrupt:
-        print("\nExiting...")
+        print("\nExiting...", file=sys.stderr)
 
     if PYGAME_AVAILABLE:
         pygame.quit()
+
+    # Clean up
+    if args.fifo_in and input_file:
+        input_file.close()
+    if output_file:
+        output_file.close()
 
 
 if __name__ == '__main__':

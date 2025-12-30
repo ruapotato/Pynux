@@ -3,11 +3,12 @@
 # Bare-metal kernel for ARM Cortex-M3.
 # Initializes hardware and provides system services.
 
-from lib.io import print_str, print_int, print_newline, uart_init
+from lib.io import print_str, print_int, print_newline, uart_init, uart_available, uart_getc
 from lib.memory import heap_init
 from kernel.ramfs import ramfs_init, ramfs_create, ramfs_write
 from kernel.timer import timer_init
-from coreutils.sh import shell_loop
+from lib.de import de_main
+from lib.shell import shell_main
 
 # Kernel version
 KERNEL_VERSION_MAJOR: int32 = 0
@@ -128,7 +129,41 @@ def kernel_tick():
 def main() -> int32:
     kernel_init()
 
-    # Start shell
-    shell_loop()
+    # Flush any pending UART input from boot process
+    while uart_available():
+        discard: char = uart_getc()
+
+    # Boot selection: press 's' for shell, any other key or wait for GUI
+    print_str("Press 's' for text shell, any other key for desktop...\n")
+    print_str("Starting in: ")
+
+    # Countdown with visual feedback
+    use_shell: bool = False
+    countdown: int32 = 3
+    while countdown > 0:
+        print_int(countdown)
+        print_str(" ")
+
+        # Check for input during each countdown second (~100000 iterations)
+        i: int32 = 0
+        while i < 100000:
+            if uart_available():
+                c: char = uart_getc()
+                if c == 's' or c == 'S':
+                    use_shell = True
+                    print_str("\n[shell mode]\n")
+                    countdown = 0
+                    break
+                else:
+                    print_str("\n[desktop mode]\n")
+                    countdown = 0
+                    break
+            i = i + 1
+        countdown = countdown - 1
+
+    if use_shell:
+        shell_main()
+    else:
+        de_main()
 
     return 0

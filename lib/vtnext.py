@@ -15,9 +15,9 @@
 
 from lib.io import uart_putc
 
-# Output buffer for batching commands
-VTN_BUF_SIZE: int32 = 4096
-vtn_buffer: Array[4096, uint8]
+# Output buffer for batching commands (8KB for better batching)
+VTN_BUF_SIZE: int32 = 8192
+vtn_buffer: Array[8192, uint8]
 vtn_buf_pos: int32 = 0
 
 # Escape codes
@@ -302,3 +302,44 @@ VTN_YELLOW: int32 = 0xFFFF00
 VTN_CYAN: int32 = 0x00FFFF
 VTN_MAGENTA: int32 = 0xFF00FF
 VTN_GRAY: int32 = 0x808080
+
+# ============================================================================
+# Optimized terminal text rendering
+# ============================================================================
+
+# Draw terminal line - optimized for console output
+# Uses simpler protocol: textline;x;y;r;g;b;"text"
+def vtn_textline(text: Ptr[uint8], x: int32, y: int32, r: int32, g: int32, b: int32):
+    vtn_begin_cmd("textline")
+    vtn_write_int(x)
+    vtn_sep()
+    vtn_write_int(y)
+    vtn_sep()
+    vtn_write_int(r)
+    vtn_sep()
+    vtn_write_int(g)
+    vtn_sep()
+    vtn_write_int(b)
+    vtn_sep()
+    vtn_write_byte(34)  # '"'
+    vtn_write_str(text)
+    vtn_write_byte(34)  # '"'
+    vtn_end_cmd()
+
+# Clear a rectangular region (for terminal line clearing)
+def vtn_clear_rect(x: int32, y: int32, w: int32, h: int32, r: int32, g: int32, b: int32):
+    vtn_begin_cmd("fillrect")
+    vtn_write_int(x)
+    vtn_sep()
+    vtn_write_int(y)
+    vtn_sep()
+    vtn_write_int(w)
+    vtn_sep()
+    vtn_write_int(h)
+    vtn_sep()
+    vtn_write_int(r)
+    vtn_sep()
+    vtn_write_int(g)
+    vtn_sep()
+    vtn_write_int(b)
+    vtn_end_cmd()

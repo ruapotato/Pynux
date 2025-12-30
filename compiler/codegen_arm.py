@@ -188,6 +188,31 @@ class ARMCodeGen:
         name = t.name if isinstance(t, Type) else str(t)
         return name in ("float32", "float64", "float")
 
+    def get_expr_type(self, expr) -> Type | None:
+        """Get the result type of an expression."""
+        if isinstance(expr, Identifier):
+            if expr.name in self.ctx.locals:
+                return self.ctx.locals[expr.name].var_type
+            return self.global_var_types.get(expr.name)
+        elif isinstance(expr, IndexExpr):
+            # For arr[i], result type is element type of arr
+            obj_type = self.get_expr_type(expr.obj)
+            if isinstance(obj_type, ArrayType):
+                return obj_type.element_type
+            elif isinstance(obj_type, PointerType):
+                return obj_type.base_type
+            return None
+        elif isinstance(expr, MemberExpr):
+            # For obj.field, look up field type
+            obj_type = self.get_expr_type(expr.obj)
+            if obj_type and hasattr(obj_type, 'name') and obj_type.name in self.structs:
+                struct_info = self.structs[obj_type.name]
+                for field_name, field_type, _ in struct_info.fields:
+                    if field_name == expr.member:
+                        return field_type
+            return None
+        return None
+
     def emit_stack_alloc(self, size: int) -> None:
         """Emit code to allocate stack space, handling large values."""
         if size == 0:
@@ -289,7 +314,11 @@ class ARMCodeGen:
             case Identifier(name=name):
                 if name in self.ctx.locals:
                     var = self.ctx.locals[name]
-                    self.emit_load_local("r0", var.offset)
+                    # Local arrays: compute address, don't load value
+                    if isinstance(var.var_type, ArrayType):
+                        self.emit_add_local_addr("r0", var.offset)
+                    else:
+                        self.emit_load_local("r0", var.offset)
                 elif name in self.global_arrays:
                     # Global array - just load address, don't dereference
                     self.emit(f"    ldr r0, ={name}")
@@ -424,16 +453,36 @@ class ARMCodeGen:
                     self.emit(f"{done_label}:")
 
                     # Scale index by element size
-                    if elem_size == 4:
-                        self.emit("    lsl r1, r1, #2")
+                    if elem_size == 1:
+                        pass  # No scaling needed
                     elif elem_size == 2:
                         self.emit("    lsl r1, r1, #1")
-                    # For elem_size == 1, no shift needed
+                    elif elem_size == 4:
+                        self.emit("    lsl r1, r1, #2")
+                    elif elem_size == 8:
+                        self.emit("    lsl r1, r1, #3")
+                    elif elem_size == 16:
+                        self.emit("    lsl r1, r1, #4")
+                    elif elem_size == 32:
+                        self.emit("    lsl r1, r1, #5")
+                    elif elem_size == 64:
+                        self.emit("    lsl r1, r1, #6")
+                    else:
+                        # General case: multiply by element size
+                        self.emit(f"    ldr r2, ={elem_size}")
+                        self.emit("    mul r1, r1, r2")
 
                     self.emit("    add r0, r0, r1")
 
-                    # Use appropriate load instruction
-                    if elem_size == 1:
+                    # Check if element type is an array (nested array access)
+                    # If so, don't load - just return the address
+                    is_nested_array = False
+                    if isinstance(var_type, ArrayType) and isinstance(var_type.element_type, ArrayType):
+                        is_nested_array = True
+
+                    if is_nested_array:
+                        pass  # Just return address, don't load
+                    elif elem_size == 1:
                         self.emit("    ldrb r0, [r0]")
                     elif elem_size == 2:
                         self.emit("    ldrh r0, [r0]")
@@ -661,23 +710,33 @@ class ARMCodeGen:
                 # &arr[i] - array element address
                 self.gen_expr(operand.index)
 
-                # Determine element size
+                # Determine element size by getting the type of operand.obj
                 elem_size = 4  # Default to word
-                if isinstance(operand.obj, Identifier):
+                obj_type = self.get_expr_type(operand.obj)
+                if isinstance(obj_type, ArrayType):
+                    elem_size = self.get_type_size(obj_type.element_type)
+                elif isinstance(obj_type, PointerType):
+                    elem_size = self.get_type_size(obj_type.base_type)
+                elif isinstance(operand.obj, Identifier):
+                    # Fallback for simple identifiers
                     elem_size = self.array_element_sizes.get(operand.obj.name, 4)
-                    # Check for Ptr[T] types
-                    var_type = self.global_var_types.get(operand.obj.name)
-                    if var_type is None and operand.obj.name in self.ctx.locals:
-                        var_type = self.ctx.locals[operand.obj.name].var_type
-                    if isinstance(var_type, PointerType):
-                        elem_size = self.get_type_size(var_type.base_type)
 
                 # Scale index by element size
-                if elem_size == 4:
-                    self.emit("    lsl r0, r0, #2")
+                if elem_size == 1:
+                    pass  # No scaling needed
                 elif elem_size == 2:
                     self.emit("    lsl r0, r0, #1")
-                # For elem_size == 1, no shift needed
+                elif elem_size == 4:
+                    self.emit("    lsl r0, r0, #2")
+                elif elem_size == 8:
+                    self.emit("    lsl r0, r0, #3")
+                elif elem_size == 16:
+                    self.emit("    lsl r0, r0, #4")
+                elif elem_size == 32:
+                    self.emit("    lsl r0, r0, #5")
+                else:
+                    self.emit(f"    ldr r2, ={elem_size}")
+                    self.emit("    mul r0, r0, r2")
 
                 self.emit("    push {r0}")
                 self.gen_expr(operand.obj)
@@ -1969,23 +2028,33 @@ class ARMCodeGen:
         self.emit(f"    push {{{value_reg}}}")  # Save value
         self.gen_expr(target.index)
 
-        # Determine element size
+        # Determine element size by getting the type of target.obj
         elem_size = 4  # Default to word
-        if isinstance(target.obj, Identifier):
+        obj_type = self.get_expr_type(target.obj)
+        if isinstance(obj_type, ArrayType):
+            elem_size = self.get_type_size(obj_type.element_type)
+        elif isinstance(obj_type, PointerType):
+            elem_size = self.get_type_size(obj_type.base_type)
+        elif isinstance(target.obj, Identifier):
+            # Fallback for simple identifiers
             elem_size = self.array_element_sizes.get(target.obj.name, 4)
-            # Check for Ptr[T] types
-            var_type = self.global_var_types.get(target.obj.name)
-            if var_type is None and target.obj.name in self.ctx.locals:
-                var_type = self.ctx.locals[target.obj.name].var_type
-            if isinstance(var_type, PointerType):
-                elem_size = self.get_type_size(var_type.base_type)
 
         # Scale index by element size
-        if elem_size == 4:
-            self.emit("    lsl r0, r0, #2")
+        if elem_size == 1:
+            pass  # No scaling needed
         elif elem_size == 2:
             self.emit("    lsl r0, r0, #1")
-        # For elem_size == 1, no shift needed
+        elif elem_size == 4:
+            self.emit("    lsl r0, r0, #2")
+        elif elem_size == 8:
+            self.emit("    lsl r0, r0, #3")
+        elif elem_size == 16:
+            self.emit("    lsl r0, r0, #4")
+        elif elem_size == 32:
+            self.emit("    lsl r0, r0, #5")
+        else:
+            self.emit(f"    ldr r3, ={elem_size}")
+            self.emit("    mul r0, r0, r3")
 
         self.emit("    push {r0}")  # Save offset
         self.gen_expr(target.obj)

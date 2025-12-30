@@ -122,3 +122,21 @@ def memcmp(a: Ptr[uint8], b: Ptr[uint8], size: int32) -> int32:
             return cast[int32](a[i]) - cast[int32](b[i])
         i = i + 1
     return 0
+
+# Get remaining heap space
+def heap_remaining() -> int32:
+    state: int32 = critical_enter()
+    remaining: int32 = cast[int32](heap_end - heap_ptr)
+    critical_exit(state)
+    return remaining
+
+# Get heap size
+def heap_total() -> int32:
+    return cast[int32](HEAP_SIZE)
+
+# Get used heap space
+def heap_used() -> int32:
+    state: int32 = critical_enter()
+    used: int32 = cast[int32](heap_ptr - HEAP_START)
+    critical_exit(state)
+    return used
