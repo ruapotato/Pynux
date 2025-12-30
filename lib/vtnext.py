@@ -13,7 +13,7 @@
 #   input - Set input mode (raw/normal)
 #   cursor - Show/hide cursor
 
-from lib.io import uart_putc
+from lib.io import uart_putc, uart_available, uart_getc
 
 # Output buffer for batching commands (8KB for better batching)
 VTN_BUF_SIZE: int32 = 8192
@@ -32,12 +32,11 @@ def vtn_flush():
         i = i + 1
     vtn_buf_pos = 0
 
-# Write byte to buffer
+# Write byte to buffer (never auto-flush mid-command)
 def vtn_write_byte(b: int32):
-    if vtn_buf_pos >= VTN_BUF_SIZE - 1:
-        vtn_flush()
-    vtn_buffer[vtn_buf_pos] = cast[uint8](b)
-    vtn_buf_pos = vtn_buf_pos + 1
+    if vtn_buf_pos < VTN_BUF_SIZE:
+        vtn_buffer[vtn_buf_pos] = cast[uint8](b)
+        vtn_buf_pos = vtn_buf_pos + 1
 
 # Write string to buffer
 def vtn_write_str(s: Ptr[uint8]):
@@ -69,8 +68,11 @@ def vtn_write_int(n: int32):
         temp = temp / 10
         count = count - 1
 
-# Begin VTNext command
+# Begin VTNext command - flush if buffer getting full
 def vtn_begin_cmd(cmd: Ptr[uint8]):
+    # Flush if less than 512 bytes remaining (ensures room for command)
+    if vtn_buf_pos > VTN_BUF_SIZE - 512:
+        vtn_flush()
     vtn_write_byte(ESC)
     vtn_write_byte(93)  # ']'
     vtn_write_str("vtn;")
@@ -276,6 +278,26 @@ def vtn_present():
 # ============================================================================
 # High-level helpers
 # ============================================================================
+
+# Probe to check if VTNext renderer is connected
+# Sends probe command, waits for 'V' response
+# Returns True if VTNext is available, False otherwise
+def vtn_probe() -> bool:
+    # Send probe command
+    vtn_begin_cmd("probe")
+    vtn_end_cmd()
+    vtn_flush()
+
+    # Wait for response with iteration-based timeout
+    # Need longer timeout for FIFO setup - ~2M iterations
+    i: int32 = 0
+    while i < 2000000:
+        if uart_available():
+            c: char = uart_getc()
+            if c == 'V':
+                return True
+        i = i + 1
+    return False
 
 # Initialize graphics mode
 def vtn_init(width: int32, height: int32):

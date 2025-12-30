@@ -2790,6 +2790,12 @@ class ARMCodeGen:
                         import struct
                         bits = struct.unpack('<I', struct.pack('<f', var.value.value))[0]
                         self.emit(f"    .long {bits}  @ float {var.value.value}")
+                    elif isinstance(var.value, CastExpr):
+                        # Handle cast of integer literal (e.g., cast[Ptr[...]](0xE000E010))
+                        if isinstance(var.value.expr, IntLiteral):
+                            self.emit(f"    .long {var.value.expr.value}")
+                        else:
+                            self.emit(f"    .space {size}")
                     else:
                         # Default to zero
                         self.emit(f"    .space {size}")

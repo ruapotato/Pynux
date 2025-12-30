@@ -98,12 +98,16 @@ class VTNextRenderer:
             pygame.display.flip()
 
     def handle_command(self, cmd):
-        """Handle a parsed VTNext command."""
-        if not PYGAME_AVAILABLE:
-            return
-
+        """Handle a parsed VTNext command. Returns response string if needed."""
         name = cmd['cmd']
         params = cmd['params']
+
+        # Handle probe command - always respond even without pygame
+        if name == 'probe':
+            return 'V'  # VTNext available
+
+        if not PYGAME_AVAILABLE:
+            return None
 
         try:
             if name == 'clear':
@@ -115,6 +119,13 @@ class VTNextRenderer:
                     x, y, w, h = int(params[0]), int(params[1]), int(params[2]), int(params[3])
                     r, g, b, a = int(params[4]), int(params[5]), int(params[6]), int(params[7])
                     self.rect(x, y, w, h, r, g, b, a)
+            elif name == 'rect_outline':
+                # Format: x;y;w;h;thickness;r;g;b;a
+                if len(params) >= 9:
+                    x, y, w, h = int(params[0]), int(params[1]), int(params[2]), int(params[3])
+                    thickness = int(params[4])
+                    r, g, b, a = int(params[5]), int(params[6]), int(params[7]), int(params[8])
+                    self.rect_outline(x, y, w, h, thickness, r, g, b, a)
             elif name == 'circle':
                 if len(params) >= 7:
                     x, y, radius = int(params[0]), int(params[1]), int(params[2])
@@ -168,6 +179,9 @@ class VTNextRenderer:
     def rect(self, x, y, w, h, r, g, b, a):
         pygame.draw.rect(self.screen, (r, g, b), (x, y, w, h))
 
+    def rect_outline(self, x, y, w, h, thickness, r, g, b, a):
+        pygame.draw.rect(self.screen, (r, g, b), (x, y, w, h), thickness)
+
     def circle(self, cx, cy, radius, r, g, b, a):
         pygame.draw.circle(self.screen, (r, g, b), (cx, cy), radius)
 
@@ -189,17 +203,31 @@ class VTNextRenderer:
         self.screen = pygame.display.set_mode((w, h))
 
     def process_events(self):
-        """Process pygame events, returns (running, keys_pressed)."""
+        """Process pygame events, returns (running, keys_pressed, mouse_events)."""
         keys = []
+        mouse = []
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                return False, keys
+                return False, keys, mouse
             elif event.type == pygame.KEYDOWN:
                 # Convert pygame key to character
                 char = self.key_to_char(event)
                 if char:
                     keys.append(char)
-        return True, keys
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                x, y = event.pos
+                btn = event.button  # 1=left, 2=middle, 3=right
+                mouse.append(('down', x, y, btn))
+            elif event.type == pygame.MOUSEBUTTONUP:
+                x, y = event.pos
+                btn = event.button
+                mouse.append(('up', x, y, btn))
+            elif event.type == pygame.MOUSEMOTION:
+                x, y = event.pos
+                btns = event.buttons  # (left, middle, right)
+                if btns[0]:  # Left button held
+                    mouse.append(('drag', x, y, 1))
+        return True, keys, mouse
 
     def key_to_char(self, event):
         """Convert pygame key event to character for UART."""
@@ -243,8 +271,10 @@ def main():
     arg_parser = argparse.ArgumentParser(description='VTNext Renderer')
     arg_parser.add_argument('--fifo-in', help='FIFO to read graphics commands from')
     arg_parser.add_argument('--fifo-out', help='FIFO to write keyboard input to')
+    arg_parser.add_argument('--debug', action='store_true', help='Show raw VTNext commands')
     args = arg_parser.parse_args()
 
+    debug_mode = args.debug
     parser = VTNextParser()
     renderer = VTNextRenderer(WIDTH, HEIGHT)
 
@@ -271,7 +301,7 @@ def main():
         while True:
             # Check pygame events and get key presses
             if PYGAME_AVAILABLE:
-                running, keys = renderer.process_events()
+                running, keys, mouse = renderer.process_events()
                 if not running:
                     break
 
@@ -279,7 +309,29 @@ def main():
                 if output_file and keys:
                     for key in keys:
                         try:
+                            if debug_mode:
+                                print(f"[KEY] {repr(key)}", file=sys.stderr)
                             output_file.write(key.encode('latin-1'))
+                            output_file.flush()
+                        except (BrokenPipeError, OSError):
+                            pass
+
+                # Send mouse events as escape sequences
+                # Format: ESC [ M <type> <x> <y> where type: 0=down, 1=up, 2=drag
+                if output_file and mouse:
+                    for event in mouse:
+                        try:
+                            etype, x, y, btn = event
+                            if etype == 'down':
+                                t = 0
+                            elif etype == 'up':
+                                t = 1
+                            else:  # drag
+                                t = 2
+                            # Encode as: ESC [ M <type+32> <x+33> <y+33>
+                            # Using xterm mouse encoding (adjusted for printable range)
+                            seq = f"\x1b[M{chr(t + 32)}{chr(min(x // 10, 94) + 33)}{chr(min(y // 10, 94) + 33)}"
+                            output_file.write(seq.encode('latin-1'))
                             output_file.flush()
                         except (BrokenPipeError, OSError):
                             pass
@@ -297,9 +349,24 @@ def main():
                         # Decode bytes to string
                         if isinstance(data, bytes):
                             data = data.decode('latin-1', errors='replace')
+                        if debug_mode:
+                            # Show raw data (escape non-printable)
+                            escaped = data.replace('\x1b', '<ESC>').replace('\x07', '<BEL>')
+                            print(f"[IN] {repr(escaped)}", file=sys.stderr)
                         commands = parser.feed(data)
                         for cmd in commands:
-                            renderer.handle_command(cmd)
+                            if debug_mode:
+                                print(f"[CMD] {cmd['cmd']} params={cmd['params']}", file=sys.stderr)
+                            response = renderer.handle_command(cmd)
+                            # Send response back if needed (e.g., probe -> 'V')
+                            if response and output_file:
+                                if debug_mode:
+                                    print(f"[OUT] Sending response: {repr(response)}", file=sys.stderr)
+                                try:
+                                    output_file.write(response.encode('latin-1'))
+                                    output_file.flush()
+                                except (BrokenPipeError, OSError):
+                                    pass
             except (ValueError, OSError):
                 # File closed
                 input_eof = True

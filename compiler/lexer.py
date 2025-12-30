@@ -380,6 +380,8 @@ class Lexer:
                         value.append('\t')
                     elif escaped == 'r':
                         value.append('\r')
+                    elif escaped == 'b':
+                        value.append('\b')
                     elif escaped == '\\':
                         value.append('\\')
                     elif escaped == quote:
@@ -566,12 +568,24 @@ class Lexer:
                 ch = '\t'
             elif escaped == 'r':
                 ch = '\r'
+            elif escaped == 'b':
+                ch = '\b'
             elif escaped == '0':
                 ch = '\0'
             elif escaped == '\\':
                 ch = '\\'
             elif escaped == "'":
                 ch = "'"
+            elif escaped == 'x':
+                # Hex escape \xNN
+                self.advance()
+                hex_chars = self.current_char() + self.peek_char()
+                self.advance()
+                try:
+                    ch = chr(int(hex_chars, 16))
+                except ValueError:
+                    raise LexerError(f"Invalid hex escape: \\x{hex_chars}",
+                                   self.line, self.column)
             else:
                 ch = escaped
 

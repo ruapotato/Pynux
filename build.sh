@@ -40,11 +40,14 @@ PYNUX_SOURCES=(
 
 python3 << 'PYEND'
 import sys
+import os
+import glob
 sys.path.insert(0, '.')
 
 from compiler.parser import parse
 from compiler.codegen_arm import ARMCodeGen
 
+# Core system sources
 sources = [
     ("kernel/kernel.py", "kernel"),
     ("kernel/timer.py", "timer"),
@@ -55,6 +58,16 @@ sources = [
     ("lib/de.py", "de"),
     ("lib/shell.py", "shell"),
 ]
+
+# Add user programs from programs/ folder
+user_programs = []
+for prog_path in sorted(glob.glob("programs/*.py")):
+    name = os.path.basename(prog_path).replace(".py", "")
+    sources.append((prog_path, f"prog_{name}"))
+    user_programs.append(name)
+
+if user_programs:
+    print(f"  Found user programs: {', '.join(user_programs)}")
 
 for src_path, name in sources:
     try:
@@ -70,6 +83,11 @@ for src_path, name in sources:
     except Exception as e:
         print(f"  ERROR: {src_path}: {e}")
         sys.exit(1)
+
+# Save list of user programs for linker
+with open("build/user_programs.txt", "w") as f:
+    for name in user_programs:
+        f.write(f"prog_{name}\n")
 PYEND
 
 # Step 2: Assemble all .s files
@@ -88,20 +106,35 @@ for name in kernel timer ramfs memory string vtnext de shell; do
     echo "  build/${name}.s"
 done
 
+# Compile user programs
+if [ -f "$BUILD_DIR/user_programs.txt" ]; then
+    while read -r progname; do
+        if [ -f "$BUILD_DIR/${progname}.s" ]; then
+            $AS $ASFLAGS -o "$BUILD_DIR/${progname}.o" "$BUILD_DIR/${progname}.s"
+            echo "  build/${progname}.s"
+        fi
+    done < "$BUILD_DIR/user_programs.txt"
+fi
+
 # Step 3: Link
 echo "[3/4] Linking..."
-$LD -T "$RUNTIME_DIR/mps2-an385.ld" \
-    -o "$BUILD_DIR/pynux.elf" \
-    "$BUILD_DIR/startup.o" \
-    "$BUILD_DIR/io.o" \
-    "$BUILD_DIR/kernel.o" \
-    "$BUILD_DIR/timer.o" \
-    "$BUILD_DIR/ramfs.o" \
-    "$BUILD_DIR/memory.o" \
-    "$BUILD_DIR/string.o" \
-    "$BUILD_DIR/vtnext.o" \
-    "$BUILD_DIR/de.o" \
-    "$BUILD_DIR/shell.o"
+
+# Build list of object files
+OBJS="$BUILD_DIR/startup.o $BUILD_DIR/io.o"
+OBJS="$OBJS $BUILD_DIR/kernel.o $BUILD_DIR/timer.o $BUILD_DIR/ramfs.o"
+OBJS="$OBJS $BUILD_DIR/memory.o $BUILD_DIR/string.o"
+OBJS="$OBJS $BUILD_DIR/vtnext.o $BUILD_DIR/de.o $BUILD_DIR/shell.o"
+
+# Add user program objects
+if [ -f "$BUILD_DIR/user_programs.txt" ]; then
+    while read -r progname; do
+        if [ -f "$BUILD_DIR/${progname}.o" ]; then
+            OBJS="$OBJS $BUILD_DIR/${progname}.o"
+        fi
+    done < "$BUILD_DIR/user_programs.txt"
+fi
+
+$LD -T "$RUNTIME_DIR/mps2-an385.ld" -o "$BUILD_DIR/pynux.elf" $OBJS
 echo "  -> build/pynux.elf"
 
 # Create binary

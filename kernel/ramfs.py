@@ -92,15 +92,16 @@ def ramfs_lookup(path: Ptr[char]) -> int32:
                 j: int32 = 0
                 while j < MAX_FILES:
                     if file_types[j] != FTYPE_FREE and file_parents[j] == current_dir:
-                        # Compare names
+                        # Compare names using pointer (workaround for 2D array bug)
+                        name_ptr: Ptr[char] = &file_names[j][0]
                         is_match: bool = True
                         k: int32 = 0
                         while k < name_len:
-                            if file_names[j][k] != path[name_start + k]:
+                            if name_ptr[k] != path[name_start + k]:
                                 is_match = False
                                 break
                             k = k + 1
-                        if is_match and file_names[j][name_len] == '\0':
+                        if is_match and name_ptr[name_len] == '\0':
                             found = j
                             break
                     j = j + 1

@@ -7,6 +7,7 @@ from lib.io import print_str, print_int, print_newline, uart_init, uart_availabl
 from lib.memory import heap_init
 from kernel.ramfs import ramfs_init, ramfs_create, ramfs_write
 from kernel.timer import timer_init
+from lib.vtnext import vtn_probe
 from lib.de import de_main
 from lib.shell import shell_main
 
@@ -133,37 +134,15 @@ def main() -> int32:
     while uart_available():
         discard: char = uart_getc()
 
-    # Boot selection: press 's' for shell, any other key or wait for GUI
-    print_str("Press 's' for text shell, any other key for desktop...\n")
-    print_str("Starting in: ")
-
-    # Countdown with visual feedback
-    use_shell: bool = False
-    countdown: int32 = 3
-    while countdown > 0:
-        print_int(countdown)
-        print_str(" ")
-
-        # Check for input during each countdown second (~100000 iterations)
-        i: int32 = 0
-        while i < 100000:
-            if uart_available():
-                c: char = uart_getc()
-                if c == 's' or c == 'S':
-                    use_shell = True
-                    print_str("\n[shell mode]\n")
-                    countdown = 0
-                    break
-                else:
-                    print_str("\n[desktop mode]\n")
-                    countdown = 0
-                    break
-            i = i + 1
-        countdown = countdown - 1
-
-    if use_shell:
-        shell_main()
-    else:
+    # Probe for VTNext renderer
+    print_str("[kernel] Probing for VTNext... ")
+    if vtn_probe():
+        print_str("OK\n")
+        print_str("[kernel] Starting graphical desktop\n")
         de_main()
+    else:
+        print_str("not found\n")
+        print_str("[kernel] Starting text shell\n")
+        shell_main()
 
     return 0

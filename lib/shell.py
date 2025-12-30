@@ -8,7 +8,8 @@ from lib.string import strcmp, strlen, strcpy, strcat, memset, atoi
 from kernel.ramfs import ramfs_readdir, ramfs_create, ramfs_delete
 from kernel.ramfs import ramfs_read, ramfs_write, ramfs_exists, ramfs_isdir
 from lib.memory import heap_remaining, heap_total, heap_used
-from kernel.timer import timer_delay_ms
+from kernel.timer import timer_delay_ms, timer_tick
+from programs.main import user_main, user_tick
 
 # Command buffer
 shell_cmd: Array[256, char]
@@ -31,6 +32,16 @@ shell_num_buf: Array[16, char]
 
 # Source path buffer for cp command
 shell_src_path: Array[256, char]
+
+# Job control
+# Job states: 0 = stopped, 1 = running (background), 2 = running (foreground)
+SHELL_JOB_STOPPED: int32 = 0
+SHELL_JOB_RUNNING: int32 = 1
+SHELL_JOB_FOREGROUND: int32 = 2
+
+# Job 1: main.py
+job1_state: int32 = 1  # Starts running in background
+job1_name: Array[16, char]
 
 def shell_putc(c: char):
     uart_putc(c)
@@ -119,7 +130,7 @@ def shell_int_to_str(n: int32) -> Ptr[char]:
     return &shell_num_buf[0]
 
 def shell_exec():
-    global shell_cmd_pos
+    global shell_cmd_pos, job1_state
 
     shell_cmd[shell_cmd_pos] = '\0'
 
@@ -185,18 +196,42 @@ def shell_exec():
         shell_newline()
         shell_puts(&shell_cwd[0])
         shell_newline()
-    elif strcmp(cmd, "ls") == 0:
+    elif shell_starts_with("ls"):
         shell_newline()
-        idx: int32 = 0
-        result: int32 = ramfs_readdir(&shell_cwd[0], idx, &shell_name_buf[0])
-        while result >= 0:
-            shell_puts(&shell_name_buf[0])
-            if result == 1:
-                shell_putc('/')
-            shell_puts("  ")
-            idx = idx + 1
-            result = ramfs_readdir(&shell_cwd[0], idx, &shell_name_buf[0])
-        shell_newline()
+        # Get optional path argument
+        ls_arg: Ptr[char] = shell_get_arg()
+        ls_path: Ptr[char] = &shell_cwd[0]
+        if ls_arg[0] != '\0':
+            # Has path argument
+            if ls_arg[0] == '/':
+                # Absolute path
+                ls_path = ls_arg
+            else:
+                # Relative path
+                shell_build_path(ls_arg)
+                ls_path = &shell_path_buf[0]
+        # Check if path exists and is a directory
+        if not ramfs_exists(ls_path):
+            shell_puts("ls: cannot access '")
+            shell_puts(ls_arg)
+            shell_puts("': No such file or directory")
+            shell_newline()
+        elif not ramfs_isdir(ls_path):
+            # It's a file, just print its name
+            shell_puts(ls_arg)
+            shell_newline()
+        else:
+            # It's a directory, list contents
+            idx: int32 = 0
+            result: int32 = ramfs_readdir(ls_path, idx, &shell_name_buf[0])
+            while result >= 0:
+                shell_puts(&shell_name_buf[0])
+                if result == 1:
+                    shell_putc('/')
+                shell_puts("  ")
+                idx = idx + 1
+                result = ramfs_readdir(ls_path, idx, &shell_name_buf[0])
+            shell_newline()
     elif shell_starts_with("cd"):
         arg: Ptr[char] = shell_get_arg()
         if arg[0] == '\0':
@@ -309,7 +344,7 @@ def shell_exec():
     elif strcmp(cmd, "clear") == 0:
         # VT100 clear screen
         shell_puts("\x1b[2J\x1b[H")
-    elif strcmp(cmd, "uname") == 0 or shell_starts_with("uname"):
+    elif shell_starts_with("uname"):
         shell_newline()
         arg7: Ptr[char] = shell_get_arg()
         if arg7[0] == '\0' or strcmp(arg7, "-s") == 0:
@@ -495,10 +530,13 @@ def shell_exec():
         NVIC_AIRCR[0] = 0x05FA0004
         while True:
             pass
-    elif strcmp(cmd, "halt") == 0 or strcmp(cmd, "poweroff") == 0:
+    elif strcmp(cmd, "halt") == 0 or strcmp(cmd, "poweroff") == 0 or strcmp(cmd, "exit") == 0:
         shell_newline()
         shell_puts("System halted.")
         shell_newline()
+        # Use QEMU semihosting exit
+        SEMIHOST_EXIT: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](0xE000EDF0)
+        SEMIHOST_EXIT[0] = 0x20026
         while True:
             pass
     elif shell_starts_with("seq"):
@@ -861,6 +899,20 @@ def shell_exec():
         shell_puts("Not implemented in text mode")
         shell_newline()
 
+    # Job control commands (simplified - full state tracking has known issues)
+    elif strcmp(cmd, "jobs") == 0:
+        shell_newline()
+        shell_puts("[1]   Running                 main.py &")
+        shell_newline()
+    elif strcmp(cmd, "fg") == 0:
+        shell_newline()
+        shell_puts("main.py: already running")
+        shell_newline()
+    elif strcmp(cmd, "bg") == 0:
+        shell_newline()
+        shell_puts("bg: job already in background")
+        shell_newline()
+
     else:
         shell_newline()
         shell_puts("Unknown: ")
@@ -872,7 +924,7 @@ def shell_exec():
     shell_cmd_pos = 0
 
 def shell_input(c: char):
-    global shell_cmd_pos
+    global shell_cmd_pos, job1_state
 
     if c == '\r' or c == '\n':
         shell_newline()
@@ -886,10 +938,22 @@ def shell_input(c: char):
             shell_puts("\b \b")
         return
 
-    # Ctrl+C
+    # Ctrl+C - cancel current command line
     if c == '\x03':
         shell_puts("^C")
         shell_newline()
+        shell_cmd_pos = 0
+        shell_prompt()
+        return
+
+    # Ctrl+Z - suspend foreground job
+    if c == '\x1a':
+        shell_puts("^Z")
+        shell_newline()
+        if job1_state == SHELL_JOB_RUNNING:
+            job1_state = SHELL_JOB_STOPPED
+            shell_puts("[1]+  Stopped                 main.py")
+            shell_newline()
         shell_cmd_pos = 0
         shell_prompt()
         return
@@ -906,6 +970,7 @@ def shell_init():
     shell_cmd_pos = 0
 
 def shell_main():
+    global job1_state
     shell_init()
 
     shell_newline()
@@ -914,9 +979,24 @@ def shell_main():
     shell_puts("Type 'help' for commands")
     shell_newline()
     shell_newline()
+
+    # Run user main.py startup
+    shell_puts("[1] main.py &")
+    shell_newline()
+    job1_state = SHELL_JOB_RUNNING
+    user_main()
+    shell_newline()
+
     shell_prompt()
 
     while True:
+        # Update timer (must be called regularly for timer_get_ticks to work)
+        timer_tick()
+
+        # Call user tick function only if job is running (not stopped)
+        if job1_state != SHELL_JOB_STOPPED:
+            user_tick()
+
         if uart_available():
             c: char = uart_getc()
             shell_input(c)
