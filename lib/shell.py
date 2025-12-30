@@ -68,14 +68,18 @@ shell_tab_match: Array[64, char]
 shell_tab_dir: Array[256, char]
 
 # Job control
-# Job states: 0 = stopped, 1 = running (background), 2 = running (foreground)
+# Job states: 0 = stopped, 1 = running (background), 2 = running (foreground), 3 = terminated
 SHELL_JOB_STOPPED: int32 = 0
 SHELL_JOB_RUNNING: int32 = 1
 SHELL_JOB_FOREGROUND: int32 = 2
+SHELL_JOB_TERMINATED: int32 = 3
 
 # Job 1: main.py
 job1_state: int32 = 1  # Starts running in background
 job1_name: Array[16, char]
+
+# Flag to track if we're in foreground mode (for Ctrl+C handling)
+shell_fg_mode: int32 = 0  # 0 = normal shell, 1 = fg running
 
 def shell_putc(c: char):
     uart_putc(c)
@@ -386,7 +390,7 @@ def shell_tab_complete():
 
 def shell_exec_job(cmd: Ptr[char]) -> bool:
     """Handle job control commands. Returns True if handled."""
-    global job1_state
+    global job1_state, shell_fg_mode
 
     if strcmp(cmd, "jobs") == 0:
         shell_newline()
@@ -394,18 +398,25 @@ def shell_exec_job(cmd: Ptr[char]) -> bool:
             shell_puts("[1]   Running                 main.py &")
         elif job1_state == SHELL_JOB_STOPPED:
             shell_puts("[1]+  Stopped                 main.py")
-        else:
+        elif job1_state == SHELL_JOB_TERMINATED:
+            shell_puts("[1]   Terminated              main.py")
+        elif job1_state == SHELL_JOB_FOREGROUND:
             shell_puts("[1]   Running                 main.py")
         shell_newline()
         return True
 
     if strcmp(cmd, "fg") == 0:
         shell_newline()
-        if job1_state == SHELL_JOB_STOPPED:
-            job1_state = SHELL_JOB_RUNNING
-            shell_puts("main.py: continued")
+        if job1_state == SHELL_JOB_TERMINATED:
+            shell_puts("fg: job has terminated")
+        elif job1_state == SHELL_JOB_STOPPED or job1_state == SHELL_JOB_RUNNING:
+            job1_state = SHELL_JOB_FOREGROUND
+            shell_fg_mode = 1
+            shell_puts("main.py")
+            shell_newline()
+            shell_puts("(Press Ctrl+C to stop)")
         else:
-            shell_puts("main.py: already running")
+            shell_puts("main.py: already in foreground")
         shell_newline()
         return True
 
@@ -872,9 +883,24 @@ def shell_exec_sys(cmd: Ptr[char]) -> bool:
         shell_newline()
         return True
 
-    if strcmp(cmd, "kill") == 0:
+    if shell_starts_with("kill"):
+        kill_arg: Ptr[char] = shell_get_arg()
         shell_newline()
-        shell_puts("kill: No processes to kill")
+        # Parse job number - accept %1, 1, or just "kill" for job 1
+        job_num: int32 = 1
+        if kill_arg[0] == '%':
+            job_num = atoi(&kill_arg[1])
+        elif kill_arg[0] >= '0' and kill_arg[0] <= '9':
+            job_num = atoi(kill_arg)
+
+        if job_num == 1:
+            if job1_state != SHELL_JOB_TERMINATED:
+                job1_state = SHELL_JOB_TERMINATED
+                shell_puts("[1]   Terminated              main.py")
+            else:
+                shell_puts("kill: job 1 already terminated")
+        else:
+            shell_puts("kill: no such job")
         shell_newline()
         return True
 
@@ -1753,6 +1779,7 @@ def shell_input(c: char):
     global shell_cmd_pos
     global job1_state
     global shell_history_pos
+    global shell_fg_mode
 
     # Handle escape sequences for arrow keys
     if shell_esc[0] == 1:
@@ -1813,10 +1840,16 @@ def shell_input(c: char):
         shell_tab_complete()
         return
 
-    # Ctrl+C - cancel current command line
+    # Ctrl+C - cancel current command line or stop foreground job
     if c == '\x03':
         shell_puts("^C")
         shell_newline()
+        if shell_fg_mode == 1:
+            # Stop the foreground job
+            job1_state = SHELL_JOB_STOPPED
+            shell_fg_mode = 0
+            shell_puts("[1]+  Stopped                 main.py")
+            shell_newline()
         shell_cmd_pos = 0
         history_reset_pos()
         shell_prompt()
@@ -1871,8 +1904,8 @@ def shell_main():
         # Update timer (must be called regularly for timer_get_ticks to work)
         timer_tick()
 
-        # Call user tick function only if job is running (not stopped)
-        if job1_state != SHELL_JOB_STOPPED:
+        # Call user tick function only if job is running (not stopped or terminated)
+        if job1_state == SHELL_JOB_RUNNING or job1_state == SHELL_JOB_FOREGROUND:
             user_tick()
 
         if uart_available():

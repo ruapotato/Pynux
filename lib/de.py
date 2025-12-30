@@ -1955,7 +1955,8 @@ def de_main():
         # Flush any output from user_tick to terminal 0
         if console_has_output():
             term_puts_idx(0, console_flush())
-            win_dirty[0] = True
+            # Use full redraw to maintain proper z-order
+            needs_full_redraw = True
 
         if uart_available():
             c: char = uart_getc()
