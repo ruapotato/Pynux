@@ -233,9 +233,30 @@ class ARMCodeGen:
                 self.gen_call(func, args)
 
             case MethodCallExpr(obj=obj, method=method, args=args):
-                # For now, treat as regular call with obj as first arg
-                all_args = [obj] + args
-                self.gen_call(Identifier(method), all_args)
+                # Handle string methods specially
+                string_methods = {
+                    'upper': '__pynux_str_upper',
+                    'lower': '__pynux_str_lower',
+                    'strip': '__pynux_str_strip',
+                    'lstrip': '__pynux_str_lstrip',
+                    'rstrip': '__pynux_str_rstrip',
+                    'startswith': '__pynux_str_startswith',
+                    'endswith': '__pynux_str_endswith',
+                    'find': '__pynux_str_find',
+                    'replace': '__pynux_str_replace',
+                    'split': '__pynux_str_split',
+                    'join': '__pynux_str_join',
+                    'isdigit': '__pynux_str_isdigit',
+                    'isalpha': '__pynux_str_isalpha',
+                }
+                if method in string_methods:
+                    # Call runtime function with obj as first arg
+                    all_args = [obj] + args
+                    self.gen_call(Identifier(string_methods[method]), all_args)
+                else:
+                    # Generic method call - treat as function with obj as first arg
+                    all_args = [obj] + args
+                    self.gen_call(Identifier(method), all_args)
 
             case IndexExpr(obj=obj, index=index):
                 # Array indexing: obj[index]
@@ -306,6 +327,9 @@ class ARMCodeGen:
 
             case TupleLiteral(elements=elements):
                 self.gen_tuple_literal(elements)
+
+            case ListComprehension(element=element, var=var, iterable=iterable, condition=cond):
+                self.gen_list_comprehension(element, var, iterable, cond)
 
             case ConditionalExpr(condition=cond, then_expr=then_e, else_expr=else_e):
                 else_label = self.ctx.new_label("else")
@@ -939,6 +963,100 @@ class ARMCodeGen:
 
         self.emit("    pop {r0}")
 
+    def gen_list_comprehension(self, element: Expr, var: str, iterable: Expr, condition: Optional[Expr]) -> None:
+        """Generate list comprehension: [expr for var in iterable if cond]."""
+        # This is complex - we need to:
+        # 1. Allocate initial list on heap
+        # 2. Iterate over iterable
+        # 3. For each item, optionally check condition
+        # 4. Evaluate element expression and append to list
+
+        # For simplicity, support range() iterables for now
+        if not isinstance(iterable, CallExpr) or not isinstance(iterable.func, Identifier):
+            raise CodeGenError("List comprehensions only support range() for now")
+
+        if iterable.func.name != "range":
+            raise CodeGenError("List comprehensions only support range() for now")
+
+        # Parse range args
+        range_args = iterable.args
+        if len(range_args) == 1:
+            start_val, end_val, step_val = 0, None, 1
+            end_expr = range_args[0]
+        elif len(range_args) == 2:
+            start_val, step_val = None, 1
+            start_expr, end_expr = range_args[0], range_args[1]
+        else:
+            start_expr, end_expr, step_expr = range_args[0], range_args[1], range_args[2]
+            start_val, step_val = None, None
+
+        # Allocate list with estimated size (we'll use max 256 elements)
+        self.emit("    movs r0, #264")  # 8 bytes header + 256 elements max
+        self.emit("    bl malloc")
+        self.emit("    push {r0}")  # Save list pointer
+
+        # Initialize length = 0
+        self.emit("    movs r1, #0")
+        self.emit("    str r1, [r0]")
+
+        # Allocate loop variable
+        loop_var = self.ctx.alloc_local(var)
+
+        # Get range parameters
+        if len(range_args) == 1:
+            self.emit("    movs r0, #0")
+            self.emit(f"    str r0, [r7, #{loop_var.offset}]")
+        else:
+            self.gen_expr(range_args[0])
+            self.emit(f"    str r0, [r7, #{loop_var.offset}]")
+
+        end_var = self.ctx.alloc_local(f"_end_{var}")
+        if len(range_args) >= 1:
+            self.gen_expr(end_expr)
+            self.emit(f"    str r0, [r7, #{end_var.offset}]")
+
+        # Loop
+        start_label = self.ctx.new_label("listcomp")
+        end_label = self.ctx.new_label("endlistcomp")
+        continue_label = self.ctx.new_label("listcompcont")
+
+        self.emit(f"{start_label}:")
+        self.emit(f"    ldr r0, [r7, #{loop_var.offset}]")
+        self.emit(f"    ldr r1, [r7, #{end_var.offset}]")
+        self.emit("    cmp r0, r1")
+        self.emit(f"    bge {end_label}")
+
+        # Check condition if present
+        if condition:
+            self.gen_expr(condition)
+            self.emit("    cmp r0, #0")
+            self.emit(f"    beq {continue_label}")
+
+        # Evaluate element expression
+        self.gen_expr(element)
+        self.emit("    push {r0}")  # Save element value
+
+        # Append to list: list[len] = value, len++
+        self.emit("    ldr r0, [sp, #4]")  # Get list pointer (below saved element)
+        self.emit("    ldr r1, [r0]")       # Get current length
+        self.emit("    add r2, r0, #8")     # Data starts at offset 8
+        self.emit("    lsl r3, r1, #2")     # Offset = len * 4
+        self.emit("    add r2, r2, r3")     # Data address
+        self.emit("    pop {r3}")           # Get saved element
+        self.emit("    str r3, [r2]")       # Store element
+        self.emit("    add r1, r1, #1")     # len++
+        self.emit("    str r1, [r0]")       # Store new length
+
+        self.emit(f"{continue_label}:")
+        # Increment loop variable
+        self.emit(f"    ldr r0, [r7, #{loop_var.offset}]")
+        self.emit("    add r0, r0, #1")
+        self.emit(f"    str r0, [r7, #{loop_var.offset}]")
+        self.emit(f"    b {start_label}")
+
+        self.emit(f"{end_label}:")
+        self.emit("    pop {r0}")  # Return list pointer
+
     # -------------------------------------------------------------------------
     # Statement generation
     # -------------------------------------------------------------------------
@@ -1019,6 +1137,15 @@ class ARMCodeGen:
 
             case MatchStmt(expr=expr, arms=arms):
                 self.gen_match(expr, arms)
+
+            case TupleUnpackAssign(targets=targets, value=value):
+                self.gen_tuple_unpack_assign(targets, value)
+
+            case TryStmt(try_body=try_body, handlers=handlers, else_body=else_body, finally_body=finally_body):
+                self.gen_try_stmt(try_body, handlers, else_body, finally_body)
+
+            case RaiseStmt(exception=exc):
+                self.gen_raise(exc)
 
             case _:
                 raise CodeGenError(f"Unsupported statement: {type(stmt).__name__}")
@@ -1383,6 +1510,110 @@ class ARMCodeGen:
         self.emit("    add sp, sp, #4")
 
         self.emit(f"{end_label}:")
+
+    def gen_tuple_unpack_assign(self, targets: list[str], value: Expr) -> None:
+        """Generate tuple unpacking assignment: a, b = expr."""
+        # Evaluate the right-hand side
+        self.gen_expr(value)
+        self.emit("    push {r0}")  # Save tuple/value pointer
+
+        # For tuple literal on RHS: evaluate and store directly
+        if isinstance(value, TupleLiteral):
+            # Values are on the heap, indexed
+            for i, target in enumerate(targets):
+                self.emit("    ldr r0, [sp]")
+                self.emit(f"    ldr r0, [r0, #{i * 4}]")
+                if target in self.ctx.locals:
+                    var = self.ctx.locals[target]
+                    self.emit(f"    str r0, [r7, #{var.offset}]")
+                else:
+                    # Allocate new local
+                    var = self.ctx.alloc_local(target)
+                    self.emit(f"    str r0, [r7, #{var.offset}]")
+        else:
+            # For other expressions (function returns, etc.)
+            # Assume the result is a pointer to contiguous values
+            for i, target in enumerate(targets):
+                self.emit("    ldr r0, [sp]")
+                if i > 0:
+                    self.emit(f"    add r0, r0, #{i * 4}")
+                self.emit("    ldr r0, [r0]")
+                if target in self.ctx.locals:
+                    var = self.ctx.locals[target]
+                    self.emit(f"    str r0, [r7, #{var.offset}]")
+                else:
+                    var = self.ctx.alloc_local(target)
+                    self.emit(f"    str r0, [r7, #{var.offset}]")
+
+        self.emit("    pop {r0}")  # Clean up
+
+    def gen_try_stmt(self, try_body: list, handlers: list, else_body: list, finally_body: list) -> None:
+        """Generate try/except/finally statement."""
+        # Simple implementation: try/except is just conditional execution
+        # In a real system, we'd need setjmp/longjmp or similar
+
+        # For now, we use a simple error flag approach
+        # Set error flag to 0, run try block
+        # If any function sets error flag, jump to handler
+
+        error_var = self.ctx.alloc_local("_error_flag")
+        handler_label = self.ctx.new_label("except")
+        else_label = self.ctx.new_label("else")
+        finally_label = self.ctx.new_label("finally")
+        end_label = self.ctx.new_label("endtry")
+
+        # Initialize error flag to 0
+        self.emit("    movs r0, #0")
+        self.emit(f"    str r0, [r7, #{error_var.offset}]")
+
+        # Execute try body
+        for s in try_body:
+            self.gen_stmt(s)
+
+        # Check if error occurred
+        self.emit(f"    ldr r0, [r7, #{error_var.offset}]")
+        self.emit("    cmp r0, #0")
+        self.emit(f"    bne {handler_label}")
+
+        # No error - run else block if present
+        if else_body:
+            for s in else_body:
+                self.gen_stmt(s)
+        self.emit(f"    b {finally_label}")
+
+        # Exception handlers
+        self.emit(f"{handler_label}:")
+        for handler in handlers:
+            # For now, just run the handler body
+            # (proper exception matching would need type checking)
+            if handler.name:
+                # Create variable for exception
+                exc_var = self.ctx.alloc_local(handler.name)
+                self.emit(f"    ldr r0, [r7, #{error_var.offset}]")
+                self.emit(f"    str r0, [r7, #{exc_var.offset}]")
+            for s in handler.body:
+                self.gen_stmt(s)
+            # Clear error flag after handling
+            self.emit("    movs r0, #0")
+            self.emit(f"    str r0, [r7, #{error_var.offset}]")
+            break  # Only run first matching handler
+
+        # Finally block (always runs)
+        self.emit(f"{finally_label}:")
+        for s in finally_body:
+            self.gen_stmt(s)
+
+        self.emit(f"{end_label}:")
+
+    def gen_raise(self, exc: Optional[Expr]) -> None:
+        """Generate raise statement."""
+        if exc:
+            self.gen_expr(exc)
+            # Store exception and halt
+            self.emit("    bl __pynux_raise")
+        else:
+            # Re-raise current exception
+            self.emit("    bl __pynux_reraise")
 
     # -------------------------------------------------------------------------
     # Declaration generation

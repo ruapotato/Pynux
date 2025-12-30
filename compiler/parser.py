@@ -487,15 +487,32 @@ class Parser:
             # Just the type - shouldn't happen in expression context
             return Identifier("Ptr", self.make_span(tok))
 
-        # List literal
+        # List literal or list comprehension
         if self.match(TokenType.LBRACKET):
-            elements = []
-            if not self.check(TokenType.RBRACKET):
+            if self.check(TokenType.RBRACKET):
+                self.advance()
+                return ListLiteral([], self.make_span(tok))
+
+            first = self.parse_expression()
+
+            # Check for list comprehension: [expr for var in iterable]
+            if self.match(TokenType.FOR):
+                var_tok = self.expect(TokenType.IDENT)
+                var_name = var_tok.value
+                self.expect(TokenType.IN)
+                iterable = self.parse_expression()
+                condition = None
+                if self.match(TokenType.IF):
+                    condition = self.parse_expression()
+                self.expect(TokenType.RBRACKET)
+                return ListComprehension(first, var_name, iterable, condition, self.make_span(tok))
+
+            # Regular list literal
+            elements = [first]
+            while self.match(TokenType.COMMA):
+                if self.check(TokenType.RBRACKET):
+                    break
                 elements.append(self.parse_expression())
-                while self.match(TokenType.COMMA):
-                    if self.check(TokenType.RBRACKET):
-                        break
-                    elements.append(self.parse_expression())
             self.expect(TokenType.RBRACKET)
             return ListLiteral(elements, self.make_span(tok))
 
@@ -703,10 +720,67 @@ class Parser:
             self.expect(TokenType.DEDENT)
             return MatchStmt(expr, arms, self.make_span(tok))
 
+        # Try/except/finally statement
+        if self.match(TokenType.TRY):
+            try_body = self.parse_block()
+            handlers = []
+            else_body = []
+            finally_body = []
+
+            # Parse except handlers
+            while self.match(TokenType.EXCEPT):
+                exc_type = None
+                exc_name = None
+                if not self.check(TokenType.COLON):
+                    exc_type = self.expect(TokenType.IDENT).value
+                    if self.match(TokenType.AS):
+                        exc_name = self.expect(TokenType.IDENT).value
+                handler_body = self.parse_block()
+                handlers.append(ExceptHandler(exc_type, exc_name, handler_body))
+
+            # Optional else block
+            if self.match(TokenType.ELSE):
+                else_body = self.parse_block()
+
+            # Optional finally block
+            if self.match(TokenType.FINALLY):
+                finally_body = self.parse_block()
+
+            return TryStmt(try_body, handlers, else_body, finally_body, self.make_span(tok))
+
+        # Raise statement
+        if self.match(TokenType.RAISE):
+            exc = None
+            if not self.check(TokenType.NEWLINE):
+                exc = self.parse_expression()
+            self.expect(TokenType.NEWLINE)
+            return RaiseStmt(exc, self.make_span(tok))
+
         # Variable declaration or expression statement
-        # Check for: name: type = value  or  name = value
+        # Check for: name: type = value  or  name = value  or  a, b = value
         if self.check(TokenType.IDENT):
             name = self.advance().value
+
+            # Check for tuple unpacking: a, b = value or a, b = b, a
+            if self.match(TokenType.COMMA):
+                targets = [name]
+                targets.append(self.expect(TokenType.IDENT).value)
+                while self.match(TokenType.COMMA):
+                    targets.append(self.expect(TokenType.IDENT).value)
+                self.expect(TokenType.ASSIGN)
+                # Parse RHS - could be a tuple (b, a) or single expression
+                first_expr = self.parse_expression()
+                if self.match(TokenType.COMMA):
+                    # Multiple values on RHS - create TupleLiteral
+                    elements = [first_expr]
+                    elements.append(self.parse_expression())
+                    while self.match(TokenType.COMMA):
+                        elements.append(self.parse_expression())
+                    value = TupleLiteral(elements)
+                else:
+                    value = first_expr
+                self.expect(TokenType.NEWLINE)
+                return TupleUnpackAssign(targets, value, self.make_span(tok))
 
             # Type annotation: x: int32 or x: int32 = value
             if self.match(TokenType.COLON):

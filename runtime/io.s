@@ -550,7 +550,358 @@ __pynux_memset:
     pop {r4, pc}
     .size __pynux_memset, . - __pynux_memset
 
+@ ============================================================================
+@ String Methods
+@ ============================================================================
+
+@ char* __pynux_str_upper(const char* s)
+@ Convert string to uppercase, returns new string
+    .global __pynux_str_upper
+    .type __pynux_str_upper, %function
+__pynux_str_upper:
+    push {r4, r5, r6, lr}
+    mov r4, r0         @ source string
+    @ Get length
+    bl __pynux_strlen
+    mov r5, r0         @ length
+    add r0, r5, #1
+    bl malloc
+    mov r6, r0         @ destination
+
+.upper_loop:
+    ldrb r0, [r4]
+    cmp r0, #0
+    beq .upper_done
+    @ Check if lowercase letter (a-z = 97-122)
+    cmp r0, #97
+    blt .upper_store
+    cmp r0, #122
+    bgt .upper_store
+    sub r0, r0, #32    @ Convert to uppercase
+.upper_store:
+    strb r0, [r6]
+    adds r4, r4, #1
+    adds r6, r6, #1
+    b .upper_loop
+.upper_done:
+    movs r0, #0
+    strb r0, [r6]      @ Null terminate
+    sub r0, r6, r5     @ Return start of new string
+    pop {r4, r5, r6, pc}
+    .size __pynux_str_upper, . - __pynux_str_upper
+
+@ char* __pynux_str_lower(const char* s)
+@ Convert string to lowercase, returns new string
+    .global __pynux_str_lower
+    .type __pynux_str_lower, %function
+__pynux_str_lower:
+    push {r4, r5, r6, lr}
+    mov r4, r0         @ source string
+    bl __pynux_strlen
+    mov r5, r0
+    add r0, r5, #1
+    bl malloc
+    mov r6, r0
+
+.lower_loop:
+    ldrb r0, [r4]
+    cmp r0, #0
+    beq .lower_done
+    @ Check if uppercase letter (A-Z = 65-90)
+    cmp r0, #65
+    blt .lower_store
+    cmp r0, #90
+    bgt .lower_store
+    add r0, r0, #32    @ Convert to lowercase
+.lower_store:
+    strb r0, [r6]
+    adds r4, r4, #1
+    adds r6, r6, #1
+    b .lower_loop
+.lower_done:
+    movs r0, #0
+    strb r0, [r6]
+    sub r0, r6, r5
+    pop {r4, r5, r6, pc}
+    .size __pynux_str_lower, . - __pynux_str_lower
+
+@ char* __pynux_str_strip(const char* s)
+@ Remove leading and trailing whitespace, returns new string
+    .global __pynux_str_strip
+    .type __pynux_str_strip, %function
+__pynux_str_strip:
+    push {r4, r5, r6, r7, lr}
+    mov r4, r0         @ source
+
+    @ Find first non-whitespace
+.strip_start:
+    ldrb r0, [r4]
+    cmp r0, #0
+    beq .strip_empty
+    cmp r0, #' '
+    beq .strip_skip
+    cmp r0, #'\t'
+    beq .strip_skip
+    cmp r0, #'\n'
+    beq .strip_skip
+    cmp r0, #'\r'
+    beq .strip_skip
+    b .strip_find_end
+.strip_skip:
+    adds r4, r4, #1
+    b .strip_start
+
+.strip_find_end:
+    mov r5, r4         @ start of content
+    @ Find end of string
+    mov r0, r4
+    bl __pynux_strlen
+    add r6, r4, r0     @ end pointer
+    @ Move back over trailing whitespace
+.strip_end:
+    subs r6, r6, #1
+    cmp r6, r5
+    blt .strip_empty
+    ldrb r0, [r6]
+    cmp r0, #' '
+    beq .strip_end
+    cmp r0, #'\t'
+    beq .strip_end
+    cmp r0, #'\n'
+    beq .strip_end
+    cmp r0, #'\r'
+    beq .strip_end
+
+    @ Calculate length and allocate
+    sub r7, r6, r5
+    add r7, r7, #1     @ length
+    add r0, r7, #1     @ +1 for null
+    bl malloc
+    mov r6, r0         @ destination
+    @ Copy
+.strip_copy:
+    ldrb r0, [r5]
+    strb r0, [r6]
+    adds r5, r5, #1
+    adds r6, r6, #1
+    subs r7, r7, #1
+    bne .strip_copy
+    movs r0, #0
+    strb r0, [r6]      @ null terminate
+    sub r0, r6, r7     @ This gives us back the start
+    @ Actually we need to fix this - let's recalculate
+    sub r6, r6, #1
+.strip_back:
+    ldrb r1, [r6]
+    cmp r1, #0
+    beq .strip_return
+    subs r6, r6, #1
+    b .strip_back
+.strip_return:
+    add r0, r6, #1
+    pop {r4, r5, r6, r7, pc}
+
+.strip_empty:
+    movs r0, #1
+    bl malloc
+    movs r1, #0
+    strb r1, [r0]
+    pop {r4, r5, r6, r7, pc}
+    .size __pynux_str_strip, . - __pynux_str_strip
+
+@ bool __pynux_str_startswith(const char* s, const char* prefix)
+@ Check if string starts with prefix
+    .global __pynux_str_startswith
+    .type __pynux_str_startswith, %function
+__pynux_str_startswith:
+    push {r4, r5, lr}
+    mov r4, r0         @ string
+    mov r5, r1         @ prefix
+.startswith_loop:
+    ldrb r0, [r5]
+    cmp r0, #0
+    beq .startswith_yes   @ End of prefix, matched!
+    ldrb r1, [r4]
+    cmp r0, r1
+    bne .startswith_no
+    adds r4, r4, #1
+    adds r5, r5, #1
+    b .startswith_loop
+.startswith_yes:
+    movs r0, #1
+    pop {r4, r5, pc}
+.startswith_no:
+    movs r0, #0
+    pop {r4, r5, pc}
+    .size __pynux_str_startswith, . - __pynux_str_startswith
+
+@ bool __pynux_str_endswith(const char* s, const char* suffix)
+@ Check if string ends with suffix
+    .global __pynux_str_endswith
+    .type __pynux_str_endswith, %function
+__pynux_str_endswith:
+    push {r4, r5, r6, r7, lr}
+    mov r4, r0         @ string
+    mov r5, r1         @ suffix
+    @ Get lengths
+    bl __pynux_strlen
+    mov r6, r0         @ string length
+    mov r0, r5
+    bl __pynux_strlen
+    mov r7, r0         @ suffix length
+    @ Check if suffix is longer than string
+    cmp r7, r6
+    bgt .endswith_no
+    @ Compare from end
+    add r4, r4, r6
+    sub r4, r4, r7     @ Position in string to compare
+.endswith_loop:
+    ldrb r0, [r5]
+    cmp r0, #0
+    beq .endswith_yes
+    ldrb r1, [r4]
+    cmp r0, r1
+    bne .endswith_no
+    adds r4, r4, #1
+    adds r5, r5, #1
+    b .endswith_loop
+.endswith_yes:
+    movs r0, #1
+    pop {r4, r5, r6, r7, pc}
+.endswith_no:
+    movs r0, #0
+    pop {r4, r5, r6, r7, pc}
+    .size __pynux_str_endswith, . - __pynux_str_endswith
+
+@ int __pynux_str_find(const char* s, const char* sub)
+@ Find first occurrence of substring, returns index or -1
+    .global __pynux_str_find
+    .type __pynux_str_find, %function
+__pynux_str_find:
+    push {r4, r5, r6, r7, lr}
+    mov r4, r0         @ string
+    mov r5, r1         @ substring
+    movs r6, #0        @ index
+.find_outer:
+    ldrb r0, [r4]
+    cmp r0, #0
+    beq .find_notfound
+    @ Try to match substring here
+    mov r7, r4
+    push {r5}
+.find_inner:
+    ldrb r0, [r5]
+    cmp r0, #0
+    beq .find_found    @ End of substring, found!
+    ldrb r1, [r7]
+    cmp r1, #0
+    beq .find_inner_fail
+    cmp r0, r1
+    bne .find_inner_fail
+    adds r5, r5, #1
+    adds r7, r7, #1
+    b .find_inner
+.find_inner_fail:
+    pop {r5}
+    adds r4, r4, #1
+    adds r6, r6, #1
+    b .find_outer
+.find_found:
+    pop {r5}
+    mov r0, r6
+    pop {r4, r5, r6, r7, pc}
+.find_notfound:
+    mov r0, #-1
+    pop {r4, r5, r6, r7, pc}
+    .size __pynux_str_find, . - __pynux_str_find
+
+@ bool __pynux_str_isdigit(const char* s)
+@ Check if all characters are digits
+    .global __pynux_str_isdigit
+    .type __pynux_str_isdigit, %function
+__pynux_str_isdigit:
+    push {r4, lr}
+    mov r4, r0
+    ldrb r0, [r4]
+    cmp r0, #0
+    beq .isdigit_empty
+.isdigit_loop:
+    ldrb r0, [r4]
+    cmp r0, #0
+    beq .isdigit_yes
+    cmp r0, #'0'
+    blt .isdigit_no
+    cmp r0, #'9'
+    bgt .isdigit_no
+    adds r4, r4, #1
+    b .isdigit_loop
+.isdigit_yes:
+    movs r0, #1
+    pop {r4, pc}
+.isdigit_no:
+.isdigit_empty:
+    movs r0, #0
+    pop {r4, pc}
+    .size __pynux_str_isdigit, . - __pynux_str_isdigit
+
+@ bool __pynux_str_isalpha(const char* s)
+@ Check if all characters are alphabetic
+    .global __pynux_str_isalpha
+    .type __pynux_str_isalpha, %function
+__pynux_str_isalpha:
+    push {r4, lr}
+    mov r4, r0
+    ldrb r0, [r4]
+    cmp r0, #0
+    beq .isalpha_empty
+.isalpha_loop:
+    ldrb r0, [r4]
+    cmp r0, #0
+    beq .isalpha_yes
+    @ Check A-Z (65-90)
+    cmp r0, #65
+    blt .isalpha_check_lower
+    cmp r0, #90
+    ble .isalpha_next
+.isalpha_check_lower:
+    @ Check a-z (97-122)
+    cmp r0, #97
+    blt .isalpha_no
+    cmp r0, #122
+    bgt .isalpha_no
+.isalpha_next:
+    adds r4, r4, #1
+    b .isalpha_loop
+.isalpha_yes:
+    movs r0, #1
+    pop {r4, pc}
+.isalpha_no:
+.isalpha_empty:
+    movs r0, #0
+    pop {r4, pc}
+    .size __pynux_str_isalpha, . - __pynux_str_isalpha
+
+@ Exception handling stubs
+    .global __pynux_raise
+    .type __pynux_raise, %function
+__pynux_raise:
+    push {lr}
+    ldr r0, =.raise_msg
+    bl print_str
+.raise_halt:
+    b .raise_halt
+    .size __pynux_raise, . - __pynux_raise
+
+    .global __pynux_reraise
+    .type __pynux_reraise, %function
+__pynux_reraise:
+    b __pynux_raise
+    .size __pynux_reraise, . - __pynux_reraise
+
     .section .rodata
+.raise_msg:
+    .asciz "Exception raised\n"
+    .align 2
 .assert_msg:
     .asciz "Assertion failed: "
     .align 2

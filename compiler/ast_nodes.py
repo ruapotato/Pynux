@@ -282,6 +282,16 @@ class TupleLiteral:
 
 
 @dataclass
+class ListComprehension:
+    """List comprehension: [x*2 for x in items if x > 0]"""
+    element: 'Expr'  # Expression for each element
+    var: str  # Loop variable
+    iterable: 'Expr'  # What to iterate over
+    condition: Optional['Expr'] = None  # Optional filter
+    span: Optional[Span] = None
+
+
+@dataclass
 class ConditionalExpr:
     """Ternary: x if cond else y"""
     condition: 'Expr'
@@ -325,8 +335,8 @@ Expr = (IntLiteral | FloatLiteral | StringLiteral | FStringLiteral |
         CharLiteral | BoolLiteral | NoneLiteral | Identifier |
         BinaryExpr | UnaryExpr | CallExpr | MethodCallExpr |
         IndexExpr | SliceExpr | MemberExpr | ListLiteral |
-        DictLiteral | TupleLiteral | ConditionalExpr | LambdaExpr |
-        SizeOfExpr | CastExpr | AsmExpr)
+        DictLiteral | TupleLiteral | ListComprehension | ConditionalExpr |
+        LambdaExpr | SizeOfExpr | CastExpr | AsmExpr)
 
 
 # Statements
@@ -439,10 +449,45 @@ class GlobalStmt:
     span: Optional[Span] = None
 
 
+@dataclass
+class TupleUnpackAssign:
+    """Tuple unpacking assignment: a, b = b, a or a, b = func()"""
+    targets: list[str]  # Variable names to assign to
+    value: Expr  # Right-hand side expression
+    span: Optional[Span] = None
+
+
+@dataclass
+class ExceptHandler:
+    """Exception handler: except ExceptionType as e: ..."""
+    exception_type: Optional[str] = None  # None for bare except
+    name: Optional[str] = None  # Variable name for 'as name'
+    body: list['Stmt'] = field(default_factory=list)
+    span: Optional[Span] = None
+
+
+@dataclass
+class TryStmt:
+    """Try/except/finally statement."""
+    try_body: list['Stmt']
+    handlers: list[ExceptHandler] = field(default_factory=list)
+    else_body: list['Stmt'] = field(default_factory=list)
+    finally_body: list['Stmt'] = field(default_factory=list)
+    span: Optional[Span] = None
+
+
+@dataclass
+class RaiseStmt:
+    """Raise statement: raise Exception("error")"""
+    exception: Optional[Expr] = None
+    span: Optional[Span] = None
+
+
 # Type alias for statements
 Stmt = (VarDecl | Assignment | ExprStmt | ReturnStmt | IfStmt |
         WhileStmt | ForStmt | ForUnpackStmt | BreakStmt | ContinueStmt |
-        PassStmt | DeferStmt | AssertStmt | GlobalStmt)
+        PassStmt | DeferStmt | AssertStmt | GlobalStmt | TupleUnpackAssign |
+        TryStmt | RaiseStmt)
 
 
 # Declarations
