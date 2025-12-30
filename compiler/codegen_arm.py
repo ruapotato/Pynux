@@ -424,7 +424,13 @@ class ARMCodeGen:
                 # For now, just pass through (soft-float would need runtime calls)
 
             case AsmExpr(code=code):
-                self.emit(f"    {code}")
+                # Handle multi-line asm blocks - strip common indent and emit each line
+                import textwrap
+                code = textwrap.dedent(code).strip()
+                for line in code.split('\n'):
+                    line = line.rstrip()
+                    if line:
+                        self.emit(f"    {line}")
 
             case _:
                 raise CodeGenError(f"Unsupported expression: {type(expr).__name__}")
@@ -735,6 +741,300 @@ class ARMCodeGen:
             # Send Event
             self.emit("    sev")
             self.emit("    movs r0, #0")
+            return
+
+        # Atomic operations using LDREX/STREX (Cortex-M3+)
+        elif func_name == "atomic_load":
+            # atomic_load(ptr) -> value
+            # Uses LDREX for exclusive load
+            if len(args) != 1:
+                raise CodeGenError("atomic_load takes 1 argument")
+            self.gen_expr(args[0])  # ptr in r0
+            self.emit("    ldrex r0, [r0]")
+            return
+
+        elif func_name == "atomic_store":
+            # atomic_store(ptr, value) -> success (0 = success)
+            # Uses STREX for exclusive store
+            if len(args) != 2:
+                raise CodeGenError("atomic_store takes 2 arguments")
+            self.gen_expr(args[0])  # ptr
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # value
+            self.emit("    mov r1, r0")  # value in r1
+            self.emit("    pop {r2}")    # ptr in r2
+            self.emit("    strex r0, r1, [r2]")  # r0 = 0 on success
+            return
+
+        elif func_name == "atomic_add":
+            # atomic_add(ptr, val) -> old_value
+            # LDREX, ADD, STREX loop
+            if len(args) != 2:
+                raise CodeGenError("atomic_add takes 2 arguments")
+            label = self.ctx.new_label("atomic_add")
+            self.gen_expr(args[0])  # ptr
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # val
+            self.emit("    mov r1, r0")  # val in r1
+            self.emit("    pop {r2}")    # ptr in r2
+            self.emit(f"{label}:")
+            self.emit("    ldrex r0, [r2]")      # old value
+            self.emit("    add r3, r0, r1")      # new value
+            self.emit("    strex r4, r3, [r2]")  # try store
+            self.emit(f"    cbnz r4, {label}")   # retry if failed
+            return
+
+        elif func_name == "atomic_sub":
+            # atomic_sub(ptr, val) -> old_value
+            if len(args) != 2:
+                raise CodeGenError("atomic_sub takes 2 arguments")
+            label = self.ctx.new_label("atomic_sub")
+            self.gen_expr(args[0])  # ptr
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # val
+            self.emit("    mov r1, r0")  # val in r1
+            self.emit("    pop {r2}")    # ptr in r2
+            self.emit(f"{label}:")
+            self.emit("    ldrex r0, [r2]")      # old value
+            self.emit("    sub r3, r0, r1")      # new value
+            self.emit("    strex r4, r3, [r2]")  # try store
+            self.emit(f"    cbnz r4, {label}")   # retry if failed
+            return
+
+        elif func_name == "atomic_cmpxchg":
+            # atomic_cmpxchg(ptr, expected, desired) -> old_value
+            # Compare-and-swap: if *ptr == expected, *ptr = desired
+            if len(args) != 3:
+                raise CodeGenError("atomic_cmpxchg takes 3 arguments")
+            label = self.ctx.new_label("atomic_cmpxchg")
+            label_done = self.ctx.new_label("atomic_cmpxchg_done")
+            self.gen_expr(args[0])  # ptr
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # expected
+            self.emit("    push {r0}")
+            self.gen_expr(args[2])  # desired
+            self.emit("    mov r3, r0")  # desired in r3
+            self.emit("    pop {r1}")    # expected in r1
+            self.emit("    pop {r2}")    # ptr in r2
+            self.emit(f"{label}:")
+            self.emit("    ldrex r0, [r2]")      # old value
+            self.emit("    cmp r0, r1")          # compare with expected
+            self.emit(f"    bne {label_done}")   # if not equal, return old value
+            self.emit("    strex r4, r3, [r2]")  # try store desired
+            self.emit(f"    cbnz r4, {label}")   # retry if failed
+            self.emit(f"{label_done}:")
+            return
+
+        elif func_name == "atomic_or":
+            # atomic_or(ptr, val) -> old_value
+            if len(args) != 2:
+                raise CodeGenError("atomic_or takes 2 arguments")
+            label = self.ctx.new_label("atomic_or")
+            self.gen_expr(args[0])  # ptr
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # val
+            self.emit("    mov r1, r0")
+            self.emit("    pop {r2}")
+            self.emit(f"{label}:")
+            self.emit("    ldrex r0, [r2]")
+            self.emit("    orr r3, r0, r1")
+            self.emit("    strex r4, r3, [r2]")
+            self.emit(f"    cbnz r4, {label}")
+            return
+
+        elif func_name == "atomic_and":
+            # atomic_and(ptr, val) -> old_value
+            if len(args) != 2:
+                raise CodeGenError("atomic_and takes 2 arguments")
+            label = self.ctx.new_label("atomic_and")
+            self.gen_expr(args[0])  # ptr
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # val
+            self.emit("    mov r1, r0")
+            self.emit("    pop {r2}")
+            self.emit(f"{label}:")
+            self.emit("    ldrex r0, [r2]")
+            self.emit("    and r3, r0, r1")
+            self.emit("    strex r4, r3, [r2]")
+            self.emit(f"    cbnz r4, {label}")
+            return
+
+        elif func_name == "atomic_xor":
+            # atomic_xor(ptr, val) -> old_value
+            if len(args) != 2:
+                raise CodeGenError("atomic_xor takes 2 arguments")
+            label = self.ctx.new_label("atomic_xor")
+            self.gen_expr(args[0])  # ptr
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # val
+            self.emit("    mov r1, r0")
+            self.emit("    pop {r2}")
+            self.emit(f"{label}:")
+            self.emit("    ldrex r0, [r2]")
+            self.emit("    eor r3, r0, r1")
+            self.emit("    strex r4, r3, [r2]")
+            self.emit(f"    cbnz r4, {label}")
+            return
+
+        elif func_name == "critical_enter":
+            # critical_enter() -> old_primask
+            # Disable interrupts and return previous state
+            self.emit("    mrs r0, primask")  # save old state
+            self.emit("    cpsid i")          # disable interrupts
+            return
+
+        elif func_name == "critical_exit":
+            # critical_exit(old_primask)
+            # Restore interrupt state
+            if len(args) != 1:
+                raise CodeGenError("critical_exit takes 1 argument")
+            self.gen_expr(args[0])  # old primask
+            self.emit("    msr primask, r0")  # restore state
+            self.emit("    movs r0, #0")
+            return
+
+        elif func_name == "clrex":
+            # clrex() - Clear exclusive monitor
+            self.emit("    clrex")
+            self.emit("    movs r0, #0")
+            return
+
+        # Bit manipulation builtins for register/hardware access
+        elif func_name == "bit_set":
+            # bit_set(val, bit) -> val with bit set
+            if len(args) != 2:
+                raise CodeGenError("bit_set takes 2 arguments")
+            self.gen_expr(args[0])  # val
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # bit position
+            self.emit("    movs r1, #1")
+            self.emit("    lsl r1, r1, r0")  # r1 = 1 << bit
+            self.emit("    pop {r0}")
+            self.emit("    orr r0, r0, r1")
+            return
+
+        elif func_name == "bit_clear":
+            # bit_clear(val, bit) -> val with bit cleared
+            if len(args) != 2:
+                raise CodeGenError("bit_clear takes 2 arguments")
+            self.gen_expr(args[0])  # val
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # bit position
+            self.emit("    movs r1, #1")
+            self.emit("    lsl r1, r1, r0")  # r1 = 1 << bit
+            self.emit("    pop {r0}")
+            self.emit("    bic r0, r0, r1")
+            return
+
+        elif func_name == "bit_test":
+            # bit_test(val, bit) -> 1 if set, 0 if clear
+            if len(args) != 2:
+                raise CodeGenError("bit_test takes 2 arguments")
+            self.gen_expr(args[0])  # val
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # bit position
+            self.emit("    movs r1, #1")
+            self.emit("    lsl r1, r1, r0")  # r1 = 1 << bit
+            self.emit("    pop {r0}")
+            self.emit("    tst r0, r1")
+            self.emit("    ite ne")
+            self.emit("    movne r0, #1")
+            self.emit("    moveq r0, #0")
+            return
+
+        elif func_name == "bit_toggle":
+            # bit_toggle(val, bit) -> val with bit toggled
+            if len(args) != 2:
+                raise CodeGenError("bit_toggle takes 2 arguments")
+            self.gen_expr(args[0])  # val
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # bit position
+            self.emit("    movs r1, #1")
+            self.emit("    lsl r1, r1, r0")  # r1 = 1 << bit
+            self.emit("    pop {r0}")
+            self.emit("    eor r0, r0, r1")
+            return
+
+        elif func_name == "bits_get":
+            # bits_get(val, start, width) -> extracted bits
+            # Uses UBFX (Unsigned Bit Field Extract) on Cortex-M3+
+            if len(args) != 3:
+                raise CodeGenError("bits_get takes 3 arguments (val, start, width)")
+            self.gen_expr(args[0])  # val
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # start bit
+            self.emit("    push {r0}")
+            self.gen_expr(args[2])  # width
+            self.emit("    mov r2, r0")      # width in r2
+            self.emit("    pop {r1}")        # start in r1
+            self.emit("    pop {r0}")        # val in r0
+            # Use shift and mask (UBFX would require immediate args)
+            self.emit("    lsr r0, r0, r1")  # shift right by start
+            self.emit("    movs r3, #1")
+            self.emit("    lsl r3, r3, r2")  # r3 = 1 << width
+            self.emit("    subs r3, r3, #1") # r3 = mask
+            self.emit("    and r0, r0, r3")
+            return
+
+        elif func_name == "bits_set":
+            # bits_set(val, field, start, width) -> val with field inserted
+            # Clears bits at [start:start+width] and inserts field value
+            if len(args) != 4:
+                raise CodeGenError("bits_set takes 4 arguments (val, field, start, width)")
+            self.gen_expr(args[0])  # val
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])  # field value to insert
+            self.emit("    push {r0}")
+            self.gen_expr(args[2])  # start bit
+            self.emit("    push {r0}")
+            self.gen_expr(args[3])  # width
+            self.emit("    mov r3, r0")      # width in r3
+            self.emit("    pop {r2}")        # start in r2
+            self.emit("    pop {r1}")        # field in r1
+            self.emit("    pop {r0}")        # val in r0
+            # Create mask for the field
+            self.emit("    push {r4, r5}")
+            self.emit("    movs r4, #1")
+            self.emit("    lsl r4, r4, r3")  # r4 = 1 << width
+            self.emit("    subs r4, r4, #1") # r4 = width mask
+            self.emit("    and r1, r1, r4")  # mask field value
+            self.emit("    lsl r4, r4, r2")  # shift mask to position
+            self.emit("    bic r0, r0, r4")  # clear bits in val
+            self.emit("    lsl r1, r1, r2")  # shift field to position
+            self.emit("    orr r0, r0, r1")  # insert field
+            self.emit("    pop {r4, r5}")
+            return
+
+        elif func_name == "clz":
+            # clz(val) -> count of leading zeros (Cortex-M3+)
+            if len(args) != 1:
+                raise CodeGenError("clz takes 1 argument")
+            self.gen_expr(args[0])
+            self.emit("    clz r0, r0")
+            return
+
+        elif func_name == "rbit":
+            # rbit(val) -> bit-reversed value (Cortex-M3+)
+            if len(args) != 1:
+                raise CodeGenError("rbit takes 1 argument")
+            self.gen_expr(args[0])
+            self.emit("    rbit r0, r0")
+            return
+
+        elif func_name == "rev":
+            # rev(val) -> byte-reversed value (big-endian swap)
+            if len(args) != 1:
+                raise CodeGenError("rev takes 1 argument")
+            self.gen_expr(args[0])
+            self.emit("    rev r0, r0")
+            return
+
+        elif func_name == "rev16":
+            # rev16(val) -> halfword byte swap
+            if len(args) != 1:
+                raise CodeGenError("rev16 takes 1 argument")
+            self.gen_expr(args[0])
+            self.emit("    rev16 r0, r0")
             return
 
         # Save caller-saved registers if needed
