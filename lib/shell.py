@@ -501,6 +501,349 @@ def shell_exec():
         shell_newline()
         while True:
             pass
+    elif shell_starts_with("seq"):
+        arg11: Ptr[char] = shell_get_arg()
+        if arg11[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: seq [start] end")
+            shell_newline()
+        else:
+            start: int32 = 1
+            end: int32 = 0
+            i: int32 = 0
+            while arg11[i] != '\0' and arg11[i] != ' ':
+                i = i + 1
+            if arg11[i] == ' ':
+                arg11[i] = '\0'
+                start = atoi(arg11)
+                end = atoi(&arg11[i + 1])
+            else:
+                end = atoi(arg11)
+            shell_newline()
+            j: int32 = start
+            while j <= end:
+                shell_puts(shell_int_to_str(j))
+                shell_newline()
+                j = j + 1
+    elif shell_starts_with("factor"):
+        arg12: Ptr[char] = shell_get_arg()
+        if arg12[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: factor <number>")
+            shell_newline()
+        else:
+            n: int32 = atoi(arg12)
+            shell_newline()
+            shell_puts(shell_int_to_str(n))
+            shell_puts(": ")
+            if n >= 2:
+                while n % 2 == 0:
+                    shell_puts("2 ")
+                    n = n / 2
+                i: int32 = 3
+                while i * i <= n:
+                    while n % i == 0:
+                        shell_puts(shell_int_to_str(i))
+                        shell_putc(' ')
+                        n = n / i
+                    i = i + 2
+                if n > 1:
+                    shell_puts(shell_int_to_str(n))
+            shell_newline()
+    elif strcmp(cmd, "fortune") == 0:
+        shell_newline()
+        fortunes: Array[10, Ptr[char]]
+        fortunes[0] = "The best way to predict the future is to invent it."
+        fortunes[1] = "In theory, there is no difference between theory and practice."
+        fortunes[2] = "Simplicity is the ultimate sophistication."
+        fortunes[3] = "First, solve the problem. Then, write the code."
+        fortunes[4] = "Talk is cheap. Show me the code."
+        fortunes[5] = "The only way to go fast is to go well."
+        fortunes[6] = "Any fool can write code that a computer can understand."
+        fortunes[7] = "Debugging is twice as hard as writing the code."
+        fortunes[8] = "It works on my machine."
+        fortunes[9] = "There are only two hard things: cache invalidation and naming."
+        idx: int32 = heap_used() % 10
+        shell_puts(fortunes[idx])
+        shell_newline()
+    elif shell_starts_with("basename"):
+        arg13: Ptr[char] = shell_get_arg()
+        if arg13[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: basename <path>")
+            shell_newline()
+        else:
+            i: int32 = strlen(arg13) - 1
+            while i >= 0 and arg13[i] != '/':
+                i = i - 1
+            shell_newline()
+            shell_puts(&arg13[i + 1])
+            shell_newline()
+    elif shell_starts_with("dirname"):
+        arg14: Ptr[char] = shell_get_arg()
+        if arg14[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: dirname <path>")
+            shell_newline()
+        else:
+            i: int32 = strlen(arg14) - 1
+            while i > 0 and arg14[i] != '/':
+                i = i - 1
+            shell_newline()
+            if i == 0:
+                if arg14[0] == '/':
+                    shell_putc('/')
+                else:
+                    shell_putc('.')
+            else:
+                arg14[i] = '\0'
+                shell_puts(arg14)
+            shell_newline()
+    elif strcmp(cmd, "arch") == 0:
+        shell_newline()
+        shell_puts("armv7m")
+        shell_newline()
+    elif strcmp(cmd, "nproc") == 0:
+        shell_newline()
+        shell_puts("1")
+        shell_newline()
+    elif strcmp(cmd, "tty") == 0:
+        shell_newline()
+        shell_puts("/dev/ttyS0")
+        shell_newline()
+    elif strcmp(cmd, "logname") == 0:
+        shell_newline()
+        shell_puts("root")
+        shell_newline()
+    elif strcmp(cmd, "printenv") == 0:
+        shell_newline()
+        shell_puts("HOME=/home")
+        shell_newline()
+        shell_puts("USER=root")
+        shell_newline()
+        shell_puts("SHELL=/bin/psh")
+        shell_newline()
+        shell_puts("PATH=/bin")
+        shell_newline()
+        shell_puts("TERM=vt100")
+        shell_newline()
+        shell_puts("PWD=")
+        shell_puts(&shell_cwd[0])
+        shell_newline()
+    elif shell_starts_with("banner"):
+        arg15: Ptr[char] = shell_get_arg()
+        if arg15[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: banner <text>")
+            shell_newline()
+        else:
+            shell_newline()
+            line: int32 = 0
+            while line < 5:
+                i: int32 = 0
+                while arg15[i] != '\0':
+                    c: char = arg15[i]
+                    j: int32 = 0
+                    while j < 5:
+                        if c >= 'a' and c <= 'z':
+                            shell_putc(cast[char](cast[int32](c) - 32))
+                        elif c == ' ':
+                            shell_putc(' ')
+                        else:
+                            shell_putc(c)
+                        j = j + 1
+                    shell_putc(' ')
+                    i = i + 1
+                shell_newline()
+                line = line + 1
+    elif strcmp(cmd, "dmesg") == 0:
+        shell_newline()
+        shell_puts("[    0.000] Pynux kernel booting...")
+        shell_newline()
+        shell_puts("[    0.001] UART initialized")
+        shell_newline()
+        shell_puts("[    0.002] Heap initialized (16KB)")
+        shell_newline()
+        shell_puts("[    0.003] Timer initialized")
+        shell_newline()
+        shell_puts("[    0.004] RAMFS initialized")
+        shell_newline()
+        shell_puts("[    0.005] Kernel ready")
+        shell_newline()
+    elif strcmp(cmd, "lscpu") == 0:
+        shell_newline()
+        shell_puts("Architecture:    armv7m")
+        shell_newline()
+        shell_puts("Vendor:          ARM")
+        shell_newline()
+        shell_puts("Model:           Cortex-M3")
+        shell_newline()
+        shell_puts("CPU(s):          1")
+        shell_newline()
+        shell_puts("Max MHz:         25")
+        shell_newline()
+    elif strcmp(cmd, "sync") == 0:
+        shell_newline()
+    elif strcmp(cmd, "reset") == 0:
+        shell_puts("\x1b[2J\x1b[H")
+    elif strcmp(cmd, "users") == 0:
+        shell_newline()
+        shell_puts("root")
+        shell_newline()
+    elif strcmp(cmd, "groups") == 0:
+        shell_newline()
+        shell_puts("root")
+        shell_newline()
+    elif strcmp(cmd, "kill") == 0:
+        shell_newline()
+        shell_puts("kill: No processes to kill")
+        shell_newline()
+    elif strcmp(cmd, "ps") == 0:
+        shell_newline()
+        shell_puts("  PID TTY      TIME CMD")
+        shell_newline()
+        shell_puts("    1 ttyS0    0:00 psh")
+        shell_newline()
+    elif strcmp(cmd, "df") == 0:
+        shell_newline()
+        shell_puts("Filesystem  1K-blocks  Used  Available  Use%  Mounted on")
+        shell_newline()
+        shell_puts("ramfs            16     ")
+        used_kb: int32 = heap_used() / 1024
+        shell_puts(shell_int_to_str(used_kb))
+        shell_puts("         ")
+        free_kb: int32 = heap_remaining() / 1024
+        shell_puts(shell_int_to_str(free_kb))
+        shell_puts("     ")
+        pct: int32 = (heap_used() * 100) / heap_total()
+        shell_puts(shell_int_to_str(pct))
+        shell_puts("%   /")
+        shell_newline()
+    elif strcmp(cmd, "mount") == 0:
+        shell_newline()
+        shell_puts("ramfs on / type ramfs (rw)")
+        shell_newline()
+    elif strcmp(cmd, "umount") == 0:
+        shell_newline()
+        shell_puts("umount: cannot unmount /: device is busy")
+        shell_newline()
+    elif shell_starts_with("head"):
+        arg16: Ptr[char] = shell_get_arg()
+        if arg16[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: head <file>")
+            shell_newline()
+        else:
+            shell_build_path(arg16)
+            if ramfs_exists(&shell_path_buf[0]) and not ramfs_isdir(&shell_path_buf[0]):
+                shell_newline()
+                bytes_read: int32 = ramfs_read(&shell_path_buf[0], &shell_read_buf[0], 511)
+                if bytes_read > 0:
+                    shell_read_buf[bytes_read] = 0
+                    lines: int32 = 0
+                    i: int32 = 0
+                    while i < bytes_read and lines < 10:
+                        shell_putc(cast[char](shell_read_buf[i]))
+                        if shell_read_buf[i] == 10:
+                            lines = lines + 1
+                        i = i + 1
+                shell_newline()
+            else:
+                shell_newline()
+                shell_puts("No such file: ")
+                shell_puts(arg16)
+                shell_newline()
+    elif shell_starts_with("tail"):
+        arg17: Ptr[char] = shell_get_arg()
+        if arg17[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: tail <file>")
+            shell_newline()
+        else:
+            shell_build_path(arg17)
+            if ramfs_exists(&shell_path_buf[0]) and not ramfs_isdir(&shell_path_buf[0]):
+                shell_newline()
+                bytes_read: int32 = ramfs_read(&shell_path_buf[0], &shell_read_buf[0], 511)
+                if bytes_read > 0:
+                    shell_read_buf[bytes_read] = 0
+                    shell_puts(cast[Ptr[char]](&shell_read_buf[0]))
+                shell_newline()
+            else:
+                shell_newline()
+                shell_puts("No such file: ")
+                shell_puts(arg17)
+                shell_newline()
+    elif shell_starts_with("wc"):
+        arg18: Ptr[char] = shell_get_arg()
+        if arg18[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: wc <file>")
+            shell_newline()
+        else:
+            shell_build_path(arg18)
+            if ramfs_exists(&shell_path_buf[0]) and not ramfs_isdir(&shell_path_buf[0]):
+                bytes_read: int32 = ramfs_read(&shell_path_buf[0], &shell_read_buf[0], 511)
+                lines: int32 = 0
+                words: int32 = 0
+                chars: int32 = bytes_read
+                in_word: bool = False
+                i: int32 = 0
+                while i < bytes_read:
+                    c: char = cast[char](shell_read_buf[i])
+                    if c == '\n':
+                        lines = lines + 1
+                        in_word = False
+                    elif c == ' ' or c == '\t':
+                        in_word = False
+                    else:
+                        if not in_word:
+                            words = words + 1
+                            in_word = True
+                    i = i + 1
+                shell_newline()
+                shell_puts("  ")
+                shell_puts(shell_int_to_str(lines))
+                shell_puts("  ")
+                shell_puts(shell_int_to_str(words))
+                shell_puts("  ")
+                shell_puts(shell_int_to_str(chars))
+                shell_puts(" ")
+                shell_puts(arg18)
+                shell_newline()
+            else:
+                shell_newline()
+                shell_puts("No such file: ")
+                shell_puts(arg18)
+                shell_newline()
+    elif shell_starts_with("stat"):
+        arg19: Ptr[char] = shell_get_arg()
+        if arg19[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: stat <file>")
+            shell_newline()
+        else:
+            shell_build_path(arg19)
+            if ramfs_exists(&shell_path_buf[0]):
+                shell_newline()
+                shell_puts("  File: ")
+                shell_puts(&shell_path_buf[0])
+                shell_newline()
+                if ramfs_isdir(&shell_path_buf[0]):
+                    shell_puts("  Type: directory")
+                    shell_newline()
+                else:
+                    shell_puts("  Type: regular file")
+                    shell_newline()
+                    bytes_read: int32 = ramfs_read(&shell_path_buf[0], &shell_read_buf[0], 511)
+                    shell_puts("  Size: ")
+                    shell_puts(shell_int_to_str(bytes_read))
+                    shell_puts(" bytes")
+                    shell_newline()
+            else:
+                shell_newline()
+                shell_puts("No such file: ")
+                shell_puts(arg19)
+                shell_newline()
     else:
         shell_newline()
         shell_puts("Unknown: ")

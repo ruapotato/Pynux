@@ -685,6 +685,304 @@ def exec_cmd():
     elif strcmp(cmd, "exit") == 0:
         term_puts("\nExiting to text mode...\n")
         # Not implemented - would need to return to kernel
+    elif cmd_starts_with("seq"):
+        # seq <end> or seq <start> <end>
+        arg11: Ptr[char] = cmd_get_arg()
+        if arg11[0] == '\0':
+            term_puts("\nUsage: seq [start] end\n")
+        else:
+            start: int32 = 1
+            end: int32 = 0
+            # Check if there's a second number
+            i: int32 = 0
+            while arg11[i] != '\0' and arg11[i] != ' ':
+                i = i + 1
+            if arg11[i] == ' ':
+                arg11[i] = '\0'
+                start = atoi(arg11)
+                end = atoi(&arg11[i + 1])
+            else:
+                end = atoi(arg11)
+            term_putc('\n')
+            j: int32 = start
+            while j <= end:
+                term_puts(int_to_str(j))
+                term_putc('\n')
+                j = j + 1
+    elif cmd_starts_with("factor"):
+        # factor <number>
+        arg12: Ptr[char] = cmd_get_arg()
+        if arg12[0] == '\0':
+            term_puts("\nUsage: factor <number>\n")
+        else:
+            n: int32 = atoi(arg12)
+            term_putc('\n')
+            term_puts(int_to_str(n))
+            term_puts(": ")
+            if n >= 2:
+                # Factor out 2s
+                while n % 2 == 0:
+                    term_puts("2 ")
+                    n = n / 2
+                # Factor out odd numbers
+                i: int32 = 3
+                while i * i <= n:
+                    while n % i == 0:
+                        term_puts(int_to_str(i))
+                        term_putc(' ')
+                        n = n / i
+                    i = i + 2
+                if n > 1:
+                    term_puts(int_to_str(n))
+            term_putc('\n')
+    elif strcmp(cmd, "fortune") == 0:
+        term_putc('\n')
+        # Simple fortune cookie messages
+        fortunes: Array[10, Ptr[char]]
+        fortunes[0] = "The best way to predict the future is to invent it."
+        fortunes[1] = "In theory, there is no difference between theory and practice."
+        fortunes[2] = "Simplicity is the ultimate sophistication."
+        fortunes[3] = "First, solve the problem. Then, write the code."
+        fortunes[4] = "Talk is cheap. Show me the code."
+        fortunes[5] = "The only way to go fast is to go well."
+        fortunes[6] = "Any fool can write code that a computer can understand."
+        fortunes[7] = "Debugging is twice as hard as writing the code."
+        fortunes[8] = "It works on my machine."
+        fortunes[9] = "There are only two hard things: cache invalidation and naming."
+        # Use a simple hash of heap_used as "random"
+        idx: int32 = heap_used() % 10
+        term_puts(fortunes[idx])
+        term_putc('\n')
+    elif cmd_starts_with("basename"):
+        # basename <path>
+        arg13: Ptr[char] = cmd_get_arg()
+        if arg13[0] == '\0':
+            term_puts("\nUsage: basename <path>\n")
+        else:
+            # Find last /
+            i: int32 = strlen(arg13) - 1
+            while i >= 0 and arg13[i] != '/':
+                i = i - 1
+            term_putc('\n')
+            term_puts(&arg13[i + 1])
+            term_putc('\n')
+    elif cmd_starts_with("dirname"):
+        # dirname <path>
+        arg14: Ptr[char] = cmd_get_arg()
+        if arg14[0] == '\0':
+            term_puts("\nUsage: dirname <path>\n")
+        else:
+            # Find last /
+            i: int32 = strlen(arg14) - 1
+            while i > 0 and arg14[i] != '/':
+                i = i - 1
+            term_putc('\n')
+            if i == 0:
+                if arg14[0] == '/':
+                    term_putc('/')
+                else:
+                    term_putc('.')
+            else:
+                arg14[i] = '\0'
+                term_puts(arg14)
+            term_putc('\n')
+    elif strcmp(cmd, "arch") == 0:
+        term_puts("\narmv7m\n")
+    elif strcmp(cmd, "nproc") == 0:
+        term_puts("\n1\n")
+    elif strcmp(cmd, "tty") == 0:
+        term_puts("\n/dev/ttyS0\n")
+    elif strcmp(cmd, "logname") == 0:
+        term_puts("\nroot\n")
+    elif strcmp(cmd, "printenv") == 0:
+        term_puts("\nHOME=/home\n")
+        term_puts("USER=root\n")
+        term_puts("SHELL=/bin/psh\n")
+        term_puts("PATH=/bin\n")
+        term_puts("TERM=vtnext\n")
+        term_puts("PWD=")
+        term_puts(&cwd[0])
+        term_putc('\n')
+    elif cmd_starts_with("banner"):
+        # banner <text>
+        arg15: Ptr[char] = cmd_get_arg()
+        if arg15[0] == '\0':
+            term_puts("\nUsage: banner <text>\n")
+        else:
+            term_putc('\n')
+            # Print 5 lines of the text (simple banner)
+            line: int32 = 0
+            while line < 5:
+                i: int32 = 0
+                while arg15[i] != '\0':
+                    c: char = arg15[i]
+                    j: int32 = 0
+                    while j < 5:
+                        if c >= 'a' and c <= 'z':
+                            term_putc(cast[char](cast[int32](c) - 32))
+                        elif c == ' ':
+                            term_putc(' ')
+                        else:
+                            term_putc(c)
+                        j = j + 1
+                    term_putc(' ')
+                    i = i + 1
+                term_putc('\n')
+                line = line + 1
+    elif strcmp(cmd, "dmesg") == 0:
+        term_puts("\n[    0.000] Pynux kernel booting...\n")
+        term_puts("[    0.001] UART initialized\n")
+        term_puts("[    0.002] Heap initialized (16KB)\n")
+        term_puts("[    0.003] Timer initialized\n")
+        term_puts("[    0.004] RAMFS initialized\n")
+        term_puts("[    0.005] Kernel ready\n")
+    elif strcmp(cmd, "lscpu") == 0:
+        term_puts("\nArchitecture:    armv7m\n")
+        term_puts("Vendor:          ARM\n")
+        term_puts("Model:           Cortex-M3\n")
+        term_puts("CPU(s):          1\n")
+        term_puts("Max MHz:         25\n")
+    elif strcmp(cmd, "sync") == 0:
+        term_puts("\n")  # In RAMFS, sync is a no-op
+    elif strcmp(cmd, "reset") == 0:
+        term_init()
+        needs_full_redraw = True
+    elif cmd_starts_with("head"):
+        # head <file> - show first lines of file
+        arg16: Ptr[char] = cmd_get_arg()
+        if arg16[0] == '\0':
+            term_puts("\nUsage: head <file>\n")
+        else:
+            build_path(arg16)
+            if ramfs_exists(&path_buf[0]) and not ramfs_isdir(&path_buf[0]):
+                term_putc('\n')
+                bytes_read: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
+                if bytes_read > 0:
+                    read_buf[bytes_read] = 0
+                    # Print first 10 lines
+                    lines: int32 = 0
+                    i: int32 = 0
+                    while i < bytes_read and lines < 10:
+                        term_putc(cast[char](read_buf[i]))
+                        if read_buf[i] == 10:
+                            lines = lines + 1
+                        i = i + 1
+                term_putc('\n')
+            else:
+                term_puts("\nNo such file: ")
+                term_puts(arg16)
+                term_putc('\n')
+    elif cmd_starts_with("tail"):
+        # tail <file> - show last lines
+        arg17: Ptr[char] = cmd_get_arg()
+        if arg17[0] == '\0':
+            term_puts("\nUsage: tail <file>\n")
+        else:
+            build_path(arg17)
+            if ramfs_exists(&path_buf[0]) and not ramfs_isdir(&path_buf[0]):
+                term_putc('\n')
+                bytes_read: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
+                if bytes_read > 0:
+                    read_buf[bytes_read] = 0
+                    term_puts(cast[Ptr[char]](&read_buf[0]))
+                term_putc('\n')
+            else:
+                term_puts("\nNo such file: ")
+                term_puts(arg17)
+                term_putc('\n')
+    elif cmd_starts_with("wc"):
+        # wc <file> - word count
+        arg18: Ptr[char] = cmd_get_arg()
+        if arg18[0] == '\0':
+            term_puts("\nUsage: wc <file>\n")
+        else:
+            build_path(arg18)
+            if ramfs_exists(&path_buf[0]) and not ramfs_isdir(&path_buf[0]):
+                bytes_read: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
+                if bytes_read > 0:
+                    read_buf[bytes_read] = 0
+                    lines: int32 = 0
+                    words: int32 = 0
+                    chars: int32 = bytes_read
+                    in_word: bool = False
+                    i: int32 = 0
+                    while i < bytes_read:
+                        c: char = cast[char](read_buf[i])
+                        if c == '\n':
+                            lines = lines + 1
+                            in_word = False
+                        elif c == ' ' or c == '\t':
+                            in_word = False
+                        else:
+                            if not in_word:
+                                words = words + 1
+                                in_word = True
+                        i = i + 1
+                    term_puts("\n  ")
+                    term_puts(int_to_str(lines))
+                    term_puts("  ")
+                    term_puts(int_to_str(words))
+                    term_puts("  ")
+                    term_puts(int_to_str(chars))
+                    term_puts(" ")
+                    term_puts(arg18)
+                    term_putc('\n')
+                else:
+                    term_puts("\n  0  0  0 ")
+                    term_puts(arg18)
+                    term_putc('\n')
+            else:
+                term_puts("\nNo such file: ")
+                term_puts(arg18)
+                term_putc('\n')
+    elif cmd_starts_with("stat"):
+        # stat <file>
+        arg19: Ptr[char] = cmd_get_arg()
+        if arg19[0] == '\0':
+            term_puts("\nUsage: stat <file>\n")
+        else:
+            build_path(arg19)
+            if ramfs_exists(&path_buf[0]):
+                term_puts("\n  File: ")
+                term_puts(&path_buf[0])
+                term_putc('\n')
+                if ramfs_isdir(&path_buf[0]):
+                    term_puts("  Type: directory\n")
+                else:
+                    term_puts("  Type: regular file\n")
+                    bytes_read: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
+                    term_puts("  Size: ")
+                    term_puts(int_to_str(bytes_read))
+                    term_puts(" bytes\n")
+            else:
+                term_puts("\nNo such file: ")
+                term_puts(arg19)
+                term_putc('\n')
+    elif strcmp(cmd, "users") == 0:
+        term_puts("\nroot\n")
+    elif strcmp(cmd, "groups") == 0:
+        term_puts("\nroot\n")
+    elif strcmp(cmd, "kill") == 0:
+        term_puts("\nkill: No processes to kill\n")
+    elif strcmp(cmd, "ps") == 0:
+        term_puts("\n  PID TTY      TIME CMD\n")
+        term_puts("    1 ttyS0    0:00 psh\n")
+    elif strcmp(cmd, "df") == 0:
+        term_puts("\nFilesystem  1K-blocks  Used  Available  Use%  Mounted on\n")
+        term_puts("ramfs            16     ")
+        used_kb: int32 = heap_used() / 1024
+        term_puts(int_to_str(used_kb))
+        term_puts("         ")
+        free_kb: int32 = heap_remaining() / 1024
+        term_puts(int_to_str(free_kb))
+        term_puts("     ")
+        pct: int32 = (heap_used() * 100) / heap_total()
+        term_puts(int_to_str(pct))
+        term_puts("%   /\n")
+    elif strcmp(cmd, "mount") == 0:
+        term_puts("\nramfs on / type ramfs (rw)\n")
+    elif strcmp(cmd, "umount") == 0:
+        term_puts("\numount: cannot unmount /: device is busy\n")
     else:
         term_puts("\nUnknown command: ")
         term_puts(cmd)
