@@ -28,6 +28,9 @@ shell_read_buf: Array[512, uint8]
 # Number buffer for printing integers
 shell_num_buf: Array[16, char]
 
+# Source path buffer for cp command
+shell_src_path: Array[256, char]
+
 def shell_putc(c: char):
     uart_putc(c)
 
@@ -163,9 +166,13 @@ def shell_exec():
         shell_newline()
         shell_puts("  write f t  - Write text to file")
         shell_newline()
+        shell_puts("  cp s d     - Copy file")
+        shell_newline()
         shell_puts("  id         - User identity")
         shell_newline()
         shell_puts("  env        - Environment vars")
+        shell_newline()
+        shell_puts("  true/false - Exit with status")
         shell_newline()
         shell_puts("  version    - Show version")
         shell_newline()
@@ -388,6 +395,69 @@ def shell_exec():
         shell_newline()
         shell_puts("PWD=")
         shell_puts(&shell_cwd[0])
+        shell_newline()
+    elif shell_starts_with("cp"):
+        # cp <src> <dst>
+        arg9: Ptr[char] = shell_get_arg()
+        if arg9[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: cp <src> <dst>")
+            shell_newline()
+        else:
+            # Find src and dst
+            i: int32 = 0
+            while arg9[i] != '\0' and arg9[i] != ' ':
+                i = i + 1
+            if arg9[i] == ' ':
+                arg9[i] = '\0'
+                dst: Ptr[char] = &arg9[i + 1]
+                while dst[0] == ' ':
+                    dst = &dst[1]
+                if dst[0] != '\0':
+                    shell_build_path(arg9)
+                    strcpy(&shell_src_path[0], &shell_path_buf[0])
+                    if ramfs_exists(&shell_src_path[0]) and not ramfs_isdir(&shell_src_path[0]):
+                        bytes_read: int32 = ramfs_read(&shell_src_path[0], &shell_read_buf[0], 511)
+                        if bytes_read >= 0:
+                            shell_read_buf[bytes_read] = 0
+                            shell_build_path(dst)
+                            if not ramfs_exists(&shell_path_buf[0]):
+                                ramfs_create(&shell_path_buf[0], False)
+                            if ramfs_write(&shell_path_buf[0], cast[Ptr[char]](&shell_read_buf[0])) >= 0:
+                                shell_newline()
+                                shell_puts("Copied ")
+                                shell_puts(&shell_src_path[0])
+                                shell_puts(" -> ")
+                                shell_puts(&shell_path_buf[0])
+                                shell_newline()
+                            else:
+                                shell_newline()
+                                shell_puts("Failed to write dest")
+                                shell_newline()
+                        else:
+                            shell_newline()
+                            shell_puts("Failed to read source")
+                            shell_newline()
+                    else:
+                        shell_newline()
+                        shell_puts("Source not found: ")
+                        shell_puts(arg9)
+                        shell_newline()
+                else:
+                    shell_newline()
+                    shell_puts("Usage: cp <src> <dst>")
+                    shell_newline()
+            else:
+                shell_newline()
+                shell_puts("Usage: cp <src> <dst>")
+                shell_newline()
+    elif strcmp(cmd, "true") == 0:
+        pass
+    elif strcmp(cmd, "false") == 0:
+        shell_newline()
+    elif strcmp(cmd, "yes") == 0:
+        shell_newline()
+        shell_puts("y")
         shell_newline()
     else:
         shell_newline()

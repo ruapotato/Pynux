@@ -409,8 +409,10 @@ def exec_cmd():
         term_puts("  date       - Current date\n")
         term_puts("  uptime     - System uptime\n")
         term_puts("  write f t  - Write text to file\n")
+        term_puts("  cp s d     - Copy file\n")
         term_puts("  id         - User identity\n")
         term_puts("  env        - Environment vars\n")
+        term_puts("  true/false - Exit with status\n")
         term_puts("  version    - Show version\n")
     elif strcmp(cmd, "clear") == 0:
         term_init()
@@ -589,6 +591,60 @@ def exec_cmd():
         term_puts("PWD=")
         term_puts(&cwd[0])
         term_putc('\n')
+    elif cmd_starts_with("cp"):
+        # cp <src> <dst>
+        arg9: Ptr[char] = cmd_get_arg()
+        if arg9[0] == '\0':
+            term_puts("\nUsage: cp <src> <dst>\n")
+        else:
+            # Find src and dst
+            i: int32 = 0
+            while arg9[i] != '\0' and arg9[i] != ' ':
+                i = i + 1
+            if arg9[i] == ' ':
+                arg9[i] = '\0'
+                dst: Ptr[char] = &arg9[i + 1]
+                # Skip spaces
+                while dst[0] == ' ':
+                    dst = &dst[1]
+                if dst[0] != '\0':
+                    # Read source
+                    build_path(arg9)
+                    src_path: Array[256, char]
+                    strcpy(&src_path[0], &path_buf[0])
+                    if ramfs_exists(&src_path[0]) and not ramfs_isdir(&src_path[0]):
+                        bytes_read: int32 = ramfs_read(&src_path[0], &read_buf[0], 511)
+                        if bytes_read >= 0:
+                            read_buf[bytes_read] = 0
+                            # Write to dest
+                            build_path(dst)
+                            if not ramfs_exists(&path_buf[0]):
+                                ramfs_create(&path_buf[0], False)
+                            if ramfs_write(&path_buf[0], cast[Ptr[char]](&read_buf[0])) >= 0:
+                                term_puts("\nCopied ")
+                                term_puts(&src_path[0])
+                                term_puts(" -> ")
+                                term_puts(&path_buf[0])
+                                term_putc('\n')
+                            else:
+                                term_puts("\nFailed to write dest\n")
+                        else:
+                            term_puts("\nFailed to read source\n")
+                    else:
+                        term_puts("\nSource not found: ")
+                        term_puts(arg9)
+                        term_putc('\n')
+                else:
+                    term_puts("\nUsage: cp <src> <dst>\n")
+            else:
+                term_puts("\nUsage: cp <src> <dst>\n")
+    elif strcmp(cmd, "true") == 0:
+        pass  # Do nothing, return success
+    elif strcmp(cmd, "false") == 0:
+        term_puts("\n")  # Just print newline, simulates failure
+    elif strcmp(cmd, "yes") == 0:
+        # Just print y once (don't loop forever!)
+        term_puts("\ny\n")
     else:
         term_puts("\nUnknown command: ")
         term_puts(cmd)
