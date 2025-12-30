@@ -2098,6 +2098,10 @@ class ARMCodeGen:
         if elifs:
             for i, (elif_cond, elif_body) in enumerate(elifs):
                 self.emit(f"{else_label}:")
+                # Add literal pool dump every 10 elif branches to prevent
+                # "offset out of range" errors in large if-elif chains
+                if i > 0 and i % 10 == 0:
+                    self.emit("    .ltorg")
                 else_label = self.ctx.new_label("else")
                 self.gen_expr(elif_cond)
                 self.emit("    cmp r0, #0")

@@ -408,6 +408,9 @@ def exec_cmd():
         term_puts("  hostname   - System hostname\n")
         term_puts("  date       - Current date\n")
         term_puts("  uptime     - System uptime\n")
+        term_puts("  write f t  - Write text to file\n")
+        term_puts("  id         - User identity\n")
+        term_puts("  env        - Environment vars\n")
         term_puts("  version    - Show version\n")
     elif strcmp(cmd, "clear") == 0:
         term_init()
@@ -548,6 +551,44 @@ def exec_cmd():
         term_puts("\nJan 1 00:00:00 UTC 2025\n")
     elif strcmp(cmd, "uptime") == 0:
         term_puts("\nup 0 days, 0:00\n")
+    elif cmd_starts_with("write"):
+        # write <file> <content>
+        arg8: Ptr[char] = cmd_get_arg()
+        if arg8[0] == '\0':
+            term_puts("\nUsage: write <file> <content>\n")
+        else:
+            # Find the content (after the filename)
+            i: int32 = 0
+            while arg8[i] != '\0' and arg8[i] != ' ':
+                i = i + 1
+            if arg8[i] == ' ':
+                arg8[i] = '\0'
+                content: Ptr[char] = &arg8[i + 1]
+                build_path(arg8)
+                # Create file if it doesn't exist
+                if not ramfs_exists(&path_buf[0]):
+                    ramfs_create(&path_buf[0], False)
+                # Write content
+                content_len: int32 = strlen(content)
+                if ramfs_write(&path_buf[0], content) >= 0:
+                    term_puts("\nWrote ")
+                    term_puts(int_to_str(content_len))
+                    term_puts(" bytes to ")
+                    term_puts(&path_buf[0])
+                    term_putc('\n')
+                else:
+                    term_puts("\nFailed to write\n")
+            else:
+                term_puts("\nUsage: write <file> <content>\n")
+    elif strcmp(cmd, "id") == 0:
+        term_puts("\nuid=0(root) gid=0(root)\n")
+    elif strcmp(cmd, "env") == 0:
+        term_puts("\nHOME=/home\n")
+        term_puts("USER=root\n")
+        term_puts("SHELL=/bin/psh\n")
+        term_puts("PWD=")
+        term_puts(&cwd[0])
+        term_putc('\n')
     else:
         term_puts("\nUnknown command: ")
         term_puts(cmd)

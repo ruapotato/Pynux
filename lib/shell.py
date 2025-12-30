@@ -161,6 +161,12 @@ def shell_exec():
         shell_newline()
         shell_puts("  uptime     - System uptime")
         shell_newline()
+        shell_puts("  write f t  - Write text to file")
+        shell_newline()
+        shell_puts("  id         - User identity")
+        shell_newline()
+        shell_puts("  env        - Environment vars")
+        shell_newline()
         shell_puts("  version    - Show version")
         shell_newline()
     elif strcmp(cmd, "pwd") == 0:
@@ -331,6 +337,57 @@ def shell_exec():
     elif strcmp(cmd, "uptime") == 0:
         shell_newline()
         shell_puts("up 0 days, 0:00")
+        shell_newline()
+    elif shell_starts_with("write"):
+        # write <file> <content>
+        arg8: Ptr[char] = shell_get_arg()
+        if arg8[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: write <file> <content>")
+            shell_newline()
+        else:
+            # Find the content (after the filename)
+            i: int32 = 0
+            while arg8[i] != '\0' and arg8[i] != ' ':
+                i = i + 1
+            if arg8[i] == ' ':
+                arg8[i] = '\0'
+                content: Ptr[char] = &arg8[i + 1]
+                shell_build_path(arg8)
+                # Create file if it doesn't exist
+                if not ramfs_exists(&shell_path_buf[0]):
+                    ramfs_create(&shell_path_buf[0], False)
+                # Write content
+                content_len: int32 = strlen(content)
+                if ramfs_write(&shell_path_buf[0], content) >= 0:
+                    shell_newline()
+                    shell_puts("Wrote ")
+                    shell_puts(shell_int_to_str(content_len))
+                    shell_puts(" bytes to ")
+                    shell_puts(&shell_path_buf[0])
+                    shell_newline()
+                else:
+                    shell_newline()
+                    shell_puts("Failed to write")
+                    shell_newline()
+            else:
+                shell_newline()
+                shell_puts("Usage: write <file> <content>")
+                shell_newline()
+    elif strcmp(cmd, "id") == 0:
+        shell_newline()
+        shell_puts("uid=0(root) gid=0(root)")
+        shell_newline()
+    elif strcmp(cmd, "env") == 0:
+        shell_newline()
+        shell_puts("HOME=/home")
+        shell_newline()
+        shell_puts("USER=root")
+        shell_newline()
+        shell_puts("SHELL=/bin/psh")
+        shell_newline()
+        shell_puts("PWD=")
+        shell_puts(&shell_cwd[0])
         shell_newline()
     else:
         shell_newline()
