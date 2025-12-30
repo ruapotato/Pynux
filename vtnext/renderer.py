@@ -92,7 +92,8 @@ class VTNextRenderer:
             self.screen = pygame.display.set_mode((width, height))
             pygame.display.set_caption("Pynux VTNext")
             self.font = pygame.font.SysFont('monospace', 16)
-            self.clear(0, 0, 0, 255)
+            self.screen.fill((0, 0, 0))
+            pygame.display.flip()
 
     def handle_command(self, cmd):
         """Handle a parsed VTNext command."""
@@ -124,10 +125,13 @@ class VTNextRenderer:
                     r, g, b, a = int(params[5]), int(params[6]), int(params[7]), int(params[8])
                     self.line(x1, y1, x2, y2, thickness, r, g, b, a)
             elif name == 'text':
-                if len(params) >= 8:
-                    text = params[0]
-                    x, y, scale = int(params[1]), int(params[2]), int(params[3])
-                    r, g, b, a = int(params[4]), int(params[5]), int(params[6]), int(params[7])
+                # Format: x;y;z;rotation;scale;r;g;b;a;"text"
+                if len(params) >= 10:
+                    x, y = int(params[0]), int(params[1])
+                    # z = params[2], rotation = params[3] (unused for now)
+                    scale = int(params[4])
+                    r, g, b, a = int(params[5]), int(params[6]), int(params[7]), int(params[8])
+                    text = params[9].strip('"')
                     self.text(text, x, y, scale, r, g, b, a)
             elif name == 'print':
                 if len(params) >= 3:
@@ -162,6 +166,7 @@ class VTNextRenderer:
 
     def present(self):
         pygame.display.flip()
+        pygame.event.pump()  # Ensure display updates
 
     def resize(self, w, h):
         self.width = w
@@ -182,21 +187,28 @@ def main():
     print("VTNext Renderer - waiting for graphics commands...")
     print("(Reading from stdin, Ctrl+C to exit)")
 
+    stdin_eof = False
     try:
         while True:
             # Check pygame events
             if PYGAME_AVAILABLE and not renderer.process_events():
                 break
 
-            # Read available input (non-blocking would be better)
+            # Read available input (non-blocking)
             import select
-            if select.select([sys.stdin], [], [], 0.01)[0]:
-                char = sys.stdin.read(1)
-                if not char:
-                    break
-                commands = parser.feed(char)
+            if not stdin_eof and select.select([sys.stdin], [], [], 0.01)[0]:
+                # Read multiple characters at once for efficiency
+                data = sys.stdin.read(1024)
+                if not data:
+                    stdin_eof = True
+                    print("Input complete. Close window to exit.", file=sys.stderr)
+                    continue
+                commands = parser.feed(data)
                 for cmd in commands:
                     renderer.handle_command(cmd)
+                # Process events after handling commands to update display
+                if PYGAME_AVAILABLE:
+                    renderer.process_events()
 
     except KeyboardInterrupt:
         print("\nExiting...")
