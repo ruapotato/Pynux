@@ -1,12 +1,12 @@
 # Pynux Desktop Environment
 #
-# Graphical desktop with windowed terminal over VTNext protocol.
-# Optimized for serial communication with dirty region tracking.
+# Graphical desktop with windowed applications over VTNext protocol.
+# Features: Menu, multiple terminals, text editor, file manager
 
 from lib.io import uart_putc, uart_getc, uart_available, print_str, print_int
 from lib.vtnext import vtn_init, vtn_clear, vtn_rect, vtn_textline
 from lib.vtnext import vtn_clear_rect, vtn_present, vtn_flush
-from lib.vtnext import vtn_line, vtn_text
+from lib.vtnext import vtn_line, vtn_text, vtn_rect_outline
 from lib.string import strcmp, strlen, strcpy, memset, strcat, atoi
 from kernel.ramfs import ramfs_readdir, ramfs_create, ramfs_delete
 from kernel.ramfs import ramfs_read, ramfs_write, ramfs_exists, ramfs_isdir
@@ -25,6 +25,10 @@ BG_R: int32 = 30
 BG_G: int32 = 40
 BG_B: int32 = 60
 
+MENU_BG_R: int32 = 45
+MENU_BG_G: int32 = 50
+MENU_BG_B: int32 = 70
+
 TITLE_R: int32 = 50
 TITLE_G: int32 = 60
 TITLE_B: int32 = 80
@@ -41,118 +45,139 @@ ACCENT_R: int32 = 100
 ACCENT_G: int32 = 150
 ACCENT_B: int32 = 255
 
-# ============================================================================
-# Terminal widget state
-# ============================================================================
+SELECT_R: int32 = 70
+SELECT_G: int32 = 100
+SELECT_B: int32 = 150
 
-# Terminal dimensions
-TERM_X: int32 = 50
-TERM_Y: int32 = 60
-TERM_W: int32 = 700
-TERM_H: int32 = 480
-TERM_COLS: int32 = 80
-TERM_ROWS: int32 = 24
-TERM_SCROLL_MAX: int32 = 100
+# Window constants
+WIN_TITLE_H: int32 = 20
+MENU_H: int32 = 24
+STATUS_H: int32 = 20
 CHAR_W: int32 = 8
 CHAR_H: int32 = 16
 
-# Terminal buffer (100 lines of 80 chars each)
-term_buffer: Array[8000, char]  # 100 * 80
-term_line_dirty: Array[100, bool]
-term_scroll_pos: int32 = 0
-term_cursor_x: int32 = 0
-term_cursor_y: int32 = 0
-term_line_count: int32 = 0
+# ============================================================================
+# Window management
+# ============================================================================
 
-# Command input buffer
+# Window types
+WIN_NONE: int32 = 0
+WIN_TERMINAL: int32 = 1
+WIN_EDITOR: int32 = 2
+WIN_FILES: int32 = 3
+
+# Maximum windows
+MAX_WINDOWS: int32 = 4
+
+# Window state arrays
+win_type: Array[4, int32]
+win_x: Array[4, int32]
+win_y: Array[4, int32]
+win_w: Array[4, int32]
+win_h: Array[4, int32]
+win_visible: Array[4, bool]
+win_dirty: Array[4, bool]
+
+# Active window index
+active_win: int32 = -1
+win_count: int32 = 0
+
+# Menu state
+menu_open: bool = False
+menu_selection: int32 = 0
+MENU_ITEMS: int32 = 4
+
+# Global dirty flags
+needs_full_redraw: bool = True
+menu_dirty: bool = False
+status_dirty: bool = False
+
+# ============================================================================
+# Terminal state (per-window terminal data)
+# ============================================================================
+
+# Terminal dimensions (in chars)
+TERM_COLS: int32 = 80
+TERM_ROWS: int32 = 20
+TERM_SCROLL: int32 = 100
+
+# Terminal buffers - one per possible terminal window
+# Each terminal gets 100 lines * 80 chars = 8000 bytes
+term_buf0: Array[8000, char]
+term_buf1: Array[8000, char]
+
+# Line dirty flags
+term_dirty0: Array[100, bool]
+term_dirty1: Array[100, bool]
+
+# Terminal state per window
+term_scroll: Array[4, int32]
+term_cursor_x: Array[4, int32]
+term_cursor_y: Array[4, int32]
+
+# Command input buffer (shared)
 cmd_buffer: Array[256, char]
 cmd_pos: int32 = 0
 
-# Current working directory
-cwd: Array[128, char]
+# Current working directory per terminal
+term_cwd0: Array[128, char]
+term_cwd1: Array[128, char]
 
-# Temp path buffer for building full paths
+# ============================================================================
+# Editor state
+# ============================================================================
+
+edit_buffer: Array[4096, char]
+edit_size: int32 = 0
+edit_cursor: int32 = 0
+edit_scroll: int32 = 0
+edit_filename: Array[128, char]
+edit_dirty: bool = False
+edit_modified: bool = False
+
+# ============================================================================
+# File manager state
+# ============================================================================
+
+fm_cwd: Array[128, char]
+fm_selection: int32 = 0
+fm_count: int32 = 0
+fm_names: Array[512, char]  # 16 entries * 32 chars
+fm_types: Array[16, int32]  # 0=file, 1=dir
+fm_dirty: bool = False
+
+# ============================================================================
+# Shared buffers
+# ============================================================================
+
 path_buf: Array[256, char]
-
-# Read buffer for cat
 read_buf: Array[512, uint8]
-
-# Number buffer for printing integers
 num_buf: Array[16, char]
-
-# ============================================================================
-# Dirty region tracking
-# ============================================================================
-
-needs_full_redraw: bool = True
-term_needs_redraw: bool = False
-status_needs_redraw: bool = False
+status_buf: Array[80, char]
+line_buf: Array[128, char]
 
 # ============================================================================
 # Helper functions
 # ============================================================================
 
-def cmd_get_arg() -> Ptr[char]:
-    """Get the argument part of the command (after first space)."""
-    i: int32 = 0
-    # Skip command name
-    while cmd_buffer[i] != '\0' and cmd_buffer[i] != ' ':
-        i = i + 1
-    # Skip spaces
-    while cmd_buffer[i] == ' ':
-        i = i + 1
-    return &cmd_buffer[i]
-
-def cmd_starts_with(prefix: Ptr[char]) -> bool:
-    """Check if command starts with prefix."""
-    i: int32 = 0
-    while prefix[i] != '\0':
-        if cmd_buffer[i] != prefix[i]:
-            return False
-        i = i + 1
-    # Must be followed by space or end of string
-    return cmd_buffer[i] == ' ' or cmd_buffer[i] == '\0'
-
-def build_path(name: Ptr[char]):
-    """Build full path from cwd and name into path_buf."""
-    if name[0] == '/':
-        # Absolute path
-        strcpy(&path_buf[0], name)
-    else:
-        # Relative path
-        strcpy(&path_buf[0], &cwd[0])
-        # Add / if cwd doesn't end with /
-        cwd_len: int32 = strlen(&cwd[0])
-        if cwd_len > 0 and cwd[cwd_len - 1] != '/':
-            strcat(&path_buf[0], "/")
-        strcat(&path_buf[0], name)
-
 def int_to_str(n: int32) -> Ptr[char]:
-    """Convert integer to string in num_buf."""
     if n == 0:
         num_buf[0] = '0'
         num_buf[1] = '\0'
         return &num_buf[0]
-
     neg: bool = False
     if n < 0:
         neg = True
         n = -n
-
-    # Build digits in reverse
     i: int32 = 0
     while n > 0:
         num_buf[i] = cast[char](48 + (n % 10))
         n = n / 10
         i = i + 1
-
     if neg:
         num_buf[i] = '-'
         i = i + 1
-
     num_buf[i] = '\0'
-
-    # Reverse the string
     j: int32 = 0
     k: int32 = i - 1
     while j < k:
@@ -161,1515 +186,999 @@ def int_to_str(n: int32) -> Ptr[char]:
         num_buf[k] = tmp
         j = j + 1
         k = k - 1
-
     return &num_buf[0]
 
-def term_line_ptr(line: int32) -> Ptr[char]:
-    """Get pointer to a terminal line buffer."""
-    offset: int32 = line * TERM_COLS
-    return &term_buffer[offset]
+def build_path(base: Ptr[char], name: Ptr[char]):
+    if name[0] == '/':
+        strcpy(&path_buf[0], name)
+    else:
+        strcpy(&path_buf[0], base)
+        blen: int32 = strlen(base)
+        if blen > 0 and base[blen - 1] != '/':
+            strcat(&path_buf[0], "/")
+        strcat(&path_buf[0], name)
 
-def term_clear_line(line: int32):
-    """Clear a terminal line."""
-    ptr: Ptr[char] = term_line_ptr(line)
+# ============================================================================
+# Window management functions
+# ============================================================================
+
+def win_create(wtype: int32, x: int32, y: int32, w: int32, h: int32) -> int32:
+    global win_count, active_win
+    if win_count >= MAX_WINDOWS:
+        return -1
+    idx: int32 = win_count
+    win_type[idx] = wtype
+    win_x[idx] = x
+    win_y[idx] = y
+    win_w[idx] = w
+    win_h[idx] = h
+    win_visible[idx] = True
+    win_dirty[idx] = True
+    win_count = win_count + 1
+    active_win = idx
+    return idx
+
+def win_close(idx: int32):
+    global win_count, active_win, needs_full_redraw
+    if idx < 0 or idx >= win_count:
+        return
+    # Shift windows down
+    i: int32 = idx
+    while i < win_count - 1:
+        win_type[i] = win_type[i + 1]
+        win_x[i] = win_x[i + 1]
+        win_y[i] = win_y[i + 1]
+        win_w[i] = win_w[i + 1]
+        win_h[i] = win_h[i + 1]
+        win_visible[i] = win_visible[i + 1]
+        win_dirty[i] = win_dirty[i + 1]
+        i = i + 1
+    win_count = win_count - 1
+    if active_win >= win_count:
+        active_win = win_count - 1
+    needs_full_redraw = True
+
+def win_focus(idx: int32):
+    global active_win, needs_full_redraw
+    if idx >= 0 and idx < win_count:
+        active_win = idx
+        needs_full_redraw = True
+
+# ============================================================================
+# Terminal functions
+# ============================================================================
+
+def term_get_buf(idx: int32) -> Ptr[char]:
+    if idx == 0:
+        return &term_buf0[0]
+    return &term_buf1[0]
+
+def term_get_dirty(idx: int32) -> Ptr[bool]:
+    if idx == 0:
+        return &term_dirty0[0]
+    return &term_dirty1[0]
+
+def term_get_cwd(idx: int32) -> Ptr[char]:
+    if idx == 0:
+        return &term_cwd0[0]
+    return &term_cwd1[0]
+
+def term_line_ptr(idx: int32, line: int32) -> Ptr[char]:
+    buf: Ptr[char] = term_get_buf(idx)
+    return &buf[line * TERM_COLS]
+
+def term_clear_line(idx: int32, line: int32):
+    ptr: Ptr[char] = term_line_ptr(idx, line)
     i: int32 = 0
     while i < TERM_COLS:
         ptr[i] = ' '
         i = i + 1
-    term_line_dirty[line] = True
+    dirty: Ptr[bool] = term_get_dirty(idx)
+    dirty[line] = True
 
-def term_init():
-    """Initialize terminal state."""
-    global term_scroll_pos, term_cursor_x, term_cursor_y, term_line_count, cmd_pos
-
-    # Clear all lines
+def term_init_win(idx: int32):
     i: int32 = 0
-    while i < TERM_SCROLL_MAX:
-        term_clear_line(i)
+    while i < TERM_SCROLL:
+        term_clear_line(idx, i)
         i = i + 1
-
-    term_scroll_pos = 0
-    term_cursor_x = 0
-    term_cursor_y = 0
-    term_line_count = 0
-    cmd_pos = 0
-
-    # Initialize cwd
+    term_scroll[idx] = 0
+    term_cursor_x[idx] = 0
+    term_cursor_y[idx] = 0
+    cwd: Ptr[char] = term_get_cwd(idx)
     cwd[0] = '/'
     cwd[1] = '\0'
 
-def term_scroll():
-    """Scroll terminal up by one line."""
-    global term_scroll_pos, term_cursor_y
-
-    if term_scroll_pos < TERM_SCROLL_MAX - TERM_ROWS:
-        term_scroll_pos = term_scroll_pos + 1
+def term_scroll_up(idx: int32):
+    scr: int32 = term_scroll[idx]
+    if scr < TERM_SCROLL - TERM_ROWS:
+        term_scroll[idx] = scr + 1
     else:
-        # Wrap around - shift buffer
+        # Shift buffer up
+        buf: Ptr[char] = term_get_buf(idx)
         i: int32 = 0
-        while i < TERM_SCROLL_MAX - 1:
-            src: Ptr[char] = term_line_ptr(i + 1)
-            dst: Ptr[char] = term_line_ptr(i)
-            j: int32 = 0
-            while j < TERM_COLS:
-                dst[j] = src[j]
-                j = j + 1
+        while i < (TERM_SCROLL - 1) * TERM_COLS:
+            buf[i] = buf[i + TERM_COLS]
             i = i + 1
-        term_clear_line(TERM_SCROLL_MAX - 1)
-
-    # Mark all visible lines dirty
+        term_clear_line(idx, TERM_SCROLL - 1)
+    # Mark visible lines dirty
+    dirty: Ptr[bool] = term_get_dirty(idx)
+    scr = term_scroll[idx]
     i = 0
     while i < TERM_ROWS:
-        term_line_dirty[term_scroll_pos + i] = True
+        dirty[scr + i] = True
         i = i + 1
 
-def term_newline():
-    """Move to next line, scroll if needed."""
-    global term_cursor_x, term_cursor_y
+def term_newline(idx: int32):
+    term_cursor_x[idx] = 0
+    cy: int32 = term_cursor_y[idx] + 1
+    if cy >= TERM_ROWS:
+        cy = TERM_ROWS - 1
+        term_scroll_up(idx)
+    term_cursor_y[idx] = cy
 
-    term_cursor_x = 0
-    term_cursor_y = term_cursor_y + 1
-
-    if term_cursor_y >= TERM_ROWS:
-        term_cursor_y = TERM_ROWS - 1
-        term_scroll()
-
-def term_putc(c: char):
-    """Output a character to terminal."""
-    global term_cursor_x, term_cursor_y, term_needs_redraw
-
+def term_putc_idx(idx: int32, c: char):
     if c == '\n':
-        term_newline()
+        term_newline(idx)
         return
-
     if c == '\r':
-        term_cursor_x = 0
+        term_cursor_x[idx] = 0
         return
-
     if c == '\b':
-        if term_cursor_x > 0:
-            term_cursor_x = term_cursor_x - 1
+        if term_cursor_x[idx] > 0:
+            term_cursor_x[idx] = term_cursor_x[idx] - 1
         return
+    line: int32 = term_scroll[idx] + term_cursor_y[idx]
+    ptr: Ptr[char] = term_line_ptr(idx, line)
+    cx: int32 = term_cursor_x[idx]
+    ptr[cx] = c
+    dirty: Ptr[bool] = term_get_dirty(idx)
+    dirty[line] = True
+    cx = cx + 1
+    if cx >= TERM_COLS:
+        term_newline(idx)
+    else:
+        term_cursor_x[idx] = cx
+    win_dirty[idx] = True
 
-    # Regular character
-    line: int32 = term_scroll_pos + term_cursor_y
-    ptr: Ptr[char] = term_line_ptr(line)
-    ptr[term_cursor_x] = c
-    term_line_dirty[line] = True
-    term_needs_redraw = True
-
-    term_cursor_x = term_cursor_x + 1
-    if term_cursor_x >= TERM_COLS:
-        term_newline()
-
-def term_puts(s: Ptr[char]):
-    """Output a string to terminal."""
+def term_puts_idx(idx: int32, s: Ptr[char]):
     i: int32 = 0
     while s[i] != '\0':
-        term_putc(s[i])
+        term_putc_idx(idx, s[i])
         i = i + 1
 
-def term_print_prompt():
-    """Print shell prompt."""
-    term_puts("pynux:")
-    term_puts(&cwd[0])
-    term_puts("> ")
+def term_print_prompt(idx: int32):
+    cwd: Ptr[char] = term_get_cwd(idx)
+    term_puts_idx(idx, "pynux:")
+    term_puts_idx(idx, cwd)
+    term_puts_idx(idx, "> ")
+
+# ============================================================================
+# Terminal command helpers
+# ============================================================================
+
+def cmd_get_arg() -> Ptr[char]:
+    i: int32 = 0
+    while cmd_buffer[i] != '\0' and cmd_buffer[i] != ' ':
+        i = i + 1
+    while cmd_buffer[i] == ' ':
+        i = i + 1
+    return &cmd_buffer[i]
+
+def cmd_starts_with(prefix: Ptr[char]) -> bool:
+    i: int32 = 0
+    while prefix[i] != '\0':
+        if cmd_buffer[i] != prefix[i]:
+            return False
+        i = i + 1
+    return cmd_buffer[i] == ' ' or cmd_buffer[i] == '\0'
+
+# ============================================================================
+# Terminal commands (split into small functions to avoid branch limits)
+# ============================================================================
+
+def cmd_help(idx: int32):
+    term_puts_idx(idx, "\nCommands: help clear ls cd cat mkdir touch rm\n")
+    term_puts_idx(idx, "echo pwd cp write uname free whoami hostname\n")
+    term_puts_idx(idx, "date uptime id env ps df stat head tail wc\n")
+
+def cmd_ls(idx: int32):
+    cwd: Ptr[char] = term_get_cwd(idx)
+    term_putc_idx(idx, '\n')
+    name: Array[64, char]
+    i: int32 = 0
+    result: int32 = ramfs_readdir(cwd, i, &name[0])
+    while result >= 0:
+        term_puts_idx(idx, &name[0])
+        if result == 1:
+            term_putc_idx(idx, '/')
+        term_puts_idx(idx, "  ")
+        i = i + 1
+        result = ramfs_readdir(cwd, i, &name[0])
+    term_putc_idx(idx, '\n')
+
+def cmd_cd(idx: int32):
+    cwd: Ptr[char] = term_get_cwd(idx)
+    arg: Ptr[char] = cmd_get_arg()
+    if arg[0] == '\0':
+        cwd[0] = '/'
+        cwd[1] = '\0'
+        return
+    if strcmp(arg, "..") == 0:
+        clen: int32 = strlen(cwd)
+        if clen > 1:
+            i: int32 = clen - 1
+            if cwd[i] == '/':
+                i = i - 1
+            while i > 0 and cwd[i] != '/':
+                i = i - 1
+            if i == 0:
+                cwd[0] = '/'
+                cwd[1] = '\0'
+            else:
+                cwd[i] = '\0'
+        return
+    build_path(cwd, arg)
+    if ramfs_exists(&path_buf[0]) and ramfs_isdir(&path_buf[0]):
+        strcpy(cwd, &path_buf[0])
+    else:
+        term_puts_idx(idx, "\nNo such directory\n")
+
+def cmd_cat(idx: int32):
+    cwd: Ptr[char] = term_get_cwd(idx)
+    arg: Ptr[char] = cmd_get_arg()
+    if arg[0] == '\0':
+        term_puts_idx(idx, "\nUsage: cat <file>\n")
+        return
+    build_path(cwd, arg)
+    if not ramfs_exists(&path_buf[0]) or ramfs_isdir(&path_buf[0]):
+        term_puts_idx(idx, "\nFile not found\n")
+        return
+    term_putc_idx(idx, '\n')
+    sz: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
+    if sz > 0:
+        read_buf[sz] = 0
+        term_puts_idx(idx, cast[Ptr[char]](&read_buf[0]))
+    term_putc_idx(idx, '\n')
+
+def cmd_mkdir(idx: int32):
+    cwd: Ptr[char] = term_get_cwd(idx)
+    arg: Ptr[char] = cmd_get_arg()
+    if arg[0] == '\0':
+        term_puts_idx(idx, "\nUsage: mkdir <name>\n")
+        return
+    build_path(cwd, arg)
+    if ramfs_create(&path_buf[0], True) >= 0:
+        term_puts_idx(idx, "\nCreated\n")
+    else:
+        term_puts_idx(idx, "\nFailed\n")
+
+def cmd_touch(idx: int32):
+    cwd: Ptr[char] = term_get_cwd(idx)
+    arg: Ptr[char] = cmd_get_arg()
+    if arg[0] == '\0':
+        term_puts_idx(idx, "\nUsage: touch <name>\n")
+        return
+    build_path(cwd, arg)
+    if ramfs_create(&path_buf[0], False) >= 0:
+        term_puts_idx(idx, "\nCreated\n")
+    else:
+        term_puts_idx(idx, "\nFailed\n")
+
+def cmd_rm(idx: int32):
+    cwd: Ptr[char] = term_get_cwd(idx)
+    arg: Ptr[char] = cmd_get_arg()
+    if arg[0] == '\0':
+        term_puts_idx(idx, "\nUsage: rm <name>\n")
+        return
+    build_path(cwd, arg)
+    if ramfs_delete(&path_buf[0]) >= 0:
+        term_puts_idx(idx, "\nRemoved\n")
+    else:
+        term_puts_idx(idx, "\nFailed\n")
+
+def cmd_echo(idx: int32):
+    arg: Ptr[char] = cmd_get_arg()
+    term_putc_idx(idx, '\n')
+    term_puts_idx(idx, arg)
+    term_putc_idx(idx, '\n')
+
+def cmd_pwd(idx: int32):
+    cwd: Ptr[char] = term_get_cwd(idx)
+    term_putc_idx(idx, '\n')
+    term_puts_idx(idx, cwd)
+    term_putc_idx(idx, '\n')
+
+def cmd_write(idx: int32):
+    cwd: Ptr[char] = term_get_cwd(idx)
+    arg: Ptr[char] = cmd_get_arg()
+    if arg[0] == '\0':
+        term_puts_idx(idx, "\nUsage: write <file> <text>\n")
+        return
+    i: int32 = 0
+    while arg[i] != '\0' and arg[i] != ' ':
+        i = i + 1
+    if arg[i] != ' ':
+        term_puts_idx(idx, "\nUsage: write <file> <text>\n")
+        return
+    arg[i] = '\0'
+    content: Ptr[char] = &arg[i + 1]
+    build_path(cwd, arg)
+    if not ramfs_exists(&path_buf[0]):
+        ramfs_create(&path_buf[0], False)
+    if ramfs_write(&path_buf[0], content) >= 0:
+        term_puts_idx(idx, "\nWritten\n")
+    else:
+        term_puts_idx(idx, "\nFailed\n")
+
+def cmd_uname(idx: int32):
+    arg: Ptr[char] = cmd_get_arg()
+    term_putc_idx(idx, '\n')
+    if arg[0] == '\0' or strcmp(arg, "-s") == 0:
+        term_puts_idx(idx, "Pynux\n")
+    elif strcmp(arg, "-a") == 0:
+        term_puts_idx(idx, "Pynux 0.1.0 armv7m Cortex-M3\n")
+    else:
+        term_puts_idx(idx, "Pynux\n")
+
+def cmd_free(idx: int32):
+    term_puts_idx(idx, "\n       total     used     free\n")
+    term_puts_idx(idx, "Heap:  ")
+    term_puts_idx(idx, int_to_str(heap_total()))
+    term_puts_idx(idx, "    ")
+    term_puts_idx(idx, int_to_str(heap_used()))
+    term_puts_idx(idx, "    ")
+    term_puts_idx(idx, int_to_str(heap_remaining()))
+    term_putc_idx(idx, '\n')
+
+def cmd_stat(idx: int32):
+    cwd: Ptr[char] = term_get_cwd(idx)
+    arg: Ptr[char] = cmd_get_arg()
+    if arg[0] == '\0':
+        term_puts_idx(idx, "\nUsage: stat <file>\n")
+        return
+    build_path(cwd, arg)
+    if not ramfs_exists(&path_buf[0]):
+        term_puts_idx(idx, "\nNot found\n")
+        return
+    term_puts_idx(idx, "\n  File: ")
+    term_puts_idx(idx, &path_buf[0])
+    term_putc_idx(idx, '\n')
+    if ramfs_isdir(&path_buf[0]):
+        term_puts_idx(idx, "  Type: directory\n")
+    else:
+        term_puts_idx(idx, "  Type: file\n")
+        sz: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
+        term_puts_idx(idx, "  Size: ")
+        term_puts_idx(idx, int_to_str(sz))
+        term_puts_idx(idx, "\n")
+
+# ============================================================================
+# Terminal command execution
+# ============================================================================
+
+def term_exec_cmd(idx: int32):
+    global cmd_pos
+    cmd_buffer[cmd_pos] = '\0'
+    if cmd_pos == 0:
+        term_print_prompt(idx)
+        return
+    # Dispatch commands
+    if strcmp(&cmd_buffer[0], "help") == 0:
+        cmd_help(idx)
+    elif strcmp(&cmd_buffer[0], "clear") == 0:
+        term_init_win(idx)
+        win_dirty[idx] = True
+    elif strcmp(&cmd_buffer[0], "ls") == 0:
+        cmd_ls(idx)
+    elif cmd_starts_with("cd"):
+        cmd_cd(idx)
+    elif cmd_starts_with("cat"):
+        cmd_cat(idx)
+    elif cmd_starts_with("mkdir"):
+        cmd_mkdir(idx)
+    elif cmd_starts_with("touch"):
+        cmd_touch(idx)
+    elif cmd_starts_with("rm"):
+        cmd_rm(idx)
+    elif cmd_starts_with("echo"):
+        cmd_echo(idx)
+    elif strcmp(&cmd_buffer[0], "pwd") == 0:
+        cmd_pwd(idx)
+    elif cmd_starts_with("write"):
+        cmd_write(idx)
+    elif cmd_starts_with("uname"):
+        cmd_uname(idx)
+    elif strcmp(&cmd_buffer[0], "free") == 0:
+        cmd_free(idx)
+    elif strcmp(&cmd_buffer[0], "whoami") == 0:
+        term_puts_idx(idx, "\nroot\n")
+    elif strcmp(&cmd_buffer[0], "hostname") == 0:
+        term_puts_idx(idx, "\npynux\n")
+    elif strcmp(&cmd_buffer[0], "date") == 0:
+        term_puts_idx(idx, "\nJan 1 00:00:00 UTC 2025\n")
+    elif strcmp(&cmd_buffer[0], "uptime") == 0:
+        term_puts_idx(idx, "\nup 0 days, 0:00\n")
+    elif strcmp(&cmd_buffer[0], "id") == 0:
+        term_puts_idx(idx, "\nuid=0(root) gid=0(root)\n")
+    elif strcmp(&cmd_buffer[0], "env") == 0:
+        term_puts_idx(idx, "\nHOME=/home\nUSER=root\nSHELL=/bin/psh\n")
+    elif strcmp(&cmd_buffer[0], "ps") == 0:
+        term_puts_idx(idx, "\n  PID CMD\n    1 psh\n")
+    elif strcmp(&cmd_buffer[0], "df") == 0:
+        term_puts_idx(idx, "\nFilesystem  Used  Free\nramfs       ")
+        term_puts_idx(idx, int_to_str(heap_used() / 1024))
+        term_puts_idx(idx, "K   ")
+        term_puts_idx(idx, int_to_str(heap_remaining() / 1024))
+        term_puts_idx(idx, "K\n")
+    elif cmd_starts_with("stat"):
+        cmd_stat(idx)
+    else:
+        term_puts_idx(idx, "\nUnknown: ")
+        term_puts_idx(idx, &cmd_buffer[0])
+        term_putc_idx(idx, '\n')
+    term_newline(idx)
+    term_print_prompt(idx)
+    cmd_pos = 0
+
+# ============================================================================
+# Editor functions
+# ============================================================================
+
+def edit_init():
+    global edit_size, edit_cursor, edit_scroll, edit_modified
+    edit_size = 0
+    edit_cursor = 0
+    edit_scroll = 0
+    edit_modified = False
+    edit_filename[0] = '\0'
+    i: int32 = 0
+    while i < 4096:
+        edit_buffer[i] = '\0'
+        i = i + 1
+
+def edit_load(path: Ptr[char]):
+    global edit_size, edit_cursor, edit_scroll, edit_modified
+    edit_init()
+    if ramfs_exists(path) and not ramfs_isdir(path):
+        sz: int32 = ramfs_read(path, cast[Ptr[uint8]](&edit_buffer[0]), 4095)
+        if sz > 0:
+            edit_size = sz
+        strcpy(&edit_filename[0], path)
+    edit_modified = False
+
+def edit_save():
+    global edit_modified
+    if edit_filename[0] == '\0':
+        return
+    edit_buffer[edit_size] = '\0'
+    if not ramfs_exists(&edit_filename[0]):
+        ramfs_create(&edit_filename[0], False)
+    ramfs_write(&edit_filename[0], &edit_buffer[0])
+    edit_modified = False
+
+def edit_insert(c: char):
+    global edit_size, edit_cursor, edit_modified, edit_dirty
+    if edit_size >= 4095:
+        return
+    # Shift right
+    i: int32 = edit_size
+    while i > edit_cursor:
+        edit_buffer[i] = edit_buffer[i - 1]
+        i = i - 1
+    edit_buffer[edit_cursor] = c
+    edit_cursor = edit_cursor + 1
+    edit_size = edit_size + 1
+    edit_modified = True
+    edit_dirty = True
+
+def edit_delete():
+    global edit_size, edit_cursor, edit_modified, edit_dirty
+    if edit_cursor >= edit_size:
+        return
+    i: int32 = edit_cursor
+    while i < edit_size - 1:
+        edit_buffer[i] = edit_buffer[i + 1]
+        i = i + 1
+    edit_size = edit_size - 1
+    edit_modified = True
+    edit_dirty = True
+
+def edit_backspace():
+    global edit_cursor, edit_dirty
+    if edit_cursor <= 0:
+        return
+    edit_cursor = edit_cursor - 1
+    edit_delete()
+    edit_dirty = True
+
+# ============================================================================
+# File manager functions
+# ============================================================================
+
+def fm_init():
+    global fm_selection, fm_count
+    fm_cwd[0] = '/'
+    fm_cwd[1] = '\0'
+    fm_selection = 0
+    fm_count = 0
+
+def fm_refresh():
+    global fm_count, fm_dirty
+    fm_count = 0
+    i: int32 = 0
+    name: Array[64, char]
+    result: int32 = ramfs_readdir(&fm_cwd[0], i, &name[0])
+    while result >= 0 and fm_count < 16:
+        # Store name
+        j: int32 = 0
+        base: int32 = fm_count * 32
+        while j < 31 and name[j] != '\0':
+            fm_names[base + j] = name[j]
+            j = j + 1
+        fm_names[base + j] = '\0'
+        fm_types[fm_count] = result
+        fm_count = fm_count + 1
+        i = i + 1
+        result = ramfs_readdir(&fm_cwd[0], i, &name[0])
+    fm_dirty = True
+
+def fm_get_name(idx: int32) -> Ptr[char]:
+    return &fm_names[idx * 32]
+
+def fm_enter():
+    global fm_selection, fm_dirty
+    if fm_count == 0:
+        return
+    name: Ptr[char] = fm_get_name(fm_selection)
+    if fm_types[fm_selection] == 1:
+        # Directory
+        build_path(&fm_cwd[0], name)
+        strcpy(&fm_cwd[0], &path_buf[0])
+        fm_selection = 0
+        fm_refresh()
+    else:
+        # File - open in editor
+        build_path(&fm_cwd[0], name)
+        edit_load(&path_buf[0])
+        # Find editor window and focus it
+        i: int32 = 0
+        while i < win_count:
+            if win_type[i] == WIN_EDITOR:
+                win_focus(i)
+                break
+            i = i + 1
+    fm_dirty = True
+
+def fm_up():
+    global fm_selection, fm_dirty
+    # Go up one directory
+    clen: int32 = strlen(&fm_cwd[0])
+    if clen > 1:
+        i: int32 = clen - 1
+        while i > 0 and fm_cwd[i] != '/':
+            i = i - 1
+        if i == 0:
+            fm_cwd[0] = '/'
+            fm_cwd[1] = '\0'
+        else:
+            fm_cwd[i] = '\0'
+        fm_selection = 0
+        fm_refresh()
+    fm_dirty = True
 
 # ============================================================================
 # Drawing functions
 # ============================================================================
 
-def draw_titlebar():
-    """Draw the desktop title bar."""
-    vtn_rect(0, 0, SCREEN_W, 30, TITLE_R, TITLE_G, TITLE_B, 255)
-    vtn_textline("Pynux Desktop", 10, 8, TEXT_R, TEXT_G, TEXT_B)
+def draw_menu():
+    # Menu bar background
+    vtn_rect(0, 0, SCREEN_W, MENU_H, MENU_BG_R, MENU_BG_G, MENU_BG_B, 255)
+    # Menu items
+    vtn_textline("Menu", 8, 4, TEXT_R, TEXT_G, TEXT_B)
+    # Draw dropdown if open
+    if menu_open:
+        vtn_rect(0, MENU_H, 120, MENU_ITEMS * 20 + 4, TITLE_R, TITLE_G, TITLE_B, 255)
+        # Highlight selection
+        vtn_rect(2, MENU_H + 2 + menu_selection * 20, 116, 18, SELECT_R, SELECT_G, SELECT_B, 255)
+        vtn_textline("Terminal", 8, MENU_H + 4, TEXT_R, TEXT_G, TEXT_B)
+        vtn_textline("Editor", 8, MENU_H + 24, TEXT_R, TEXT_G, TEXT_B)
+        vtn_textline("Files", 8, MENU_H + 44, TEXT_R, TEXT_G, TEXT_B)
+        vtn_textline("Close Win", 8, MENU_H + 64, TEXT_R, TEXT_G, TEXT_B)
 
-status_buf: Array[80, char]
-
-def draw_statusbar():
-    """Draw the status bar at bottom."""
-    vtn_rect(0, SCREEN_H - 25, SCREEN_W, 25, TITLE_R, TITLE_G, TITLE_B, 255)
-
-    # Build status string with memory info
-    strcpy(&status_buf[0], "Ready | Heap: ")
+def draw_status():
+    y: int32 = SCREEN_H - STATUS_H
+    vtn_rect(0, y, SCREEN_W, STATUS_H, MENU_BG_R, MENU_BG_G, MENU_BG_B, 255)
+    strcpy(&status_buf[0], "Heap: ")
     strcat(&status_buf[0], int_to_str(heap_used()))
     strcat(&status_buf[0], "/")
     strcat(&status_buf[0], int_to_str(heap_total()))
-    strcat(&status_buf[0], " bytes")
+    strcat(&status_buf[0], " | Win: ")
+    strcat(&status_buf[0], int_to_str(win_count))
+    strcat(&status_buf[0], " | F1:Menu F2:Switch")
+    vtn_textline(&status_buf[0], 8, y + 3, TEXT_R, TEXT_G, TEXT_B)
 
-    vtn_textline(&status_buf[0], 10, SCREEN_H - 18, TEXT_R, TEXT_G, TEXT_B)
+def draw_window_frame(idx: int32):
+    x: int32 = win_x[idx]
+    y: int32 = win_y[idx]
+    w: int32 = win_w[idx]
+    h: int32 = win_h[idx]
+    is_active: bool = idx == active_win
+    # Title bar
+    if is_active:
+        vtn_rect(x, y, w, WIN_TITLE_H, ACCENT_R, ACCENT_G, ACCENT_B, 255)
+    else:
+        vtn_rect(x, y, w, WIN_TITLE_H, TITLE_R, TITLE_G, TITLE_B, 255)
+    # Title text
+    if win_type[idx] == WIN_TERMINAL:
+        strcpy(&line_buf[0], "Terminal ")
+        strcat(&line_buf[0], int_to_str(idx + 1))
+    elif win_type[idx] == WIN_EDITOR:
+        strcpy(&line_buf[0], "Editor")
+        if edit_modified:
+            strcat(&line_buf[0], " *")
+    elif win_type[idx] == WIN_FILES:
+        strcpy(&line_buf[0], "Files: ")
+        strcat(&line_buf[0], &fm_cwd[0])
+    else:
+        strcpy(&line_buf[0], "Window")
+    vtn_textline(&line_buf[0], x + 4, y + 3, TEXT_R, TEXT_G, TEXT_B)
+    # Content area background
+    vtn_rect(x, y + WIN_TITLE_H, w, h - WIN_TITLE_H, TERM_BG_R, TERM_BG_G, TERM_BG_B, 255)
 
-def draw_terminal_frame():
-    """Draw terminal window frame."""
-    # Window background
-    vtn_rect(TERM_X - 2, TERM_Y - 22, TERM_W + 4, TERM_H + 24, TITLE_R, TITLE_G, TITLE_B, 255)
-
-    # Terminal title bar
-    vtn_textline("Terminal", TERM_X + 5, TERM_Y - 18, TEXT_R, TEXT_G, TEXT_B)
-
-    # Terminal content area
-    vtn_rect(TERM_X, TERM_Y, TERM_W, TERM_H, TERM_BG_R, TERM_BG_G, TERM_BG_B, 255)
-
-def draw_terminal_content():
-    """Draw terminal text content (only dirty lines)."""
-    global term_needs_redraw
-
-    line_buf: Array[81, char]
-
-    i: int32 = 0
-    while i < TERM_ROWS:
-        line: int32 = term_scroll_pos + i
-
-        if term_line_dirty[line]:
-            # Clear line area first
-            y: int32 = TERM_Y + i * CHAR_H
-            vtn_clear_rect(TERM_X, y, TERM_W, CHAR_H, TERM_BG_R, TERM_BG_G, TERM_BG_B)
-
-            # Copy line to null-terminated buffer
-            ptr: Ptr[char] = term_line_ptr(line)
+def draw_terminal_content(idx: int32):
+    x: int32 = win_x[idx] + 4
+    y: int32 = win_y[idx] + WIN_TITLE_H + 2
+    scr: int32 = term_scroll[idx]
+    dirty: Ptr[bool] = term_get_dirty(idx)
+    row: int32 = 0
+    while row < TERM_ROWS:
+        line: int32 = scr + row
+        if dirty[line]:
+            ptr: Ptr[char] = term_line_ptr(idx, line)
+            # Clear line
+            vtn_clear_rect(x, y + row * CHAR_H, win_w[idx] - 8, CHAR_H, TERM_BG_R, TERM_BG_G, TERM_BG_B)
+            # Copy to buffer and null-terminate
             j: int32 = 0
-            while j < TERM_COLS:
+            while j < TERM_COLS and j < 80:
                 line_buf[j] = ptr[j]
                 j = j + 1
-            line_buf[TERM_COLS] = '\0'
+            line_buf[j] = '\0'
+            vtn_textline(&line_buf[0], x, y + row * CHAR_H, TEXT_R, TEXT_G, TEXT_B)
+            dirty[line] = False
+        row = row + 1
+    # Draw cursor if active
+    if idx == active_win:
+        cx: int32 = x + term_cursor_x[idx] * CHAR_W
+        cy: int32 = y + term_cursor_y[idx] * CHAR_H + CHAR_H - 2
+        vtn_rect(cx, cy, CHAR_W, 2, TEXT_R, TEXT_G, TEXT_B, 255)
 
-            # Draw the text
-            vtn_textline(&line_buf[0], TERM_X + 4, y + 2, TEXT_R, TEXT_G, TEXT_B)
+def draw_editor_content(idx: int32):
+    x: int32 = win_x[idx] + 4
+    y: int32 = win_y[idx] + WIN_TITLE_H + 2
+    rows: int32 = (win_h[idx] - WIN_TITLE_H - 4) / CHAR_H
+    cols: int32 = (win_w[idx] - 8) / CHAR_W
+    # Count lines and find scroll
+    row: int32 = 0
+    pos: int32 = 0
+    cur_row: int32 = 0
+    cur_col: int32 = 0
+    # Find cursor position
+    i: int32 = 0
+    lc: int32 = 0
+    cc: int32 = 0
+    while i < edit_cursor and i < edit_size:
+        if edit_buffer[i] == '\n':
+            lc = lc + 1
+            cc = 0
+        else:
+            cc = cc + 1
+        i = i + 1
+    cur_row = lc
+    cur_col = cc
+    # Adjust scroll
+    if cur_row < edit_scroll:
+        edit_scroll = cur_row
+    if cur_row >= edit_scroll + rows:
+        edit_scroll = cur_row - rows + 1
+    # Draw lines
+    row = 0
+    pos = 0
+    # Skip to scroll position
+    sl: int32 = 0
+    while sl < edit_scroll and pos < edit_size:
+        if edit_buffer[pos] == '\n':
+            sl = sl + 1
+        pos = pos + 1
+    # Draw visible lines
+    while row < rows and pos <= edit_size:
+        col: int32 = 0
+        while col < cols and pos < edit_size:
+            if edit_buffer[pos] == '\n':
+                pos = pos + 1
+                break
+            line_buf[col] = edit_buffer[pos]
+            col = col + 1
+            pos = pos + 1
+        line_buf[col] = '\0'
+        vtn_clear_rect(x, y + row * CHAR_H, win_w[idx] - 8, CHAR_H, TERM_BG_R, TERM_BG_G, TERM_BG_B)
+        vtn_textline(&line_buf[0], x, y + row * CHAR_H, TEXT_R, TEXT_G, TEXT_B)
+        row = row + 1
+    # Clear remaining rows
+    while row < rows:
+        vtn_clear_rect(x, y + row * CHAR_H, win_w[idx] - 8, CHAR_H, TERM_BG_R, TERM_BG_G, TERM_BG_B)
+        row = row + 1
+    # Draw cursor
+    if idx == active_win:
+        vr: int32 = cur_row - edit_scroll
+        if vr >= 0 and vr < rows:
+            cx: int32 = x + cur_col * CHAR_W
+            cy: int32 = y + vr * CHAR_H + CHAR_H - 2
+            vtn_rect(cx, cy, CHAR_W, 2, ACCENT_R, ACCENT_G, ACCENT_B, 255)
 
-            term_line_dirty[line] = False
-
+def draw_files_content(idx: int32):
+    x: int32 = win_x[idx] + 4
+    y: int32 = win_y[idx] + WIN_TITLE_H + 2
+    rows: int32 = (win_h[idx] - WIN_TITLE_H - 4) / CHAR_H
+    # Draw ".." first
+    if fm_selection == 0:
+        vtn_rect(x - 2, y, win_w[idx] - 4, CHAR_H, SELECT_R, SELECT_G, SELECT_B, 255)
+    vtn_textline("..", x, y, TEXT_R, TEXT_G, TEXT_B)
+    # Draw entries
+    row: int32 = 1
+    i: int32 = 0
+    while i < fm_count and row < rows:
+        yy: int32 = y + row * CHAR_H
+        if i + 1 == fm_selection:
+            vtn_rect(x - 2, yy, win_w[idx] - 4, CHAR_H, SELECT_R, SELECT_G, SELECT_B, 255)
+        name: Ptr[char] = fm_get_name(i)
+        strcpy(&line_buf[0], name)
+        if fm_types[i] == 1:
+            strcat(&line_buf[0], "/")
+        vtn_textline(&line_buf[0], x, yy, TEXT_R, TEXT_G, TEXT_B)
+        row = row + 1
         i = i + 1
 
-    term_needs_redraw = False
-
-def draw_cursor():
-    """Draw cursor as a small rectangle."""
-    x: int32 = TERM_X + 4 + term_cursor_x * CHAR_W
-    y: int32 = TERM_Y + term_cursor_y * CHAR_H + CHAR_H - 2
-    vtn_rect(x, y, CHAR_W, 2, TEXT_R, TEXT_G, TEXT_B, 255)
+def draw_window(idx: int32):
+    draw_window_frame(idx)
+    if win_type[idx] == WIN_TERMINAL:
+        draw_terminal_content(idx)
+    elif win_type[idx] == WIN_EDITOR:
+        draw_editor_content(idx)
+    elif win_type[idx] == WIN_FILES:
+        draw_files_content(idx)
+    win_dirty[idx] = False
 
 def de_draw():
-    """Draw the entire desktop."""
-    global needs_full_redraw
-
+    global needs_full_redraw, menu_dirty, status_dirty
     if needs_full_redraw:
-        # Full redraw
         vtn_clear(BG_R, BG_G, BG_B, 255)
-        draw_titlebar()
-        draw_statusbar()
-        draw_terminal_frame()
-
-        # Mark all visible terminal lines dirty
+        draw_menu()
+        draw_status()
         i: int32 = 0
-        while i < TERM_ROWS:
-            term_line_dirty[term_scroll_pos + i] = True
+        while i < win_count:
+            if win_visible[i]:
+                draw_window(i)
             i = i + 1
-
         needs_full_redraw = False
-
-    # Always draw terminal content (respects dirty tracking)
-    draw_terminal_content()
-    draw_cursor()
-
-# ============================================================================
-# Text processing command handler (separate function to reduce branch distances)
-# ============================================================================
-
-def cmd_grep():
-    """grep <pattern> <file> - search for pattern in file"""
-    arg: Ptr[char] = cmd_get_arg()
-    pat: Array[32, char]
-    lb: Array[128, char]
-    sz: int32 = 0
+        menu_dirty = False
+        status_dirty = False
+        return
+    # Partial updates
+    if menu_dirty:
+        draw_menu()
+        menu_dirty = False
+    if status_dirty:
+        draw_status()
+        status_dirty = False
+    # Update dirty windows
     i: int32 = 0
-    j: int32 = 0
-    k: int32 = 0
-    lbi: int32 = 0
-    found: bool = False
-    mtch: bool = False
-
-    if arg[0] == '\0':
-        term_puts("\nUsage: grep <pattern> <file>\n")
-        return
-    # Parse pattern
-    while arg[j] != '\0' and arg[j] != ' ' and i < 31:
-        pat[i] = arg[j]
+    while i < win_count:
+        if win_dirty[i] and win_visible[i]:
+            draw_window(i)
         i = i + 1
-        j = j + 1
-    pat[i] = '\0'
-    while arg[j] == ' ':
-        j = j + 1
-    if arg[j] == '\0':
-        term_puts("\nUsage: grep <pattern> <file>\n")
-        return
-    build_path(&arg[j])
-    if not ramfs_exists(&path_buf[0]):
-        term_puts("\ngrep: file not found\n")
-        return
-    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
-    term_putc('\n')
-    i = 0
-    while i < sz:
-        if read_buf[i] == 10:
-            lb[lbi] = '\0'
-            found = False
-            j = 0
-            while lb[j] != '\0' and not found:
-                mtch = True
-                k = 0
-                while pat[k] != '\0' and mtch:
-                    if lb[j + k] != pat[k]:
-                        mtch = False
-                    k = k + 1
-                if mtch and pat[0] != '\0':
+
+# ============================================================================
+# Input handling
+# ============================================================================
+
+def handle_menu_input(c: char) -> bool:
+    global menu_open, menu_selection, menu_dirty, needs_full_redraw
+    if c == '\x1b':  # ESC - close menu
+        menu_open = False
+        needs_full_redraw = True
+        return True
+    if c == 'j' or c == '\x02':  # Down
+        menu_selection = (menu_selection + 1) % MENU_ITEMS
+        menu_dirty = True
+        return True
+    if c == 'k' or c == '\x10':  # Up
+        menu_selection = (menu_selection - 1 + MENU_ITEMS) % MENU_ITEMS
+        menu_dirty = True
+        return True
+    if c == '\r':  # Enter - select
+        menu_open = False
+        if menu_selection == 0:
+            # New terminal
+            if win_count < 2:  # Limit terminals
+                idx: int32 = win_create(WIN_TERMINAL, 10 + win_count * 30, 40 + win_count * 20, 380, 360)
+                if idx >= 0:
+                    term_init_win(idx)
+                    term_puts_idx(idx, "Pynux Terminal\n\n")
+                    term_print_prompt(idx)
+        elif menu_selection == 1:
+            # Editor
+            found: bool = False
+            i: int32 = 0
+            while i < win_count:
+                if win_type[i] == WIN_EDITOR:
+                    win_focus(i)
                     found = True
-                j = j + 1
-            if found:
-                term_puts(&lb[0])
-                term_putc('\n')
-            lbi = 0
-        else:
-            if lbi < 127:
-                lb[lbi] = cast[char](read_buf[i])
-                lbi = lbi + 1
-        i = i + 1
-
-def cmd_sort():
-    """sort <file> - sort lines alphabetically"""
-    arg: Ptr[char] = cmd_get_arg()
-    ls: Array[32, int32]
-    le: Array[32, int32]
-    sz: int32 = 0
-    lc: int32 = 0
-    i: int32 = 0
-    j: int32 = 0
-    k1: int32 = 0
-    k2: int32 = 0
-    swap: bool = False
-    ts: int32 = 0
-    te: int32 = 0
-
-    if arg[0] == '\0':
-        term_puts("\nUsage: sort <file>\n")
-        return
-    build_path(arg)
-    if not ramfs_exists(&path_buf[0]):
-        term_puts("\nsort: file not found\n")
-        return
-    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
-    term_putc('\n')
-    ls[0] = 0
-    i = 0
-    while i < sz:
-        if read_buf[i] == 10:
-            if lc < 32:
-                le[lc] = i
-                lc = lc + 1
-                if i < sz - 1:
-                    ls[lc] = i + 1
-        i = i + 1
-    if sz > 0 and read_buf[sz - 1] != 10 and lc < 32:
-        le[lc] = sz
-        lc = lc + 1
-    # Bubble sort
-    i = 0
-    while i < lc - 1:
-        j = 0
-        while j < lc - i - 1:
-            swap = False
-            k1 = ls[j]
-            k2 = ls[j + 1]
-            while k1 < le[j] and k2 < le[j + 1]:
-                if read_buf[k1] > read_buf[k2]:
-                    swap = True
-                    k1 = sz
-                elif read_buf[k1] < read_buf[k2]:
-                    k1 = sz
-                else:
-                    k1 = k1 + 1
-                    k2 = k2 + 1
-            if swap:
-                ts = ls[j]
-                ls[j] = ls[j + 1]
-                ls[j + 1] = ts
-                te = le[j]
-                le[j] = le[j + 1]
-                le[j + 1] = te
-            j = j + 1
-        i = i + 1
-    # Print sorted
-    i = 0
-    while i < lc:
-        j = ls[i]
-        while j < le[i]:
-            term_putc(cast[char](read_buf[j]))
-            j = j + 1
-        term_putc('\n')
-        i = i + 1
-
-def cmd_uniq():
-    """uniq <file> - filter adjacent duplicates"""
-    arg: Ptr[char] = cmd_get_arg()
-    sz: int32 = 0
-    ps: int32 = -1
-    pe: int32 = -1
-    cs: int32 = 0
-    ce: int32 = 0
-    i: int32 = 0
-    k: int32 = 0
-    dup: bool = False
-
-    if arg[0] == '\0':
-        term_puts("\nUsage: uniq <file>\n")
-        return
-    build_path(arg)
-    if not ramfs_exists(&path_buf[0]):
-        term_puts("\nuniq: file not found\n")
-        return
-    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
-    term_putc('\n')
-    while i <= sz:
-        if i == sz or read_buf[i] == 10:
-            ce = i
-            dup = False
-            if ps >= 0 and ce - cs == pe - ps:
-                dup = True
-                k = 0
-                while k < ce - cs:
-                    if read_buf[cs + k] != read_buf[ps + k]:
-                        dup = False
-                    k = k + 1
-            if not dup:
-                k = cs
-                while k < ce:
-                    term_putc(cast[char](read_buf[k]))
-                    k = k + 1
-                term_putc('\n')
-            ps = cs
-            pe = ce
-            cs = i + 1
-        i = i + 1
-
-def cmd_tr():
-    """tr <from> <to> <file> - translate characters"""
-    arg: Ptr[char] = cmd_get_arg()
-    fc: char = '\0'
-    tc: char = '\0'
-    sz: int32 = 0
-    i: int32 = 0
-
-    if arg[0] == '\0' or arg[1] != ' ' or arg[2] == '\0' or arg[3] != ' ':
-        term_puts("\nUsage: tr <char> <char> <file>\n")
-        return
-    fc = arg[0]
-    tc = arg[2]
-    i = 4
-    while arg[i] == ' ':
-        i = i + 1
-    if arg[i] == '\0':
-        term_puts("\nUsage: tr <char> <char> <file>\n")
-        return
-    build_path(&arg[i])
-    if not ramfs_exists(&path_buf[0]):
-        term_puts("\ntr: file not found\n")
-        return
-    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
-    term_putc('\n')
-    i = 0
-    while i < sz:
-        if cast[char](read_buf[i]) == fc:
-            term_putc(tc)
-        else:
-            term_putc(cast[char](read_buf[i]))
-        i = i + 1
-
-def cmd_tac():
-    """tac <file> - reverse line order"""
-    arg: Ptr[char] = cmd_get_arg()
-    ends: Array[64, int32]
-    sz: int32 = 0
-    lc: int32 = 0
-    i: int32 = 0
-    st: int32 = 0
-    ed: int32 = 0
-
-    if arg[0] == '\0':
-        term_puts("\nUsage: tac <file>\n")
-        return
-    build_path(arg)
-    if not ramfs_exists(&path_buf[0]):
-        term_puts("\ntac: file not found\n")
-        return
-    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
-    term_putc('\n')
-    i = 0
-    while i < sz:
-        if read_buf[i] == 10 and lc < 64:
-            ends[lc] = i
-            lc = lc + 1
-        i = i + 1
-    if sz > 0 and read_buf[sz - 1] != 10 and lc < 64:
-        ends[lc] = sz
-        lc = lc + 1
-    i = lc - 1
-    while i >= 0:
-        st = 0
-        if i > 0:
-            st = ends[i - 1] + 1
-        ed = ends[i]
-        while st < ed:
-            if read_buf[st] != 10:
-                term_putc(cast[char](read_buf[st]))
-            st = st + 1
-        term_putc('\n')
-        i = i - 1
-
-def cmd_fold():
-    """fold <file> - wrap at 60 columns"""
-    arg: Ptr[char] = cmd_get_arg()
-    sz: int32 = 0
-    col: int32 = 0
-    i: int32 = 0
-
-    if arg[0] == '\0':
-        term_puts("\nUsage: fold <file>\n")
-        return
-    build_path(arg)
-    if not ramfs_exists(&path_buf[0]):
-        term_puts("\nfold: file not found\n")
-        return
-    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
-    term_putc('\n')
-    while i < sz:
-        if read_buf[i] == 10:
-            term_putc('\n')
-            col = 0
-        else:
-            if col >= 60:
-                term_putc('\n')
-                col = 0
-            term_putc(cast[char](read_buf[i]))
-            col = col + 1
-        i = i + 1
-
-def cmd_cut():
-    """cut <file> - first 20 chars per line"""
-    arg: Ptr[char] = cmd_get_arg()
-    sz: int32 = 0
-    cnt: int32 = 0
-    i: int32 = 0
-
-    if arg[0] == '\0':
-        term_puts("\nUsage: cut <file>\n")
-        return
-    build_path(arg)
-    if not ramfs_exists(&path_buf[0]):
-        term_puts("\ncut: file not found\n")
-        return
-    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
-    term_putc('\n')
-    while i < sz:
-        if read_buf[i] == 10:
-            term_putc('\n')
-            cnt = 0
-        else:
-            if cnt < 20:
-                term_putc(cast[char](read_buf[i]))
-            cnt = cnt + 1
-        i = i + 1
-
-def cmd_wc():
-    """wc <file> - word/line/char count"""
-    arg: Ptr[char] = cmd_get_arg()
-    sz: int32 = 0
-    lines: int32 = 0
-    words: int32 = 0
-    in_word: bool = False
-    i: int32 = 0
-    c: int32 = 0
-
-    if arg[0] == '\0':
-        term_puts("\nUsage: wc <file>\n")
-        return
-    build_path(arg)
-    if not ramfs_exists(&path_buf[0]):
-        term_puts("\nwc: file not found\n")
-        return
-    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
-    while i < sz:
-        c = cast[int32](read_buf[i])
-        if c == 10:
-            lines = lines + 1
-        if c == 32 or c == 10 or c == 9:
-            if in_word:
-                words = words + 1
-                in_word = False
-        else:
-            in_word = True
-        i = i + 1
-    if in_word:
-        words = words + 1
-    term_putc('\n')
-    term_puts(int_to_str(lines))
-    term_putc(' ')
-    term_puts(int_to_str(words))
-    term_putc(' ')
-    term_puts(int_to_str(sz))
-    term_putc(' ')
-    term_puts(arg)
-    term_putc('\n')
-
-def exec_text_cmd(cmd: Ptr[char]) -> bool:
-    """Handle text processing commands. Returns True if handled."""
-    if cmd_starts_with("grep"):
-        cmd_grep()
-        return True
-    if cmd_starts_with("sort"):
-        cmd_sort()
-        return True
-    if cmd_starts_with("uniq"):
-        cmd_uniq()
-        return True
-    if cmd_starts_with("tr"):
-        cmd_tr()
-        return True
-    if cmd_starts_with("tac"):
-        cmd_tac()
-        return True
-    if cmd_starts_with("fold"):
-        cmd_fold()
-        return True
-    if cmd_starts_with("cut"):
-        cmd_cut()
-        return True
-    if cmd_starts_with("wc"):
-        cmd_wc()
+                    break
+                i = i + 1
+            if not found:
+                idx: int32 = win_create(WIN_EDITOR, 400, 40, 380, 360)
+                if idx >= 0:
+                    edit_init()
+        elif menu_selection == 2:
+            # Files
+            found = False
+            i = 0
+            while i < win_count:
+                if win_type[i] == WIN_FILES:
+                    win_focus(i)
+                    found = True
+                    break
+                i = i + 1
+            if not found:
+                idx: int32 = win_create(WIN_FILES, 10, 200, 200, 300)
+                if idx >= 0:
+                    fm_init()
+                    fm_refresh()
+        elif menu_selection == 3:
+            # Close active window
+            if active_win >= 0:
+                win_close(active_win)
+        needs_full_redraw = True
         return True
     return False
 
-# ============================================================================
-# Command execution
-# ============================================================================
-
-def exec_cmd():
-    """Execute command in cmd_buffer."""
+def handle_terminal_input(idx: int32, c: char):
     global cmd_pos
-
-    # Null terminate
-    cmd_buffer[cmd_pos] = '\0'
-
-    # Skip empty commands
-    if cmd_pos == 0:
-        term_print_prompt()
+    if c == '\r':
+        term_putc_idx(idx, '\n')
+        term_exec_cmd(idx)
+        win_dirty[idx] = True
         return
-
-    # Parse command (simple first-word extraction)
-    cmd: Ptr[char] = &cmd_buffer[0]
-
-    # Built-in commands
-    if strcmp(cmd, "help") == 0:
-        term_puts("\nPynux Desktop Commands:\n")
-        term_puts("  help       - Show this help\n")
-        term_puts("  clear      - Clear terminal\n")
-        term_puts("  pwd        - Print working directory\n")
-        term_puts("  ls         - List directory\n")
-        term_puts("  cd <dir>   - Change directory\n")
-        term_puts("  cat <file> - Show file contents\n")
-        term_puts("  mkdir <n>  - Create directory\n")
-        term_puts("  touch <n>  - Create empty file\n")
-        term_puts("  rm <name>  - Remove file/dir\n")
-        term_puts("  echo <txt> - Print text\n")
-        term_puts("  uname [-a] - System name\n")
-        term_puts("  free       - Memory usage\n")
-        term_puts("  whoami     - Current user\n")
-        term_puts("  hostname   - System hostname\n")
-        term_puts("  date       - Current date\n")
-        term_puts("  uptime     - System uptime\n")
-        term_puts("  write f t  - Write text to file\n")
-        term_puts("  cp s d     - Copy file\n")
-        term_puts("  id         - User identity\n")
-        term_puts("  env        - Environment vars\n")
-        term_puts("  sleep <n>  - Sleep N seconds\n")
-        term_puts("  reboot     - Reboot system\n")
-        term_puts("  halt       - Halt system\n")
-        term_puts("  version    - Show version\n")
-    elif strcmp(cmd, "clear") == 0:
-        term_init()
-        needs_full_redraw = True
-    elif strcmp(cmd, "pwd") == 0:
-        term_putc('\n')
-        term_puts(&cwd[0])
-        term_putc('\n')
-    elif strcmp(cmd, "ls") == 0:
-        term_putc('\n')
-        name_buf: Array[64, char]
-        idx: int32 = 0
-        result: int32 = ramfs_readdir(&cwd[0], idx, &name_buf[0])
-        while result >= 0:
-            term_puts(&name_buf[0])
-            if result == 1:
-                term_putc('/')
-            term_puts("  ")
-            idx = idx + 1
-            result = ramfs_readdir(&cwd[0], idx, &name_buf[0])
-        term_putc('\n')
-    elif cmd_starts_with("cd"):
-        arg: Ptr[char] = cmd_get_arg()
-        if arg[0] == '\0':
-            # cd with no arg goes to /
-            cwd[0] = '/'
-            cwd[1] = '\0'
-        elif strcmp(arg, "..") == 0:
-            # Go up one level
-            cwd_len: int32 = strlen(&cwd[0])
-            if cwd_len > 1:
-                i: int32 = cwd_len - 1
-                if cwd[i] == '/':
-                    i = i - 1
-                while i > 0 and cwd[i] != '/':
-                    i = i - 1
-                if i == 0:
-                    cwd[0] = '/'
-                    cwd[1] = '\0'
-                else:
-                    cwd[i] = '\0'
-        else:
-            build_path(arg)
-            if ramfs_exists(&path_buf[0]) and ramfs_isdir(&path_buf[0]):
-                strcpy(&cwd[0], &path_buf[0])
-            else:
-                term_puts("\nNo such directory: ")
-                term_puts(arg)
-                term_putc('\n')
-    elif cmd_starts_with("cat"):
-        arg2: Ptr[char] = cmd_get_arg()
-        if arg2[0] == '\0':
-            term_puts("\nUsage: cat <file>\n")
-        else:
-            build_path(arg2)
-            if ramfs_exists(&path_buf[0]) and not ramfs_isdir(&path_buf[0]):
-                term_putc('\n')
-                bytes_read: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
-                if bytes_read > 0:
-                    read_buf[bytes_read] = 0
-                    term_puts(cast[Ptr[char]](&read_buf[0]))
-                term_putc('\n')
-            else:
-                term_puts("\nNo such file: ")
-                term_puts(arg2)
-                term_putc('\n')
-    elif cmd_starts_with("mkdir"):
-        arg3: Ptr[char] = cmd_get_arg()
-        if arg3[0] == '\0':
-            term_puts("\nUsage: mkdir <name>\n")
-        else:
-            build_path(arg3)
-            if ramfs_create(&path_buf[0], True) >= 0:
-                term_puts("\nCreated: ")
-                term_puts(&path_buf[0])
-                term_putc('\n')
-            else:
-                term_puts("\nFailed to create directory\n")
-    elif cmd_starts_with("touch"):
-        arg4: Ptr[char] = cmd_get_arg()
-        if arg4[0] == '\0':
-            term_puts("\nUsage: touch <name>\n")
-        else:
-            build_path(arg4)
-            if ramfs_create(&path_buf[0], False) >= 0:
-                term_puts("\nCreated: ")
-                term_puts(&path_buf[0])
-                term_putc('\n')
-            else:
-                term_puts("\nFailed to create file\n")
-    elif cmd_starts_with("rm"):
-        arg5: Ptr[char] = cmd_get_arg()
-        if arg5[0] == '\0':
-            term_puts("\nUsage: rm <name>\n")
-        else:
-            build_path(arg5)
-            if ramfs_delete(&path_buf[0]) >= 0:
-                term_puts("\nRemoved: ")
-                term_puts(&path_buf[0])
-                term_putc('\n')
-            else:
-                term_puts("\nFailed to remove\n")
-    elif cmd_starts_with("echo"):
-        arg6: Ptr[char] = cmd_get_arg()
-        term_putc('\n')
-        term_puts(arg6)
-        term_putc('\n')
-    elif strcmp(cmd, "version") == 0:
-        term_puts("\nPynux Desktop v0.1\n")
-        term_puts("ARM Cortex-M3 / VTNext Graphics\n")
-    elif strcmp(cmd, "uname") == 0 or cmd_starts_with("uname"):
-        term_putc('\n')
-        arg7: Ptr[char] = cmd_get_arg()
-        if arg7[0] == '\0' or strcmp(arg7, "-s") == 0:
-            term_puts("Pynux\n")
-        elif strcmp(arg7, "-a") == 0:
-            term_puts("Pynux 0.1.0 armv7m Cortex-M3\n")
-        elif strcmp(arg7, "-r") == 0:
-            term_puts("0.1.0\n")
-        elif strcmp(arg7, "-m") == 0:
-            term_puts("armv7m\n")
-        else:
-            term_puts("Pynux\n")
-    elif strcmp(cmd, "free") == 0:
-        term_puts("\n       total     used     free\n")
-        term_puts("Heap:  ")
-        term_puts(int_to_str(heap_total()))
-        term_puts("    ")
-        term_puts(int_to_str(heap_used()))
-        term_puts("    ")
-        term_puts(int_to_str(heap_remaining()))
-        term_putc('\n')
-    elif strcmp(cmd, "whoami") == 0:
-        term_puts("\nroot\n")
-    elif strcmp(cmd, "hostname") == 0:
-        term_puts("\npynux\n")
-    elif strcmp(cmd, "date") == 0:
-        term_puts("\nJan 1 00:00:00 UTC 2025\n")
-    elif strcmp(cmd, "uptime") == 0:
-        term_puts("\nup 0 days, 0:00\n")
-    elif cmd_starts_with("write"):
-        # write <file> <content>
-        arg8: Ptr[char] = cmd_get_arg()
-        if arg8[0] == '\0':
-            term_puts("\nUsage: write <file> <content>\n")
-        else:
-            # Find the content (after the filename)
-            i: int32 = 0
-            while arg8[i] != '\0' and arg8[i] != ' ':
-                i = i + 1
-            if arg8[i] == ' ':
-                arg8[i] = '\0'
-                content: Ptr[char] = &arg8[i + 1]
-                build_path(arg8)
-                # Create file if it doesn't exist
-                if not ramfs_exists(&path_buf[0]):
-                    ramfs_create(&path_buf[0], False)
-                # Write content
-                content_len: int32 = strlen(content)
-                if ramfs_write(&path_buf[0], content) >= 0:
-                    term_puts("\nWrote ")
-                    term_puts(int_to_str(content_len))
-                    term_puts(" bytes to ")
-                    term_puts(&path_buf[0])
-                    term_putc('\n')
-                else:
-                    term_puts("\nFailed to write\n")
-            else:
-                term_puts("\nUsage: write <file> <content>\n")
-    elif strcmp(cmd, "id") == 0:
-        term_puts("\nuid=0(root) gid=0(root)\n")
-    elif strcmp(cmd, "env") == 0:
-        term_puts("\nHOME=/home\n")
-        term_puts("USER=root\n")
-        term_puts("SHELL=/bin/psh\n")
-        term_puts("PWD=")
-        term_puts(&cwd[0])
-        term_putc('\n')
-    elif cmd_starts_with("cp"):
-        # cp <src> <dst>
-        arg9: Ptr[char] = cmd_get_arg()
-        if arg9[0] == '\0':
-            term_puts("\nUsage: cp <src> <dst>\n")
-        else:
-            # Find src and dst
-            i: int32 = 0
-            while arg9[i] != '\0' and arg9[i] != ' ':
-                i = i + 1
-            if arg9[i] == ' ':
-                arg9[i] = '\0'
-                dst: Ptr[char] = &arg9[i + 1]
-                # Skip spaces
-                while dst[0] == ' ':
-                    dst = &dst[1]
-                if dst[0] != '\0':
-                    # Read source
-                    build_path(arg9)
-                    src_path: Array[256, char]
-                    strcpy(&src_path[0], &path_buf[0])
-                    if ramfs_exists(&src_path[0]) and not ramfs_isdir(&src_path[0]):
-                        bytes_read: int32 = ramfs_read(&src_path[0], &read_buf[0], 511)
-                        if bytes_read >= 0:
-                            read_buf[bytes_read] = 0
-                            # Write to dest
-                            build_path(dst)
-                            if not ramfs_exists(&path_buf[0]):
-                                ramfs_create(&path_buf[0], False)
-                            if ramfs_write(&path_buf[0], cast[Ptr[char]](&read_buf[0])) >= 0:
-                                term_puts("\nCopied ")
-                                term_puts(&src_path[0])
-                                term_puts(" -> ")
-                                term_puts(&path_buf[0])
-                                term_putc('\n')
-                            else:
-                                term_puts("\nFailed to write dest\n")
-                        else:
-                            term_puts("\nFailed to read source\n")
-                    else:
-                        term_puts("\nSource not found: ")
-                        term_puts(arg9)
-                        term_putc('\n')
-                else:
-                    term_puts("\nUsage: cp <src> <dst>\n")
-            else:
-                term_puts("\nUsage: cp <src> <dst>\n")
-    elif strcmp(cmd, "true") == 0:
-        pass  # Do nothing, return success
-    elif strcmp(cmd, "false") == 0:
-        term_puts("\n")  # Just print newline, simulates failure
-    elif strcmp(cmd, "yes") == 0:
-        # Just print y once (don't loop forever!)
-        term_puts("\ny\n")
-    elif cmd_starts_with("sleep"):
-        # sleep <seconds>
-        arg10: Ptr[char] = cmd_get_arg()
-        if arg10[0] == '\0':
-            term_puts("\nUsage: sleep <seconds>\n")
-        else:
-            secs: int32 = atoi(arg10)
-            if secs > 0 and secs <= 60:
-                term_puts("\nSleeping for ")
-                term_puts(int_to_str(secs))
-                term_puts(" seconds...\n")
-                # Redraw before sleeping
-                de_draw()
-                vtn_present()
-                timer_delay_ms(secs * 1000)
-                term_puts("Done.\n")
-            else:
-                term_puts("\nInvalid sleep time (1-60)\n")
-    elif strcmp(cmd, "reboot") == 0:
-        term_puts("\nRebooting...\n")
-        de_draw()
-        vtn_present()
-        timer_delay_ms(1000)
-        # Trigger system reset via NVIC
-        NVIC_AIRCR: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](0xE000ED0C)
-        NVIC_AIRCR[0] = 0x05FA0004
-        while True:
-            pass
-    elif strcmp(cmd, "halt") == 0 or strcmp(cmd, "poweroff") == 0:
-        term_puts("\nSystem halted.\n")
-        de_draw()
-        vtn_present()
-        while True:
-            pass
-    elif strcmp(cmd, "exit") == 0:
-        term_puts("\nExiting to text mode...\n")
-        # Not implemented - would need to return to kernel
-    elif cmd_starts_with("seq"):
-        # seq <end> or seq <start> <end>
-        arg11: Ptr[char] = cmd_get_arg()
-        if arg11[0] == '\0':
-            term_puts("\nUsage: seq [start] end\n")
-        else:
-            start: int32 = 1
-            end: int32 = 0
-            # Check if there's a second number
-            i: int32 = 0
-            while arg11[i] != '\0' and arg11[i] != ' ':
-                i = i + 1
-            if arg11[i] == ' ':
-                arg11[i] = '\0'
-                start = atoi(arg11)
-                end = atoi(&arg11[i + 1])
-            else:
-                end = atoi(arg11)
-            term_putc('\n')
-            j: int32 = start
-            while j <= end:
-                term_puts(int_to_str(j))
-                term_putc('\n')
-                j = j + 1
-    elif cmd_starts_with("factor"):
-        # factor <number>
-        arg12: Ptr[char] = cmd_get_arg()
-        if arg12[0] == '\0':
-            term_puts("\nUsage: factor <number>\n")
-        else:
-            n: int32 = atoi(arg12)
-            term_putc('\n')
-            term_puts(int_to_str(n))
-            term_puts(": ")
-            if n >= 2:
-                # Factor out 2s
-                while n % 2 == 0:
-                    term_puts("2 ")
-                    n = n / 2
-                # Factor out odd numbers
-                i: int32 = 3
-                while i * i <= n:
-                    while n % i == 0:
-                        term_puts(int_to_str(i))
-                        term_putc(' ')
-                        n = n / i
-                    i = i + 2
-                if n > 1:
-                    term_puts(int_to_str(n))
-            term_putc('\n')
-    elif strcmp(cmd, "fortune") == 0:
-        term_putc('\n')
-        # Simple fortune cookie messages
-        fortunes: Array[10, Ptr[char]]
-        fortunes[0] = "The best way to predict the future is to invent it."
-        fortunes[1] = "In theory, there is no difference between theory and practice."
-        fortunes[2] = "Simplicity is the ultimate sophistication."
-        fortunes[3] = "First, solve the problem. Then, write the code."
-        fortunes[4] = "Talk is cheap. Show me the code."
-        fortunes[5] = "The only way to go fast is to go well."
-        fortunes[6] = "Any fool can write code that a computer can understand."
-        fortunes[7] = "Debugging is twice as hard as writing the code."
-        fortunes[8] = "It works on my machine."
-        fortunes[9] = "There are only two hard things: cache invalidation and naming."
-        # Use a simple hash of heap_used as "random"
-        idx: int32 = heap_used() % 10
-        term_puts(fortunes[idx])
-        term_putc('\n')
-    elif cmd_starts_with("basename"):
-        # basename <path>
-        arg13: Ptr[char] = cmd_get_arg()
-        if arg13[0] == '\0':
-            term_puts("\nUsage: basename <path>\n")
-        else:
-            # Find last /
-            i: int32 = strlen(arg13) - 1
-            while i >= 0 and arg13[i] != '/':
-                i = i - 1
-            term_putc('\n')
-            term_puts(&arg13[i + 1])
-            term_putc('\n')
-    elif cmd_starts_with("dirname"):
-        # dirname <path>
-        arg14: Ptr[char] = cmd_get_arg()
-        if arg14[0] == '\0':
-            term_puts("\nUsage: dirname <path>\n")
-        else:
-            # Find last /
-            i: int32 = strlen(arg14) - 1
-            while i > 0 and arg14[i] != '/':
-                i = i - 1
-            term_putc('\n')
-            if i == 0:
-                if arg14[0] == '/':
-                    term_putc('/')
-                else:
-                    term_putc('.')
-            else:
-                arg14[i] = '\0'
-                term_puts(arg14)
-            term_putc('\n')
-    elif strcmp(cmd, "arch") == 0:
-        term_puts("\narmv7m\n")
-    elif strcmp(cmd, "nproc") == 0:
-        term_puts("\n1\n")
-    elif strcmp(cmd, "tty") == 0:
-        term_puts("\n/dev/ttyS0\n")
-    elif strcmp(cmd, "logname") == 0:
-        term_puts("\nroot\n")
-    elif strcmp(cmd, "printenv") == 0:
-        term_puts("\nHOME=/home\n")
-        term_puts("USER=root\n")
-        term_puts("SHELL=/bin/psh\n")
-        term_puts("PATH=/bin\n")
-        term_puts("TERM=vtnext\n")
-        term_puts("PWD=")
-        term_puts(&cwd[0])
-        term_putc('\n')
-    elif cmd_starts_with("banner"):
-        # banner <text>
-        arg15: Ptr[char] = cmd_get_arg()
-        if arg15[0] == '\0':
-            term_puts("\nUsage: banner <text>\n")
-        else:
-            term_putc('\n')
-            # Print 5 lines of the text (simple banner)
-            line: int32 = 0
-            while line < 5:
-                i: int32 = 0
-                while arg15[i] != '\0':
-                    c: char = arg15[i]
-                    j: int32 = 0
-                    while j < 5:
-                        if c >= 'a' and c <= 'z':
-                            term_putc(cast[char](cast[int32](c) - 32))
-                        elif c == ' ':
-                            term_putc(' ')
-                        else:
-                            term_putc(c)
-                        j = j + 1
-                    term_putc(' ')
-                    i = i + 1
-                term_putc('\n')
-                line = line + 1
-    elif strcmp(cmd, "dmesg") == 0:
-        term_puts("\n[    0.000] Pynux kernel booting...\n")
-        term_puts("[    0.001] UART initialized\n")
-        term_puts("[    0.002] Heap initialized (16KB)\n")
-        term_puts("[    0.003] Timer initialized\n")
-        term_puts("[    0.004] RAMFS initialized\n")
-        term_puts("[    0.005] Kernel ready\n")
-    elif strcmp(cmd, "lscpu") == 0:
-        term_puts("\nArchitecture:    armv7m\n")
-        term_puts("Vendor:          ARM\n")
-        term_puts("Model:           Cortex-M3\n")
-        term_puts("CPU(s):          1\n")
-        term_puts("Max MHz:         25\n")
-    elif strcmp(cmd, "sync") == 0:
-        term_puts("\n")  # In RAMFS, sync is a no-op
-    elif strcmp(cmd, "reset") == 0:
-        term_init()
-        needs_full_redraw = True
-    elif cmd_starts_with("head"):
-        # head <file> - show first lines of file
-        arg16: Ptr[char] = cmd_get_arg()
-        if arg16[0] == '\0':
-            term_puts("\nUsage: head <file>\n")
-        else:
-            build_path(arg16)
-            if ramfs_exists(&path_buf[0]) and not ramfs_isdir(&path_buf[0]):
-                term_putc('\n')
-                bytes_read: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
-                if bytes_read > 0:
-                    read_buf[bytes_read] = 0
-                    # Print first 10 lines
-                    lines: int32 = 0
-                    i: int32 = 0
-                    while i < bytes_read and lines < 10:
-                        term_putc(cast[char](read_buf[i]))
-                        if read_buf[i] == 10:
-                            lines = lines + 1
-                        i = i + 1
-                term_putc('\n')
-            else:
-                term_puts("\nNo such file: ")
-                term_puts(arg16)
-                term_putc('\n')
-    elif cmd_starts_with("tail"):
-        # tail <file> - show last lines
-        arg17: Ptr[char] = cmd_get_arg()
-        if arg17[0] == '\0':
-            term_puts("\nUsage: tail <file>\n")
-        else:
-            build_path(arg17)
-            if ramfs_exists(&path_buf[0]) and not ramfs_isdir(&path_buf[0]):
-                term_putc('\n')
-                bytes_read: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
-                if bytes_read > 0:
-                    read_buf[bytes_read] = 0
-                    term_puts(cast[Ptr[char]](&read_buf[0]))
-                term_putc('\n')
-            else:
-                term_puts("\nNo such file: ")
-                term_puts(arg17)
-                term_putc('\n')
-    elif cmd_starts_with("wc"):
-        # wc <file> - word count
-        arg18: Ptr[char] = cmd_get_arg()
-        if arg18[0] == '\0':
-            term_puts("\nUsage: wc <file>\n")
-        else:
-            build_path(arg18)
-            if ramfs_exists(&path_buf[0]) and not ramfs_isdir(&path_buf[0]):
-                bytes_read: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
-                if bytes_read > 0:
-                    read_buf[bytes_read] = 0
-                    lines: int32 = 0
-                    words: int32 = 0
-                    chars: int32 = bytes_read
-                    in_word: bool = False
-                    i: int32 = 0
-                    while i < bytes_read:
-                        c: char = cast[char](read_buf[i])
-                        if c == '\n':
-                            lines = lines + 1
-                            in_word = False
-                        elif c == ' ' or c == '\t':
-                            in_word = False
-                        else:
-                            if not in_word:
-                                words = words + 1
-                                in_word = True
-                        i = i + 1
-                    term_puts("\n  ")
-                    term_puts(int_to_str(lines))
-                    term_puts("  ")
-                    term_puts(int_to_str(words))
-                    term_puts("  ")
-                    term_puts(int_to_str(chars))
-                    term_puts(" ")
-                    term_puts(arg18)
-                    term_putc('\n')
-                else:
-                    term_puts("\n  0  0  0 ")
-                    term_puts(arg18)
-                    term_putc('\n')
-            else:
-                term_puts("\nNo such file: ")
-                term_puts(arg18)
-                term_putc('\n')
-    elif cmd_starts_with("stat"):
-        # stat <file>
-        arg19: Ptr[char] = cmd_get_arg()
-        if arg19[0] == '\0':
-            term_puts("\nUsage: stat <file>\n")
-        else:
-            build_path(arg19)
-            if ramfs_exists(&path_buf[0]):
-                term_puts("\n  File: ")
-                term_puts(&path_buf[0])
-                term_putc('\n')
-                if ramfs_isdir(&path_buf[0]):
-                    term_puts("  Type: directory\n")
-                else:
-                    term_puts("  Type: regular file\n")
-                    bytes_read: int32 = ramfs_read(&path_buf[0], &read_buf[0], 511)
-                    term_puts("  Size: ")
-                    term_puts(int_to_str(bytes_read))
-                    term_puts(" bytes\n")
-            else:
-                term_puts("\nNo such file: ")
-                term_puts(arg19)
-                term_putc('\n')
-    elif strcmp(cmd, "users") == 0:
-        term_puts("\nroot\n")
-    elif strcmp(cmd, "groups") == 0:
-        term_puts("\nroot\n")
-    elif strcmp(cmd, "kill") == 0:
-        term_puts("\nkill: No processes to kill\n")
-    elif strcmp(cmd, "ps") == 0:
-        term_puts("\n  PID TTY      TIME CMD\n")
-        term_puts("    1 ttyS0    0:00 psh\n")
-    elif strcmp(cmd, "df") == 0:
-        term_puts("\nFilesystem  1K-blocks  Used  Available  Use%  Mounted on\n")
-        term_puts("ramfs            16     ")
-        used_kb: int32 = heap_used() / 1024
-        term_puts(int_to_str(used_kb))
-        term_puts("         ")
-        free_kb: int32 = heap_remaining() / 1024
-        term_puts(int_to_str(free_kb))
-        term_puts("     ")
-        pct: int32 = (heap_used() * 100) / heap_total()
-        term_puts(int_to_str(pct))
-        term_puts("%   /\n")
-    elif strcmp(cmd, "mount") == 0:
-        term_puts("\nramfs on / type ramfs (rw)\n")
-    elif strcmp(cmd, "umount") == 0:
-        term_puts("\numount: cannot unmount /: device is busy\n")
-    elif cmd_starts_with("expr") or cmd_starts_with("calc"):
-        # Simple expression evaluator: expr <num> <op> <num>
-        arg20: Ptr[char] = cmd_get_arg()
-        if arg20[0] == '\0':
-            term_puts("\nUsage: expr <num> <op> <num>\n")
-        else:
-            # Parse: num op num
-            num1: int32 = atoi(arg20)
-            # Find operator
-            i: int32 = 0
-            while arg20[i] != '\0' and arg20[i] != ' ':
-                i = i + 1
-            while arg20[i] == ' ':
-                i = i + 1
-            op: char = arg20[i]
-            # Find second number
-            i = i + 1
-            while arg20[i] == ' ':
-                i = i + 1
-            num2: int32 = atoi(&arg20[i])
-            result: int32 = 0
-            valid: bool = True
-            if op == '+':
-                result = num1 + num2
-            elif op == '-':
-                result = num1 - num2
-            elif op == '*':
-                result = num1 * num2
-            elif op == '/':
-                if num2 != 0:
-                    result = num1 / num2
-                else:
-                    term_puts("\nDivision by zero\n")
-                    valid = False
-            elif op == '%':
-                if num2 != 0:
-                    result = num1 % num2
-                else:
-                    valid = False
-            else:
-                term_puts("\nUnknown operator: ")
-                term_putc(op)
-                term_putc('\n')
-                valid = False
-            if valid:
-                term_putc('\n')
-                term_puts(int_to_str(result))
-                term_putc('\n')
-    elif cmd_starts_with("which") or cmd_starts_with("type"):
-        arg21: Ptr[char] = cmd_get_arg()
-        if arg21[0] == '\0':
-            term_puts("\nUsage: which <command>\n")
-        else:
-            term_putc('\n')
-            term_puts(arg21)
-            term_puts(": shell built-in\n")
-    elif strcmp(cmd, "history") == 0:
-        term_puts("\nNo history available (single-line buffer)\n")
-    elif strcmp(cmd, "alias") == 0:
-        term_puts("\nNo aliases defined\n")
-    elif strcmp(cmd, "unalias") == 0:
-        term_puts("\nunalias: no aliases to remove\n")
-    elif strcmp(cmd, "export") == 0:
-        term_puts("\nexport: no environment to modify\n")
-    elif strcmp(cmd, "set") == 0:
-        term_puts("\nPOSIXLY_CORRECT=y\n")
-        term_puts("PATH=/bin\n")
-        term_puts("HOME=/home\n")
-        term_puts("PWD=")
-        term_puts(&cwd[0])
-        term_putc('\n')
-    elif strcmp(cmd, "unset") == 0:
-        term_puts("\nunset: cannot unset in this shell\n")
-    elif strcmp(cmd, "source") == 0 or strcmp(cmd, ".") == 0:
-        term_puts("\nUsage: source <file> (not implemented)\n")
-    elif cmd_starts_with("test") or cmd_buffer[0] == '[':
-        term_puts("\ntest: not implemented\n")
-    elif cmd_starts_with("printf"):
-        arg22: Ptr[char] = cmd_get_arg()
-        term_putc('\n')
-        term_puts(arg22)
-    elif strcmp(cmd, "read") == 0:
-        term_puts("\nread: not implemented\n")
-    elif strcmp(cmd, "exec") == 0:
-        term_puts("\nexec: not implemented\n")
-    elif strcmp(cmd, "wait") == 0:
-        term_puts("\nwait: no jobs to wait for\n")
-    elif strcmp(cmd, "jobs") == 0:
-        term_puts("\njobs: no background jobs\n")
-    elif strcmp(cmd, "fg") == 0:
-        term_puts("\nfg: no foreground jobs\n")
-    elif strcmp(cmd, "bg") == 0:
-        term_puts("\nbg: no background jobs\n")
-    elif strcmp(cmd, "time") == 0:
-        term_puts("\nreal 0m0.000s\nuser 0m0.000s\nsys  0m0.000s\n")
-    elif strcmp(cmd, "times") == 0:
-        term_puts("\n0m0.000s 0m0.000s\n")
-    elif strcmp(cmd, "ulimit") == 0:
-        term_puts("\nunlimited\n")
-    elif strcmp(cmd, "umask") == 0:
-        term_puts("\n0022\n")
-    elif strcmp(cmd, "getconf") == 0:
-        term_puts("\nUsage: getconf <name>\n")
-    elif strcmp(cmd, "locale") == 0:
-        term_puts("\nLANG=C\n")
-        term_puts("LC_ALL=C\n")
-    elif strcmp(cmd, "mesg") == 0:
-        term_puts("\nis y\n")
-    elif strcmp(cmd, "stty") == 0:
-        term_puts("\nspeed 115200 baud\n")
-        term_puts("rows 24; columns 80;\n")
-    elif strcmp(cmd, "tput") == 0:
-        term_putc('\n')
-    elif strcmp(cmd, "pathchk") == 0:
-        term_puts("\npathchk: no arguments\n")
-    elif strcmp(cmd, "link") == 0 or strcmp(cmd, "ln") == 0:
-        term_puts("\nlink: not supported on ramfs\n")
-    elif strcmp(cmd, "unlink") == 0:
-        term_puts("\nunlink: use rm instead\n")
-    elif strcmp(cmd, "readlink") == 0:
-        term_puts("\nreadlink: no symlinks on ramfs\n")
-    elif strcmp(cmd, "realpath") == 0:
-        arg23: Ptr[char] = cmd_get_arg()
-        if arg23[0] == '\0':
-            term_puts("\nUsage: realpath <path>\n")
-        else:
-            build_path(arg23)
-            term_putc('\n')
-            term_puts(&path_buf[0])
-            term_putc('\n')
-    elif cmd_starts_with("mktemp"):
-        term_puts("\n/tmp/tmp.XXXXXX\n")
-    elif strcmp(cmd, "install") == 0:
-        term_puts("\ninstall: no destination specified\n")
-    elif strcmp(cmd, "shred") == 0:
-        term_puts("\nshred: not implemented (ramfs)\n")
-    elif strcmp(cmd, "truncate") == 0:
-        term_puts("\ntruncate: not implemented\n")
-
-    # Text processing commands (in separate function to avoid branch offset limits)
-    elif exec_text_cmd(cmd):
-        pass  # Handled by exec_text_cmd
-
-    # Simple text commands that fit here
-    elif cmd_starts_with("cal"):
-        term_puts("\n    January 2025\nSu Mo Tu We Th Fr Sa\n          1  2  3  4\n 5  6  7  8  9 10 11\n12 13 14 15 16 17 18\n19 20 21 22 23 24 25\n26 27 28 29 30 31\n")
-
-    elif cmd_starts_with("rev"):
-        arg_rv: Ptr[char] = cmd_get_arg()
-        if arg_rv[0] == '\0':
-            term_puts("\nUsage: rev <file>\n")
-        else:
-            build_path(arg_rv)
-            if not ramfs_exists(&path_buf[0]):
-                term_puts("\nrev: file not found\n")
-            else:
-                szr: int32 = ramfs_read(&path_buf[0], &read_buf[0], 512)
-                term_putc('\n')
-                lsr: int32 = 0
-                ir: int32 = 0
-                jr: int32 = 0
-                while ir <= szr:
-                    if ir == szr or read_buf[ir] == 10:
-                        jr = ir - 1
-                        while jr >= lsr:
-                            term_putc(cast[char](read_buf[jr]))
-                            jr = jr - 1
-                        term_putc('\n')
-                        lsr = ir + 1
-                    ir = ir + 1
-
-    elif cmd_starts_with("nl"):
-        arg_n: Ptr[char] = cmd_get_arg()
-        if arg_n[0] == '\0':
-            term_puts("\nUsage: nl <file>\n")
-        else:
-            build_path(arg_n)
-            if not ramfs_exists(&path_buf[0]):
-                term_puts("\nnl: file not found\n")
-            else:
-                szn: int32 = ramfs_read(&path_buf[0], &read_buf[0], 512)
-                term_putc('\n')
-                lnn: int32 = 1
-                term_puts(int_to_str(lnn))
-                term_putc('\t')
-                inn: int32 = 0
-                while inn < szn:
-                    if read_buf[inn] == 10:
-                        term_putc('\n')
-                        lnn = lnn + 1
-                        if inn < szn - 1:
-                            term_puts(int_to_str(lnn))
-                            term_putc('\t')
-                    else:
-                        term_putc(cast[char](read_buf[inn]))
-                    inn = inn + 1
-
-    elif cmd_starts_with("xxd"):
-        arg_x: Ptr[char] = cmd_get_arg()
-        if arg_x[0] == '\0':
-            term_puts("\nUsage: xxd <file>\n")
-        else:
-            build_path(arg_x)
-            if not ramfs_exists(&path_buf[0]):
-                term_puts("\nxxd: file not found\n")
-            else:
-                szx: int32 = ramfs_read(&path_buf[0], &read_buf[0], 128)
-                term_putc('\n')
-                hxc: Ptr[char] = "0123456789abcdef"
-                ix: int32 = 0
-                jx: int32 = 0
-                bx: int32 = 0
-                while ix < szx:
-                    term_putc(hxc[(ix >> 4) & 15])
-                    term_putc(hxc[ix & 15])
-                    term_puts(": ")
-                    jx = 0
-                    while jx < 8 and ix + jx < szx:
-                        bx = cast[int32](read_buf[ix + jx])
-                        term_putc(hxc[(bx >> 4) & 15])
-                        term_putc(hxc[bx & 15])
-                        term_putc(' ')
-                        jx = jx + 1
-                    term_putc(' ')
-                    jx = 0
-                    while jx < 8 and ix + jx < szx:
-                        bx = cast[int32](read_buf[ix + jx])
-                        if bx >= 32 and bx < 127:
-                            term_putc(cast[char](bx))
-                        else:
-                            term_putc('.')
-                        jx = jx + 1
-                    term_putc('\n')
-                    ix = ix + 8
-
-    else:
-        term_puts("\nUnknown command: ")
-        term_puts(cmd)
-        term_putc('\n')
-
-    term_newline()
-    term_print_prompt()
-    cmd_pos = 0
-
-def handle_input(c: char):
-    """Handle keyboard input."""
-    global cmd_pos, term_needs_redraw
-
-    if c == '\r' or c == '\n':
-        term_putc('\n')
-        exec_cmd()
-        term_needs_redraw = True
-        return
-
     if c == '\b' or c == '\x7f':
         if cmd_pos > 0:
             cmd_pos = cmd_pos - 1
-            term_putc('\b')
-            term_putc(' ')
-            term_putc('\b')
-            term_needs_redraw = True
+            term_putc_idx(idx, '\b')
+            term_putc_idx(idx, ' ')
+            term_putc_idx(idx, '\b')
+        win_dirty[idx] = True
         return
-
-    # Ctrl+C - cancel line
-    if c == '\x03':
-        term_puts("^C\n")
+    if c == '\x03':  # Ctrl+C
+        term_puts_idx(idx, "^C\n")
         cmd_pos = 0
-        term_print_prompt()
-        term_needs_redraw = True
+        term_print_prompt(idx)
+        win_dirty[idx] = True
         return
-
-    # Regular character
     if cmd_pos < 255:
         cmd_buffer[cmd_pos] = c
         cmd_pos = cmd_pos + 1
-        term_putc(c)
-        term_needs_redraw = True
+        term_putc_idx(idx, c)
+        win_dirty[idx] = True
+
+def handle_editor_input(idx: int32, c: char):
+    global edit_cursor, edit_dirty
+    if c == '\x13':  # Ctrl+S - save
+        edit_save()
+        win_dirty[idx] = True
+        return
+    if c == '\b' or c == '\x7f':
+        edit_backspace()
+        win_dirty[idx] = True
+        return
+    if c >= ' ' or c == '\n' or c == '\t':
+        edit_insert(c)
+        win_dirty[idx] = True
+        return
+
+def handle_files_input(idx: int32, c: char):
+    global fm_selection, fm_dirty
+    if c == 'j' or c == '\x02':  # Down
+        if fm_selection < fm_count:
+            fm_selection = fm_selection + 1
+        fm_dirty = True
+        win_dirty[idx] = True
+        return
+    if c == 'k' or c == '\x10':  # Up
+        if fm_selection > 0:
+            fm_selection = fm_selection - 1
+        fm_dirty = True
+        win_dirty[idx] = True
+        return
+    if c == '\r':  # Enter
+        if fm_selection == 0:
+            fm_up()
+        else:
+            fm_selection = fm_selection - 1
+            fm_enter()
+            fm_selection = fm_selection + 1
+        win_dirty[idx] = True
+        return
+    if c == 'u':  # Go up
+        fm_up()
+        win_dirty[idx] = True
+
+def handle_input(c: char):
+    global menu_open, menu_dirty, active_win, needs_full_redraw, status_dirty
+    # F1 (ESC O P) or Ctrl+M for menu - simplified to just 'm'
+    if c == '\x1b':
+        # Start of escape sequence - for now just toggle menu
+        menu_open = not menu_open
+        menu_dirty = True
+        needs_full_redraw = True
+        return
+    if menu_open:
+        if handle_menu_input(c):
+            return
+    # F2 or Tab to switch windows
+    if c == '\t':
+        if win_count > 0:
+            active_win = (active_win + 1) % win_count
+            needs_full_redraw = True
+            status_dirty = True
+        return
+    # Route to active window
+    if active_win < 0 or active_win >= win_count:
+        return
+    wt: int32 = win_type[active_win]
+    if wt == WIN_TERMINAL:
+        handle_terminal_input(active_win, c)
+    elif wt == WIN_EDITOR:
+        handle_editor_input(active_win, c)
+    elif wt == WIN_FILES:
+        handle_files_input(active_win, c)
 
 # ============================================================================
 # Main DE loop
 # ============================================================================
 
 def de_init():
-    """Initialize the desktop environment."""
-    term_init()
+    global win_count, active_win, needs_full_redraw
+    win_count = 0
+    active_win = -1
     vtn_init(SCREEN_W, SCREEN_H)
+    # Create initial terminal
+    idx: int32 = win_create(WIN_TERMINAL, 10, 40, 780, 380)
+    if idx >= 0:
+        term_init_win(idx)
+        term_puts_idx(idx, "Pynux Desktop Environment\n")
+        term_puts_idx(idx, "ESC=Menu TAB=Switch Ctrl+S=Save(editor)\n\n")
+        term_print_prompt(idx)
+    # Create file manager
+    fm_idx: int32 = win_create(WIN_FILES, 10, 430, 250, 140)
+    if fm_idx >= 0:
+        fm_init()
+        fm_refresh()
+    # Create editor
+    ed_idx: int32 = win_create(WIN_EDITOR, 270, 430, 520, 140)
+    if ed_idx >= 0:
+        edit_init()
+    active_win = 0
+    needs_full_redraw = True
 
 def de_main():
-    """Main desktop environment loop."""
-    global needs_full_redraw, term_needs_redraw
-
+    global needs_full_redraw, status_dirty
     de_init()
-
-    # Initial welcome message
-    term_puts("Pynux Desktop Environment\n")
-    term_puts("Type 'help' for commands.\n\n")
-    term_print_prompt()
-
-    # Force initial draw
-    needs_full_redraw = True
     de_draw()
     vtn_present()
-
-    # Main loop
     while True:
-        # Check for input
         if uart_available():
             c: char = uart_getc()
             handle_input(c)
-
-        # Redraw if needed
-        if needs_full_redraw or term_needs_redraw:
+            status_dirty = True
+        if needs_full_redraw or status_dirty or win_dirty[0] or win_dirty[1] or win_dirty[2] or win_dirty[3]:
             de_draw()
             vtn_present()

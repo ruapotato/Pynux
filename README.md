@@ -8,8 +8,7 @@ Pynux is a Python-syntax systems language that compiles to native ARM. Run `cat`
 
 - **Python syntax** you already know
 - **Compiles to native ARM** Thumb-2 (Cortex-M)
-- **100+ shell commands** - Full Unix-like environment
-- **VTNext** - Graphical desktop over USB serial
+- **Graphical desktop** - Multi-window DE over VTNext protocol
 - **Not interpreted** - Real compiled code
 
 ## Quick Start
@@ -18,27 +17,63 @@ Pynux is a Python-syntax systems language that compiles to native ARM. Run `cat`
 # Build
 ./build.sh
 
-# Run in QEMU with VTNext graphical terminal
-python vtnext/renderer.py &
+# Run in QEMU with VTNext graphical desktop
 ./boot_vm.sh
+```
+
+## Desktop Environment
+
+Pynux includes a graphical desktop environment with:
+
+- **Menu** (ESC) - Launch apps, close windows
+- **Terminal** - Full shell with file operations
+- **Editor** - Text editor with Ctrl+S save
+- **File Manager** - Navigate and open files
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| ESC | Toggle menu |
+| TAB | Switch windows |
+| j/k | Navigate (menu/files) |
+| Enter | Select/execute |
+| Ctrl+S | Save (editor) |
+| Ctrl+C | Cancel (terminal) |
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Menu                                                    │
+├─────────────────────────────────────────────────────────┤
+│ ┌─ Terminal 1 ────────────────────────────────────────┐ │
+│ │ Pynux Desktop Environment                          │ │
+│ │ ESC=Menu TAB=Switch Ctrl+S=Save(editor)            │ │
+│ │                                                     │ │
+│ │ pynux:/> ls                                         │ │
+│ │ dev/  etc/  home/  tmp/                             │ │
+│ │ pynux:/> _                                          │ │
+│ └─────────────────────────────────────────────────────┘ │
+│ ┌─ Files: / ─────────┐ ┌─ Editor ────────────────────┐ │
+│ │ ..                  │ │                             │ │
+│ │ dev/                │ │ (empty)                     │ │
+│ │ etc/                │ │                             │ │
+│ │ home/               │ └─────────────────────────────┘ │
+│ └─────────────────────┘                                 │
+├─────────────────────────────────────────────────────────┤
+│ Heap: 1234/16384 | Win: 3 | F1:Menu F2:Switch          │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ## Shell Commands
 
 ### File Operations
-`ls` `cat` `cp` `rm` `mkdir` `touch` `stat` `head` `tail`
-
-### Text Processing
-`grep` `sort` `uniq` `wc` `nl` `rev` `tac` `tr` `fold` `cut` `xxd` `strings`
+`ls` `cat` `cp` `rm` `mkdir` `touch` `stat` `pwd` `cd`
 
 ### System
 `uname` `hostname` `whoami` `id` `uptime` `free` `ps` `df` `env`
 
-### Shell Builtins
-`cd` `pwd` `echo` `sleep` `clear` `help` `exit`
-
 ### Utilities
-`cal` `date` `seq` `factor` `basename` `dirname` `true` `false` `yes`
+`echo` `write` `clear` `help` `date`
 
 ## Example
 
@@ -49,25 +84,6 @@ from lib.io import print_str
 def main() -> int32:
     print_str("Hello from Pynux!\n")
     return 0
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Pynux Desktop Environment                              │
-├─────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────┐   │
-│  │ Terminal                                        │   │
-│  │ pynux:/> ls                                     │   │
-│  │ dev/  etc/  home/  tmp/                         │   │
-│  │ pynux:/> grep hello file.txt                    │   │
-│  │ hello world                                     │   │
-│  │ pynux:/> _                                      │   │
-│  └─────────────────────────────────────────────────┘   │
-├─────────────────────────────────────────────────────────┤
-│  Status: Ready                          Heap: 12KB     │
-└─────────────────────────────────────────────────────────┘
 ```
 
 ## Target Hardware
@@ -84,8 +100,7 @@ def main() -> int32:
 compiler/       # Python 3.10+ compiler (runs on host)
 runtime/        # ARM assembly startup code
 kernel/         # Kernel, RAMFS, timer
-lib/            # Standard library (io, string, memory, vtnext, shell, de)
-coreutils/      # Standalone command implementations
+lib/            # Standard library (io, string, memory, vtnext, de)
 vtnext/         # Graphical terminal renderer (pygame)
 ```
 
@@ -98,18 +113,17 @@ sudo apt install gcc-arm-none-eabi qemu-system-arm python3-pygame
 # Build
 ./build.sh
 
-# Run (text mode)
-qemu-system-arm -M mps2-an385 -nographic -kernel build/pynux.elf
+# Run (text mode - press 's' at boot)
+./build.sh --run
 
 # Run (graphical mode)
-python vtnext/renderer.py &
 ./boot_vm.sh
 ```
 
 ## Memory
 
 - 16KB heap (bump allocator)
-- ~80KB code
+- ~62KB code
 - RAMFS for files
 
 ## License
