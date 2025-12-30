@@ -559,14 +559,15 @@ __pynux_memset:
     .global __pynux_str_upper
     .type __pynux_str_upper, %function
 __pynux_str_upper:
-    push {r4, r5, r6, lr}
+    push {r4, r5, r6, r7, lr}
     mov r4, r0         @ source string
     @ Get length
     bl __pynux_strlen
     mov r5, r0         @ length
     add r0, r5, #1
     bl malloc
-    mov r6, r0         @ destination
+    mov r6, r0         @ destination (working pointer)
+    mov r7, r0         @ save original destination for return
 
 .upper_loop:
     ldrb r0, [r4]
@@ -586,8 +587,8 @@ __pynux_str_upper:
 .upper_done:
     movs r0, #0
     strb r0, [r6]      @ Null terminate
-    sub r0, r6, r5     @ Return start of new string
-    pop {r4, r5, r6, pc}
+    mov r0, r7         @ Return start of new string
+    pop {r4, r5, r6, r7, pc}
     .size __pynux_str_upper, . - __pynux_str_upper
 
 @ char* __pynux_str_lower(const char* s)
@@ -595,13 +596,14 @@ __pynux_str_upper:
     .global __pynux_str_lower
     .type __pynux_str_lower, %function
 __pynux_str_lower:
-    push {r4, r5, r6, lr}
+    push {r4, r5, r6, r7, lr}
     mov r4, r0         @ source string
     bl __pynux_strlen
     mov r5, r0
     add r0, r5, #1
     bl malloc
-    mov r6, r0
+    mov r6, r0         @ destination (working pointer)
+    mov r7, r0         @ save original destination for return
 
 .lower_loop:
     ldrb r0, [r4]
@@ -620,9 +622,9 @@ __pynux_str_lower:
     b .lower_loop
 .lower_done:
     movs r0, #0
-    strb r0, [r6]
-    sub r0, r6, r5
-    pop {r4, r5, r6, pc}
+    strb r0, [r6]      @ Null terminate
+    mov r0, r7         @ Return start of new string
+    pop {r4, r5, r6, r7, pc}
     .size __pynux_str_lower, . - __pynux_str_lower
 
 @ char* __pynux_str_strip(const char* s)
@@ -945,6 +947,205 @@ __pynux_context_exit:
     @ A real implementation would call obj.__exit__(None, None, None)
     bx lr
     .size __pynux_context_exit, . - __pynux_context_exit
+
+@ Dictionary functions
+@ int32 __pynux_dict_get_int(dict* d, int32 key)
+@ Dict layout: [count, key0, val0, key1, val1, ...]
+@ Returns value for integer key, or 0 if not found
+    .global __pynux_dict_get_int
+    .type __pynux_dict_get_int, %function
+__pynux_dict_get_int:
+    push {r4, r5, r6, lr}
+    mov r4, r0          @ r4 = dict pointer
+    mov r5, r1          @ r5 = key to find
+    ldr r6, [r4]        @ r6 = count
+    add r4, r4, #4      @ r4 = &pairs[0]
+.dict_int_loop:
+    cmp r6, #0
+    beq .dict_int_notfound
+    ldr r0, [r4]        @ r0 = current key
+    cmp r0, r5
+    beq .dict_int_found
+    add r4, r4, #8      @ next pair
+    sub r6, r6, #1
+    b .dict_int_loop
+.dict_int_found:
+    ldr r0, [r4, #4]    @ return value
+    pop {r4, r5, r6, pc}
+.dict_int_notfound:
+    movs r0, #0         @ return 0 if not found
+    pop {r4, r5, r6, pc}
+    .size __pynux_dict_get_int, . - __pynux_dict_get_int
+
+@ int32 __pynux_dict_get_str(dict* d, char* key)
+@ Returns value for string key, or 0 if not found
+    .global __pynux_dict_get_str
+    .type __pynux_dict_get_str, %function
+__pynux_dict_get_str:
+    push {r4, r5, r6, r7, lr}
+    mov r4, r0          @ r4 = dict pointer
+    mov r5, r1          @ r5 = key to find
+    ldr r6, [r4]        @ r6 = count
+    add r4, r4, #4      @ r4 = &pairs[0]
+.dict_str_loop:
+    cmp r6, #0
+    beq .dict_str_notfound
+    ldr r0, [r4]        @ r0 = current key (string ptr)
+    mov r1, r5          @ r1 = search key
+    bl __pynux_strcmp
+    cmp r0, #0
+    beq .dict_str_found
+    add r4, r4, #8      @ next pair
+    sub r6, r6, #1
+    b .dict_str_loop
+.dict_str_found:
+    ldr r0, [r4, #4]    @ return value
+    pop {r4, r5, r6, r7, pc}
+.dict_str_notfound:
+    movs r0, #0         @ return 0 if not found
+    pop {r4, r5, r6, r7, pc}
+    .size __pynux_dict_get_str, . - __pynux_dict_get_str
+
+@ void __pynux_dict_set_int(dict* d, int32 key, int32 value)
+@ Sets value for integer key (if key exists, updates; otherwise adds at end)
+    .global __pynux_dict_set_int
+    .type __pynux_dict_set_int, %function
+__pynux_dict_set_int:
+    push {r4, r5, r6, r7, lr}
+    mov r4, r0          @ r4 = dict pointer
+    mov r5, r1          @ r5 = key
+    mov r7, r2          @ r7 = value
+    ldr r6, [r4]        @ r6 = count
+    add r0, r4, #4      @ r0 = &pairs[0]
+.dict_set_int_loop:
+    cmp r6, #0
+    beq .dict_set_int_add
+    ldr r1, [r0]        @ r1 = current key
+    cmp r1, r5
+    beq .dict_set_int_update
+    add r0, r0, #8      @ next pair
+    sub r6, r6, #1
+    b .dict_set_int_loop
+.dict_set_int_update:
+    str r7, [r0, #4]    @ update value
+    pop {r4, r5, r6, r7, pc}
+.dict_set_int_add:
+    @ Add new key-value pair at end
+    ldr r6, [r4]        @ get count again
+    add r0, r4, #4      @ base of pairs
+    lsl r1, r6, #3      @ offset = count * 8
+    add r0, r0, r1      @ r0 = &pairs[count]
+    str r5, [r0]        @ store key
+    str r7, [r0, #4]    @ store value
+    add r6, r6, #1      @ increment count
+    str r6, [r4]
+    pop {r4, r5, r6, r7, pc}
+    .size __pynux_dict_set_int, . - __pynux_dict_set_int
+
+@ Slicing functions
+@ char* __pynux_slice(char* str, int32 start, int32 end, int32 step)
+@ Returns a new string containing the slice [start:end:step]
+@ If end == -1, uses strlen as end
+    .global __pynux_slice
+    .type __pynux_slice, %function
+__pynux_slice:
+    push {r4, r5, r6, r7, lr}
+    sub sp, sp, #12     @ Reserve space for locals
+    mov r4, r0          @ r4 = source string
+    mov r5, r1          @ r5 = start
+    mov r6, r2          @ r6 = end
+    str r3, [sp, #0]    @ step on stack
+
+    @ Get string length
+    bl __pynux_strlen
+    mov r7, r0          @ r7 = strlen
+
+    @ Handle negative start
+    cmp r5, #0
+    bge .slice_start_ok
+    add r5, r5, r7      @ start += len
+    cmp r5, #0
+    bge .slice_start_ok
+    movs r5, #0         @ clamp to 0
+.slice_start_ok:
+
+    @ Handle end == -1 (means "to end")
+    cmp r6, #-1
+    bne .slice_check_neg_end
+    mov r6, r7          @ end = len
+    b .slice_end_ok
+.slice_check_neg_end:
+    @ Handle negative end
+    cmp r6, #0
+    bge .slice_clamp_end
+    add r6, r6, r7      @ end += len
+.slice_clamp_end:
+    @ Clamp end to length
+    cmp r6, r7
+    ble .slice_end_ok
+    mov r6, r7
+.slice_end_ok:
+
+    @ Calculate result length: (end - start + step - 1) / step
+    @ For step=1: just end - start
+    ldr r3, [sp, #0]    @ get step
+    cmp r3, #1
+    bne .slice_calc_len_step
+    sub r0, r6, r5      @ len = end - start
+    b .slice_len_done
+.slice_calc_len_step:
+    sub r0, r6, r5      @ end - start
+    add r0, r0, r3      @ + step
+    sub r0, r0, #1      @ - 1
+    @ divide by step (assume step > 0)
+    mov r1, r3
+    bl __aeabi_idiv
+.slice_len_done:
+    cmp r0, #0
+    bgt .slice_has_len
+    movs r0, #0         @ empty string
+    b .slice_return_empty
+.slice_has_len:
+    str r0, [sp, #4]    @ save result length
+
+    @ Allocate result string
+    add r0, r0, #1      @ +1 for null terminator
+    bl malloc
+    str r0, [sp, #8]    @ save result ptr
+
+    @ Copy characters
+    ldr r0, [sp, #8]    @ dest
+    mov r1, r4          @ source
+    add r1, r1, r5      @ source + start
+    ldr r2, [sp, #4]    @ length
+    ldr r3, [sp, #0]    @ step
+
+.slice_copy_loop:
+    cmp r2, #0
+    beq .slice_copy_done
+    ldrb r7, [r1]       @ load char from source
+    strb r7, [r0]       @ store to dest
+    add r0, r0, #1      @ dest++
+    add r1, r1, r3      @ source += step
+    sub r2, r2, #1      @ length--
+    b .slice_copy_loop
+
+.slice_copy_done:
+    movs r7, #0
+    strb r7, [r0]       @ null terminate
+    ldr r0, [sp, #8]    @ return result ptr
+    add sp, sp, #12
+    pop {r4, r5, r6, r7, pc}
+
+.slice_return_empty:
+    @ Allocate empty string
+    movs r0, #1
+    bl malloc
+    movs r1, #0
+    strb r1, [r0]       @ empty null-terminated string
+    add sp, sp, #12
+    pop {r4, r5, r6, r7, pc}
+    .size __pynux_slice, . - __pynux_slice
 
     .section .rodata
 .raise_msg:

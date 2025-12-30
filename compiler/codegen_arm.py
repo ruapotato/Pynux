@@ -115,6 +115,7 @@ class ARMCodeGen:
         self.global_var_types: dict[str, Type] = {}  # Global variable types
         self.class_bases: dict[str, str] = {}  # Class name -> parent class name
         self.properties: dict[str, str] = {}  # "Class.prop" -> method name
+        self.pending_lambdas: list[tuple[str, list[str], Expr]] = []  # Deferred lambda generation
 
     def emit(self, line: str) -> None:
         """Emit a line of assembly."""
@@ -231,8 +232,8 @@ class ARMCodeGen:
             case UnaryExpr(op=op, operand=operand):
                 self.gen_unary(op, operand)
 
-            case CallExpr(func=func, args=args):
-                self.gen_call(func, args)
+            case CallExpr(func=func, args=args, kwargs=kwargs):
+                self.gen_call(func, args, kwargs)
 
             case MethodCallExpr(obj=obj, method=method, args=args):
                 # Handle string methods specially
@@ -261,64 +262,108 @@ class ARMCodeGen:
                     func_name = f"{class_name}_{method}"
                     self.gen_call(Identifier(func_name), args)
                 else:
-                    # Generic method call - treat as function with obj as first arg
+                    # Generic method call - look up object's type for class prefix
                     all_args = [obj] + args
-                    self.gen_call(Identifier(method), all_args)
+                    class_name = None
+                    if isinstance(obj, Identifier):
+                        # Try to get type from locals first
+                        if obj.name in self.ctx.locals:
+                            var_type = self.ctx.locals[obj.name].var_type
+                            if var_type is not None:
+                                type_name = getattr(var_type, 'name', str(var_type))
+                                if type_name in self.structs:
+                                    class_name = type_name
+                        # Try global types
+                        elif obj.name in self.global_var_types:
+                            var_type = self.global_var_types[obj.name]
+                            if var_type is not None:
+                                type_name = getattr(var_type, 'name', str(var_type))
+                                if type_name in self.structs:
+                                    class_name = type_name
+
+                    if class_name:
+                        func_name = f"{class_name}_{method}"
+                        self.gen_call(Identifier(func_name), all_args)
+                    else:
+                        self.gen_call(Identifier(method), all_args)
 
             case IndexExpr(obj=obj, index=index):
-                # Array indexing: obj[index]
-                # Support negative indexing like Python (arr[-1] = last element)
-                self.gen_expr(index)
-                self.emit("    push {r0}")  # Save index
-                self.gen_expr(obj)
-                self.emit("    pop {r1}")   # r1 = index, r0 = array base
-
-                # Determine element size and array length
-                elem_size = 4  # Default to word
-                array_len = None
+                # Check if this is dictionary access
+                var_type = None
                 if isinstance(obj, Identifier):
-                    elem_size = self.array_element_sizes.get(obj.name, 4)
-                    # Get array length if known
                     var_type = self.global_var_types.get(obj.name)
                     if var_type is None and obj.name in self.ctx.locals:
                         var_type = self.ctx.locals[obj.name].var_type
-                    if isinstance(var_type, ArrayType):
-                        array_len = var_type.size
 
-                # Handle negative indices: if index < 0, add length
-                neg_label = self.ctx.new_label("negidx")
-                done_label = self.ctx.new_label("idxdone")
-                self.emit("    cmp r1, #0")
-                self.emit(f"    bge {done_label}")
-                # Negative index - add array length
-                if array_len is not None:
-                    self.emit(f"    add r1, r1, #{array_len}")
+                if isinstance(var_type, DictType):
+                    # Dictionary access: d[key]
+                    self.gen_expr(index)
+                    self.emit("    push {r0}")  # Save key
+                    self.gen_expr(obj)
+                    self.emit("    pop {r1}")   # r1 = key, r0 = dict ptr
+                    # Determine key type and call appropriate lookup
+                    key_is_str = isinstance(index, StringLiteral)
+                    if hasattr(var_type.key_type, 'name') and var_type.key_type.name == 'str':
+                        key_is_str = True
+                    if key_is_str:
+                        self.emit("    bl __pynux_dict_get_str")
+                    else:
+                        self.emit("    bl __pynux_dict_get_int")
                 else:
-                    # For dynamic arrays/strings, call strlen
-                    self.emit("    push {r0, r1}")
-                    self.emit("    bl __pynux_strlen")
-                    self.emit("    pop {r1}")  # Just pop the old r1
-                    self.emit("    pop {r2}")  # Get array base back
-                    self.emit("    add r1, r1, r0")  # index += length
-                    self.emit("    mov r0, r2")  # Restore array base
-                self.emit(f"{done_label}:")
+                    # Array/string indexing: obj[index]
+                    # Support negative indexing like Python (arr[-1] = last element)
+                    self.gen_expr(index)
+                    self.emit("    push {r0}")  # Save index
+                    self.gen_expr(obj)
+                    self.emit("    pop {r1}")   # r1 = index, r0 = array base
 
-                # Scale index by element size
-                if elem_size == 4:
-                    self.emit("    lsl r1, r1, #2")
-                elif elem_size == 2:
-                    self.emit("    lsl r1, r1, #1")
-                # For elem_size == 1, no shift needed
+                    # Determine element size and array length
+                    elem_size = 4  # Default to word
+                    array_len = None
+                    if isinstance(obj, Identifier):
+                        elem_size = self.array_element_sizes.get(obj.name, 4)
+                        # Check for string type - characters are 1 byte
+                        if var_type is not None:
+                            type_name = getattr(var_type, 'name', str(var_type))
+                            if type_name == 'str':
+                                elem_size = 1
+                        if isinstance(var_type, ArrayType):
+                            array_len = var_type.size
 
-                self.emit("    add r0, r0, r1")
+                    # Handle negative indices: if index < 0, add length
+                    neg_label = self.ctx.new_label("negidx")
+                    done_label = self.ctx.new_label("idxdone")
+                    self.emit("    cmp r1, #0")
+                    self.emit(f"    bge {done_label}")
+                    # Negative index - add array length
+                    if array_len is not None:
+                        self.emit(f"    add r1, r1, #{array_len}")
+                    else:
+                        # For dynamic arrays/strings, call strlen
+                        self.emit("    push {r0, r1}")
+                        self.emit("    bl __pynux_strlen")
+                        self.emit("    pop {r1}")  # Just pop the old r1
+                        self.emit("    pop {r2}")  # Get array base back
+                        self.emit("    add r1, r1, r0")  # index += length
+                        self.emit("    mov r0, r2")  # Restore array base
+                    self.emit(f"{done_label}:")
 
-                # Use appropriate load instruction
-                if elem_size == 1:
-                    self.emit("    ldrb r0, [r0]")
-                elif elem_size == 2:
-                    self.emit("    ldrh r0, [r0]")
-                else:
-                    self.emit("    ldr r0, [r0]")
+                    # Scale index by element size
+                    if elem_size == 4:
+                        self.emit("    lsl r1, r1, #2")
+                    elif elem_size == 2:
+                        self.emit("    lsl r1, r1, #1")
+                    # For elem_size == 1, no shift needed
+
+                    self.emit("    add r0, r0, r1")
+
+                    # Use appropriate load instruction
+                    if elem_size == 1:
+                        self.emit("    ldrb r0, [r0]")
+                    elif elem_size == 2:
+                        self.emit("    ldrh r0, [r0]")
+                    else:
+                        self.emit("    ldr r0, [r0]")
 
             case SliceExpr(obj=obj, start=start, end=end, step=step):
                 self.gen_slice(obj, start, end, step)
@@ -573,8 +618,11 @@ class ARMCodeGen:
             case _:
                 raise CodeGenError(f"Unsupported unary op: {op}")
 
-    def gen_call(self, func: Expr, args: list[Expr]) -> None:
+    def gen_call(self, func: Expr, args: list[Expr], kwargs: dict = None) -> None:
         """Generate function call."""
+        if kwargs is None:
+            kwargs = {}
+
         # Handle method calls on class names (static/class methods)
         if isinstance(func, MemberExpr):
             if isinstance(func.obj, Identifier):
@@ -619,7 +667,7 @@ class ARMCodeGen:
 
         # Handle built-in functions specially
         if func_name == "print":
-            self.gen_builtin_print(args)
+            self.gen_builtin_print(args, kwargs)
             return
         elif func_name == "len":
             self.gen_builtin_len(args)
@@ -647,6 +695,9 @@ class ARMCodeGen:
         if len(args) > 4:
             raise CodeGenError("More than 4 arguments not yet supported")
 
+        # Check if this is an indirect call through a local variable (function pointer)
+        is_indirect = func_name in self.ctx.locals
+
         # Push args in reverse order, then pop to r0-r3
         for arg in reversed(args):
             self.gen_expr(arg)
@@ -655,15 +706,39 @@ class ARMCodeGen:
         for i in range(len(args)):
             self.emit(f"    pop {{r{i}}}")
 
-        self.emit(f"    bl {func_name}")
+        if is_indirect:
+            # Load function pointer from local variable and call indirectly
+            var = self.ctx.locals[func_name]
+            self.emit(f"    ldr r4, [r7, #{var.offset}]")
+            self.emit("    blx r4")
+        else:
+            self.emit(f"    bl {func_name}")
 
-    def gen_builtin_print(self, args: list[Expr]) -> None:
+    def gen_builtin_print(self, args: list[Expr], kwargs: dict = None) -> None:
         """Generate print() built-in - auto-detects type and prints."""
+        if kwargs is None:
+            kwargs = {}
+
+        # Get sep and end parameters (default: sep=" ", end="\n")
+        sep = " "
+        end = "\n"
+        if 'sep' in kwargs:
+            if isinstance(kwargs['sep'], StringLiteral):
+                sep = kwargs['sep'].value
+        if 'end' in kwargs:
+            if isinstance(kwargs['end'], StringLiteral):
+                end = kwargs['end'].value
+
         for i, arg in enumerate(args):
-            if i > 0:
-                # Print space separator between args
-                self.emit("    movs r0, #' '")
-                self.emit("    bl uart_putc")
+            if i > 0 and sep:
+                # Print separator between args
+                if len(sep) == 1:
+                    self.emit(f"    movs r0, #{ord(sep)}")
+                    self.emit("    bl uart_putc")
+                else:
+                    label = self.add_string(sep)
+                    self.emit(f"    ldr r0, ={label}")
+                    self.emit("    bl print_str")
 
             # Determine type and call appropriate print function
             if isinstance(arg, StringLiteral):
@@ -692,9 +767,15 @@ class ARMCodeGen:
                 self.gen_expr(arg)
                 self.emit("    bl print_int")
 
-        # Print newline at end
-        self.emit("    movs r0, #'\\n'")
-        self.emit("    bl uart_putc")
+        # Print end string
+        if end:
+            if len(end) == 1:
+                self.emit(f"    movs r0, #{ord(end)}")
+                self.emit("    bl uart_putc")
+            else:
+                label = self.add_string(end)
+                self.emit(f"    ldr r0, ={label}")
+                self.emit("    bl print_str")
 
     def gen_fstring_print(self, fstr: str) -> None:
         """Generate code for printing f-string interpolation."""
@@ -938,34 +1019,37 @@ class ARMCodeGen:
     def gen_slice(self, obj: Expr, start: Optional[Expr], end: Optional[Expr],
                   step: Optional[Expr]) -> None:
         """Generate array/string slice."""
-        # Slicing creates a new view/copy - needs runtime support
-        # For now, emit a runtime call
-        self.gen_expr(obj)
-        self.emit("    push {r0}")
+        # Slicing creates a new string/list copy
+        # Args: r0=obj, r1=start, r2=end, r3=step
 
-        if start:
-            self.gen_expr(start)
-        else:
-            self.emit("    movs r0, #0")
-        self.emit("    push {r0}")
-
-        if end:
-            self.gen_expr(end)
-        else:
-            self.emit("    movs r0, #-1")  # -1 means "to end"
-        self.emit("    push {r0}")
-
+        # Evaluate step first and save
         if step:
             self.gen_expr(step)
         else:
             self.emit("    movs r0, #1")
+        self.emit("    push {r0}")  # save step
 
-        self.emit("    pop {r2}")  # end
+        # Evaluate end and save
+        if end:
+            self.gen_expr(end)
+        else:
+            self.emit("    mov r0, #-1")  # -1 means "to end"
+        self.emit("    push {r0}")  # save end
+
+        # Evaluate start and save
+        if start:
+            self.gen_expr(start)
+        else:
+            self.emit("    movs r0, #0")
+        self.emit("    push {r0}")  # save start
+
+        # Evaluate obj
+        self.gen_expr(obj)
+
+        # Now set up args: r0=obj (already), r1=start, r2=end, r3=step
         self.emit("    pop {r1}")  # start
-        self.emit("    pop {r0}")  # obj
-        self.emit("    push {r3}")  # save step in r3 temporarily
-        self.emit("    mov r3, r0")  # step is already in r0
-        self.emit("    pop {r3}")
+        self.emit("    pop {r2}")  # end
+        self.emit("    pop {r3}")  # step
         self.emit("    bl __pynux_slice")
 
     def gen_list_literal(self, elements: list[Expr]) -> None:
@@ -1137,58 +1221,70 @@ class ARMCodeGen:
         self.emit(f"    b {start_label}")
 
         self.emit(f"{end_label}:")
-        self.emit("    pop {r0}")  # Return list pointer
+        self.emit("    pop {r0}")  # Get list pointer
+        self.emit("    add r0, r0, #8")  # Skip header, return pointer to elements
 
     def gen_lambda(self, params: list[str], body: Expr) -> None:
-        """Generate lambda expression as anonymous function."""
+        """Generate lambda expression as anonymous function (deferred)."""
         # Generate unique function name
         lambda_name = f"__lambda_{self.string_counter}"
         self.string_counter += 1
 
-        # Save current context
-        saved_ctx = self.ctx
+        # Store lambda for deferred generation
+        self.pending_lambdas.append((lambda_name, params, body))
 
-        # Create new context for lambda
-        self.ctx = FunctionContext(lambda_name)
-
-        # Emit lambda function
-        self.emit("")
-        self.emit(f"    .type {lambda_name}, %function")
-        self.emit(f"{lambda_name}:")
-        self.emit("    push {r7, lr}")
-        self.emit("    mov r7, sp")
-
-        # Reserve space for locals (will be fixed up)
-        stack_reserve_idx = len(self.output)
-        self.emit("    sub sp, sp, #0  @ placeholder")
-
-        # Store parameters as locals
-        for i, param in enumerate(params):
-            var = self.ctx.alloc_local(param)
-            if i < 4:
-                self.emit(f"    str r{i}, [r7, #{var.offset}]")
-
-        # Generate body expression
-        self.gen_expr(body)
-
-        # Return - result is in r0
-        self.emit("    mov sp, r7")
-        self.emit("    pop {r7, pc}")
-
-        # Fix up stack reservation
-        stack_size = (self.ctx.stack_size + 7) & ~7
-        if stack_size > 0:
-            self.output[stack_reserve_idx] = f"    sub sp, sp, #{stack_size}"
-        else:
-            self.output[stack_reserve_idx] = "    @ no locals"
-
-        self.emit(f"    .size {lambda_name}, . - {lambda_name}")
-
-        # Restore context
-        self.ctx = saved_ctx
-
-        # Load lambda function address
+        # Just load the lambda function address - it will be generated later
         self.emit(f"    ldr r0, ={lambda_name}")
+
+    def gen_pending_lambdas(self) -> None:
+        """Generate all deferred lambda functions."""
+        for lambda_name, params, body in self.pending_lambdas:
+            # Save current context
+            saved_ctx = self.ctx
+
+            # Create new context for lambda
+            self.ctx = FunctionContext(lambda_name)
+
+            # Emit lambda function
+            self.emit("")
+            self.emit(f"    .global {lambda_name}")
+            self.emit(f"    .type {lambda_name}, %function")
+            self.emit(f"{lambda_name}:")
+            self.emit("    push {r7, lr}")
+            self.emit("    mov r7, sp")
+
+            # Reserve space for locals (will be fixed up)
+            stack_reserve_idx = len(self.output)
+            self.emit("    sub sp, sp, #0  @ placeholder")
+
+            # Store parameters as locals
+            for i, param in enumerate(params):
+                var = self.ctx.alloc_local(param)
+                if i < 4:
+                    self.emit(f"    str r{i}, [r7, #{var.offset}]")
+
+            # Generate body expression
+            self.gen_expr(body)
+
+            # Return - result is in r0
+            self.emit("    mov sp, r7")
+            self.emit("    pop {r7, pc}")
+
+            # Fix up stack reservation
+            stack_size = (self.ctx.stack_size + 7) & ~7
+            if stack_size > 0:
+                self.output[stack_reserve_idx] = f"    sub sp, sp, #{stack_size}"
+            else:
+                self.output[stack_reserve_idx] = "    @ no locals"
+
+            self.emit(f"    .size {lambda_name}, . - {lambda_name}")
+            self.emit("    .ltorg")
+
+            # Restore context
+            self.ctx = saved_ctx
+
+        # Clear pending lambdas
+        self.pending_lambdas.clear()
 
     # -------------------------------------------------------------------------
     # Statement generation
@@ -1331,10 +1427,14 @@ class ARMCodeGen:
             var = self.ctx.locals.get(target.name)
             if var:
                 self.emit(f"    str r0, [r7, #{var.offset}]")
-            else:
-                # Global
+            elif target.name in self.global_var_types:
+                # Known global variable
                 self.emit(f"    ldr r1, ={target.name}")
                 self.emit("    str r0, [r1]")
+            else:
+                # First assignment to new local variable - create it
+                var = self.ctx.alloc_local(target.name)
+                self.emit(f"    str r0, [r7, #{var.offset}]")
         elif isinstance(target, IndexExpr):
             self.gen_index_store(target, "r0")
         elif isinstance(target, MemberExpr):
@@ -1790,34 +1890,58 @@ class ARMCodeGen:
         # 4. Execute body
         # 5. Call __exit__ method (even if exception)
 
-        exit_vars = []  # Store context manager objects for __exit__ calls
+        exit_info = []  # Store (context_manager_type, item) for __exit__ calls
 
         for item in items:
-            # Evaluate context expression
+            # Evaluate context expression and determine type
+            class_name = None
+            if isinstance(item.context, CallExpr):
+                # Constructor call like File("name")
+                if isinstance(item.context.func, Identifier):
+                    if item.context.func.name in self.structs:
+                        class_name = item.context.func.name
+            elif isinstance(item.context, Identifier):
+                # Variable reference
+                if item.context.name in self.ctx.locals:
+                    var_type = self.ctx.locals[item.context.name].var_type
+                    if var_type is not None:
+                        type_name = getattr(var_type, 'name', str(var_type))
+                        if type_name in self.structs:
+                            class_name = type_name
+
             self.gen_expr(item.context)
             self.emit("    push {r0}")  # Save context manager
 
-            # Call __enter__ (context manager is on stack)
-            self.emit("    ldr r0, [sp]")
-            # Assume __enter__ is at offset 0 in vtable
-            # For now, just call a convention: ClassName___enter__
-            self.emit("    bl __pynux_context_enter")
+            # Call __enter__ method
+            self.emit("    @ with: call __enter__")
+            if class_name:
+                enter_func = f"{class_name}___enter__"
+                self.emit(f"    bl {enter_func}")
+            else:
+                # Fallback to generic runtime function
+                self.emit("    ldr r0, [sp]")
+                self.emit("    bl __pynux_context_enter")
 
             # Store result in variable if 'as' clause
             if item.var:
                 var = self.ctx.alloc_local(item.var)
                 self.emit(f"    str r0, [r7, #{var.offset}]")
 
-            exit_vars.append(item)
+            exit_info.append((class_name, item))
 
         # Execute body
         for s in body:
             self.gen_stmt(s)
 
         # Call __exit__ for each context manager (in reverse order)
-        for item in reversed(exit_vars):
+        for class_name, item in reversed(exit_info):
+            self.emit("    @ with: call __exit__")
             self.emit("    pop {r0}")  # Get context manager
-            self.emit("    bl __pynux_context_exit")
+            if class_name:
+                exit_func = f"{class_name}___exit__"
+                self.emit(f"    bl {exit_func}")
+            else:
+                self.emit("    bl __pynux_context_exit")
 
     # -------------------------------------------------------------------------
     # Declaration generation
@@ -1985,6 +2109,9 @@ class ARMCodeGen:
                     pass  # Enums don't need codegen
                 case VarDecl():
                     pass  # Already collected
+
+        # Generate any pending lambda functions
+        self.gen_pending_lambdas()
 
         # Data section for global variables
         if global_vars:
