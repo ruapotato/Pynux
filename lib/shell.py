@@ -4,10 +4,11 @@
 # No graphics, just plain serial I/O.
 
 from lib.io import uart_putc, uart_getc, uart_available, print_str, print_int
-from lib.string import strcmp, strlen, strcpy, strcat, memset
+from lib.string import strcmp, strlen, strcpy, strcat, memset, atoi
 from kernel.ramfs import ramfs_readdir, ramfs_create, ramfs_delete
 from kernel.ramfs import ramfs_read, ramfs_write, ramfs_exists, ramfs_isdir
 from lib.memory import heap_remaining, heap_total, heap_used
+from kernel.timer import timer_delay_ms
 
 # Command buffer
 shell_cmd: Array[256, char]
@@ -172,7 +173,11 @@ def shell_exec():
         shell_newline()
         shell_puts("  env        - Environment vars")
         shell_newline()
-        shell_puts("  true/false - Exit with status")
+        shell_puts("  sleep <n>  - Sleep N seconds")
+        shell_newline()
+        shell_puts("  reboot     - Reboot system")
+        shell_newline()
+        shell_puts("  halt       - Halt system")
         shell_newline()
         shell_puts("  version    - Show version")
         shell_newline()
@@ -459,6 +464,43 @@ def shell_exec():
         shell_newline()
         shell_puts("y")
         shell_newline()
+    elif shell_starts_with("sleep"):
+        arg10: Ptr[char] = shell_get_arg()
+        if arg10[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: sleep <seconds>")
+            shell_newline()
+        else:
+            secs: int32 = atoi(arg10)
+            if secs > 0 and secs <= 60:
+                shell_newline()
+                shell_puts("Sleeping for ")
+                shell_puts(shell_int_to_str(secs))
+                shell_puts(" seconds...")
+                shell_newline()
+                timer_delay_ms(secs * 1000)
+                shell_puts("Done.")
+                shell_newline()
+            else:
+                shell_newline()
+                shell_puts("Invalid sleep time (1-60)")
+                shell_newline()
+    elif strcmp(cmd, "reboot") == 0:
+        shell_newline()
+        shell_puts("Rebooting...")
+        shell_newline()
+        timer_delay_ms(1000)
+        # Trigger system reset via NVIC
+        NVIC_AIRCR: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](0xE000ED0C)
+        NVIC_AIRCR[0] = 0x05FA0004
+        while True:
+            pass
+    elif strcmp(cmd, "halt") == 0 or strcmp(cmd, "poweroff") == 0:
+        shell_newline()
+        shell_puts("System halted.")
+        shell_newline()
+        while True:
+            pass
     else:
         shell_newline()
         shell_puts("Unknown: ")

@@ -7,10 +7,11 @@ from lib.io import uart_putc, uart_getc, uart_available, print_str, print_int
 from lib.vtnext import vtn_init, vtn_clear, vtn_rect, vtn_textline
 from lib.vtnext import vtn_clear_rect, vtn_present, vtn_flush
 from lib.vtnext import vtn_line, vtn_text
-from lib.string import strcmp, strlen, strcpy, memset, strcat
+from lib.string import strcmp, strlen, strcpy, memset, strcat, atoi
 from kernel.ramfs import ramfs_readdir, ramfs_create, ramfs_delete
 from kernel.ramfs import ramfs_read, ramfs_write, ramfs_exists, ramfs_isdir
 from lib.memory import heap_remaining, heap_total, heap_used
+from kernel.timer import timer_delay_ms
 
 # ============================================================================
 # Screen and color constants
@@ -412,7 +413,9 @@ def exec_cmd():
         term_puts("  cp s d     - Copy file\n")
         term_puts("  id         - User identity\n")
         term_puts("  env        - Environment vars\n")
-        term_puts("  true/false - Exit with status\n")
+        term_puts("  sleep <n>  - Sleep N seconds\n")
+        term_puts("  reboot     - Reboot system\n")
+        term_puts("  halt       - Halt system\n")
         term_puts("  version    - Show version\n")
     elif strcmp(cmd, "clear") == 0:
         term_init()
@@ -645,6 +648,43 @@ def exec_cmd():
     elif strcmp(cmd, "yes") == 0:
         # Just print y once (don't loop forever!)
         term_puts("\ny\n")
+    elif cmd_starts_with("sleep"):
+        # sleep <seconds>
+        arg10: Ptr[char] = cmd_get_arg()
+        if arg10[0] == '\0':
+            term_puts("\nUsage: sleep <seconds>\n")
+        else:
+            secs: int32 = atoi(arg10)
+            if secs > 0 and secs <= 60:
+                term_puts("\nSleeping for ")
+                term_puts(int_to_str(secs))
+                term_puts(" seconds...\n")
+                # Redraw before sleeping
+                de_draw()
+                vtn_present()
+                timer_delay_ms(secs * 1000)
+                term_puts("Done.\n")
+            else:
+                term_puts("\nInvalid sleep time (1-60)\n")
+    elif strcmp(cmd, "reboot") == 0:
+        term_puts("\nRebooting...\n")
+        de_draw()
+        vtn_present()
+        timer_delay_ms(1000)
+        # Trigger system reset via NVIC
+        NVIC_AIRCR: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](0xE000ED0C)
+        NVIC_AIRCR[0] = 0x05FA0004
+        while True:
+            pass
+    elif strcmp(cmd, "halt") == 0 or strcmp(cmd, "poweroff") == 0:
+        term_puts("\nSystem halted.\n")
+        de_draw()
+        vtn_present()
+        while True:
+            pass
+    elif strcmp(cmd, "exit") == 0:
+        term_puts("\nExiting to text mode...\n")
+        # Not implemented - would need to return to kernel
     else:
         term_puts("\nUnknown command: ")
         term_puts(cmd)
