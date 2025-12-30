@@ -239,15 +239,41 @@ class ARMCodeGen:
 
             case IndexExpr(obj=obj, index=index):
                 # Array indexing: obj[index]
+                # Support negative indexing like Python (arr[-1] = last element)
                 self.gen_expr(index)
-                self.emit("    push {r0}")
+                self.emit("    push {r0}")  # Save index
                 self.gen_expr(obj)
-                self.emit("    pop {r1}")
+                self.emit("    pop {r1}")   # r1 = index, r0 = array base
 
-                # Determine element size
+                # Determine element size and array length
                 elem_size = 4  # Default to word
+                array_len = None
                 if isinstance(obj, Identifier):
                     elem_size = self.array_element_sizes.get(obj.name, 4)
+                    # Get array length if known
+                    var_type = self.global_var_types.get(obj.name)
+                    if var_type is None and obj.name in self.ctx.locals:
+                        var_type = self.ctx.locals[obj.name].var_type
+                    if isinstance(var_type, ArrayType):
+                        array_len = var_type.size
+
+                # Handle negative indices: if index < 0, add length
+                neg_label = self.ctx.new_label("negidx")
+                done_label = self.ctx.new_label("idxdone")
+                self.emit("    cmp r1, #0")
+                self.emit(f"    bge {done_label}")
+                # Negative index - add array length
+                if array_len is not None:
+                    self.emit(f"    add r1, r1, #{array_len}")
+                else:
+                    # For dynamic arrays/strings, call strlen
+                    self.emit("    push {r0, r1}")
+                    self.emit("    bl __pynux_strlen")
+                    self.emit("    pop {r1}")  # Just pop the old r1
+                    self.emit("    pop {r2}")  # Get array base back
+                    self.emit("    add r1, r1, r0")  # index += length
+                    self.emit("    mov r0, r2")  # Restore array base
+                self.emit(f"{done_label}:")
 
                 # Scale index by element size
                 if elem_size == 4:
@@ -517,6 +543,38 @@ class ARMCodeGen:
 
     def gen_call(self, func: Expr, args: list[Expr]) -> None:
         """Generate function call."""
+        # Get function name
+        if isinstance(func, Identifier):
+            func_name = func.name
+        else:
+            raise CodeGenError("Indirect function calls not yet supported")
+
+        # Handle built-in functions specially
+        if func_name == "print":
+            self.gen_builtin_print(args)
+            return
+        elif func_name == "len":
+            self.gen_builtin_len(args)
+            return
+        elif func_name == "abs":
+            self.gen_builtin_abs(args)
+            return
+        elif func_name == "min":
+            self.gen_builtin_min(args)
+            return
+        elif func_name == "max":
+            self.gen_builtin_max(args)
+            return
+        elif func_name == "ord":
+            self.gen_builtin_ord(args)
+            return
+        elif func_name == "chr":
+            self.gen_builtin_chr(args)
+            return
+        elif func_name == "input":
+            self.gen_builtin_input(args)
+            return
+
         # Save caller-saved registers if needed
         if len(args) > 4:
             raise CodeGenError("More than 4 arguments not yet supported")
@@ -529,13 +587,189 @@ class ARMCodeGen:
         for i in range(len(args)):
             self.emit(f"    pop {{r{i}}}")
 
-        # Get function name
-        if isinstance(func, Identifier):
-            func_name = func.name
-        else:
-            raise CodeGenError("Indirect function calls not yet supported")
-
         self.emit(f"    bl {func_name}")
+
+    def gen_builtin_print(self, args: list[Expr]) -> None:
+        """Generate print() built-in - auto-detects type and prints."""
+        for i, arg in enumerate(args):
+            if i > 0:
+                # Print space separator between args
+                self.emit("    movs r0, #' '")
+                self.emit("    bl uart_putc")
+
+            # Determine type and call appropriate print function
+            if isinstance(arg, StringLiteral):
+                label = self.add_string(arg.value)
+                self.emit(f"    ldr r0, ={label}")
+                self.emit("    bl print_str")
+            elif isinstance(arg, IntLiteral):
+                self.gen_expr(arg)
+                self.emit("    bl print_int")
+            elif isinstance(arg, BoolLiteral):
+                if arg.value:
+                    label = self.add_string("True")
+                else:
+                    label = self.add_string("False")
+                self.emit(f"    ldr r0, ={label}")
+                self.emit("    bl print_str")
+            elif isinstance(arg, CharLiteral):
+                self.emit(f"    movs r0, #{ord(arg.value)}")
+                self.emit("    bl uart_putc")
+            elif isinstance(arg, FStringLiteral):
+                # F-string: parse and print each part
+                self.gen_fstring_print(arg.value)
+            else:
+                # For other expressions, evaluate and print as int
+                # In the future we could add type inference
+                self.gen_expr(arg)
+                self.emit("    bl print_int")
+
+        # Print newline at end
+        self.emit("    movs r0, #'\\n'")
+        self.emit("    bl uart_putc")
+
+    def gen_fstring_print(self, fstr: str) -> None:
+        """Generate code for printing f-string interpolation."""
+        i = 0
+        while i < len(fstr):
+            if fstr[i] == '{' and i + 1 < len(fstr) and fstr[i+1] != '{':
+                # Find matching }
+                j = i + 1
+                while j < len(fstr) and fstr[j] != '}':
+                    j += 1
+                expr_str = fstr[i+1:j]
+                # For now, parse and evaluate as identifier
+                # This is simplified - full implementation would use parser
+                if expr_str.isidentifier():
+                    if expr_str in self.ctx.locals:
+                        var = self.ctx.locals[expr_str]
+                        self.emit(f"    ldr r0, [r7, #{var.offset}]")
+                    else:
+                        self.emit(f"    ldr r0, ={expr_str}")
+                        self.emit("    ldr r0, [r0]")
+                    self.emit("    bl print_int")
+                i = j + 1
+            elif fstr[i] == '{' and i + 1 < len(fstr) and fstr[i+1] == '{':
+                self.emit("    movs r0, #'{'")
+                self.emit("    bl uart_putc")
+                i += 2
+            elif fstr[i] == '}' and i + 1 < len(fstr) and fstr[i+1] == '}':
+                self.emit("    movs r0, #'}'")
+                self.emit("    bl uart_putc")
+                i += 2
+            else:
+                # Collect consecutive literal characters
+                start = i
+                while i < len(fstr) and fstr[i] != '{' and fstr[i] != '}':
+                    i += 1
+                if start < i:
+                    substr = fstr[start:i]
+                    label = self.add_string(substr)
+                    self.emit(f"    ldr r0, ={label}")
+                    self.emit("    bl print_str")
+
+    def gen_builtin_len(self, args: list[Expr]) -> None:
+        """Generate len() built-in - returns length of string or array."""
+        if len(args) != 1:
+            raise CodeGenError("len() takes exactly 1 argument")
+
+        arg = args[0]
+
+        # For string literals, we know the length at compile time
+        if isinstance(arg, StringLiteral):
+            self.emit(f"    movs r0, #{len(arg.value)}")
+            return
+
+        # For identifiers, check if it's an array or string
+        if isinstance(arg, Identifier):
+            if arg.name in self.global_arrays:
+                # Get array size from type
+                var_type = self.global_var_types.get(arg.name)
+                if isinstance(var_type, ArrayType):
+                    self.emit(f"    movs r0, #{var_type.size}")
+                    return
+
+        # For runtime strings, call strlen
+        self.gen_expr(arg)
+        self.emit("    bl __pynux_strlen")
+
+    def gen_builtin_abs(self, args: list[Expr]) -> None:
+        """Generate abs() built-in."""
+        if len(args) != 1:
+            raise CodeGenError("abs() takes exactly 1 argument")
+        self.gen_expr(args[0])
+        # if negative, negate
+        self.emit("    cmp r0, #0")
+        self.emit("    it lt")
+        self.emit("    rsblt r0, r0, #0")
+
+    def gen_builtin_min(self, args: list[Expr]) -> None:
+        """Generate min() built-in."""
+        if len(args) < 2:
+            raise CodeGenError("min() takes at least 2 arguments")
+        # Start with first arg
+        self.gen_expr(args[0])
+        for arg in args[1:]:
+            self.emit("    push {r0}")
+            self.gen_expr(arg)
+            self.emit("    pop {r1}")
+            # r1 = current min, r0 = new value
+            self.emit("    cmp r0, r1")
+            self.emit("    it ge")
+            self.emit("    movge r0, r1")
+
+    def gen_builtin_max(self, args: list[Expr]) -> None:
+        """Generate max() built-in."""
+        if len(args) < 2:
+            raise CodeGenError("max() takes at least 2 arguments")
+        # Start with first arg
+        self.gen_expr(args[0])
+        for arg in args[1:]:
+            self.emit("    push {r0}")
+            self.gen_expr(arg)
+            self.emit("    pop {r1}")
+            # r1 = current max, r0 = new value
+            self.emit("    cmp r0, r1")
+            self.emit("    it le")
+            self.emit("    movle r0, r1")
+
+    def gen_builtin_ord(self, args: list[Expr]) -> None:
+        """Generate ord() built-in - get ASCII value of character."""
+        if len(args) != 1:
+            raise CodeGenError("ord() takes exactly 1 argument")
+        arg = args[0]
+        if isinstance(arg, CharLiteral):
+            self.emit(f"    movs r0, #{ord(arg.value)}")
+        elif isinstance(arg, StringLiteral) and len(arg.value) == 1:
+            self.emit(f"    movs r0, #{ord(arg.value[0])}")
+        else:
+            # Get first character of string/expression
+            self.gen_expr(arg)
+            self.emit("    ldrb r0, [r0]")
+
+    def gen_builtin_chr(self, args: list[Expr]) -> None:
+        """Generate chr() built-in - convert int to character."""
+        if len(args) != 1:
+            raise CodeGenError("chr() takes exactly 1 argument")
+        self.gen_expr(args[0])
+        # Result is already in r0 as the character value
+
+    def gen_builtin_input(self, args: list[Expr]) -> None:
+        """Generate input() built-in - read line from UART."""
+        # Print prompt if provided
+        if args:
+            self.gen_expr(args[0])
+            self.emit("    bl print_str")
+
+        # Allocate buffer on heap (128 bytes)
+        self.emit("    movs r0, #128")
+        self.emit("    bl malloc")
+        self.emit("    push {r0}")  # Save buffer address
+
+        # Read line into buffer
+        self.emit("    bl __pynux_read_line")
+
+        self.emit("    pop {r0}")  # Return buffer address
 
     def gen_member_access(self, obj: Expr, member: str) -> None:
         """Generate struct field access."""

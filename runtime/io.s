@@ -352,6 +352,204 @@ malloc:
     bx lr
     .size malloc, . - malloc
 
+@ int __pynux_strlen(const char* s)
+@ Get string length
+    .global __pynux_strlen
+    .type __pynux_strlen, %function
+__pynux_strlen:
+    mov r1, r0         @ save string pointer
+    movs r0, #0        @ length = 0
+.strlen_loop:
+    ldrb r2, [r1]
+    cmp r2, #0
+    beq .strlen_done
+    adds r0, r0, #1
+    adds r1, r1, #1
+    b .strlen_loop
+.strlen_done:
+    bx lr
+    .size __pynux_strlen, . - __pynux_strlen
+
+@ char* __pynux_read_line(char* buf)
+@ Read line from UART into buffer (expects buffer address in r0)
+@ Returns when newline received, null-terminates the string
+    .global __pynux_read_line
+    .type __pynux_read_line, %function
+__pynux_read_line:
+    push {r4, r5, lr}
+    mov r4, r0         @ buffer pointer
+    mov r5, r0         @ save start
+.read_line_loop:
+    bl uart_getc       @ get character
+    cmp r0, #'\r'      @ carriage return?
+    beq .read_line_done
+    cmp r0, #'\n'      @ newline?
+    beq .read_line_done
+    cmp r0, #8         @ backspace?
+    beq .read_line_back
+    cmp r0, #127       @ DEL?
+    beq .read_line_back
+    strb r0, [r4]      @ store character
+    adds r4, r4, #1
+    bl uart_putc       @ echo character
+    b .read_line_loop
+.read_line_back:
+    cmp r4, r5         @ at start?
+    beq .read_line_loop
+    subs r4, r4, #1
+    movs r0, #8        @ backspace
+    bl uart_putc
+    movs r0, #' '      @ space
+    bl uart_putc
+    movs r0, #8        @ backspace
+    bl uart_putc
+    b .read_line_loop
+.read_line_done:
+    movs r0, #0
+    strb r0, [r4]      @ null terminate
+    movs r0, #'\n'
+    bl uart_putc       @ echo newline
+    mov r0, r5         @ return buffer start
+    pop {r4, r5, pc}
+    .size __pynux_read_line, . - __pynux_read_line
+
+@ bool __pynux_in(int needle, void* haystack)
+@ Check if needle is in haystack (string char check or list membership)
+@ For strings: r0 = char, r1 = string pointer, returns 1 if char in string
+    .global __pynux_in
+    .type __pynux_in, %function
+__pynux_in:
+    @ Assume string search for now (char in string)
+    push {r4, lr}
+    mov r4, r0         @ save needle (char value)
+.in_loop:
+    ldrb r0, [r1]      @ load character from haystack
+    cmp r0, #0         @ end of string?
+    beq .in_not_found
+    cmp r0, r4         @ found?
+    beq .in_found
+    adds r1, r1, #1
+    b .in_loop
+.in_found:
+    movs r0, #1
+    pop {r4, pc}
+.in_not_found:
+    movs r0, #0
+    pop {r4, pc}
+    .size __pynux_in, . - __pynux_in
+
+@ char* __pynux_strcat(char* dest, const char* src)
+@ Concatenate src to dest, return dest
+@ Note: caller must ensure dest has enough space
+    .global __pynux_strcat
+    .type __pynux_strcat, %function
+__pynux_strcat:
+    push {r4, r5, lr}
+    mov r4, r0         @ save dest
+    mov r5, r1         @ save src
+    @ Find end of dest
+.strcat_find_end:
+    ldrb r2, [r0]
+    cmp r2, #0
+    beq .strcat_copy
+    adds r0, r0, #1
+    b .strcat_find_end
+.strcat_copy:
+    ldrb r2, [r5]
+    strb r2, [r0]
+    cmp r2, #0
+    beq .strcat_done
+    adds r0, r0, #1
+    adds r5, r5, #1
+    b .strcat_copy
+.strcat_done:
+    mov r0, r4         @ return dest
+    pop {r4, r5, pc}
+    .size __pynux_strcat, . - __pynux_strcat
+
+@ char* __pynux_strcpy(char* dest, const char* src)
+@ Copy src to dest, return dest
+    .global __pynux_strcpy
+    .type __pynux_strcpy, %function
+__pynux_strcpy:
+    push {r4, lr}
+    mov r4, r0         @ save dest
+.strcpy_loop:
+    ldrb r2, [r1]
+    strb r2, [r0]
+    cmp r2, #0
+    beq .strcpy_done
+    adds r0, r0, #1
+    adds r1, r1, #1
+    b .strcpy_loop
+.strcpy_done:
+    mov r0, r4         @ return dest
+    pop {r4, pc}
+    .size __pynux_strcpy, . - __pynux_strcpy
+
+@ int __pynux_strcmp(const char* s1, const char* s2)
+@ Compare two strings, return 0 if equal
+    .global __pynux_strcmp
+    .type __pynux_strcmp, %function
+__pynux_strcmp:
+.strcmp_loop:
+    ldrb r2, [r0]
+    ldrb r3, [r1]
+    cmp r2, r3
+    bne .strcmp_diff
+    cmp r2, #0         @ both null?
+    beq .strcmp_equal
+    adds r0, r0, #1
+    adds r1, r1, #1
+    b .strcmp_loop
+.strcmp_equal:
+    movs r0, #0
+    bx lr
+.strcmp_diff:
+    subs r0, r2, r3
+    bx lr
+    .size __pynux_strcmp, . - __pynux_strcmp
+
+@ void* __pynux_memcpy(void* dest, const void* src, int n)
+@ Copy n bytes from src to dest
+    .global __pynux_memcpy
+    .type __pynux_memcpy, %function
+__pynux_memcpy:
+    push {r4, lr}
+    mov r4, r0         @ save dest
+.memcpy_loop:
+    cmp r2, #0
+    beq .memcpy_done
+    ldrb r3, [r1]
+    strb r3, [r0]
+    adds r0, r0, #1
+    adds r1, r1, #1
+    subs r2, r2, #1
+    b .memcpy_loop
+.memcpy_done:
+    mov r0, r4
+    pop {r4, pc}
+    .size __pynux_memcpy, . - __pynux_memcpy
+
+@ void* __pynux_memset(void* dest, int c, int n)
+@ Set n bytes to value c
+    .global __pynux_memset
+    .type __pynux_memset, %function
+__pynux_memset:
+    push {r4, lr}
+    mov r4, r0         @ save dest
+.memset_loop:
+    cmp r2, #0
+    beq .memset_done
+    strb r1, [r0]
+    adds r0, r0, #1
+    subs r2, r2, #1
+    b .memset_loop
+.memset_done:
+    mov r0, r4
+    pop {r4, pc}
+    .size __pynux_memset, . - __pynux_memset
+
     .section .rodata
 .assert_msg:
     .asciz "Assertion failed: "
