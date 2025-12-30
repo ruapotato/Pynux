@@ -372,6 +372,382 @@ def de_draw():
     draw_cursor()
 
 # ============================================================================
+# Text processing command handler (separate function to reduce branch distances)
+# ============================================================================
+
+def cmd_grep():
+    """grep <pattern> <file> - search for pattern in file"""
+    arg: Ptr[char] = cmd_get_arg()
+    pat: Array[32, char]
+    lb: Array[128, char]
+    sz: int32 = 0
+    i: int32 = 0
+    j: int32 = 0
+    k: int32 = 0
+    lbi: int32 = 0
+    found: bool = False
+    mtch: bool = False
+
+    if arg[0] == '\0':
+        term_puts("\nUsage: grep <pattern> <file>\n")
+        return
+    # Parse pattern
+    while arg[j] != '\0' and arg[j] != ' ' and i < 31:
+        pat[i] = arg[j]
+        i = i + 1
+        j = j + 1
+    pat[i] = '\0'
+    while arg[j] == ' ':
+        j = j + 1
+    if arg[j] == '\0':
+        term_puts("\nUsage: grep <pattern> <file>\n")
+        return
+    build_path(&arg[j])
+    if not ramfs_exists(&path_buf[0]):
+        term_puts("\ngrep: file not found\n")
+        return
+    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
+    term_putc('\n')
+    i = 0
+    while i < sz:
+        if read_buf[i] == 10:
+            lb[lbi] = '\0'
+            found = False
+            j = 0
+            while lb[j] != '\0' and not found:
+                mtch = True
+                k = 0
+                while pat[k] != '\0' and mtch:
+                    if lb[j + k] != pat[k]:
+                        mtch = False
+                    k = k + 1
+                if mtch and pat[0] != '\0':
+                    found = True
+                j = j + 1
+            if found:
+                term_puts(&lb[0])
+                term_putc('\n')
+            lbi = 0
+        else:
+            if lbi < 127:
+                lb[lbi] = cast[char](read_buf[i])
+                lbi = lbi + 1
+        i = i + 1
+
+def cmd_sort():
+    """sort <file> - sort lines alphabetically"""
+    arg: Ptr[char] = cmd_get_arg()
+    ls: Array[32, int32]
+    le: Array[32, int32]
+    sz: int32 = 0
+    lc: int32 = 0
+    i: int32 = 0
+    j: int32 = 0
+    k1: int32 = 0
+    k2: int32 = 0
+    swap: bool = False
+    ts: int32 = 0
+    te: int32 = 0
+
+    if arg[0] == '\0':
+        term_puts("\nUsage: sort <file>\n")
+        return
+    build_path(arg)
+    if not ramfs_exists(&path_buf[0]):
+        term_puts("\nsort: file not found\n")
+        return
+    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
+    term_putc('\n')
+    ls[0] = 0
+    i = 0
+    while i < sz:
+        if read_buf[i] == 10:
+            if lc < 32:
+                le[lc] = i
+                lc = lc + 1
+                if i < sz - 1:
+                    ls[lc] = i + 1
+        i = i + 1
+    if sz > 0 and read_buf[sz - 1] != 10 and lc < 32:
+        le[lc] = sz
+        lc = lc + 1
+    # Bubble sort
+    i = 0
+    while i < lc - 1:
+        j = 0
+        while j < lc - i - 1:
+            swap = False
+            k1 = ls[j]
+            k2 = ls[j + 1]
+            while k1 < le[j] and k2 < le[j + 1]:
+                if read_buf[k1] > read_buf[k2]:
+                    swap = True
+                    k1 = sz
+                elif read_buf[k1] < read_buf[k2]:
+                    k1 = sz
+                else:
+                    k1 = k1 + 1
+                    k2 = k2 + 1
+            if swap:
+                ts = ls[j]
+                ls[j] = ls[j + 1]
+                ls[j + 1] = ts
+                te = le[j]
+                le[j] = le[j + 1]
+                le[j + 1] = te
+            j = j + 1
+        i = i + 1
+    # Print sorted
+    i = 0
+    while i < lc:
+        j = ls[i]
+        while j < le[i]:
+            term_putc(cast[char](read_buf[j]))
+            j = j + 1
+        term_putc('\n')
+        i = i + 1
+
+def cmd_uniq():
+    """uniq <file> - filter adjacent duplicates"""
+    arg: Ptr[char] = cmd_get_arg()
+    sz: int32 = 0
+    ps: int32 = -1
+    pe: int32 = -1
+    cs: int32 = 0
+    ce: int32 = 0
+    i: int32 = 0
+    k: int32 = 0
+    dup: bool = False
+
+    if arg[0] == '\0':
+        term_puts("\nUsage: uniq <file>\n")
+        return
+    build_path(arg)
+    if not ramfs_exists(&path_buf[0]):
+        term_puts("\nuniq: file not found\n")
+        return
+    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
+    term_putc('\n')
+    while i <= sz:
+        if i == sz or read_buf[i] == 10:
+            ce = i
+            dup = False
+            if ps >= 0 and ce - cs == pe - ps:
+                dup = True
+                k = 0
+                while k < ce - cs:
+                    if read_buf[cs + k] != read_buf[ps + k]:
+                        dup = False
+                    k = k + 1
+            if not dup:
+                k = cs
+                while k < ce:
+                    term_putc(cast[char](read_buf[k]))
+                    k = k + 1
+                term_putc('\n')
+            ps = cs
+            pe = ce
+            cs = i + 1
+        i = i + 1
+
+def cmd_tr():
+    """tr <from> <to> <file> - translate characters"""
+    arg: Ptr[char] = cmd_get_arg()
+    fc: char = '\0'
+    tc: char = '\0'
+    sz: int32 = 0
+    i: int32 = 0
+
+    if arg[0] == '\0' or arg[1] != ' ' or arg[2] == '\0' or arg[3] != ' ':
+        term_puts("\nUsage: tr <char> <char> <file>\n")
+        return
+    fc = arg[0]
+    tc = arg[2]
+    i = 4
+    while arg[i] == ' ':
+        i = i + 1
+    if arg[i] == '\0':
+        term_puts("\nUsage: tr <char> <char> <file>\n")
+        return
+    build_path(&arg[i])
+    if not ramfs_exists(&path_buf[0]):
+        term_puts("\ntr: file not found\n")
+        return
+    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
+    term_putc('\n')
+    i = 0
+    while i < sz:
+        if cast[char](read_buf[i]) == fc:
+            term_putc(tc)
+        else:
+            term_putc(cast[char](read_buf[i]))
+        i = i + 1
+
+def cmd_tac():
+    """tac <file> - reverse line order"""
+    arg: Ptr[char] = cmd_get_arg()
+    ends: Array[64, int32]
+    sz: int32 = 0
+    lc: int32 = 0
+    i: int32 = 0
+    st: int32 = 0
+    ed: int32 = 0
+
+    if arg[0] == '\0':
+        term_puts("\nUsage: tac <file>\n")
+        return
+    build_path(arg)
+    if not ramfs_exists(&path_buf[0]):
+        term_puts("\ntac: file not found\n")
+        return
+    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
+    term_putc('\n')
+    i = 0
+    while i < sz:
+        if read_buf[i] == 10 and lc < 64:
+            ends[lc] = i
+            lc = lc + 1
+        i = i + 1
+    if sz > 0 and read_buf[sz - 1] != 10 and lc < 64:
+        ends[lc] = sz
+        lc = lc + 1
+    i = lc - 1
+    while i >= 0:
+        st = 0
+        if i > 0:
+            st = ends[i - 1] + 1
+        ed = ends[i]
+        while st < ed:
+            if read_buf[st] != 10:
+                term_putc(cast[char](read_buf[st]))
+            st = st + 1
+        term_putc('\n')
+        i = i - 1
+
+def cmd_fold():
+    """fold <file> - wrap at 60 columns"""
+    arg: Ptr[char] = cmd_get_arg()
+    sz: int32 = 0
+    col: int32 = 0
+    i: int32 = 0
+
+    if arg[0] == '\0':
+        term_puts("\nUsage: fold <file>\n")
+        return
+    build_path(arg)
+    if not ramfs_exists(&path_buf[0]):
+        term_puts("\nfold: file not found\n")
+        return
+    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
+    term_putc('\n')
+    while i < sz:
+        if read_buf[i] == 10:
+            term_putc('\n')
+            col = 0
+        else:
+            if col >= 60:
+                term_putc('\n')
+                col = 0
+            term_putc(cast[char](read_buf[i]))
+            col = col + 1
+        i = i + 1
+
+def cmd_cut():
+    """cut <file> - first 20 chars per line"""
+    arg: Ptr[char] = cmd_get_arg()
+    sz: int32 = 0
+    cnt: int32 = 0
+    i: int32 = 0
+
+    if arg[0] == '\0':
+        term_puts("\nUsage: cut <file>\n")
+        return
+    build_path(arg)
+    if not ramfs_exists(&path_buf[0]):
+        term_puts("\ncut: file not found\n")
+        return
+    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
+    term_putc('\n')
+    while i < sz:
+        if read_buf[i] == 10:
+            term_putc('\n')
+            cnt = 0
+        else:
+            if cnt < 20:
+                term_putc(cast[char](read_buf[i]))
+            cnt = cnt + 1
+        i = i + 1
+
+def cmd_wc():
+    """wc <file> - word/line/char count"""
+    arg: Ptr[char] = cmd_get_arg()
+    sz: int32 = 0
+    lines: int32 = 0
+    words: int32 = 0
+    in_word: bool = False
+    i: int32 = 0
+    c: int32 = 0
+
+    if arg[0] == '\0':
+        term_puts("\nUsage: wc <file>\n")
+        return
+    build_path(arg)
+    if not ramfs_exists(&path_buf[0]):
+        term_puts("\nwc: file not found\n")
+        return
+    sz = ramfs_read(&path_buf[0], &read_buf[0], 512)
+    while i < sz:
+        c = cast[int32](read_buf[i])
+        if c == 10:
+            lines = lines + 1
+        if c == 32 or c == 10 or c == 9:
+            if in_word:
+                words = words + 1
+                in_word = False
+        else:
+            in_word = True
+        i = i + 1
+    if in_word:
+        words = words + 1
+    term_putc('\n')
+    term_puts(int_to_str(lines))
+    term_putc(' ')
+    term_puts(int_to_str(words))
+    term_putc(' ')
+    term_puts(int_to_str(sz))
+    term_putc(' ')
+    term_puts(arg)
+    term_putc('\n')
+
+def exec_text_cmd(cmd: Ptr[char]) -> bool:
+    """Handle text processing commands. Returns True if handled."""
+    if cmd_starts_with("grep"):
+        cmd_grep()
+        return True
+    if cmd_starts_with("sort"):
+        cmd_sort()
+        return True
+    if cmd_starts_with("uniq"):
+        cmd_uniq()
+        return True
+    if cmd_starts_with("tr"):
+        cmd_tr()
+        return True
+    if cmd_starts_with("tac"):
+        cmd_tac()
+        return True
+    if cmd_starts_with("fold"):
+        cmd_fold()
+        return True
+    if cmd_starts_with("cut"):
+        cmd_cut()
+        return True
+    if cmd_starts_with("wc"):
+        cmd_wc()
+        return True
+    return False
+
+# ============================================================================
 # Command execution
 # ============================================================================
 
@@ -1122,129 +1498,101 @@ def exec_cmd():
     elif strcmp(cmd, "truncate") == 0:
         term_puts("\ntruncate: not implemented\n")
 
-    # ========================================================================
-    # Text processing commands
-    # ========================================================================
+    # Text processing commands (in separate function to avoid branch offset limits)
+    elif exec_text_cmd(cmd):
+        pass  # Handled by exec_text_cmd
 
+    # Simple text commands that fit here
     elif cmd_starts_with("cal"):
-        # cal - display calendar (January 2025)
-        term_puts("\n    January 2025\nSu Mo Tu We Th Fr Sa\n")
-        term_puts("          1  2  3  4\n")
-        term_puts(" 5  6  7  8  9 10 11\n")
-        term_puts("12 13 14 15 16 17 18\n")
-        term_puts("19 20 21 22 23 24 25\n")
-        term_puts("26 27 28 29 30 31\n")
+        term_puts("\n    January 2025\nSu Mo Tu We Th Fr Sa\n          1  2  3  4\n 5  6  7  8  9 10 11\n12 13 14 15 16 17 18\n19 20 21 22 23 24 25\n26 27 28 29 30 31\n")
 
     elif cmd_starts_with("rev"):
-        # rev <file> - reverse characters in each line
-        arg_rev: Ptr[char] = cmd_get_arg()
-        if arg_rev[0] == '\0':
+        arg_rv: Ptr[char] = cmd_get_arg()
+        if arg_rv[0] == '\0':
             term_puts("\nUsage: rev <file>\n")
         else:
-            build_path(arg_rev)
+            build_path(arg_rv)
             if not ramfs_exists(&path_buf[0]):
                 term_puts("\nrev: file not found\n")
             else:
-                sz_rev: int32 = ramfs_read(&path_buf[0], &read_buf[0], 512)
+                szr: int32 = ramfs_read(&path_buf[0], &read_buf[0], 512)
                 term_putc('\n')
-                ls_r: int32 = 0
-                i_rev: int32 = 0
-                j_rev: int32 = 0
-                while i_rev <= sz_rev:
-                    if i_rev == sz_rev or read_buf[i_rev] == 10:
-                        j_rev = i_rev - 1
-                        while j_rev >= ls_r:
-                            term_putc(cast[char](read_buf[j_rev]))
-                            j_rev = j_rev - 1
+                lsr: int32 = 0
+                ir: int32 = 0
+                jr: int32 = 0
+                while ir <= szr:
+                    if ir == szr or read_buf[ir] == 10:
+                        jr = ir - 1
+                        while jr >= lsr:
+                            term_putc(cast[char](read_buf[jr]))
+                            jr = jr - 1
                         term_putc('\n')
-                        ls_r = i_rev + 1
-                    i_rev = i_rev + 1
-
-    elif cmd_starts_with("tac"):
-        # tac - reverse file (stub)
-        term_puts("\ntac: use rev for line reversal\n")
+                        lsr = ir + 1
+                    ir = ir + 1
 
     elif cmd_starts_with("nl"):
-        # nl <file> - number lines
-        arg_nl: Ptr[char] = cmd_get_arg()
-        if arg_nl[0] == '\0':
+        arg_n: Ptr[char] = cmd_get_arg()
+        if arg_n[0] == '\0':
             term_puts("\nUsage: nl <file>\n")
         else:
-            build_path(arg_nl)
+            build_path(arg_n)
             if not ramfs_exists(&path_buf[0]):
                 term_puts("\nnl: file not found\n")
             else:
-                sz_nl: int32 = ramfs_read(&path_buf[0], &read_buf[0], 512)
+                szn: int32 = ramfs_read(&path_buf[0], &read_buf[0], 512)
                 term_putc('\n')
-                ln: int32 = 1
-                term_puts(int_to_str(ln))
+                lnn: int32 = 1
+                term_puts(int_to_str(lnn))
                 term_putc('\t')
-                i_nl: int32 = 0
-                while i_nl < sz_nl:
-                    if read_buf[i_nl] == 10:
+                inn: int32 = 0
+                while inn < szn:
+                    if read_buf[inn] == 10:
                         term_putc('\n')
-                        ln = ln + 1
-                        if i_nl < sz_nl - 1:
-                            term_puts(int_to_str(ln))
+                        lnn = lnn + 1
+                        if inn < szn - 1:
+                            term_puts(int_to_str(lnn))
                             term_putc('\t')
                     else:
-                        term_putc(cast[char](read_buf[i_nl]))
-                    i_nl = i_nl + 1
-
-    elif cmd_starts_with("grep"):
-        # grep <pattern> <file>
-        term_puts("\ngrep: use cat and visual search\n")
-
-    elif cmd_starts_with("sort"):
-        # sort - alphabetical sort (stub)
-        term_puts("\nsort: not implemented\n")
-
-    elif cmd_starts_with("uniq"):
-        # uniq - filter duplicates (stub)
-        term_puts("\nuniq: not implemented\n")
-
-    elif cmd_starts_with("tr"):
-        # tr - translate (stub)
-        term_puts("\ntr: not implemented\n")
+                        term_putc(cast[char](read_buf[inn]))
+                    inn = inn + 1
 
     elif cmd_starts_with("xxd"):
-        # xxd <file> - hex dump
-        arg_xxd: Ptr[char] = cmd_get_arg()
-        if arg_xxd[0] == '\0':
+        arg_x: Ptr[char] = cmd_get_arg()
+        if arg_x[0] == '\0':
             term_puts("\nUsage: xxd <file>\n")
         else:
-            build_path(arg_xxd)
+            build_path(arg_x)
             if not ramfs_exists(&path_buf[0]):
                 term_puts("\nxxd: file not found\n")
             else:
-                sz_xxd: int32 = ramfs_read(&path_buf[0], &read_buf[0], 128)
+                szx: int32 = ramfs_read(&path_buf[0], &read_buf[0], 128)
                 term_putc('\n')
-                hx: Ptr[char] = "0123456789abcdef"
-                i_x: int32 = 0
-                j_x: int32 = 0
-                b_x: int32 = 0
-                while i_x < sz_xxd:
-                    term_putc(hx[(i_x >> 4) & 15])
-                    term_putc(hx[i_x & 15])
+                hxc: Ptr[char] = "0123456789abcdef"
+                ix: int32 = 0
+                jx: int32 = 0
+                bx: int32 = 0
+                while ix < szx:
+                    term_putc(hxc[(ix >> 4) & 15])
+                    term_putc(hxc[ix & 15])
                     term_puts(": ")
-                    j_x = 0
-                    while j_x < 8 and i_x + j_x < sz_xxd:
-                        b_x = cast[int32](read_buf[i_x + j_x])
-                        term_putc(hx[(b_x >> 4) & 15])
-                        term_putc(hx[b_x & 15])
+                    jx = 0
+                    while jx < 8 and ix + jx < szx:
+                        bx = cast[int32](read_buf[ix + jx])
+                        term_putc(hxc[(bx >> 4) & 15])
+                        term_putc(hxc[bx & 15])
                         term_putc(' ')
-                        j_x = j_x + 1
+                        jx = jx + 1
                     term_putc(' ')
-                    j_x = 0
-                    while j_x < 8 and i_x + j_x < sz_xxd:
-                        b_x = cast[int32](read_buf[i_x + j_x])
-                        if b_x >= 32 and b_x < 127:
-                            term_putc(cast[char](b_x))
+                    jx = 0
+                    while jx < 8 and ix + jx < szx:
+                        bx = cast[int32](read_buf[ix + jx])
+                        if bx >= 32 and bx < 127:
+                            term_putc(cast[char](bx))
                         else:
                             term_putc('.')
-                        j_x = j_x + 1
+                        jx = jx + 1
                     term_putc('\n')
-                    i_x = i_x + 8
+                    ix = ix + 8
 
     else:
         term_puts("\nUnknown command: ")
