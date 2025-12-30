@@ -24,6 +24,10 @@ def heap_init():
 
 # Allocate memory (returns null on failure)
 def alloc(size: int32) -> Ptr[uint8]:
+    global heap_ptr
+
+    state: int32 = critical_enter()
+
     if not heap_initialized:
         heap_init()
 
@@ -32,6 +36,7 @@ def alloc(size: int32) -> Ptr[uint8]:
     total: int32 = aligned + HEADER_SIZE
 
     if heap_ptr + total > heap_end:
+        critical_exit(state)
         return Ptr[uint8](0)  # Out of memory
 
     # Write header (size)
@@ -43,6 +48,7 @@ def alloc(size: int32) -> Ptr[uint8]:
     result: Ptr[uint8] = cast[Ptr[uint8]](heap_ptr + HEADER_SIZE)
     heap_ptr = heap_ptr + total
 
+    critical_exit(state)
     return result
 
 # Allocate zeroed memory
@@ -55,20 +61,25 @@ def calloc(count: int32, size: int32) -> Ptr[uint8]:
 
 # Free memory (currently a no-op - bump allocator doesn't free)
 def free(ptr: Ptr[uint8]):
+    state: int32 = critical_enter()
     # For a real implementation, mark block as free
     # and coalesce with neighbors
-    pass
+    critical_exit(state)
 
 # Reallocate (allocate new + copy)
 def realloc(ptr: Ptr[uint8], new_size: int32) -> Ptr[uint8]:
     if cast[uint32](ptr) == 0:
         return alloc(new_size)
 
+    state: int32 = critical_enter()
+
     # Get old size from header
     header: Ptr[int32] = cast[Ptr[int32]](cast[uint32](ptr) - HEADER_SIZE)
     old_size: int32 = header[0] - HEADER_SIZE
 
-    # Allocate new block
+    critical_exit(state)
+
+    # Allocate new block (alloc has its own critical section)
     new_ptr: Ptr[uint8] = alloc(new_size)
     if cast[uint32](new_ptr) == 0:
         return Ptr[uint8](0)

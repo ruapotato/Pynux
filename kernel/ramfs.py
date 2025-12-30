@@ -32,6 +32,8 @@ root_fd: int32 = 0
 def ramfs_init():
     global fs_initialized, root_fd
 
+    state: int32 = critical_enter()
+
     # Clear all entries
     i: int32 = 0
     while i < MAX_FILES:
@@ -49,6 +51,8 @@ def ramfs_init():
     root_fd = 0
 
     fs_initialized = True
+
+    critical_exit(state)
 
 # Find a free file entry
 def ramfs_alloc_entry() -> int32:
@@ -121,6 +125,150 @@ def ramfs_lookup(path: Ptr[char]) -> int32:
 
 # Create file or directory
 def ramfs_create(path: Ptr[char], is_dir: bool) -> int32:
+    state: int32 = critical_enter()
+
+    # Check if already exists
+    if ramfs_lookup(path) >= 0:
+        critical_exit(state)
+        return -1  # Already exists
+
+    # Find parent directory
+    parent_fd: int32 = root_fd
+    name_start: int32 = 0
+
+    # Find last slash to get parent path and filename
+    last_slash: Ptr[char] = strrchr(path, '/')
+    if last_slash != Ptr[char](0):
+        # Has directory component
+        slash_pos: int32 = cast[int32](last_slash) - cast[int32](path)
+        if slash_pos > 0:
+            # Extract parent path
+            parent_path: Array[128, char]
+            i: int32 = 0
+            while i < slash_pos:
+                parent_path[i] = path[i]
+                i = i + 1
+            parent_path[i] = '\0'
+            parent_fd = ramfs_lookup(&parent_path[0])
+            if parent_fd < 0:
+                critical_exit(state)
+                return -1  # Parent not found
+        name_start = slash_pos + 1
+    else:
+        name_start = 0
+
+    # Allocate entry
+    fd: int32 = ramfs_alloc_entry()
+    if fd < 0:
+        critical_exit(state)
+        return -1  # No space
+
+    # Set up entry
+    if is_dir:
+        file_types[fd] = FTYPE_DIR
+    else:
+        file_types[fd] = FTYPE_FILE
+
+    # Copy name
+    i: int32 = 0
+    while path[name_start + i] != '\0' and i < MAX_NAME - 1:
+        file_names[fd][i] = path[name_start + i]
+        i = i + 1
+    file_names[fd][i] = '\0'
+
+    file_parents[fd] = parent_fd
+    file_sizes[fd] = 0
+    file_data[fd] = Ptr[uint8](0)
+
+    critical_exit(state)
+    return fd
+
+# Delete file
+def ramfs_delete(path: Ptr[char]) -> int32:
+    state: int32 = critical_enter()
+
+    fd: int32 = ramfs_lookup(path)
+    if fd < 0:
+        critical_exit(state)
+        return -1
+
+    if fd == root_fd:
+        critical_exit(state)
+        return -1  # Can't delete root
+
+    # Check if directory is empty
+    if file_types[fd] == FTYPE_DIR:
+        i: int32 = 0
+        while i < MAX_FILES:
+            if file_types[i] != FTYPE_FREE and file_parents[i] == fd:
+                critical_exit(state)
+                return -1  # Not empty
+            i = i + 1
+
+    # Free data if any
+    if file_data[fd] != Ptr[uint8](0):
+        free(file_data[fd])
+
+    file_types[fd] = FTYPE_FREE
+
+    critical_exit(state)
+    return 0
+
+# Read file contents
+def ramfs_read(path: Ptr[char], buf: Ptr[uint8], count: int32) -> int32:
+    fd: int32 = ramfs_lookup(path)
+    if fd < 0:
+        return -1
+
+    if file_types[fd] != FTYPE_FILE:
+        return -1
+
+    size: int32 = file_sizes[fd]
+    if count > size:
+        count = size
+
+    if count > 0 and file_data[fd] != Ptr[uint8](0):
+        memcpy(buf, file_data[fd], count)
+
+    return count
+
+# Write to file
+def ramfs_write(path: Ptr[char], data: Ptr[char]) -> int32:
+    state: int32 = critical_enter()
+
+    fd: int32 = ramfs_lookup(path)
+    if fd < 0:
+        # Create file
+        fd = ramfs_create_internal(path)
+        if fd < 0:
+            critical_exit(state)
+            return -1
+
+    if file_types[fd] != FTYPE_FILE:
+        critical_exit(state)
+        return -1
+
+    # Calculate data length
+    length: int32 = strlen(data)
+    if length > MAX_FILE_SIZE:
+        length = MAX_FILE_SIZE
+
+    # Allocate/reallocate buffer
+    if file_data[fd] == Ptr[uint8](0):
+        file_data[fd] = alloc(MAX_FILE_SIZE)
+    if file_data[fd] == Ptr[uint8](0):
+        critical_exit(state)
+        return -1
+
+    # Copy data
+    memcpy(file_data[fd], cast[Ptr[uint8]](data), length)
+    file_sizes[fd] = length
+
+    critical_exit(state)
+    return length
+
+# Internal create without critical section (called from within critical section)
+def ramfs_create_internal(path: Ptr[char]) -> int32:
     # Check if already exists
     if ramfs_lookup(path) >= 0:
         return -1  # Already exists
@@ -154,11 +302,8 @@ def ramfs_create(path: Ptr[char], is_dir: bool) -> int32:
     if fd < 0:
         return -1  # No space
 
-    # Set up entry
-    if is_dir:
-        file_types[fd] = FTYPE_DIR
-    else:
-        file_types[fd] = FTYPE_FILE
+    # Set up entry as file
+    file_types[fd] = FTYPE_FILE
 
     # Copy name
     i: int32 = 0
@@ -173,84 +318,17 @@ def ramfs_create(path: Ptr[char], is_dir: bool) -> int32:
 
     return fd
 
-# Delete file
-def ramfs_delete(path: Ptr[char]) -> int32:
-    fd: int32 = ramfs_lookup(path)
-    if fd < 0:
-        return -1
-
-    if fd == root_fd:
-        return -1  # Can't delete root
-
-    # Check if directory is empty
-    if file_types[fd] == FTYPE_DIR:
-        i: int32 = 0
-        while i < MAX_FILES:
-            if file_types[i] != FTYPE_FREE and file_parents[i] == fd:
-                return -1  # Not empty
-            i = i + 1
-
-    # Free data if any
-    if file_data[fd] != Ptr[uint8](0):
-        free(file_data[fd])
-
-    file_types[fd] = FTYPE_FREE
-    return 0
-
-# Read file contents
-def ramfs_read(path: Ptr[char], buf: Ptr[uint8], count: int32) -> int32:
-    fd: int32 = ramfs_lookup(path)
-    if fd < 0:
-        return -1
-
-    if file_types[fd] != FTYPE_FILE:
-        return -1
-
-    size: int32 = file_sizes[fd]
-    if count > size:
-        count = size
-
-    if count > 0 and file_data[fd] != Ptr[uint8](0):
-        memcpy(buf, file_data[fd], count)
-
-    return count
-
-# Write to file
-def ramfs_write(path: Ptr[char], data: Ptr[char]) -> int32:
-    fd: int32 = ramfs_lookup(path)
-    if fd < 0:
-        # Create file
-        fd = ramfs_create(path, False)
-        if fd < 0:
-            return -1
-
-    if file_types[fd] != FTYPE_FILE:
-        return -1
-
-    # Calculate data length
-    length: int32 = strlen(data)
-    if length > MAX_FILE_SIZE:
-        length = MAX_FILE_SIZE
-
-    # Allocate/reallocate buffer
-    if file_data[fd] == Ptr[uint8](0):
-        file_data[fd] = alloc(MAX_FILE_SIZE)
-    if file_data[fd] == Ptr[uint8](0):
-        return -1
-
-    # Copy data
-    memcpy(file_data[fd], cast[Ptr[uint8]](data), length)
-    file_sizes[fd] = length
-
-    return length
-
 # Append to file
 def ramfs_append(path: Ptr[char], data: Ptr[char]) -> int32:
+    state: int32 = critical_enter()
+
     fd: int32 = ramfs_lookup(path)
     if fd < 0:
+        critical_exit(state)
         return ramfs_write(path, data)
 
     if file_types[fd] != FTYPE_FILE:
+        critical_exit(state)
         return -1
 
     length: int32 = strlen(data)
@@ -260,17 +338,20 @@ def ramfs_append(path: Ptr[char], data: Ptr[char]) -> int32:
         length = MAX_FILE_SIZE - current_size
 
     if length <= 0:
+        critical_exit(state)
         return 0
 
     if file_data[fd] == Ptr[uint8](0):
         file_data[fd] = alloc(MAX_FILE_SIZE)
     if file_data[fd] == Ptr[uint8](0):
+        critical_exit(state)
         return -1
 
     # Append data
     memcpy(&file_data[fd][current_size], cast[Ptr[uint8]](data), length)
     file_sizes[fd] = current_size + length
 
+    critical_exit(state)
     return length
 
 # Get file size

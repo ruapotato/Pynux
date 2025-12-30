@@ -14,9 +14,9 @@ KERNEL_VERSION_MAJOR: int32 = 0
 KERNEL_VERSION_MINOR: int32 = 1
 KERNEL_VERSION_PATCH: int32 = 0
 
-# System state
-kernel_initialized: bool = False
-tick_count: int32 = 0
+# System state (volatile for potential interrupt access)
+kernel_initialized: volatile bool = False
+tick_count: volatile int32 = 0
 
 def kernel_banner():
     print_str("\n")
@@ -66,7 +66,7 @@ def kernel_init():
 
     # Create initial filesystem structure
     print_str("[kernel] Creating /dev... ")
-    ramfs_create("/dev", True)  # directory
+    ramfs_create("/dev", True)
     ramfs_create("/dev/null", False)
     ramfs_create("/dev/zero", False)
     ramfs_create("/dev/tty", False)
@@ -86,22 +86,43 @@ def kernel_init():
     ramfs_write("/etc/motd", "Welcome to Pynux!\n")
     print_str("OK\n")
 
+    # Mark initialization complete with proper synchronization
+    state: int32 = critical_enter()
     kernel_initialized = True
+    critical_exit(state)
+
+    # Memory barrier to ensure all init writes are visible
+    dsb()
+
     print_str("[kernel] Initialization complete.\n\n")
 
 def kernel_panic(msg: Ptr[char]):
+    # Disable interrupts during panic
+    state: int32 = critical_enter()
+
     print_str("\n*** KERNEL PANIC ***\n")
     print_str(msg)
     print_str("\nSystem halted.\n")
+
+    # Memory barrier before halt
+    dsb()
+
     while True:
-        pass  # Halt
+        pass  # Halt (interrupts remain disabled)
 
 def kernel_uptime() -> int32:
-    return tick_count
+    # Read volatile tick_count with critical section
+    state: int32 = critical_enter()
+    ticks: int32 = tick_count
+    critical_exit(state)
+    return ticks
 
 def kernel_tick():
     global tick_count
+    # Update tick count in critical section
+    state: int32 = critical_enter()
     tick_count = tick_count + 1
+    critical_exit(state)
 
 # Main entry point
 def main() -> int32:

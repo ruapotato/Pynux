@@ -1,15 +1,43 @@
 # Pynux I/O Library
 #
-# Basic I/O primitives for bare-metal ARM.
+# Basic I/O primitives for bare-metal ARM Cortex-M3.
 # Talks directly to UART for console I/O.
+
+# UART register base address
+UART_BASE: uint32 = 0x40004000
+
+# UART register offsets
+UART_DATA_OFFSET: uint32 = 0x00
+UART_STATUS_OFFSET: uint32 = 0x04
+UART_CTRL_OFFSET: uint32 = 0x08
+
+# UART status register bits
+UART_STATUS_TX_FULL: uint32 = 0x01
+UART_STATUS_RX_EMPTY: uint32 = 0x02
+
+# Volatile pointers for direct UART register access (hardware I/O)
+UART_DATA: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](UART_BASE)
+UART_STATUS: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](UART_BASE + 4)
+UART_CTRL: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](UART_BASE + 8)
 
 # These are implemented in runtime/io.s
 extern def uart_init()
-extern def uart_putc(c: char)
 extern def print_str(s: str)
 extern def print_int(n: int32)
 extern def print_hex(n: uint32)
 extern def print_newline()
+
+# Low-level UART character output using volatile register access
+def uart_putc(c: char):
+    # Wait until TX FIFO is not full
+    while (*UART_STATUS & UART_STATUS_TX_FULL) != 0:
+        pass
+    # Memory barrier before write to ensure ordering
+    dmb()
+    # Write character to data register
+    *UART_DATA = cast[uint32](c)
+    # Memory barrier after write
+    dmb()
 
 # Print a character
 def putc(c: char):
@@ -37,11 +65,24 @@ def printf(fmt: Ptr[char], arg: int32):
             uart_putc(c)
             i = i + 1
 
-# Read a character from UART (blocking)
-extern def uart_getc() -> char
+# Low-level UART character input using volatile register access
+def uart_getc() -> char:
+    # Wait until RX FIFO is not empty
+    while (*UART_STATUS & UART_STATUS_RX_EMPTY) != 0:
+        pass
+    # Memory barrier before read
+    dmb()
+    # Read character from data register
+    c: char = cast[char](*UART_DATA & 0xFF)
+    # Memory barrier after read
+    dmb()
+    return c
 
-# Check if character available
-extern def uart_available() -> bool
+# Check if character available (non-blocking)
+def uart_available() -> bool:
+    # Memory barrier to ensure fresh read
+    dmb()
+    return (*UART_STATUS & UART_STATUS_RX_EMPTY) == 0
 
 # Simple input buffer for reading lines
 INPUT_BUF_SIZE: int32 = 256
