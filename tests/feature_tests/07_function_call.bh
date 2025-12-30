@@ -1,7 +1,0 @@
-# Test 07: Function calls
-def helper():
-    print("In helper\n")
-
-def main():
-    helper()
-    print("Function call works\n")

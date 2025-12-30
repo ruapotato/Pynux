@@ -1,6 +1,0 @@
-# Test 03: Arithmetic operations
-def main():
-    x = 1 + 2
-    y = 10 - 3
-    z = 4 * 5
-    print("Arithmetic works\n")

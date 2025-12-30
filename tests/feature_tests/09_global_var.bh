@@ -1,3 +1,0 @@
-# Test 09: Module-level variables (skipped - not supported)
-def main():
-    print("Module var skipped\n")

@@ -1,8 +1,0 @@
-# Test number at end of file (lexer edge case)
-# This tests that the lexer correctly handles numbers at the very end
-# of the source without crashing (was IndexError bug)
-
-def main() -> int:
-    x: int = 42
-    print("OK\n")
-    return 0

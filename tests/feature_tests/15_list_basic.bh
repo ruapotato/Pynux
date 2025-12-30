@@ -1,4 +1,0 @@
-# Test 15: Basic list literal
-def main():
-    # Avoid dynamic append for now - just test list exists
-    print("List test skipped\n")

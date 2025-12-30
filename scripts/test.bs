@@ -1,6 +1,0 @@
-# Test brainscript
-# This is a comment
-
-echo Hello from brainscript!
-pwd
-echo Done with test

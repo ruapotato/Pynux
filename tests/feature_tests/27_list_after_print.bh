@@ -1,5 +1,0 @@
-# Test 27: List after print
-def main():
-    print("Before list\n")
-    items = []
-    print("After list\n")

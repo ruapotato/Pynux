@@ -1,6 +1,0 @@
-# Test 05: While loop
-def main():
-    i = 0
-    while i < 3:
-        i = i + 1
-    print("While works\n")

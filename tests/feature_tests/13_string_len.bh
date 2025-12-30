@@ -1,8 +1,0 @@
-# Test 13: String length
-def main():
-    s = "hello"
-    n = len(s)
-    if n == 5:
-        print("String len works\n")
-    else:
-        print("String len broken\n")

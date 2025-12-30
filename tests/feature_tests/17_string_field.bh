@@ -1,8 +1,0 @@
-# Test 17: Class with string field
-class Named:
-    def __init__(self, name: str):
-        self.name = name
-
-def main():
-    n = Named("test")
-    print("String field works\n")

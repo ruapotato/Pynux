@@ -1,9 +1,0 @@
-# Test 01: Basic I/O
-# Tests: print_int, println
-# Expected output: 42
-from lib.syscalls import *
-
-def main() -> int32:
-    print_int(42)
-    println("")
-    return 0

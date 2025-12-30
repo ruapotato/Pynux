@@ -1,7 +1,0 @@
-# Test import with alias
-import "lib/math" as m
-
-proc main(): int32 =
-    # The alias is just informational for now
-    # Functions are still accessed directly
-    return multiply(6, 7)

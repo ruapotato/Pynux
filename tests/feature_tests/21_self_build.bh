@@ -1,5 +1,0 @@
-# Test 21: Self-build test placeholder
-# This test is run separately - compile brainhair.bh with self-hosted compiler
-def main():
-    print("Self-build test requires running: ./bhc brainhair.bh -o bhc2\n")
-    print("Then: ./bhc2 test.bh -o test_out\n")

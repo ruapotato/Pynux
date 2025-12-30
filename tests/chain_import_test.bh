@@ -1,6 +1,0 @@
-# Test chained imports - geometry imports math
-import "lib/geometry"
-
-proc main(): int32 =
-    # distance_squared(3, 4) = 9 + 16 = 25
-    return distance_squared(3, 4)

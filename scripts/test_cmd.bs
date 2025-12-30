@@ -1,4 +1,0 @@
-# Test external command execution
-echo Running ls...
-ls userland/*.bh | head
-echo Done

@@ -1,7 +1,0 @@
-# Test 04: If statement
-def main():
-    x = 1
-    if x == 1:
-        print("If works\n")
-    else:
-        print("If broken\n")

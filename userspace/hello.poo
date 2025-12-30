@@ -1,6 +1,0 @@
-#!/bin/pooscript
-# Hello World in PooScript
-
-echo "Hello from BrainhairOS!"
-echo "This is native compiled code"
-pwd

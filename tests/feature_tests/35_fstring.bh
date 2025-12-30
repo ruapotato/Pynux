@@ -1,6 +1,0 @@
-# Test 35: F-string formatting
-def main():
-    x: int32 = 42
-    name: str = "test"
-    print(f"Value: {x}\n")
-    print("Done\n")

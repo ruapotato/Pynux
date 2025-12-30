@@ -1,5 +1,0 @@
-# Test 02: Variable assignment
-def main():
-    x = 42
-    y = 100
-    print("Variables work\n")

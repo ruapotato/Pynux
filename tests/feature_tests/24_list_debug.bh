@@ -1,9 +1,0 @@
-# Test 24: List with debug output
-from lib.memory import alloc
-
-def main():
-    print("Before alloc\n")
-
-    ptr: Ptr[int32] = alloc(16)
-
-    print("After alloc\n")

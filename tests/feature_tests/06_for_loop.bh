@@ -1,6 +1,0 @@
-# Test 06: For loop with range
-def main():
-    total = 0
-    for i in range(5):
-        total = total + 1
-    print("For works\n")

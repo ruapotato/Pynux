@@ -1,8 +1,0 @@
-echo "=== FINAL COMPREHENSIVE TEST ==="
-nmap 192.168.1.0/24
-nmap 192.168.5.100
-lynx bbs.cyberspace.net
-curl http://underground.bbs/
-curl http://cybermart.com/
-curl news.poo
-exit

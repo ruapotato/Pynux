@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pynux"
+version = "0.1.0"
+description = "GNU for microcontrollers - Python syntax, native ARM"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.10"
+authors = [
+    {name = "David Hamner"}
+]
+keywords = ["compiler", "arm", "microcontroller", "embedded", "pico"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Software Development :: Embedded Systems",
+]
+
+[project.scripts]
+pynux = "compiler.pynux:main"
+
+[project.urls]
+Homepage = "https://github.com/ruapotato/Pynux"
+Repository = "https://github.com/ruapotato/Pynux.git"
+
+[tool.setuptools.packages.find]
+include = ["compiler*", "lib*"]

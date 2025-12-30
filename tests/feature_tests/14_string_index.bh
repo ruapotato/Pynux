@@ -1,7 +1,0 @@
-# Test 14: String indexing
-def main():
-    s = "abc"
-    # Get first char (as byte)
-    c = s[0]
-    # Just print that we got here without crashing
-    print("String index works\n")

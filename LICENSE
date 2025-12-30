@@ -1,7 +1,7 @@
 GNU GENERAL PUBLIC LICENSE
 Version 3, 29 June 2007
 
-Copyright (C) 2024 BrainhairOS Contributors
+Copyright (C) 2024-2025 Pynux Contributors
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -20,12 +20,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 Full GPL3 License Text: https://www.gnu.org/licenses/gpl-3.0.txt
 
-BrainhairOS - A Unix-like Operating System
-===========================================
+Pynux - GNU for Microcontrollers
+================================
 
-This project includes:
-- PooScript compiler (poocc) - Compiles PooScript to C
-- BrainhairOS kernel and userspace components
-- Brainhair 2 game (archived in game/ directory)
+Python syntax. Native ARM. Run coreutils on a $4 Pico.
 
 All code is licensed under GPL3 unless otherwise noted.
