@@ -53,7 +53,7 @@ SELECT_B: int32 = 150
 WIN_TITLE_H: int32 = 20
 MENU_H: int32 = 24
 STATUS_H: int32 = 20
-CHAR_W: int32 = 8
+CHAR_W: int32 = 10  # Match pygame monospace 16pt font width
 CHAR_H: int32 = 16
 
 # ============================================================================
@@ -97,14 +97,14 @@ status_dirty: bool = False
 # ============================================================================
 
 # Terminal dimensions (in chars)
-TERM_COLS: int32 = 80
+TERM_COLS: int32 = 70  # Reduced to fit with 10px char width
 TERM_ROWS: int32 = 20
 TERM_SCROLL: int32 = 100
 
 # Terminal buffers - one per possible terminal window
-# Each terminal gets 100 lines * 80 chars = 8000 bytes
-term_buf0: Array[8000, char]
-term_buf1: Array[8000, char]
+# Each terminal gets 100 lines * 70 chars = 7000 bytes
+term_buf0: Array[7000, char]
+term_buf1: Array[7000, char]
 
 # Line dirty flags
 term_dirty0: Array[100, bool]
@@ -418,10 +418,17 @@ def cmd_cd(idx: int32):
                 cwd[i] = '\0'
         return
     build_path(cwd, arg)
-    if ramfs_exists(&path_buf[0]) and ramfs_isdir(&path_buf[0]):
-        strcpy(cwd, &path_buf[0])
+    term_puts_idx(idx, "\nChecking: ")
+    term_puts_idx(idx, &path_buf[0])
+    if ramfs_exists(&path_buf[0]):
+        term_puts_idx(idx, " [exists]")
+        if ramfs_isdir(&path_buf[0]):
+            term_puts_idx(idx, " [isdir]")
+            strcpy(cwd, &path_buf[0])
+        else:
+            term_puts_idx(idx, " [not dir]")
     else:
-        term_puts_idx(idx, "\nNo such directory\n")
+        term_puts_idx(idx, " [not found]")
 
 def cmd_cat(idx: int32):
     cwd: Ptr[char] = term_get_cwd(idx)
@@ -839,10 +846,10 @@ def draw_terminal_content(idx: int32):
             vtn_clear_rect(x, y + row * CHAR_H, win_w[idx] - 8, CHAR_H, TERM_BG_R, TERM_BG_G, TERM_BG_B)
             # Copy to buffer and null-terminate
             j: int32 = 0
-            while j < TERM_COLS and j < 80:
+            while j < TERM_COLS:
                 line_buf[j] = ptr[j]
                 j = j + 1
-            line_buf[j] = '\0'
+            line_buf[TERM_COLS] = '\0'
             vtn_textline(&line_buf[0], x, y + row * CHAR_H, TEXT_R, TEXT_G, TEXT_B)
             dirty[line] = False
         row = row + 1
@@ -948,13 +955,31 @@ def draw_window(idx: int32):
         draw_files_content(idx)
     win_dirty[idx] = False
 
+def mark_term_dirty(idx: int32):
+    """Mark all visible terminal lines as dirty."""
+    if win_type[idx] != WIN_TERMINAL:
+        return
+    dirty: Ptr[bool] = term_get_dirty(idx)
+    scr: int32 = term_scroll[idx]
+    i: int32 = 0
+    while i < TERM_ROWS:
+        dirty[scr + i] = True
+        i = i + 1
+
 def de_draw():
     global needs_full_redraw, menu_dirty, status_dirty
     if needs_full_redraw:
         vtn_clear(BG_R, BG_G, BG_B, 255)
         draw_menu()
         draw_status()
+        # Mark all terminal windows dirty before drawing
         i: int32 = 0
+        while i < win_count:
+            if win_visible[i] and win_type[i] == WIN_TERMINAL:
+                mark_term_dirty(i)
+            i = i + 1
+        # Now draw all windows
+        i = 0
         while i < win_count:
             if win_visible[i]:
                 draw_window(i)
@@ -974,6 +999,9 @@ def de_draw():
     i: int32 = 0
     while i < win_count:
         if win_dirty[i] and win_visible[i]:
+            # For terminals, ensure all visible lines are marked dirty
+            if win_type[i] == WIN_TERMINAL:
+                mark_term_dirty(i)
             draw_window(i)
         i = i + 1
 
