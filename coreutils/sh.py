@@ -6,6 +6,8 @@
 from lib.io import print_str, print_int, print_newline, uart_putc, uart_getc
 from lib.string import strcmp, strlen, strcpy, strncpy, isspace, strcat, atoi
 from lib.memory import alloc, memset
+from lib.vtnext import vtn_init, vtn_clear, vtn_rect, vtn_circle, vtn_line
+from lib.vtnext import vtn_text, vtn_print, vtn_present, vtn_flush
 from kernel.ramfs import ramfs_init, ramfs_create, ramfs_delete, ramfs_write
 from kernel.ramfs import ramfs_read, ramfs_exists, ramfs_isdir, ramfs_size
 from kernel.ramfs import ramfs_readdir, ramfs_lookup
@@ -119,6 +121,7 @@ def cmd_help():
     print_str("  version   - Show version\n")
     print_str("  exit      - Exit shell\n")
     print_str("  demo      - Run demo\n")
+    print_str("  vtnext    - VTNext graphics demo\n")
     print_str("  calc      - Simple calculator\n")
     print_str("\nFilesystem:\n")
     print_str("  ls [dir]  - List directory\n")
@@ -185,6 +188,40 @@ def cmd_demo():
     print_newline()
 
     print_str("\n=== Demo Complete ===\n")
+
+def cmd_vtnext():
+    print_str("VTNext Graphics Demo\n")
+    print_str("(Pipe output to vtnext/renderer.py)\n\n")
+
+    # Initialize VTNext
+    vtn_init(800, 600)
+
+    # Clear to dark blue
+    vtn_clear(20, 40, 80, 255)
+
+    # Draw some rectangles
+    vtn_rect(50, 50, 200, 150, 255, 100, 100, 255)
+    vtn_rect(300, 100, 150, 100, 100, 255, 100, 255)
+    vtn_rect(500, 50, 100, 200, 100, 100, 255, 255)
+
+    # Draw circles
+    vtn_circle(150, 400, 80, 255, 255, 0, 255)
+    vtn_circle(400, 400, 60, 0, 255, 255, 255)
+    vtn_circle(600, 400, 100, 255, 0, 255, 255)
+
+    # Draw lines
+    vtn_line(50, 550, 750, 550, 3, 255, 255, 255, 255)
+    vtn_line(400, 300, 400, 500, 2, 200, 200, 200, 255)
+
+    # Draw text
+    vtn_text("Pynux VTNext Demo", 250, 20, 2, 255, 255, 255, 255)
+    vtn_print("Shapes and colors!", 300, 520)
+
+    # Present the frame
+    vtn_present()
+    vtn_flush()
+
+    print_str("Graphics sent!\n")
 
 def cmd_calc(argc: int32):
     if argc < 4:
@@ -465,6 +502,8 @@ def execute(argc: int32) -> int32:
         running = False
     elif strcmp(cmd, "demo") == 0:
         cmd_demo()
+    elif strcmp(cmd, "vtnext") == 0:
+        cmd_vtnext()
     elif strcmp(cmd, "calc") == 0:
         cmd_calc(argc)
     # Filesystem commands
