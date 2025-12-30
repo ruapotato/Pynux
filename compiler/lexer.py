@@ -52,6 +52,10 @@ class TokenType(Enum):
     DEFER = auto()
     MATCH = auto()
     CASE = auto()
+    VOLATILE = auto()
+    PACKED = auto()
+    UNION = auto()
+    INTERRUPT = auto()
 
     # Types
     PTR = auto()
@@ -209,6 +213,10 @@ KEYWORDS: dict[str, TokenType] = {
     "defer": TokenType.DEFER,
     "match": TokenType.MATCH,
     "case": TokenType.CASE,
+    "volatile": TokenType.VOLATILE,
+    "packed": TokenType.PACKED,
+    "union": TokenType.UNION,
+    "interrupt": TokenType.INTERRUPT,
 
     # Type keywords
     "Ptr": TokenType.PTR,

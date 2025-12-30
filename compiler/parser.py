@@ -84,6 +84,11 @@ class Parser:
         """Parse a type annotation."""
         tok = self.current()
 
+        # Volatile type modifier: volatile int32
+        if self.match(TokenType.VOLATILE):
+            inner = self.parse_type()
+            return VolatileType(inner, self.make_span(tok))
+
         # Pointer type: Ptr[T]
         if self.match(TokenType.PTR):
             self.expect(TokenType.LBRACKET)
@@ -406,6 +411,28 @@ class Parser:
                     expr = MethodCallExpr(expr, name, args)
                 else:
                     expr = MemberExpr(expr, name)
+
+            elif self.match(TokenType.LBRACE):
+                # Struct initialization: Point{x=10, y=20}
+                if isinstance(expr, Identifier):
+                    fields = {}
+                    if not self.check(TokenType.RBRACE):
+                        # Parse field=value pairs
+                        field_name = self.expect(TokenType.IDENT).value
+                        self.expect(TokenType.ASSIGN)
+                        field_value = self.parse_expression()
+                        fields[field_name] = field_value
+                        while self.match(TokenType.COMMA):
+                            if self.check(TokenType.RBRACE):
+                                break
+                            field_name = self.expect(TokenType.IDENT).value
+                            self.expect(TokenType.ASSIGN)
+                            field_value = self.parse_expression()
+                            fields[field_name] = field_value
+                    self.expect(TokenType.RBRACE)
+                    expr = StructInitExpr(expr.name, fields)
+                else:
+                    raise ParseError("Struct initialization requires identifier", self.current())
             else:
                 break
 
@@ -1027,6 +1054,47 @@ class Parser:
         self.expect(TokenType.DEDENT)
         return ClassDef(name, fields, methods, bases, decorators or [], self.make_span(tok))
 
+    def parse_union(self, decorators: list[str] = None) -> UnionDef:
+        """Parse a union definition - fields share the same memory.
+
+        union Register:
+            raw: uint32
+            bits: BitFields
+        """
+        tok = self.current()
+        self.expect(TokenType.UNION)
+        name = self.expect(TokenType.IDENT).value
+
+        self.expect(TokenType.COLON)
+        self.expect(TokenType.NEWLINE)
+        self.expect(TokenType.INDENT)
+
+        fields = []
+
+        while not self.check(TokenType.DEDENT, TokenType.EOF):
+            self.skip_newlines()
+            if self.check(TokenType.DEDENT, TokenType.EOF):
+                break
+
+            # Pass statement
+            if self.match(TokenType.PASS):
+                self.expect(TokenType.NEWLINE)
+                continue
+
+            # Field: name: type
+            if self.check(TokenType.IDENT):
+                field_name = self.advance().value
+                self.expect(TokenType.COLON)
+                field_type = self.parse_type()
+                self.expect(TokenType.NEWLINE)
+                fields.append((field_name, field_type))
+                continue
+
+            raise ParseError(f"Expected field in union", self.current())
+
+        self.expect(TokenType.DEDENT)
+        return UnionDef(name, fields, decorators or [], self.make_span(tok))
+
     def parse_import(self) -> ImportDecl:
         """Parse an import declaration."""
         tok = self.current()
@@ -1127,6 +1195,12 @@ class Parser:
             # Class
             if self.check(TokenType.CLASS):
                 declarations.append(self.parse_class(decorators))
+                self.skip_newlines()
+                continue
+
+            # Union
+            if self.check(TokenType.UNION):
+                declarations.append(self.parse_union(decorators))
                 self.skip_newlines()
                 continue
 

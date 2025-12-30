@@ -40,6 +40,14 @@ class StructInfo:
 
 
 @dataclass
+class UnionInfo:
+    """Information about a union (all fields at offset 0)."""
+    name: str
+    fields: list[tuple[str, Type]]  # (name, type) - all at offset 0
+    total_size: int  # Size of largest field
+
+
+@dataclass
 class LoopContext:
     """Track loop labels for break/continue."""
     start_label: str
@@ -57,6 +65,7 @@ class FunctionContext:
     label_counter: int = 0
     loop_stack: list[LoopContext] = field(default_factory=list)
     defer_stack: list[Stmt] = field(default_factory=list)
+    is_interrupt: bool = False  # True for @interrupt functions
 
     def alloc_local(self, name: str, size: int = 4, var_type: Type = None) -> LocalVar:
         """Allocate a local variable on the stack."""
@@ -112,10 +121,13 @@ class ARMCodeGen:
         self.global_arrays: set[str] = set()  # Track global array names
         self.array_element_sizes: dict[str, int] = {}  # Array name -> element size
         self.structs: dict[str, StructInfo] = {}  # Struct/class definitions
+        self.unions: dict[str, 'UnionInfo'] = {}  # Union definitions
         self.global_var_types: dict[str, Type] = {}  # Global variable types
         self.class_bases: dict[str, str] = {}  # Class name -> parent class name
         self.properties: dict[str, str] = {}  # "Class.prop" -> method name
         self.pending_lambdas: list[tuple[str, list[str], Expr]] = []  # Deferred lambda generation
+        self.packed_structs: set[str] = set()  # Structs with @packed decorator
+        self.interrupt_funcs: dict[str, int] = {}  # Function name -> interrupt vector
 
     def emit(self, line: str) -> None:
         """Emit a line of assembly."""
@@ -379,6 +391,9 @@ class ARMCodeGen:
 
             case TupleLiteral(elements=elements):
                 self.gen_tuple_literal(elements)
+
+            case StructInitExpr(struct_name=name, fields=init_fields):
+                self.gen_struct_init(name, init_fields)
 
             case ListComprehension(element=element, var=var, iterable=iterable, condition=cond):
                 self.gen_list_comprehension(element, var, iterable, cond)
@@ -689,6 +704,37 @@ class ARMCodeGen:
             return
         elif func_name == "input":
             self.gen_builtin_input(args)
+            return
+        # Memory barrier builtins for hardware synchronization
+        elif func_name == "dmb":
+            # Data Memory Barrier - ensures all memory accesses complete
+            self.emit("    dmb")
+            self.emit("    movs r0, #0")
+            return
+        elif func_name == "dsb":
+            # Data Synchronization Barrier - ensures all memory accesses complete before continuing
+            self.emit("    dsb")
+            self.emit("    movs r0, #0")
+            return
+        elif func_name == "isb":
+            # Instruction Synchronization Barrier - flushes pipeline
+            self.emit("    isb")
+            self.emit("    movs r0, #0")
+            return
+        elif func_name == "wfi":
+            # Wait For Interrupt - low power wait
+            self.emit("    wfi")
+            self.emit("    movs r0, #0")
+            return
+        elif func_name == "wfe":
+            # Wait For Event
+            self.emit("    wfe")
+            self.emit("    movs r0, #0")
+            return
+        elif func_name == "sev":
+            # Send Event
+            self.emit("    sev")
+            self.emit("    movs r0, #0")
             return
 
         # Save caller-saved registers if needed
@@ -1129,6 +1175,83 @@ class ARMCodeGen:
 
         self.emit("    pop {r0}")
 
+    def gen_struct_init(self, struct_name: str, init_fields: dict[str, Expr]) -> None:
+        """Generate struct initialization: Point{x=10, y=20}."""
+        if struct_name not in self.structs:
+            # Check if it's a union
+            if struct_name in self.unions:
+                self.gen_union_init(struct_name, init_fields)
+                return
+            raise CodeGenError(f"Unknown struct: {struct_name}")
+
+        struct = self.structs[struct_name]
+
+        # Allocate memory for struct
+        self.emit(f"    @ Struct init: {struct_name}")
+        self.emit(f"    movs r0, #{struct.total_size}")
+        self.emit("    bl malloc")
+        self.emit("    push {r0}")
+
+        # Initialize to zero first
+        if struct.total_size <= 32:
+            self.emit("    movs r1, #0")
+            for i in range(0, struct.total_size, 4):
+                self.emit("    ldr r2, [sp]")
+                self.emit(f"    str r1, [r2, #{i}]")
+
+        # Set specified fields
+        for field_name, field_val in init_fields.items():
+            # Find field offset
+            field_offset = None
+            for fname, ftype, foffset in struct.fields:
+                if fname == field_name:
+                    field_offset = foffset
+                    break
+
+            if field_offset is None:
+                raise CodeGenError(f"Unknown field {field_name} in {struct_name}")
+
+            # Generate value
+            self.gen_expr(field_val)
+            self.emit("    ldr r1, [sp]")  # Get struct pointer
+            self.emit(f"    str r0, [r1, #{field_offset}]")
+
+        self.emit("    pop {r0}")  # Return struct pointer
+
+    def gen_union_init(self, union_name: str, init_fields: dict[str, Expr]) -> None:
+        """Generate union initialization."""
+        union = self.unions[union_name]
+
+        # Allocate memory for union (size of largest field)
+        self.emit(f"    @ Union init: {union_name}")
+        self.emit(f"    movs r0, #{union.total_size}")
+        self.emit("    bl malloc")
+        self.emit("    push {r0}")
+
+        # Initialize to zero
+        if union.total_size <= 32:
+            self.emit("    movs r1, #0")
+            for i in range(0, union.total_size, 4):
+                self.emit("    ldr r2, [sp]")
+                self.emit(f"    str r1, [r2, #{i}]")
+
+        # Set the field (all fields are at offset 0 in a union)
+        for field_name, field_val in init_fields.items():
+            # Verify field exists
+            found = False
+            for fname, ftype in union.fields:
+                if fname == field_name:
+                    found = True
+                    break
+            if not found:
+                raise CodeGenError(f"Unknown field {field_name} in union {union_name}")
+
+            self.gen_expr(field_val)
+            self.emit("    ldr r1, [sp]")
+            self.emit("    str r0, [r1]")  # All union fields at offset 0
+
+        self.emit("    pop {r0}")
+
     def gen_list_comprehension(self, element: Expr, var: str, iterable: Expr, condition: Optional[Expr]) -> None:
         """Generate list comprehension: [expr for var in iterable if cond]."""
         # This is complex - we need to:
@@ -1319,9 +1442,12 @@ class ARMCodeGen:
 
                 if value is not None:
                     self.gen_expr(value)
-                # Epilogue - must pop both r7 and pc (we pushed r7 and lr)
+                # Epilogue - must pop registers we pushed
                 self.emit("    mov sp, r7")
-                self.emit("    pop {r7, pc}")
+                if self.ctx.is_interrupt:
+                    self.emit("    pop {r0-r3, r7, r12, pc}")
+                else:
+                    self.emit("    pop {r7, pc}")
 
             case IfStmt(condition=cond, then_body=then_body, elif_branches=elifs, else_body=else_body):
                 self.gen_if(cond, then_body, elifs, else_body)
@@ -1951,16 +2077,27 @@ class ARMCodeGen:
         """Generate code for a function."""
         self.ctx = FunctionContext(func.name)
 
+        # Check for @interrupt decorator
+        is_interrupt = "interrupt" in func.decorators
+        self.ctx.is_interrupt = is_interrupt
+
         # Create locals for parameters
         for i, param in enumerate(func.params):
             var = self.ctx.alloc_local(param.name, 4, param.param_type)
 
         self.emit("")
         self.emit(f"    .global {func.name}")
-        self.emit(f"    .type {func.name}, %function")
-        self.emit(f"{func.name}:")
-        self.emit("    push {r7, lr}")
-        self.emit("    mov r7, sp")
+        if is_interrupt:
+            self.emit(f"    .type {func.name}, %function")
+            self.emit(f"    @ Interrupt handler - save all caller-saved registers")
+            self.emit(f"{func.name}:")
+            self.emit("    push {r0-r3, r7, r12, lr}")
+            self.emit("    mov r7, sp")
+        else:
+            self.emit(f"    .type {func.name}, %function")
+            self.emit(f"{func.name}:")
+            self.emit("    push {r7, lr}")
+            self.emit("    mov r7, sp")
 
         # Reserve space for locals (will be adjusted later)
         stack_reserve_idx = len(self.output)
@@ -1983,7 +2120,10 @@ class ARMCodeGen:
                 self.gen_stmt(deferred)
             self.emit("    movs r0, #0")
             self.emit("    mov sp, r7")
-            self.emit("    pop {r7, pc}")
+            if is_interrupt:
+                self.emit("    pop {r0-r3, r7, r12, pc}")
+            else:
+                self.emit("    pop {r7, pc}")
 
         # Fix up stack reservation
         stack_size = (self.ctx.stack_size + 7) & ~7  # Align to 8
@@ -2062,6 +2202,23 @@ class ARMCodeGen:
             self.gen_function(method)
             method.name = orig_name
 
+    def gen_union(self, union_def: UnionDef) -> None:
+        """Register a union definition - all fields share same memory at offset 0."""
+        # Find the largest field size
+        max_size = 0
+        fields = []
+
+        for field_name, field_type in union_def.fields:
+            size = self.get_type_size(field_type)
+            if size > max_size:
+                max_size = size
+            fields.append((field_name, field_type))
+
+        # Align to 4 bytes
+        max_size = (max_size + 3) & ~3
+
+        self.unions[union_def.name] = UnionInfo(union_def.name, fields, max_size)
+
     def gen_extern(self, decl: ExternDecl) -> None:
         """Generate extern function reference."""
         self.extern_funcs.add(decl.name)
@@ -2094,7 +2251,13 @@ class ARMCodeGen:
                     self.array_element_sizes[decl.name] = elem_size
             elif isinstance(decl, ClassDef):
                 # Pre-register class for field offset calculation
+                # Check for @packed decorator
+                if 'packed' in decl.decorators:
+                    self.packed_structs.add(decl.name)
                 self.gen_class(decl)
+            elif isinstance(decl, UnionDef):
+                # Register union
+                self.gen_union(decl)
 
         # Second pass: generate functions
         for decl in program.declarations:
@@ -2107,6 +2270,8 @@ class ARMCodeGen:
                     pass  # Already processed
                 case EnumDef():
                     pass  # Enums don't need codegen
+                case UnionDef():
+                    pass  # Already processed
                 case VarDecl():
                     pass  # Already collected
 

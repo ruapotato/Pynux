@@ -143,6 +143,25 @@ class GenericType:
     span: Optional[Span] = None
 
 
+@dataclass
+class VolatileType:
+    """Volatile type modifier: volatile int32"""
+    inner_type: Type
+    span: Optional[Span] = None
+
+    @property
+    def name(self) -> str:
+        return f"volatile {self.inner_type.name}"
+
+
+@dataclass
+class UnionType:
+    """Union type definition"""
+    name: str
+    fields: list[tuple[str, Type]]  # (field_name, field_type)
+    span: Optional[Span] = None
+
+
 # Expressions
 @dataclass
 class IntLiteral:
@@ -278,6 +297,14 @@ class DictLiteral:
 class TupleLiteral:
     """Tuple literal: (a, b, c)"""
     elements: list['Expr'] = field(default_factory=list)
+    span: Optional[Span] = None
+
+
+@dataclass
+class StructInitExpr:
+    """Struct initialization: Point{x=10, y=20}"""
+    struct_name: str
+    fields: dict[str, 'Expr']  # field_name -> value
     span: Optional[Span] = None
 
 
@@ -568,6 +595,20 @@ class EnumDef:
     """Enum definition."""
     name: str
     variants: list[EnumVariant] = field(default_factory=list)
+    span: Optional[Span] = None
+
+
+@dataclass
+class UnionDef:
+    """Union definition - overlapping memory fields.
+
+    union Register:
+        raw: uint32
+        bits: BitFields
+    """
+    name: str
+    fields: list[tuple[str, Type]]  # All fields share same memory
+    decorators: list[str] = field(default_factory=list)
     span: Optional[Span] = None
 
 
