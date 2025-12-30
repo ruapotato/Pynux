@@ -4,7 +4,7 @@
 # Supports built-in commands and filesystem operations.
 
 from lib.io import print_str, print_int, print_newline, uart_putc, uart_getc
-from lib.string import strcmp, strlen, strcpy, strncpy, isspace, strcat
+from lib.string import strcmp, strlen, strcpy, strncpy, isspace, strcat, atoi
 from lib.memory import alloc, memset
 from kernel.ramfs import ramfs_init, ramfs_create, ramfs_delete, ramfs_write
 from kernel.ramfs import ramfs_read, ramfs_exists, ramfs_isdir, ramfs_size
@@ -222,22 +222,6 @@ def cmd_calc(argc: int32):
 
     print_int(result)
     print_newline()
-
-# Simple atoi
-def atoi(s: Ptr[char]) -> int32:
-    result: int32 = 0
-    sign: int32 = 1
-    i: int32 = 0
-
-    if s[i] == '-':
-        sign = -1
-        i = i + 1
-
-    while s[i] >= '0' and s[i] <= '9':
-        result = result * 10 + (cast[int32](s[i]) - cast[int32]('0'))
-        i = i + 1
-
-    return result * sign
 
 # ============================================================================
 # Filesystem commands
@@ -527,7 +511,3 @@ def shell_loop():
             execute(argc)
 
     print_str("Goodbye!\n")
-
-def main() -> int32:
-    shell_loop()
-    return 0

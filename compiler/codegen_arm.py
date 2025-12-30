@@ -188,6 +188,66 @@ class ARMCodeGen:
         name = t.name if isinstance(t, Type) else str(t)
         return name in ("float32", "float64", "float")
 
+    def emit_stack_alloc(self, size: int) -> None:
+        """Emit code to allocate stack space, handling large values."""
+        if size == 0:
+            self.emit("    @ no locals")
+        elif size <= 508:
+            # Small values can use direct SUB
+            self.emit(f"    sub sp, sp, #{size}")
+        elif size <= 4095:
+            # Medium values: use SUB.W with 12-bit immediate
+            self.emit(f"    sub.w sp, sp, #{size}")
+        else:
+            # Large values: load into register first
+            self.emit(f"    ldr r12, ={size}")
+            self.emit("    sub sp, sp, r12")
+
+    def emit_stack_dealloc(self, size: int) -> None:
+        """Emit code to deallocate stack space, handling large values."""
+        if size == 0:
+            return
+        elif size <= 508:
+            self.emit(f"    add sp, sp, #{size}")
+        elif size <= 4095:
+            self.emit(f"    add.w sp, sp, #{size}")
+        else:
+            self.emit(f"    ldr r12, ={size}")
+            self.emit("    add sp, sp, r12")
+
+    def emit_load_local(self, reg: str, offset: int) -> None:
+        """Emit code to load from a local variable, handling large offsets."""
+        if -255 <= offset <= 4095:
+            self.emit(f"    ldr {reg}, [r7, #{offset}]")
+        else:
+            # Large negative offset - need to compute address
+            self.emit(f"    ldr r12, ={-offset}")
+            self.emit(f"    sub r12, r7, r12")
+            self.emit(f"    ldr {reg}, [r12]")
+
+    def emit_store_local(self, reg: str, offset: int) -> None:
+        """Emit code to store to a local variable, handling large offsets."""
+        if -255 <= offset <= 4095:
+            self.emit(f"    str {reg}, [r7, #{offset}]")
+        else:
+            # Large negative offset - need to compute address
+            # Save the value temporarily
+            self.emit(f"    mov r11, {reg}")
+            self.emit(f"    ldr r12, ={-offset}")
+            self.emit(f"    sub r12, r7, r12")
+            self.emit(f"    str r11, [r12]")
+
+    def emit_add_local_addr(self, reg: str, offset: int) -> None:
+        """Emit code to compute address of local variable into reg."""
+        if -255 <= offset <= 255:
+            if offset >= 0:
+                self.emit(f"    add {reg}, r7, #{offset}")
+            else:
+                self.emit(f"    sub {reg}, r7, #{-offset}")
+        else:
+            self.emit(f"    ldr r12, ={-offset}")
+            self.emit(f"    sub {reg}, r7, r12")
+
     # -------------------------------------------------------------------------
     # Expression generation
     # -------------------------------------------------------------------------
@@ -229,7 +289,7 @@ class ARMCodeGen:
             case Identifier(name=name):
                 if name in self.ctx.locals:
                     var = self.ctx.locals[name]
-                    self.emit(f"    ldr r0, [r7, #{var.offset}]")
+                    self.emit_load_local("r0", var.offset)
                 elif name in self.global_arrays:
                     # Global array - just load address, don't dereference
                     self.emit(f"    ldr r0, ={name}")
@@ -677,7 +737,7 @@ class ARMCodeGen:
             # Return a pointer to the struct
             # For simplicity, we'll just allocate a local struct and return its address
             self.emit(f"    @ Allocate {func_name} instance ({struct.total_size} bytes)")
-            self.emit(f"    sub sp, sp, #{struct.total_size}")
+            self.emit_stack_alloc(struct.total_size)
             self.emit("    mov r0, sp")
             # Initialize to zero
             if struct.total_size <= 16:
@@ -1055,7 +1115,7 @@ class ARMCodeGen:
         if is_indirect:
             # Load function pointer from local variable and call indirectly
             var = self.ctx.locals[func_name]
-            self.emit(f"    ldr r4, [r7, #{var.offset}]")
+            self.emit_load_local("r4", var.offset)
             self.emit("    blx r4")
         else:
             self.emit(f"    bl {func_name}")
@@ -1138,7 +1198,7 @@ class ARMCodeGen:
                 if expr_str.isidentifier():
                     if expr_str in self.ctx.locals:
                         var = self.ctx.locals[expr_str]
-                        self.emit(f"    ldr r0, [r7, #{var.offset}]")
+                        self.emit_load_local("r0", var.offset)
                     else:
                         self.emit(f"    ldr r0, ={expr_str}")
                         self.emit("    ldr r0, [r0]")
@@ -1288,7 +1348,7 @@ class ARMCodeGen:
                     if obj.name in self.ctx.locals:
                         var = self.ctx.locals[obj.name]
                         # Load the pointer to the struct instance
-                        self.emit(f"    ldr r0, [r7, #{var.offset}]")
+                        self.emit_load_local("r0", var.offset)
                     else:
                         self.emit(f"    ldr r0, ={obj.name}")
                 else:
@@ -1305,7 +1365,7 @@ class ARMCodeGen:
                 var = self.ctx.locals[obj.name]
                 if var_type and hasattr(var_type, 'name') and var_type.name in self.structs:
                     # Load pointer to struct instance
-                    self.emit(f"    ldr r0, [r7, #{var.offset}]")
+                    self.emit_load_local("r0", var.offset)
                 else:
                     self.emit(f"    add r0, r7, #{var.offset}")
             else:
@@ -1344,7 +1404,7 @@ class ARMCodeGen:
                 # load the pointer first, then add offset
                 if var_type and hasattr(var_type, 'name') and var_type.name in self.structs:
                     # Load the pointer value from local variable
-                    self.emit(f"    ldr r0, [r7, #{var.offset}]")
+                    self.emit_load_local("r0", var.offset)
                 else:
                     self.emit(f"    add r0, r7, #{var.offset}")
             else:
@@ -1594,15 +1654,15 @@ class ARMCodeGen:
         # Get range parameters
         if len(range_args) == 1:
             self.emit("    movs r0, #0")
-            self.emit(f"    str r0, [r7, #{loop_var.offset}]")
+            self.emit_store_local("r0", loop_var.offset)
         else:
             self.gen_expr(range_args[0])
-            self.emit(f"    str r0, [r7, #{loop_var.offset}]")
+            self.emit_store_local("r0", loop_var.offset)
 
         end_var = self.ctx.alloc_local(f"_end_{var}")
         if len(range_args) >= 1:
             self.gen_expr(end_expr)
-            self.emit(f"    str r0, [r7, #{end_var.offset}]")
+            self.emit_store_local("r0", end_var.offset)
 
         # Loop
         start_label = self.ctx.new_label("listcomp")
@@ -1610,8 +1670,8 @@ class ARMCodeGen:
         continue_label = self.ctx.new_label("listcompcont")
 
         self.emit(f"{start_label}:")
-        self.emit(f"    ldr r0, [r7, #{loop_var.offset}]")
-        self.emit(f"    ldr r1, [r7, #{end_var.offset}]")
+        self.emit_load_local("r0", loop_var.offset)
+        self.emit_load_local("r1", end_var.offset)
         self.emit("    cmp r0, r1")
         self.emit(f"    bge {end_label}")
 
@@ -1638,9 +1698,9 @@ class ARMCodeGen:
 
         self.emit(f"{continue_label}:")
         # Increment loop variable
-        self.emit(f"    ldr r0, [r7, #{loop_var.offset}]")
+        self.emit_load_local("r0", loop_var.offset)
         self.emit("    add r0, r0, #1")
-        self.emit(f"    str r0, [r7, #{loop_var.offset}]")
+        self.emit_store_local("r0", loop_var.offset)
         self.emit(f"    b {start_label}")
 
         self.emit(f"{end_label}:")
@@ -1695,10 +1755,14 @@ class ARMCodeGen:
 
             # Fix up stack reservation
             stack_size = (self.ctx.stack_size + 7) & ~7
-            if stack_size > 0:
-                self.output[stack_reserve_idx] = f"    sub sp, sp, #{stack_size}"
-            else:
+            if stack_size == 0:
                 self.output[stack_reserve_idx] = "    @ no locals"
+            elif stack_size <= 508:
+                self.output[stack_reserve_idx] = f"    sub sp, sp, #{stack_size}"
+            elif stack_size <= 4095:
+                self.output[stack_reserve_idx] = f"    sub.w sp, sp, #{stack_size}"
+            else:
+                self.output[stack_reserve_idx] = f"    ldr r12, ={stack_size}\n    sub sp, sp, r12"
 
             self.emit(f"    .size {lambda_name}, . - {lambda_name}")
             self.emit("    .ltorg")
@@ -1730,7 +1794,7 @@ class ARMCodeGen:
 
                 if value is not None:
                     self.gen_expr(value)
-                    self.emit(f"    str r0, [r7, #{var.offset}]")
+                    self.emit_store_local("r0", var.offset)
 
             case Assignment(target=target, value=value, op=op):
                 self.gen_assignment(target, value, op)
@@ -1821,7 +1885,7 @@ class ARMCodeGen:
             if isinstance(target, Identifier):
                 var = self.ctx.locals.get(target.name)
                 if var:
-                    self.emit(f"    ldr r0, [r7, #{var.offset}]")
+                    self.emit_load_local("r0", var.offset)
                 else:
                     self.emit(f"    ldr r0, ={target.name}")
                     self.emit("    ldr r0, [r0]")
@@ -1852,7 +1916,7 @@ class ARMCodeGen:
         if isinstance(target, Identifier):
             var = self.ctx.locals.get(target.name)
             if var:
-                self.emit(f"    str r0, [r7, #{var.offset}]")
+                self.emit_store_local("r0", var.offset)
             elif target.name in self.global_var_types:
                 # Known global variable
                 self.emit(f"    ldr r1, ={target.name}")
@@ -1860,7 +1924,7 @@ class ARMCodeGen:
             else:
                 # First assignment to new local variable - create it
                 var = self.ctx.alloc_local(target.name)
-                self.emit(f"    str r0, [r7, #{var.offset}]")
+                self.emit_store_local("r0", var.offset)
         elif isinstance(target, IndexExpr):
             self.gen_index_store(target, "r0")
         elif isinstance(target, MemberExpr):
@@ -2000,22 +2064,22 @@ class ARMCodeGen:
 
         # Initialize loop variable
         self.gen_expr(start)
-        self.emit(f"    str r0, [r7, #{loop_var.offset}]")
+        self.emit_store_local("r0", loop_var.offset)
 
         # Save end value
         end_var = self.ctx.alloc_local(f"_end_{var}")
         self.gen_expr(end)
-        self.emit(f"    str r0, [r7, #{end_var.offset}]")
+        self.emit_store_local("r0", end_var.offset)
 
         # Save step value
         step_var = self.ctx.alloc_local(f"_step_{var}")
         self.gen_expr(step)
-        self.emit(f"    str r0, [r7, #{step_var.offset}]")
+        self.emit_store_local("r0", step_var.offset)
 
         # Loop start
         self.emit(f"{start_label}:")
-        self.emit(f"    ldr r0, [r7, #{loop_var.offset}]")
-        self.emit(f"    ldr r1, [r7, #{end_var.offset}]")
+        self.emit_load_local("r0", loop_var.offset)
+        self.emit_load_local("r1", end_var.offset)
         self.emit("    cmp r0, r1")
         self.emit(f"    bge {end_label}")
 
@@ -2027,10 +2091,10 @@ class ARMCodeGen:
         self.emit(f"{continue_label}:")
 
         # Increment by step
-        self.emit(f"    ldr r0, [r7, #{loop_var.offset}]")
-        self.emit(f"    ldr r1, [r7, #{step_var.offset}]")
+        self.emit_load_local("r0", loop_var.offset)
+        self.emit_load_local("r1", step_var.offset)
         self.emit("    add r0, r0, r1")
-        self.emit(f"    str r0, [r7, #{loop_var.offset}]")
+        self.emit_store_local("r0", loop_var.offset)
         self.emit(f"    b {start_label}")
 
         self.emit(f"{end_label}:")
@@ -2056,26 +2120,26 @@ class ARMCodeGen:
 
         # Get iterable
         self.gen_expr(iterable)
-        self.emit(f"    str r0, [r7, #{iter_var.offset}]")
+        self.emit_store_local("r0", iter_var.offset)
 
         # Get length
         self.emit("    ldr r0, [r0]")  # Assume length at offset 0
-        self.emit(f"    str r0, [r7, #{len_var.offset}]")
+        self.emit_store_local("r0", len_var.offset)
 
         # Initialize index
         self.emit("    movs r0, #0")
-        self.emit(f"    str r0, [r7, #{idx_var.offset}]")
+        self.emit_store_local("r0", idx_var.offset)
 
         # Loop start
         self.emit(f"{start_label}:")
-        self.emit(f"    ldr r0, [r7, #{idx_var.offset}]")
-        self.emit(f"    ldr r1, [r7, #{len_var.offset}]")
+        self.emit_load_local("r0", idx_var.offset)
+        self.emit_load_local("r1", len_var.offset)
         self.emit("    cmp r0, r1")
         self.emit(f"    bge {end_label}")
 
         # Unpack tuple element - get tuple at index
-        self.emit(f"    ldr r0, [r7, #{iter_var.offset}]")
-        self.emit(f"    ldr r1, [r7, #{idx_var.offset}]")
+        self.emit_load_local("r0", iter_var.offset)
+        self.emit_load_local("r1", idx_var.offset)
         self.emit("    lsl r1, r1, #2")
         self.emit("    add r0, r0, r1")
         self.emit("    add r0, r0, #8")  # Skip header
@@ -2084,14 +2148,14 @@ class ARMCodeGen:
         # Unpack into variables
         for i, var in enumerate(loop_vars):
             if i > 0:
-                self.emit(f"    ldr r0, [r7, #{iter_var.offset}]")
-                self.emit(f"    ldr r1, [r7, #{idx_var.offset}]")
+                self.emit_load_local("r0", iter_var.offset)
+                self.emit_load_local("r1", idx_var.offset)
                 self.emit("    lsl r1, r1, #2")
                 self.emit("    add r0, r0, r1")
                 self.emit("    add r0, r0, #8")
                 self.emit("    ldr r0, [r0]")
             self.emit(f"    ldr r1, [r0, #{i * 4}]")
-            self.emit(f"    str r1, [r7, #{var.offset}]")
+            self.emit_store_local("r1", var.offset)
 
         # Body
         for s in body:
@@ -2101,9 +2165,9 @@ class ARMCodeGen:
         self.emit(f"{continue_label}:")
 
         # Increment index
-        self.emit(f"    ldr r0, [r7, #{idx_var.offset}]")
+        self.emit_load_local("r0", idx_var.offset)
         self.emit("    add r0, r0, #1")
-        self.emit(f"    str r0, [r7, #{idx_var.offset}]")
+        self.emit_store_local("r0", idx_var.offset)
         self.emit(f"    b {start_label}")
 
         self.emit(f"{end_label}:")
@@ -2160,7 +2224,7 @@ class ARMCodeGen:
                     # Extract from tuple/struct at offset
                     self.emit("    ldr r0, [sp]")
                     self.emit(f"    ldr r1, [r0, #{(j + 1) * 4}]")
-                    self.emit(f"    str r1, [r7, #{bind_var.offset}]")
+                    self.emit_store_local("r1", bind_var.offset)
 
                 # Execute arm body
                 for s in arm.body:
@@ -2190,11 +2254,11 @@ class ARMCodeGen:
                 self.emit(f"    ldr r0, [r0, #{i * 4}]")
                 if target in self.ctx.locals:
                     var = self.ctx.locals[target]
-                    self.emit(f"    str r0, [r7, #{var.offset}]")
+                    self.emit_store_local("r0", var.offset)
                 else:
                     # Allocate new local
                     var = self.ctx.alloc_local(target)
-                    self.emit(f"    str r0, [r7, #{var.offset}]")
+                    self.emit_store_local("r0", var.offset)
         else:
             # For other expressions (function returns, etc.)
             # Assume the result is a pointer to contiguous values
@@ -2205,10 +2269,10 @@ class ARMCodeGen:
                 self.emit("    ldr r0, [r0]")
                 if target in self.ctx.locals:
                     var = self.ctx.locals[target]
-                    self.emit(f"    str r0, [r7, #{var.offset}]")
+                    self.emit_store_local("r0", var.offset)
                 else:
                     var = self.ctx.alloc_local(target)
-                    self.emit(f"    str r0, [r7, #{var.offset}]")
+                    self.emit_store_local("r0", var.offset)
 
         self.emit("    pop {r0}")  # Clean up
 
@@ -2229,14 +2293,14 @@ class ARMCodeGen:
 
         # Initialize error flag to 0
         self.emit("    movs r0, #0")
-        self.emit(f"    str r0, [r7, #{error_var.offset}]")
+        self.emit_store_local("r0", error_var.offset)
 
         # Execute try body
         for s in try_body:
             self.gen_stmt(s)
 
         # Check if error occurred
-        self.emit(f"    ldr r0, [r7, #{error_var.offset}]")
+        self.emit_load_local("r0", error_var.offset)
         self.emit("    cmp r0, #0")
         self.emit(f"    bne {handler_label}")
 
@@ -2254,13 +2318,13 @@ class ARMCodeGen:
             if handler.name:
                 # Create variable for exception
                 exc_var = self.ctx.alloc_local(handler.name)
-                self.emit(f"    ldr r0, [r7, #{error_var.offset}]")
-                self.emit(f"    str r0, [r7, #{exc_var.offset}]")
+                self.emit_load_local("r0", error_var.offset)
+                self.emit_store_local("r0", exc_var.offset)
             for s in handler.body:
                 self.gen_stmt(s)
             # Clear error flag after handling
             self.emit("    movs r0, #0")
-            self.emit(f"    str r0, [r7, #{error_var.offset}]")
+            self.emit_store_local("r0", error_var.offset)
             break  # Only run first matching handler
 
         # Finally block (always runs)
@@ -2351,7 +2415,7 @@ class ARMCodeGen:
             # Store result in variable if 'as' clause
             if item.var:
                 var = self.ctx.alloc_local(item.var)
-                self.emit(f"    str r0, [r7, #{var.offset}]")
+                self.emit_store_local("r0", var.offset)
 
             exit_info.append((class_name, item))
 
@@ -2427,10 +2491,16 @@ class ARMCodeGen:
 
         # Fix up stack reservation
         stack_size = (self.ctx.stack_size + 7) & ~7  # Align to 8
-        if stack_size > 0:
-            self.output[stack_reserve_idx] = f"    sub sp, sp, #{stack_size}"
-        else:
+        if stack_size == 0:
             self.output[stack_reserve_idx] = "    @ no locals"
+        elif stack_size <= 508:
+            self.output[stack_reserve_idx] = f"    sub sp, sp, #{stack_size}"
+        elif stack_size <= 4095:
+            # Use wide encoding for medium values
+            self.output[stack_reserve_idx] = f"    sub.w sp, sp, #{stack_size}"
+        else:
+            # Large stack: need to load value first
+            self.output[stack_reserve_idx] = f"    ldr r12, ={stack_size}\n    sub sp, sp, r12"
 
         self.emit(f"    .size {func.name}, . - {func.name}")
         # Add literal pool after each function
