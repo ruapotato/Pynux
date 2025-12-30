@@ -51,6 +51,7 @@ sources = [
     ("kernel/ramfs.py", "ramfs"),
     ("lib/memory.py", "memory"),
     ("lib/string.py", "string"),
+    ("lib/vtnext.py", "vtnext"),
     ("coreutils/sh.py", "shell"),
 ]
 
@@ -81,7 +82,7 @@ $AS $ASFLAGS -o "$BUILD_DIR/io.o" "$RUNTIME_DIR/io.s"
 echo "  runtime/io.s"
 
 # Compiled Pynux files
-for name in kernel timer ramfs memory string shell; do
+for name in kernel timer ramfs memory string vtnext shell; do
     $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
     echo "  build/${name}.s"
 done
@@ -97,6 +98,7 @@ $LD -T "$RUNTIME_DIR/mps2-an385.ld" \
     "$BUILD_DIR/ramfs.o" \
     "$BUILD_DIR/memory.o" \
     "$BUILD_DIR/string.o" \
+    "$BUILD_DIR/vtnext.o" \
     "$BUILD_DIR/shell.o"
 echo "  -> build/pynux.elf"
 

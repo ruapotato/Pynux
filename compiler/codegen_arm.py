@@ -711,16 +711,27 @@ class ARMCodeGen:
                 method_name = func.member
                 # Check if this is a known class
                 if class_name in self.structs:
-                    # Generate call to Class_method
+                    # Generate call to Class_method with AAPCS calling convention
                     full_name = f"{class_name}_{method_name}"
-                    if len(args) > 4:
-                        raise CodeGenError("More than 4 arguments not yet supported")
-                    for arg in reversed(args):
+                    num_stack_args = max(0, len(args) - 4)
+
+                    if num_stack_args > 0:
+                        for arg in reversed(args[4:]):
+                            self.gen_expr(arg)
+                            self.emit("    push {r0}")
+
+                    first_four = args[:4]
+                    for arg in reversed(first_four):
                         self.gen_expr(arg)
                         self.emit("    push {r0}")
-                    for i in range(len(args)):
+                    for i in range(len(first_four)):
                         self.emit(f"    pop {{r{i}}}")
+
                     self.emit(f"    bl {full_name}")
+
+                    if num_stack_args > 0:
+                        stack_cleanup = num_stack_args * 4
+                        self.emit(f"    add sp, sp, #{stack_cleanup}")
                     return
             raise CodeGenError(f"Unsupported member call: {func}")
 
@@ -1097,19 +1108,25 @@ class ARMCodeGen:
             self.emit("    rev16 r0, r0")
             return
 
-        # Save caller-saved registers if needed
-        if len(args) > 4:
-            raise CodeGenError("More than 4 arguments not yet supported")
-
         # Check if this is an indirect call through a local variable (function pointer)
         is_indirect = func_name in self.ctx.locals
 
-        # Push args in reverse order, then pop to r0-r3
-        for arg in reversed(args):
+        # ARM AAPCS: r0-r3 for first 4 args, rest on stack
+        num_stack_args = max(0, len(args) - 4)
+
+        if num_stack_args > 0:
+            # Push arguments 5+ onto stack in reverse order (rightmost first)
+            for arg in reversed(args[4:]):
+                self.gen_expr(arg)
+                self.emit("    push {r0}")
+
+        # Push first 4 args in reverse order, then pop to r0-r3
+        first_four = args[:4]
+        for arg in reversed(first_four):
             self.gen_expr(arg)
             self.emit("    push {r0}")
 
-        for i in range(len(args)):
+        for i in range(len(first_four)):
             self.emit(f"    pop {{r{i}}}")
 
         if is_indirect:
@@ -1119,6 +1136,14 @@ class ARMCodeGen:
             self.emit("    blx r4")
         else:
             self.emit(f"    bl {func_name}")
+
+        # Clean up stack args after call
+        if num_stack_args > 0:
+            stack_cleanup = num_stack_args * 4
+            if stack_cleanup <= 508:
+                self.emit(f"    add sp, sp, #{stack_cleanup}")
+            else:
+                self.emit(f"    add.w sp, sp, #{stack_cleanup}")
 
     def gen_builtin_print(self, args: list[Expr], kwargs: dict = None) -> None:
         """Generate print() built-in - auto-detects type and prints."""
@@ -2468,10 +2493,16 @@ class ARMCodeGen:
         self.emit("    @ STACK_RESERVE")
 
         # Store parameters to stack
+        # First 4 args come in r0-r3, rest are on stack above saved frame
         for i, param in enumerate(func.params):
+            var = self.ctx.locals[param.name]
             if i < 4:
-                var = self.ctx.locals[param.name]
-                self.emit(f"    str r{i}, [r7, #{var.offset}]")
+                self.emit_store_local(f"r{i}", var.offset)
+            else:
+                # Stack args: [r7+8] = arg5, [r7+12] = arg6, etc.
+                stack_offset = 8 + (i - 4) * 4
+                self.emit(f"    ldr r0, [r7, #{stack_offset}]")
+                self.emit_store_local("r0", var.offset)
 
         # Generate body
         for stmt in func.body:
