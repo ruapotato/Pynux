@@ -399,6 +399,9 @@ class ARMCodeGen:
                             type_name = getattr(var_type, 'name', str(var_type))
                             if type_name == 'str':
                                 elem_size = 1
+                            # Handle Ptr[T] types - get element size from base type
+                            elif isinstance(var_type, PointerType):
+                                elem_size = self.get_type_size(var_type.base_type)
                         if isinstance(var_type, ArrayType):
                             array_len = var_type.size
 
@@ -662,6 +665,12 @@ class ARMCodeGen:
                 elem_size = 4  # Default to word
                 if isinstance(operand.obj, Identifier):
                     elem_size = self.array_element_sizes.get(operand.obj.name, 4)
+                    # Check for Ptr[T] types
+                    var_type = self.global_var_types.get(operand.obj.name)
+                    if var_type is None and operand.obj.name in self.ctx.locals:
+                        var_type = self.ctx.locals[operand.obj.name].var_type
+                    if isinstance(var_type, PointerType):
+                        elem_size = self.get_type_size(var_type.base_type)
 
                 # Scale index by element size
                 if elem_size == 4:
@@ -1964,6 +1973,12 @@ class ARMCodeGen:
         elem_size = 4  # Default to word
         if isinstance(target.obj, Identifier):
             elem_size = self.array_element_sizes.get(target.obj.name, 4)
+            # Check for Ptr[T] types
+            var_type = self.global_var_types.get(target.obj.name)
+            if var_type is None and target.obj.name in self.ctx.locals:
+                var_type = self.ctx.locals[target.obj.name].var_type
+            if isinstance(var_type, PointerType):
+                elem_size = self.get_type_size(var_type.base_type)
 
         # Scale index by element size
         if elem_size == 4:

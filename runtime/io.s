@@ -19,12 +19,12 @@
     .section .text
 
 @ void uart_init()
-@ Initialize UART (enable TX)
+@ Initialize UART (enable TX and RX)
     .global uart_init
     .type uart_init, %function
 uart_init:
     ldr r0, =UART0_CTRL
-    movs r1, #UART_CTRL_TX_EN
+    movs r1, #(UART_CTRL_TX_EN | UART_CTRL_RX_EN)
     str r1, [r0]
     bx lr
     .size uart_init, . - uart_init
