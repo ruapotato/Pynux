@@ -6,7 +6,7 @@
 from lib.io import uart_putc, uart_getc, uart_available, print_str, print_int
 from lib.string import strcmp, strlen, strcpy, strcat, memset, atoi
 from kernel.ramfs import ramfs_readdir, ramfs_create, ramfs_delete
-from kernel.ramfs import ramfs_read, ramfs_write, ramfs_exists, ramfs_isdir
+from kernel.ramfs import ramfs_read, ramfs_write, ramfs_exists, ramfs_isdir, ramfs_size
 from lib.memory import heap_remaining, heap_total, heap_used
 from kernel.timer import timer_delay_ms, timer_tick
 from programs.main import user_main, user_tick
@@ -14,6 +14,16 @@ from programs.main import user_main, user_tick
 # Command buffer
 shell_cmd: Array[256, char]
 shell_cmd_pos: int32 = 0
+
+# Command history (10 commands, 256 chars each)
+HISTORY_SIZE: int32 = 10
+shell_history: Array[2560, char]  # 10 * 256
+shell_history_count: int32 = 0
+shell_history_pos: int32 = 0  # Current position when navigating
+shell_history_idx: int32 = 0  # Next write position (circular)
+
+# Escape sequence state for arrow keys (using array for reliable global storage)
+shell_esc: Array[4, int32]  # [0]=state: 0=normal, 1=got ESC, 2=got [
 
 # Current directory
 shell_cwd: Array[128, char]
@@ -35,6 +45,27 @@ shell_num_buf: Array[16, char]
 
 # Source path buffer for cp command
 shell_src_path: Array[256, char]
+
+# Grep pattern buffer
+shell_grep_pat: Array[64, char]
+
+# Line buffer for grep
+shell_line_buf: Array[256, char]
+
+# Find command buffers
+shell_find_pat: Array[64, char]
+shell_find_path: Array[256, char]
+shell_find_buf: Array[64, char]  # for readdir names
+
+# Sed command buffers
+shell_sed_old: Array[64, char]
+shell_sed_new: Array[64, char]
+shell_sed_out: Array[512, char]
+
+# Tab completion buffers
+shell_tab_prefix: Array[64, char]
+shell_tab_match: Array[64, char]
+shell_tab_dir: Array[256, char]
 
 # Job control
 # Job states: 0 = stopped, 1 = running (background), 2 = running (foreground)
@@ -131,6 +162,222 @@ def shell_int_to_str(n: int32) -> Ptr[char]:
         k = k - 1
 
     return &shell_num_buf[0]
+
+def str_contains(haystack: Ptr[char], needle: Ptr[char]) -> bool:
+    """Check if haystack contains needle."""
+    if needle[0] == '\0':
+        return True
+    hi: int32 = 0
+    while haystack[hi] != '\0':
+        # Try to match needle starting at position hi
+        ni: int32 = 0
+        found: bool = True
+        while needle[ni] != '\0' and found:
+            if haystack[hi + ni] == '\0' or haystack[hi + ni] != needle[ni]:
+                found = False
+            ni = ni + 1
+        if found:
+            return True
+        hi = hi + 1
+    return False
+
+# ============================================================================
+# Command history functions
+# ============================================================================
+
+def history_add(cmd: Ptr[char]):
+    """Add command to history."""
+    global shell_history_count, shell_history_idx
+
+    # Don't add empty commands
+    if cmd[0] == '\0':
+        return
+
+    # Don't add if same as previous command
+    if shell_history_count > 0:
+        prev_idx: int32 = (shell_history_idx - 1 + HISTORY_SIZE) % HISTORY_SIZE
+        prev_base: int32 = prev_idx * 256
+        if strcmp(cmd, &shell_history[prev_base]) == 0:
+            return
+
+    # Copy command to history at current index
+    base: int32 = shell_history_idx * 256
+    i: int32 = 0
+    while i < 255 and cmd[i] != '\0':
+        shell_history[base + i] = cmd[i]
+        i = i + 1
+    shell_history[base + i] = '\0'
+
+    # Advance index (circular)
+    shell_history_idx = (shell_history_idx + 1) % HISTORY_SIZE
+
+    # Track count (max HISTORY_SIZE)
+    if shell_history_count < HISTORY_SIZE:
+        shell_history_count = shell_history_count + 1
+
+def history_get(index: int32) -> Ptr[char]:
+    """Get command from history. 0 = most recent."""
+    if index < 0 or index >= shell_history_count:
+        return Ptr[char](0)
+
+    # Calculate actual position (going backwards from last)
+    pos: int32 = (shell_history_idx - 1 - index + HISTORY_SIZE) % HISTORY_SIZE
+    base: int32 = pos * 256
+    return &shell_history[base]
+
+def history_reset_pos():
+    """Reset history navigation position."""
+    global shell_history_pos
+    shell_history_pos = -1
+
+def shell_clear_line():
+    """Clear current command line on screen."""
+    global shell_cmd_pos
+    # Move cursor to start of input and clear to end of line
+    while shell_cmd_pos > 0:
+        shell_putc('\b')
+        shell_cmd_pos = shell_cmd_pos - 1
+    # VT100: clear from cursor to end of line
+    shell_puts("\x1b[K")
+
+def shell_set_cmd(s: Ptr[char]):
+    """Set command buffer and display it."""
+    global shell_cmd_pos
+    shell_clear_line()
+    i: int32 = 0
+    while i < 255 and s[i] != '\0':
+        shell_cmd[i] = s[i]
+        shell_putc(s[i])
+        i = i + 1
+    shell_cmd[i] = '\0'
+    shell_cmd_pos = i
+
+def shell_tab_complete():
+    """Handle tab completion for file/directory names."""
+    global shell_cmd_pos
+
+    # Find start of current word
+    word_start: int32 = shell_cmd_pos
+    while word_start > 0 and shell_cmd[word_start - 1] != ' ':
+        word_start = word_start - 1
+
+    # Extract current word as prefix
+    prefix_len: int32 = shell_cmd_pos - word_start
+    if prefix_len > 63:
+        prefix_len = 63
+    i: int32 = 0
+    while i < prefix_len:
+        shell_tab_prefix[i] = shell_cmd[word_start + i]
+        i = i + 1
+    shell_tab_prefix[prefix_len] = '\0'
+
+    # Determine directory to search and file prefix
+    dir_path: Ptr[char] = &shell_cwd[0]
+    file_prefix: Ptr[char] = &shell_tab_prefix[0]
+
+    # Check if prefix contains /
+    last_slash: int32 = -1
+    i = 0
+    while shell_tab_prefix[i] != '\0':
+        if shell_tab_prefix[i] == '/':
+            last_slash = i
+        i = i + 1
+
+    if last_slash >= 0:
+        # Has path component
+        strcpy(&shell_tab_dir[0], &shell_tab_prefix[0])
+        shell_tab_dir[last_slash + 1] = '\0'
+        shell_build_path(&shell_tab_dir[0])
+        dir_path = &shell_path_buf[0]
+        file_prefix = &shell_tab_prefix[last_slash + 1]
+
+    # Count and find matches
+    match_count: int32 = 0
+    idx: int32 = 0
+    result: int32 = ramfs_readdir(dir_path, idx, &shell_name_buf[0])
+    while result >= 0:
+        # Check if name starts with prefix
+        j: int32 = 0
+        is_match: bool = True
+        while file_prefix[j] != '\0' and is_match:
+            if shell_name_buf[j] != file_prefix[j]:
+                is_match = False
+            j = j + 1
+
+        if is_match:
+            match_count = match_count + 1
+            strcpy(&shell_tab_match[0], &shell_name_buf[0])
+
+        idx = idx + 1
+        result = ramfs_readdir(dir_path, idx, &shell_name_buf[0])
+
+    if match_count == 1:
+        # Single match - complete it
+        # Calculate how much to add
+        prefix_file_len: int32 = strlen(file_prefix)
+        match_len: int32 = strlen(&shell_tab_match[0])
+        add_len: int32 = match_len - prefix_file_len
+
+        # Add remaining characters to command
+        j: int32 = 0
+        while j < add_len and shell_cmd_pos < 255:
+            shell_cmd[shell_cmd_pos] = shell_tab_match[prefix_file_len + j]
+            shell_putc(shell_tab_match[prefix_file_len + j])
+            shell_cmd_pos = shell_cmd_pos + 1
+            j = j + 1
+        shell_cmd[shell_cmd_pos] = '\0'
+
+        # Add trailing / for directories or space for files
+        if last_slash >= 0:
+            strcpy(&shell_tab_dir[0], &shell_tab_prefix[0])
+            shell_tab_dir[last_slash + 1] = '\0'
+            strcat(&shell_tab_dir[0], &shell_tab_match[0])
+            shell_build_path(&shell_tab_dir[0])
+        else:
+            shell_build_path(&shell_tab_match[0])
+
+        if ramfs_isdir(&shell_path_buf[0]):
+            if shell_cmd_pos < 255:
+                shell_cmd[shell_cmd_pos] = '/'
+                shell_putc('/')
+                shell_cmd_pos = shell_cmd_pos + 1
+                shell_cmd[shell_cmd_pos] = '\0'
+        else:
+            if shell_cmd_pos < 255:
+                shell_cmd[shell_cmd_pos] = ' '
+                shell_putc(' ')
+                shell_cmd_pos = shell_cmd_pos + 1
+                shell_cmd[shell_cmd_pos] = '\0'
+
+    elif match_count > 1:
+        # Multiple matches - show them
+        shell_newline()
+        idx = 0
+        result = ramfs_readdir(dir_path, idx, &shell_name_buf[0])
+        while result >= 0:
+            j: int32 = 0
+            is_match: bool = True
+            while file_prefix[j] != '\0' and is_match:
+                if shell_name_buf[j] != file_prefix[j]:
+                    is_match = False
+                j = j + 1
+
+            if is_match:
+                shell_puts(&shell_name_buf[0])
+                if result == 1:
+                    shell_putc('/')
+                shell_puts("  ")
+
+            idx = idx + 1
+            result = ramfs_readdir(dir_path, idx, &shell_name_buf[0])
+
+        shell_newline()
+        shell_prompt()
+        # Re-display current command
+        i = 0
+        while i < shell_cmd_pos:
+            shell_putc(shell_cmd[i])
+            i = i + 1
 
 # ============================================================================
 # Shell command handlers - split into small functions to avoid branch distance
@@ -248,32 +495,72 @@ def shell_exec_file(cmd: Ptr[char]) -> bool:
     if shell_starts_with("ls"):
         shell_newline()
         ls_arg: Ptr[char] = shell_get_arg()
+        ls_long: bool = False
         ls_path: Ptr[char] = &shell_cwd[0]
+
+        # Check for -l flag
+        if ls_arg[0] == '-' and ls_arg[1] == 'l':
+            ls_long = True
+            # Skip to next argument
+            ls_arg = &ls_arg[2]
+            while ls_arg[0] == ' ':
+                ls_arg = &ls_arg[1]
+
         if ls_arg[0] != '\0':
             if ls_arg[0] == '/':
                 ls_path = ls_arg
             else:
                 shell_build_path(ls_arg)
                 ls_path = &shell_path_buf[0]
+
         if not ramfs_exists(ls_path):
             shell_puts("ls: cannot access '")
             shell_puts(ls_arg)
             shell_puts("': No such file or directory")
             shell_newline()
         elif not ramfs_isdir(ls_path):
+            if ls_long:
+                shell_puts("-rw-r--r-- ")
+                fsize: int32 = ramfs_size(ls_path)
+                shell_puts(shell_int_to_str(fsize))
+                shell_puts(" ")
             shell_puts(ls_arg)
             shell_newline()
         else:
             idx: int32 = 0
             result: int32 = ramfs_readdir(ls_path, idx, &shell_name_buf[0])
             while result >= 0:
-                shell_puts(&shell_name_buf[0])
-                if result == 1:
-                    shell_putc('/')
-                shell_puts("  ")
+                if ls_long:
+                    # Build full path for size lookup
+                    strcpy(&shell_src_path[0], ls_path)
+                    if shell_src_path[strlen(&shell_src_path[0]) - 1] != '/':
+                        strcat(&shell_src_path[0], "/")
+                    strcat(&shell_src_path[0], &shell_name_buf[0])
+                    if result == 1:
+                        shell_puts("drwxr-xr-x    0 ")
+                    else:
+                        shell_puts("-rw-r--r-- ")
+                        fsize2: int32 = ramfs_size(&shell_src_path[0])
+                        # Right-align size in 4 chars
+                        if fsize2 < 10:
+                            shell_puts("   ")
+                        elif fsize2 < 100:
+                            shell_puts("  ")
+                        elif fsize2 < 1000:
+                            shell_puts(" ")
+                        shell_puts(shell_int_to_str(fsize2))
+                        shell_puts(" ")
+                    shell_puts(&shell_name_buf[0])
+                    shell_newline()
+                else:
+                    shell_puts(&shell_name_buf[0])
+                    if result == 1:
+                        shell_putc('/')
+                    shell_puts("  ")
                 idx = idx + 1
                 result = ramfs_readdir(ls_path, idx, &shell_name_buf[0])
-            shell_newline()
+            if not ls_long:
+                shell_newline()
         return True
 
     if shell_starts_with("cd"):
@@ -687,13 +974,29 @@ def shell_exec_file2(cmd: Ptr[char]) -> bool:
         return True
 
     if shell_starts_with("head"):
-        arg16: Ptr[char] = shell_get_arg()
-        if arg16[0] == '\0':
+        head_arg: Ptr[char] = shell_get_arg()
+        head_n: int32 = 10
+
+        # Parse -n flag
+        if head_arg[0] == '-' and head_arg[1] == 'n':
+            head_arg = &head_arg[2]
+            while head_arg[0] == ' ':
+                head_arg = &head_arg[1]
+            head_n = atoi(head_arg)
+            if head_n <= 0:
+                head_n = 10
+            # Skip to filename
+            while head_arg[0] != '\0' and head_arg[0] != ' ':
+                head_arg = &head_arg[1]
+            while head_arg[0] == ' ':
+                head_arg = &head_arg[1]
+
+        if head_arg[0] == '\0':
             shell_newline()
-            shell_puts("Usage: head <file>")
+            shell_puts("Usage: head [-n N] <file>")
             shell_newline()
         else:
-            shell_build_path(arg16)
+            shell_build_path(head_arg)
             if ramfs_exists(&shell_path_buf[0]) and not ramfs_isdir(&shell_path_buf[0]):
                 shell_newline()
                 bytes_read: int32 = ramfs_read(&shell_path_buf[0], &shell_read_buf[0], 511)
@@ -701,7 +1004,7 @@ def shell_exec_file2(cmd: Ptr[char]) -> bool:
                     shell_read_buf[bytes_read] = 0
                     lines: int32 = 0
                     i: int32 = 0
-                    while i < bytes_read and lines < 10:
+                    while i < bytes_read and lines < head_n:
                         shell_putc(cast[char](shell_read_buf[i]))
                         if shell_read_buf[i] == 10:
                             lines = lines + 1
@@ -710,29 +1013,68 @@ def shell_exec_file2(cmd: Ptr[char]) -> bool:
             else:
                 shell_newline()
                 shell_puts("No such file: ")
-                shell_puts(arg16)
+                shell_puts(head_arg)
                 shell_newline()
         return True
 
     if shell_starts_with("tail"):
-        arg17: Ptr[char] = shell_get_arg()
-        if arg17[0] == '\0':
+        tail_arg: Ptr[char] = shell_get_arg()
+        tail_n: int32 = 10
+
+        # Parse -n flag
+        if tail_arg[0] == '-' and tail_arg[1] == 'n':
+            tail_arg = &tail_arg[2]
+            while tail_arg[0] == ' ':
+                tail_arg = &tail_arg[1]
+            tail_n = atoi(tail_arg)
+            if tail_n <= 0:
+                tail_n = 10
+            # Skip to filename
+            while tail_arg[0] != '\0' and tail_arg[0] != ' ':
+                tail_arg = &tail_arg[1]
+            while tail_arg[0] == ' ':
+                tail_arg = &tail_arg[1]
+
+        if tail_arg[0] == '\0':
             shell_newline()
-            shell_puts("Usage: tail <file>")
+            shell_puts("Usage: tail [-n N] <file>")
             shell_newline()
         else:
-            shell_build_path(arg17)
+            shell_build_path(tail_arg)
             if ramfs_exists(&shell_path_buf[0]) and not ramfs_isdir(&shell_path_buf[0]):
                 shell_newline()
                 bytes_read: int32 = ramfs_read(&shell_path_buf[0], &shell_read_buf[0], 511)
                 if bytes_read > 0:
                     shell_read_buf[bytes_read] = 0
-                    shell_puts(cast[Ptr[char]](&shell_read_buf[0]))
+                    # Count total lines
+                    total_lines: int32 = 0
+                    i: int32 = 0
+                    while i < bytes_read:
+                        if shell_read_buf[i] == 10:
+                            total_lines = total_lines + 1
+                        i = i + 1
+                    # If last char isn't newline, count that as a line too
+                    if bytes_read > 0 and shell_read_buf[bytes_read - 1] != 10:
+                        total_lines = total_lines + 1
+                    # Find start position (skip lines until we have tail_n left)
+                    skip_lines: int32 = total_lines - tail_n
+                    if skip_lines < 0:
+                        skip_lines = 0
+                    lines_skipped: int32 = 0
+                    i = 0
+                    while i < bytes_read and lines_skipped < skip_lines:
+                        if shell_read_buf[i] == 10:
+                            lines_skipped = lines_skipped + 1
+                        i = i + 1
+                    # Print from position i
+                    while i < bytes_read:
+                        shell_putc(cast[char](shell_read_buf[i]))
+                        i = i + 1
                 shell_newline()
             else:
                 shell_newline()
                 shell_puts("No such file: ")
-                shell_puts(arg17)
+                shell_puts(tail_arg)
                 shell_newline()
         return True
 
@@ -1077,6 +1419,285 @@ def shell_exec_util(cmd: Ptr[char]) -> bool:
 
     return False
 
+def shell_exec_grep(cmd: Ptr[char]) -> bool:
+    """Handle grep command. Returns True if handled."""
+
+    if shell_starts_with("grep"):
+        grep_arg: Ptr[char] = shell_get_arg()
+        grep_invert: bool = False
+        grep_count: bool = False
+
+        # Parse flags
+        while grep_arg[0] == '-':
+            if grep_arg[1] == 'v':
+                grep_invert = True
+                grep_arg = &grep_arg[2]
+            elif grep_arg[1] == 'c':
+                grep_count = True
+                grep_arg = &grep_arg[2]
+            else:
+                break
+            while grep_arg[0] == ' ':
+                grep_arg = &grep_arg[1]
+
+        if grep_arg[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: grep [-v] [-c] pattern file")
+            shell_newline()
+        else:
+            # Extract pattern and file
+            i: int32 = 0
+            while grep_arg[i] != '\0' and grep_arg[i] != ' ':
+                shell_grep_pat[i] = grep_arg[i]
+                i = i + 1
+            shell_grep_pat[i] = '\0'
+
+            grep_file: Ptr[char] = &grep_arg[i]
+            while grep_file[0] == ' ':
+                grep_file = &grep_file[1]
+
+            if grep_file[0] == '\0':
+                shell_newline()
+                shell_puts("Usage: grep [-v] [-c] pattern file")
+                shell_newline()
+            else:
+                shell_build_path(grep_file)
+                if ramfs_exists(&shell_path_buf[0]) and not ramfs_isdir(&shell_path_buf[0]):
+                    bytes_read: int32 = ramfs_read(&shell_path_buf[0], &shell_read_buf[0], 511)
+                    shell_newline()
+                    if bytes_read > 0:
+                        shell_read_buf[bytes_read] = 0
+                        match_count: int32 = 0
+                        line_start: int32 = 0
+                        pos: int32 = 0
+                        while pos <= bytes_read:
+                            if pos == bytes_read or shell_read_buf[pos] == 10:
+                                # Extract line
+                                line_len: int32 = pos - line_start
+                                if line_len > 255:
+                                    line_len = 255
+                                j: int32 = 0
+                                while j < line_len:
+                                    shell_line_buf[j] = cast[char](shell_read_buf[line_start + j])
+                                    j = j + 1
+                                shell_line_buf[line_len] = '\0'
+
+                                # Check for match
+                                has_match: bool = str_contains(&shell_line_buf[0], &shell_grep_pat[0])
+                                if grep_invert:
+                                    has_match = not has_match
+
+                                if has_match:
+                                    match_count = match_count + 1
+                                    if not grep_count:
+                                        shell_puts(&shell_line_buf[0])
+                                        shell_newline()
+
+                                line_start = pos + 1
+                            pos = pos + 1
+                        if grep_count:
+                            shell_puts(shell_int_to_str(match_count))
+                            shell_newline()
+                else:
+                    shell_newline()
+                    shell_puts("grep: ")
+                    shell_puts(grep_file)
+                    shell_puts(": No such file")
+                    shell_newline()
+        return True
+
+    return False
+
+def shell_find_in_dir(dir_path: Ptr[char], pattern: Ptr[char], name_only: bool):
+    """Search for files matching pattern in dir_path (non-recursive)."""
+    idx: int32 = 0
+    result: int32 = ramfs_readdir(dir_path, idx, &shell_find_buf[0])
+    while result >= 0:
+        # Build full path
+        strcpy(&shell_find_path[0], dir_path)
+        if shell_find_path[strlen(&shell_find_path[0]) - 1] != '/':
+            strcat(&shell_find_path[0], "/")
+        strcat(&shell_find_path[0], &shell_find_buf[0])
+
+        # Check if name matches pattern
+        if pattern[0] == '\0' or str_contains(&shell_find_buf[0], pattern):
+            if name_only:
+                shell_puts(&shell_find_buf[0])
+            else:
+                shell_puts(&shell_find_path[0])
+            shell_newline()
+
+        idx = idx + 1
+        result = ramfs_readdir(dir_path, idx, &shell_find_buf[0])
+
+def shell_exec_find(cmd: Ptr[char]) -> bool:
+    """Handle find command. Returns True if handled."""
+
+    if shell_starts_with("find"):
+        find_arg: Ptr[char] = shell_get_arg()
+        find_name_only: bool = False
+
+        if find_arg[0] == '\0':
+            # No args - search current directory
+            shell_newline()
+            shell_find_in_dir(&shell_cwd[0], "", False)
+        else:
+            # Check for -name flag
+            find_dir: Ptr[char] = find_arg
+            find_pattern: Ptr[char] = ""
+
+            # Skip directory arg if present
+            if find_arg[0] == '-':
+                # -name pattern
+                if find_arg[1] == 'n' and find_arg[2] == 'a':
+                    find_arg = &find_arg[5]  # Skip "-name"
+                    while find_arg[0] == ' ':
+                        find_arg = &find_arg[1]
+                    # Extract pattern
+                    i: int32 = 0
+                    while find_arg[i] != '\0' and find_arg[i] != ' ' and i < 63:
+                        shell_find_pat[i] = find_arg[i]
+                        i = i + 1
+                    shell_find_pat[i] = '\0'
+                    find_pattern = &shell_find_pat[0]
+                    find_dir = &shell_cwd[0]
+            else:
+                # Directory specified, check for -name after
+                i: int32 = 0
+                while find_arg[i] != '\0' and find_arg[i] != ' ':
+                    i = i + 1
+                if find_arg[i] == ' ':
+                    find_arg[i] = '\0'
+                    find_dir = find_arg
+                    find_arg = &find_arg[i + 1]
+                    while find_arg[0] == ' ':
+                        find_arg = &find_arg[1]
+                    if find_arg[0] == '-' and find_arg[1] == 'n' and find_arg[2] == 'a':
+                        find_arg = &find_arg[5]
+                        while find_arg[0] == ' ':
+                            find_arg = &find_arg[1]
+                        j: int32 = 0
+                        while find_arg[j] != '\0' and find_arg[j] != ' ' and j < 63:
+                            shell_find_pat[j] = find_arg[j]
+                            j = j + 1
+                        shell_find_pat[j] = '\0'
+                        find_pattern = &shell_find_pat[0]
+
+            shell_newline()
+            shell_build_path(find_dir)
+            if ramfs_exists(&shell_path_buf[0]) and ramfs_isdir(&shell_path_buf[0]):
+                shell_find_in_dir(&shell_path_buf[0], find_pattern, False)
+            else:
+                shell_puts("find: ")
+                shell_puts(find_dir)
+                shell_puts(": No such directory")
+                shell_newline()
+        return True
+
+    return False
+
+def shell_exec_sed(cmd: Ptr[char]) -> bool:
+    """Handle sed command. Supports s/old/new/ substitution."""
+
+    if shell_starts_with("sed"):
+        sed_arg: Ptr[char] = shell_get_arg()
+
+        if sed_arg[0] != 's' or sed_arg[1] != '/':
+            shell_newline()
+            shell_puts("Usage: sed s/old/new/ file")
+            shell_newline()
+            return True
+
+        # Parse s/old/new/
+        sed_arg = &sed_arg[2]  # Skip "s/"
+
+        # Extract old pattern
+        i: int32 = 0
+        while sed_arg[i] != '/' and sed_arg[i] != '\0' and i < 63:
+            shell_sed_old[i] = sed_arg[i]
+            i = i + 1
+        shell_sed_old[i] = '\0'
+
+        if sed_arg[i] != '/':
+            shell_newline()
+            shell_puts("Usage: sed s/old/new/ file")
+            shell_newline()
+            return True
+
+        sed_arg = &sed_arg[i + 1]  # Skip delimiter
+
+        # Extract new pattern
+        i = 0
+        while sed_arg[i] != '/' and sed_arg[i] != '\0' and i < 63:
+            shell_sed_new[i] = sed_arg[i]
+            i = i + 1
+        shell_sed_new[i] = '\0'
+
+        if sed_arg[i] != '/':
+            shell_newline()
+            shell_puts("Usage: sed s/old/new/ file")
+            shell_newline()
+            return True
+
+        sed_arg = &sed_arg[i + 1]  # Skip trailing /
+        while sed_arg[0] == ' ':
+            sed_arg = &sed_arg[1]
+
+        if sed_arg[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: sed s/old/new/ file")
+            shell_newline()
+            return True
+
+        # Read file
+        shell_build_path(sed_arg)
+        if not ramfs_exists(&shell_path_buf[0]) or ramfs_isdir(&shell_path_buf[0]):
+            shell_newline()
+            shell_puts("sed: ")
+            shell_puts(sed_arg)
+            shell_puts(": No such file")
+            shell_newline()
+            return True
+
+        bytes_read: int32 = ramfs_read(&shell_path_buf[0], &shell_read_buf[0], 511)
+        shell_newline()
+        if bytes_read > 0:
+            shell_read_buf[bytes_read] = 0
+            old_len: int32 = strlen(&shell_sed_old[0])
+            new_len: int32 = strlen(&shell_sed_new[0])
+
+            # Process each character, looking for old pattern
+            in_pos: int32 = 0
+            out_pos: int32 = 0
+            while in_pos < bytes_read and out_pos < 500:
+                # Check for match at current position
+                j: int32 = 0
+                matched: bool = True
+                while j < old_len and matched:
+                    if shell_read_buf[in_pos + j] != cast[uint8](shell_sed_old[j]):
+                        matched = False
+                    j = j + 1
+
+                if matched and old_len > 0:
+                    # Replace with new string
+                    k: int32 = 0
+                    while k < new_len and out_pos < 500:
+                        shell_sed_out[out_pos] = shell_sed_new[k]
+                        out_pos = out_pos + 1
+                        k = k + 1
+                    in_pos = in_pos + old_len
+                else:
+                    shell_sed_out[out_pos] = cast[char](shell_read_buf[in_pos])
+                    out_pos = out_pos + 1
+                    in_pos = in_pos + 1
+
+            shell_sed_out[out_pos] = '\0'
+            shell_puts(&shell_sed_out[0])
+        shell_newline()
+        return True
+
+    return False
+
 # ============================================================================
 # Main shell_exec dispatcher - calls smaller functions to avoid branch issues
 # ============================================================================
@@ -1091,6 +1712,10 @@ def shell_exec():
         return
 
     cmd: Ptr[char] = &shell_cmd[0]
+
+    # Save to history and reset navigation
+    history_add(cmd)
+    history_reset_pos()
 
     # Try each handler in turn - each returns True if it handled the command
     if shell_exec_job(cmd):
@@ -1107,6 +1732,12 @@ def shell_exec():
         pass
     elif shell_exec_util(cmd):
         pass
+    elif shell_exec_grep(cmd):
+        pass
+    elif shell_exec_find(cmd):
+        pass
+    elif shell_exec_sed(cmd):
+        pass
     else:
         # Unknown command
         shell_newline()
@@ -1119,7 +1750,51 @@ def shell_exec():
     shell_cmd_pos = 0
 
 def shell_input(c: char):
-    global shell_cmd_pos, job1_state
+    global shell_cmd_pos
+    global job1_state
+    global shell_history_pos
+
+    # Handle escape sequences for arrow keys
+    if shell_esc[0] == 1:
+        # Got ESC, expecting [
+        if c == '[':
+            shell_esc[0] = 2
+            return
+        else:
+            shell_esc[0] = 0
+            # Fall through to process char normally
+
+    if shell_esc[0] == 2:
+        # Got ESC [, expecting A/B/C/D
+        shell_esc[0] = 0
+        if c == 'A':
+            # Up arrow - previous command
+            if shell_history_count > 0:
+                if shell_history_pos < shell_history_count - 1:
+                    shell_history_pos = shell_history_pos + 1
+                hist_cmd: Ptr[char] = history_get(shell_history_pos)
+                if hist_cmd != Ptr[char](0):
+                    shell_set_cmd(hist_cmd)
+            return
+        elif c == 'B':
+            # Down arrow - next command
+            if shell_history_pos > 0:
+                shell_history_pos = shell_history_pos - 1
+                hist_cmd2: Ptr[char] = history_get(shell_history_pos)
+                if hist_cmd2 != Ptr[char](0):
+                    shell_set_cmd(hist_cmd2)
+            elif shell_history_pos == 0:
+                shell_history_pos = -1
+                shell_clear_line()
+            return
+        # C=right, D=left - ignore for now
+        return
+
+    # Check for ESC start (use numeric comparison to avoid signedness issues)
+    code: int32 = cast[int32](c) & 0xFF
+    if code == 27:
+        shell_esc[0] = 1
+        return
 
     if c == '\r' or c == '\n':
         shell_newline()
@@ -1133,11 +1808,17 @@ def shell_input(c: char):
             shell_puts("\b \b")
         return
 
+    # TAB - filename completion
+    if c == '\t':
+        shell_tab_complete()
+        return
+
     # Ctrl+C - cancel current command line
     if c == '\x03':
         shell_puts("^C")
         shell_newline()
         shell_cmd_pos = 0
+        history_reset_pos()
         shell_prompt()
         return
 
@@ -1150,10 +1831,12 @@ def shell_input(c: char):
             shell_puts("[1]+  Stopped                 main.py")
             shell_newline()
         shell_cmd_pos = 0
+        history_reset_pos()
         shell_prompt()
         return
 
-    # Regular char
+    # Regular char - reset history position
+    history_reset_pos()
     if shell_cmd_pos < 255:
         shell_cmd[shell_cmd_pos] = c
         shell_cmd_pos = shell_cmd_pos + 1
