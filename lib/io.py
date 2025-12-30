@@ -3,6 +3,10 @@
 # Basic I/O primitives for bare-metal ARM Cortex-M3.
 # Talks directly to UART for console I/O.
 
+# ============================================================================
+# UART hardware registers
+# ============================================================================
+
 # UART register base address
 UART_BASE: uint32 = 0x40004000
 
@@ -26,18 +30,80 @@ extern def print_str(s: str)
 extern def print_int(n: int32)
 extern def print_hex(n: uint32)
 extern def print_newline()
+extern def uart_putc(c: char)
+extern def uart_getc() -> char
+extern def uart_available() -> bool
 
-# Low-level UART character output using volatile register access
-def uart_putc(c: char):
-    # Wait until TX FIFO is not full
-    while (*UART_STATUS & UART_STATUS_TX_FULL) != 0:
-        pass
-    # Memory barrier before write to ensure ordering
-    dmb()
-    # Write character to data register
-    *UART_DATA = cast[uint32](c)
-    # Memory barrier after write
-    dmb()
+# ============================================================================
+# Console output abstraction
+# ============================================================================
+# This allows output to be redirected (e.g., to DE terminal instead of UART)
+
+# Console mode: 0 = UART (direct), 1 = buffered (for DE capture)
+console_mode: int32 = 0
+
+# Output buffer for DE mode
+console_buf: Array[512, char]
+console_buf_pos: int32 = 0
+
+def console_putc(c: char):
+    """Output a character to console (UART or DE buffer based on mode)."""
+    global console_buf_pos
+    if console_mode == 0:
+        uart_putc(c)
+    else:
+        # Buffer for DE capture
+        if console_buf_pos < 510:
+            console_buf[console_buf_pos] = c
+            console_buf_pos = console_buf_pos + 1
+            console_buf[console_buf_pos] = '\0'
+
+def console_puts(s: Ptr[char]):
+    """Output a string to console."""
+    i: int32 = 0
+    while s[i] != '\0':
+        console_putc(s[i])
+        i = i + 1
+
+def console_print_int(n: int32):
+    """Output an integer to console."""
+    if n == 0:
+        console_putc('0')
+        return
+    if n < 0:
+        console_putc('-')
+        n = -n
+    # Build digits in reverse
+    digits: Array[12, char]
+    i: int32 = 0
+    while n > 0:
+        digits[i] = cast[char](48 + (n % 10))
+        n = n / 10
+        i = i + 1
+    # Output in correct order
+    while i > 0:
+        i = i - 1
+        console_putc(digits[i])
+
+def console_set_mode(mode: int32):
+    """Set console mode: 0=UART, 1=buffered for DE."""
+    global console_mode
+    console_mode = mode
+
+def console_flush() -> Ptr[char]:
+    """Get buffered output and reset. Returns pointer to buffer."""
+    global console_buf_pos
+    console_buf[console_buf_pos] = '\0'
+    console_buf_pos = 0
+    return &console_buf[0]
+
+def console_has_output() -> bool:
+    """Check if there's buffered output."""
+    return console_buf_pos > 0
+
+# ============================================================================
+# Helper print functions
+# ============================================================================
 
 # Print a character
 def putc(c: char):
@@ -65,24 +131,9 @@ def printf(fmt: Ptr[char], arg: int32):
             uart_putc(c)
             i = i + 1
 
-# Low-level UART character input using volatile register access
-def uart_getc() -> char:
-    # Wait until RX FIFO is not empty
-    while (*UART_STATUS & UART_STATUS_RX_EMPTY) != 0:
-        pass
-    # Memory barrier before read
-    dmb()
-    # Read character from data register
-    c: char = cast[char](*UART_DATA & 0xFF)
-    # Memory barrier after read
-    dmb()
-    return c
-
-# Check if character available (non-blocking)
-def uart_available() -> bool:
-    # Memory barrier to ensure fresh read
-    dmb()
-    return (*UART_STATUS & UART_STATUS_RX_EMPTY) == 0
+# ============================================================================
+# Line input
+# ============================================================================
 
 # Simple input buffer for reading lines
 INPUT_BUF_SIZE: int32 = 256

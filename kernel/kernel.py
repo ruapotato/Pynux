@@ -86,6 +86,8 @@ def kernel_init():
     ramfs_create("/etc", True)
     ramfs_create("/etc/motd", False)
     ramfs_write("/etc/motd", "Welcome to Pynux!\n")
+    ramfs_create("/etc/hostname", False)
+    ramfs_write("/etc/hostname", "pynux\n")
     print_str("OK\n")
 
     # Mark initialization complete with proper synchronization

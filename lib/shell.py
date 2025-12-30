@@ -27,6 +27,9 @@ shell_path_buf: Array[256, char]
 # Read buffer for cat
 shell_read_buf: Array[512, uint8]
 
+# Copy buffer (char version for ramfs_write)
+shell_copy_buf: Array[512, char]
+
 # Number buffer for printing integers
 shell_num_buf: Array[16, char]
 
@@ -129,16 +132,50 @@ def shell_int_to_str(n: int32) -> Ptr[char]:
 
     return &shell_num_buf[0]
 
-def shell_exec():
-    global shell_cmd_pos, job1_state
+# ============================================================================
+# Shell command handlers - split into small functions to avoid branch distance
+# issues in ARM Thumb-2 generated code
+# ============================================================================
 
-    shell_cmd[shell_cmd_pos] = '\0'
+def shell_exec_job(cmd: Ptr[char]) -> bool:
+    """Handle job control commands. Returns True if handled."""
+    global job1_state
 
-    if shell_cmd_pos == 0:
-        shell_prompt()
-        return
+    if strcmp(cmd, "jobs") == 0:
+        shell_newline()
+        if job1_state == SHELL_JOB_RUNNING:
+            shell_puts("[1]   Running                 main.py &")
+        elif job1_state == SHELL_JOB_STOPPED:
+            shell_puts("[1]+  Stopped                 main.py")
+        else:
+            shell_puts("[1]   Running                 main.py")
+        shell_newline()
+        return True
 
-    cmd: Ptr[char] = &shell_cmd[0]
+    if strcmp(cmd, "fg") == 0:
+        shell_newline()
+        if job1_state == SHELL_JOB_STOPPED:
+            job1_state = SHELL_JOB_RUNNING
+            shell_puts("main.py: continued")
+        else:
+            shell_puts("main.py: already running")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "bg") == 0:
+        shell_newline()
+        if job1_state == SHELL_JOB_STOPPED:
+            job1_state = SHELL_JOB_RUNNING
+            shell_puts("[1]+ main.py &")
+        else:
+            shell_puts("bg: job already in background")
+        shell_newline()
+        return True
+
+    return False
+
+def shell_exec_basic(cmd: Ptr[char]) -> bool:
+    """Handle basic shell commands. Returns True if handled."""
 
     if strcmp(cmd, "help") == 0:
         shell_newline()
@@ -168,60 +205,65 @@ def shell_exec():
         shell_newline()
         shell_puts("  free       - Memory usage")
         shell_newline()
-        shell_puts("  whoami     - Current user")
-        shell_newline()
-        shell_puts("  hostname   - System hostname")
-        shell_newline()
-        shell_puts("  date       - Current date")
-        shell_newline()
-        shell_puts("  uptime     - System uptime")
-        shell_newline()
-        shell_puts("  write f t  - Write text to file")
-        shell_newline()
-        shell_puts("  cp s d     - Copy file")
-        shell_newline()
-        shell_puts("  id         - User identity")
-        shell_newline()
-        shell_puts("  env        - Environment vars")
-        shell_newline()
-        shell_puts("  sleep <n>  - Sleep N seconds")
-        shell_newline()
-        shell_puts("  reboot     - Reboot system")
-        shell_newline()
-        shell_puts("  halt       - Halt system")
+        shell_puts("  jobs/fg/bg - Job control")
         shell_newline()
         shell_puts("  version    - Show version")
         shell_newline()
-    elif strcmp(cmd, "pwd") == 0:
+        return True
+
+    if strcmp(cmd, "pwd") == 0:
         shell_newline()
         shell_puts(&shell_cwd[0])
         shell_newline()
-    elif shell_starts_with("ls"):
+        return True
+
+    if shell_starts_with("echo"):
+        arg: Ptr[char] = shell_get_arg()
         shell_newline()
-        # Get optional path argument
+        shell_puts(arg)
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "version") == 0:
+        shell_newline()
+        shell_puts("Pynux Text Shell v0.1")
+        shell_newline()
+        shell_puts("ARM Cortex-M3")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "clear") == 0:
+        shell_puts("\x1b[2J\x1b[H")
+        return True
+
+    if strcmp(cmd, "reset") == 0:
+        shell_puts("\x1b[2J\x1b[H")
+        return True
+
+    return False
+
+def shell_exec_file(cmd: Ptr[char]) -> bool:
+    """Handle file system commands. Returns True if handled."""
+
+    if shell_starts_with("ls"):
+        shell_newline()
         ls_arg: Ptr[char] = shell_get_arg()
         ls_path: Ptr[char] = &shell_cwd[0]
         if ls_arg[0] != '\0':
-            # Has path argument
             if ls_arg[0] == '/':
-                # Absolute path
                 ls_path = ls_arg
             else:
-                # Relative path
                 shell_build_path(ls_arg)
                 ls_path = &shell_path_buf[0]
-        # Check if path exists and is a directory
         if not ramfs_exists(ls_path):
             shell_puts("ls: cannot access '")
             shell_puts(ls_arg)
             shell_puts("': No such file or directory")
             shell_newline()
         elif not ramfs_isdir(ls_path):
-            # It's a file, just print its name
             shell_puts(ls_arg)
             shell_newline()
         else:
-            # It's a directory, list contents
             idx: int32 = 0
             result: int32 = ramfs_readdir(ls_path, idx, &shell_name_buf[0])
             while result >= 0:
@@ -232,7 +274,9 @@ def shell_exec():
                 idx = idx + 1
                 result = ramfs_readdir(ls_path, idx, &shell_name_buf[0])
             shell_newline()
-    elif shell_starts_with("cd"):
+        return True
+
+    if shell_starts_with("cd"):
         arg: Ptr[char] = shell_get_arg()
         if arg[0] == '\0':
             shell_cwd[0] = '/'
@@ -259,7 +303,9 @@ def shell_exec():
                 shell_puts("No such directory: ")
                 shell_puts(arg)
                 shell_newline()
-    elif shell_starts_with("cat"):
+        return True
+
+    if shell_starts_with("cat"):
         arg2: Ptr[char] = shell_get_arg()
         if arg2[0] == '\0':
             shell_newline()
@@ -279,7 +325,9 @@ def shell_exec():
                 shell_puts("No such file: ")
                 shell_puts(arg2)
                 shell_newline()
-    elif shell_starts_with("mkdir"):
+        return True
+
+    if shell_starts_with("mkdir"):
         arg3: Ptr[char] = shell_get_arg()
         if arg3[0] == '\0':
             shell_newline()
@@ -296,7 +344,9 @@ def shell_exec():
                 shell_newline()
                 shell_puts("Failed to create directory")
                 shell_newline()
-    elif shell_starts_with("touch"):
+        return True
+
+    if shell_starts_with("touch"):
         arg4: Ptr[char] = shell_get_arg()
         if arg4[0] == '\0':
             shell_newline()
@@ -313,7 +363,9 @@ def shell_exec():
                 shell_newline()
                 shell_puts("Failed to create file")
                 shell_newline()
-    elif shell_starts_with("rm"):
+        return True
+
+    if shell_starts_with("rm"):
         arg5: Ptr[char] = shell_get_arg()
         if arg5[0] == '\0':
             shell_newline()
@@ -330,21 +382,14 @@ def shell_exec():
                 shell_newline()
                 shell_puts("Failed to remove")
                 shell_newline()
-    elif shell_starts_with("echo"):
-        arg6: Ptr[char] = shell_get_arg()
-        shell_newline()
-        shell_puts(arg6)
-        shell_newline()
-    elif strcmp(cmd, "version") == 0:
-        shell_newline()
-        shell_puts("Pynux Text Shell v0.1")
-        shell_newline()
-        shell_puts("ARM Cortex-M3")
-        shell_newline()
-    elif strcmp(cmd, "clear") == 0:
-        # VT100 clear screen
-        shell_puts("\x1b[2J\x1b[H")
-    elif shell_starts_with("uname"):
+        return True
+
+    return False
+
+def shell_exec_sys(cmd: Ptr[char]) -> bool:
+    """Handle system info commands. Returns True if handled."""
+
+    if shell_starts_with("uname"):
         shell_newline()
         arg7: Ptr[char] = shell_get_arg()
         if arg7[0] == '\0' or strcmp(arg7, "-s") == 0:
@@ -358,7 +403,9 @@ def shell_exec():
         else:
             shell_puts("Pynux")
         shell_newline()
-    elif strcmp(cmd, "free") == 0:
+        return True
+
+    if strcmp(cmd, "free") == 0:
         shell_newline()
         shell_puts("       total     used     free")
         shell_newline()
@@ -369,31 +416,193 @@ def shell_exec():
         shell_puts("    ")
         shell_puts(shell_int_to_str(heap_remaining()))
         shell_newline()
-    elif strcmp(cmd, "whoami") == 0:
+        return True
+
+    if strcmp(cmd, "whoami") == 0:
         shell_newline()
         shell_puts("root")
         shell_newline()
-    elif strcmp(cmd, "hostname") == 0:
+        return True
+
+    if strcmp(cmd, "hostname") == 0:
         shell_newline()
         shell_puts("pynux")
         shell_newline()
-    elif strcmp(cmd, "date") == 0:
+        return True
+
+    if strcmp(cmd, "date") == 0:
         shell_newline()
         shell_puts("Jan 1 00:00:00 UTC 2025")
         shell_newline()
-    elif strcmp(cmd, "uptime") == 0:
+        return True
+
+    if strcmp(cmd, "uptime") == 0:
         shell_newline()
         shell_puts("up 0 days, 0:00")
         shell_newline()
-    elif shell_starts_with("write"):
-        # write <file> <content>
+        return True
+
+    if strcmp(cmd, "id") == 0:
+        shell_newline()
+        shell_puts("uid=0(root) gid=0(root)")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "env") == 0:
+        shell_newline()
+        shell_puts("HOME=/home")
+        shell_newline()
+        shell_puts("USER=root")
+        shell_newline()
+        shell_puts("SHELL=/bin/psh")
+        shell_newline()
+        shell_puts("PWD=")
+        shell_puts(&shell_cwd[0])
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "printenv") == 0:
+        shell_newline()
+        shell_puts("HOME=/home")
+        shell_newline()
+        shell_puts("USER=root")
+        shell_newline()
+        shell_puts("SHELL=/bin/psh")
+        shell_newline()
+        shell_puts("PATH=/bin")
+        shell_newline()
+        shell_puts("TERM=vt100")
+        shell_newline()
+        shell_puts("PWD=")
+        shell_puts(&shell_cwd[0])
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "arch") == 0:
+        shell_newline()
+        shell_puts("armv7m")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "nproc") == 0:
+        shell_newline()
+        shell_puts("1")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "tty") == 0:
+        shell_newline()
+        shell_puts("/dev/ttyS0")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "logname") == 0:
+        shell_newline()
+        shell_puts("root")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "dmesg") == 0:
+        shell_newline()
+        shell_puts("[    0.000] Pynux kernel booting...")
+        shell_newline()
+        shell_puts("[    0.001] UART initialized")
+        shell_newline()
+        shell_puts("[    0.002] Heap initialized (16KB)")
+        shell_newline()
+        shell_puts("[    0.003] Timer initialized")
+        shell_newline()
+        shell_puts("[    0.004] RAMFS initialized")
+        shell_newline()
+        shell_puts("[    0.005] Kernel ready")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "lscpu") == 0:
+        shell_newline()
+        shell_puts("Architecture:    armv7m")
+        shell_newline()
+        shell_puts("Vendor:          ARM")
+        shell_newline()
+        shell_puts("Model:           Cortex-M3")
+        shell_newline()
+        shell_puts("CPU(s):          1")
+        shell_newline()
+        shell_puts("Max MHz:         25")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "df") == 0:
+        shell_newline()
+        shell_puts("Filesystem  1K-blocks  Used  Available  Use%  Mounted on")
+        shell_newline()
+        shell_puts("ramfs            16     ")
+        used_kb: int32 = heap_used() / 1024
+        shell_puts(shell_int_to_str(used_kb))
+        shell_puts("         ")
+        free_kb: int32 = heap_remaining() / 1024
+        shell_puts(shell_int_to_str(free_kb))
+        shell_puts("     ")
+        pct: int32 = (heap_used() * 100) / heap_total()
+        shell_puts(shell_int_to_str(pct))
+        shell_puts("%   /")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "mount") == 0:
+        shell_newline()
+        shell_puts("ramfs on / type ramfs (rw)")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "umount") == 0:
+        shell_newline()
+        shell_puts("umount: cannot unmount /: device is busy")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "ps") == 0:
+        shell_newline()
+        shell_puts("  PID TTY      TIME CMD")
+        shell_newline()
+        shell_puts("    1 ttyS0    0:00 psh")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "users") == 0:
+        shell_newline()
+        shell_puts("root")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "groups") == 0:
+        shell_newline()
+        shell_puts("root")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "sync") == 0:
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "kill") == 0:
+        shell_newline()
+        shell_puts("kill: No processes to kill")
+        shell_newline()
+        return True
+
+    return False
+
+def shell_exec_file2(cmd: Ptr[char]) -> bool:
+    """Handle more file commands (write, cp, head, tail, wc, stat)."""
+
+    if shell_starts_with("write"):
         arg8: Ptr[char] = shell_get_arg()
         if arg8[0] == '\0':
             shell_newline()
             shell_puts("Usage: write <file> <content>")
             shell_newline()
         else:
-            # Find the content (after the filename)
             i: int32 = 0
             while arg8[i] != '\0' and arg8[i] != ' ':
                 i = i + 1
@@ -401,10 +610,8 @@ def shell_exec():
                 arg8[i] = '\0'
                 content: Ptr[char] = &arg8[i + 1]
                 shell_build_path(arg8)
-                # Create file if it doesn't exist
                 if not ramfs_exists(&shell_path_buf[0]):
                     ramfs_create(&shell_path_buf[0], False)
-                # Write content
                 content_len: int32 = strlen(content)
                 if ramfs_write(&shell_path_buf[0], content) >= 0:
                     shell_newline()
@@ -421,30 +628,15 @@ def shell_exec():
                 shell_newline()
                 shell_puts("Usage: write <file> <content>")
                 shell_newline()
-    elif strcmp(cmd, "id") == 0:
-        shell_newline()
-        shell_puts("uid=0(root) gid=0(root)")
-        shell_newline()
-    elif strcmp(cmd, "env") == 0:
-        shell_newline()
-        shell_puts("HOME=/home")
-        shell_newline()
-        shell_puts("USER=root")
-        shell_newline()
-        shell_puts("SHELL=/bin/psh")
-        shell_newline()
-        shell_puts("PWD=")
-        shell_puts(&shell_cwd[0])
-        shell_newline()
-    elif shell_starts_with("cp"):
-        # cp <src> <dst>
+        return True
+
+    if shell_starts_with("cp"):
         arg9: Ptr[char] = shell_get_arg()
         if arg9[0] == '\0':
             shell_newline()
             shell_puts("Usage: cp <src> <dst>")
             shell_newline()
         else:
-            # Find src and dst
             i: int32 = 0
             while arg9[i] != '\0' and arg9[i] != ' ':
                 i = i + 1
@@ -459,21 +651,22 @@ def shell_exec():
                     if ramfs_exists(&shell_src_path[0]) and not ramfs_isdir(&shell_src_path[0]):
                         bytes_read: int32 = ramfs_read(&shell_src_path[0], &shell_read_buf[0], 511)
                         if bytes_read >= 0:
-                            shell_read_buf[bytes_read] = 0
+                            # Copy uint8 buffer to char buffer
+                            j: int32 = 0
+                            while j < bytes_read:
+                                shell_copy_buf[j] = cast[char](shell_read_buf[j])
+                                j = j + 1
+                            shell_copy_buf[bytes_read] = '\0'
                             shell_build_path(dst)
                             if not ramfs_exists(&shell_path_buf[0]):
                                 ramfs_create(&shell_path_buf[0], False)
-                            if ramfs_write(&shell_path_buf[0], cast[Ptr[char]](&shell_read_buf[0])) >= 0:
-                                shell_newline()
-                                shell_puts("Copied ")
-                                shell_puts(&shell_src_path[0])
-                                shell_puts(" -> ")
-                                shell_puts(&shell_path_buf[0])
-                                shell_newline()
-                            else:
-                                shell_newline()
-                                shell_puts("Failed to write dest")
-                                shell_newline()
+                            ramfs_write(&shell_path_buf[0], &shell_copy_buf[0])
+                            shell_newline()
+                            shell_puts("Copied ")
+                            shell_puts(&shell_src_path[0])
+                            shell_puts(" -> ")
+                            shell_puts(&shell_path_buf[0])
+                            shell_newline()
                         else:
                             shell_newline()
                             shell_puts("Failed to read source")
@@ -491,281 +684,9 @@ def shell_exec():
                 shell_newline()
                 shell_puts("Usage: cp <src> <dst>")
                 shell_newline()
-    elif strcmp(cmd, "true") == 0:
-        pass
-    elif strcmp(cmd, "false") == 0:
-        shell_newline()
-    elif strcmp(cmd, "yes") == 0:
-        shell_newline()
-        shell_puts("y")
-        shell_newline()
-    elif shell_starts_with("sleep"):
-        arg10: Ptr[char] = shell_get_arg()
-        if arg10[0] == '\0':
-            shell_newline()
-            shell_puts("Usage: sleep <seconds>")
-            shell_newline()
-        else:
-            secs: int32 = atoi(arg10)
-            if secs > 0 and secs <= 60:
-                shell_newline()
-                shell_puts("Sleeping for ")
-                shell_puts(shell_int_to_str(secs))
-                shell_puts(" seconds...")
-                shell_newline()
-                timer_delay_ms(secs * 1000)
-                shell_puts("Done.")
-                shell_newline()
-            else:
-                shell_newline()
-                shell_puts("Invalid sleep time (1-60)")
-                shell_newline()
-    elif strcmp(cmd, "reboot") == 0:
-        shell_newline()
-        shell_puts("Rebooting...")
-        shell_newline()
-        timer_delay_ms(1000)
-        # Trigger system reset via NVIC
-        NVIC_AIRCR: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](0xE000ED0C)
-        NVIC_AIRCR[0] = 0x05FA0004
-        while True:
-            pass
-    elif strcmp(cmd, "halt") == 0 or strcmp(cmd, "poweroff") == 0 or strcmp(cmd, "exit") == 0:
-        shell_newline()
-        shell_puts("System halted.")
-        shell_newline()
-        # Use QEMU semihosting exit
-        SEMIHOST_EXIT: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](0xE000EDF0)
-        SEMIHOST_EXIT[0] = 0x20026
-        while True:
-            pass
-    elif shell_starts_with("seq"):
-        arg11: Ptr[char] = shell_get_arg()
-        if arg11[0] == '\0':
-            shell_newline()
-            shell_puts("Usage: seq [start] end")
-            shell_newline()
-        else:
-            start: int32 = 1
-            end: int32 = 0
-            i: int32 = 0
-            while arg11[i] != '\0' and arg11[i] != ' ':
-                i = i + 1
-            if arg11[i] == ' ':
-                arg11[i] = '\0'
-                start = atoi(arg11)
-                end = atoi(&arg11[i + 1])
-            else:
-                end = atoi(arg11)
-            shell_newline()
-            j: int32 = start
-            while j <= end:
-                shell_puts(shell_int_to_str(j))
-                shell_newline()
-                j = j + 1
-    elif shell_starts_with("factor"):
-        arg12: Ptr[char] = shell_get_arg()
-        if arg12[0] == '\0':
-            shell_newline()
-            shell_puts("Usage: factor <number>")
-            shell_newline()
-        else:
-            n: int32 = atoi(arg12)
-            shell_newline()
-            shell_puts(shell_int_to_str(n))
-            shell_puts(": ")
-            if n >= 2:
-                while n % 2 == 0:
-                    shell_puts("2 ")
-                    n = n / 2
-                i: int32 = 3
-                while i * i <= n:
-                    while n % i == 0:
-                        shell_puts(shell_int_to_str(i))
-                        shell_putc(' ')
-                        n = n / i
-                    i = i + 2
-                if n > 1:
-                    shell_puts(shell_int_to_str(n))
-            shell_newline()
-    elif strcmp(cmd, "fortune") == 0:
-        shell_newline()
-        fortunes: Array[10, Ptr[char]]
-        fortunes[0] = "The best way to predict the future is to invent it."
-        fortunes[1] = "In theory, there is no difference between theory and practice."
-        fortunes[2] = "Simplicity is the ultimate sophistication."
-        fortunes[3] = "First, solve the problem. Then, write the code."
-        fortunes[4] = "Talk is cheap. Show me the code."
-        fortunes[5] = "The only way to go fast is to go well."
-        fortunes[6] = "Any fool can write code that a computer can understand."
-        fortunes[7] = "Debugging is twice as hard as writing the code."
-        fortunes[8] = "It works on my machine."
-        fortunes[9] = "There are only two hard things: cache invalidation and naming."
-        idx: int32 = heap_used() % 10
-        shell_puts(fortunes[idx])
-        shell_newline()
-    elif shell_starts_with("basename"):
-        arg13: Ptr[char] = shell_get_arg()
-        if arg13[0] == '\0':
-            shell_newline()
-            shell_puts("Usage: basename <path>")
-            shell_newline()
-        else:
-            i: int32 = strlen(arg13) - 1
-            while i >= 0 and arg13[i] != '/':
-                i = i - 1
-            shell_newline()
-            shell_puts(&arg13[i + 1])
-            shell_newline()
-    elif shell_starts_with("dirname"):
-        arg14: Ptr[char] = shell_get_arg()
-        if arg14[0] == '\0':
-            shell_newline()
-            shell_puts("Usage: dirname <path>")
-            shell_newline()
-        else:
-            i: int32 = strlen(arg14) - 1
-            while i > 0 and arg14[i] != '/':
-                i = i - 1
-            shell_newline()
-            if i == 0:
-                if arg14[0] == '/':
-                    shell_putc('/')
-                else:
-                    shell_putc('.')
-            else:
-                arg14[i] = '\0'
-                shell_puts(arg14)
-            shell_newline()
-    elif strcmp(cmd, "arch") == 0:
-        shell_newline()
-        shell_puts("armv7m")
-        shell_newline()
-    elif strcmp(cmd, "nproc") == 0:
-        shell_newline()
-        shell_puts("1")
-        shell_newline()
-    elif strcmp(cmd, "tty") == 0:
-        shell_newline()
-        shell_puts("/dev/ttyS0")
-        shell_newline()
-    elif strcmp(cmd, "logname") == 0:
-        shell_newline()
-        shell_puts("root")
-        shell_newline()
-    elif strcmp(cmd, "printenv") == 0:
-        shell_newline()
-        shell_puts("HOME=/home")
-        shell_newline()
-        shell_puts("USER=root")
-        shell_newline()
-        shell_puts("SHELL=/bin/psh")
-        shell_newline()
-        shell_puts("PATH=/bin")
-        shell_newline()
-        shell_puts("TERM=vt100")
-        shell_newline()
-        shell_puts("PWD=")
-        shell_puts(&shell_cwd[0])
-        shell_newline()
-    elif shell_starts_with("banner"):
-        arg15: Ptr[char] = shell_get_arg()
-        if arg15[0] == '\0':
-            shell_newline()
-            shell_puts("Usage: banner <text>")
-            shell_newline()
-        else:
-            shell_newline()
-            line: int32 = 0
-            while line < 5:
-                i: int32 = 0
-                while arg15[i] != '\0':
-                    c: char = arg15[i]
-                    j: int32 = 0
-                    while j < 5:
-                        if c >= 'a' and c <= 'z':
-                            shell_putc(cast[char](cast[int32](c) - 32))
-                        elif c == ' ':
-                            shell_putc(' ')
-                        else:
-                            shell_putc(c)
-                        j = j + 1
-                    shell_putc(' ')
-                    i = i + 1
-                shell_newline()
-                line = line + 1
-    elif strcmp(cmd, "dmesg") == 0:
-        shell_newline()
-        shell_puts("[    0.000] Pynux kernel booting...")
-        shell_newline()
-        shell_puts("[    0.001] UART initialized")
-        shell_newline()
-        shell_puts("[    0.002] Heap initialized (16KB)")
-        shell_newline()
-        shell_puts("[    0.003] Timer initialized")
-        shell_newline()
-        shell_puts("[    0.004] RAMFS initialized")
-        shell_newline()
-        shell_puts("[    0.005] Kernel ready")
-        shell_newline()
-    elif strcmp(cmd, "lscpu") == 0:
-        shell_newline()
-        shell_puts("Architecture:    armv7m")
-        shell_newline()
-        shell_puts("Vendor:          ARM")
-        shell_newline()
-        shell_puts("Model:           Cortex-M3")
-        shell_newline()
-        shell_puts("CPU(s):          1")
-        shell_newline()
-        shell_puts("Max MHz:         25")
-        shell_newline()
-    elif strcmp(cmd, "sync") == 0:
-        shell_newline()
-    elif strcmp(cmd, "reset") == 0:
-        shell_puts("\x1b[2J\x1b[H")
-    elif strcmp(cmd, "users") == 0:
-        shell_newline()
-        shell_puts("root")
-        shell_newline()
-    elif strcmp(cmd, "groups") == 0:
-        shell_newline()
-        shell_puts("root")
-        shell_newline()
-    elif strcmp(cmd, "kill") == 0:
-        shell_newline()
-        shell_puts("kill: No processes to kill")
-        shell_newline()
-    elif strcmp(cmd, "ps") == 0:
-        shell_newline()
-        shell_puts("  PID TTY      TIME CMD")
-        shell_newline()
-        shell_puts("    1 ttyS0    0:00 psh")
-        shell_newline()
-    elif strcmp(cmd, "df") == 0:
-        shell_newline()
-        shell_puts("Filesystem  1K-blocks  Used  Available  Use%  Mounted on")
-        shell_newline()
-        shell_puts("ramfs            16     ")
-        used_kb: int32 = heap_used() / 1024
-        shell_puts(shell_int_to_str(used_kb))
-        shell_puts("         ")
-        free_kb: int32 = heap_remaining() / 1024
-        shell_puts(shell_int_to_str(free_kb))
-        shell_puts("     ")
-        pct: int32 = (heap_used() * 100) / heap_total()
-        shell_puts(shell_int_to_str(pct))
-        shell_puts("%   /")
-        shell_newline()
-    elif strcmp(cmd, "mount") == 0:
-        shell_newline()
-        shell_puts("ramfs on / type ramfs (rw)")
-        shell_newline()
-    elif strcmp(cmd, "umount") == 0:
-        shell_newline()
-        shell_puts("umount: cannot unmount /: device is busy")
-        shell_newline()
-    elif shell_starts_with("head"):
+        return True
+
+    if shell_starts_with("head"):
         arg16: Ptr[char] = shell_get_arg()
         if arg16[0] == '\0':
             shell_newline()
@@ -791,7 +712,9 @@ def shell_exec():
                 shell_puts("No such file: ")
                 shell_puts(arg16)
                 shell_newline()
-    elif shell_starts_with("tail"):
+        return True
+
+    if shell_starts_with("tail"):
         arg17: Ptr[char] = shell_get_arg()
         if arg17[0] == '\0':
             shell_newline()
@@ -811,7 +734,14 @@ def shell_exec():
                 shell_puts("No such file: ")
                 shell_puts(arg17)
                 shell_newline()
-    elif shell_starts_with("wc"):
+        return True
+
+    return False
+
+def shell_exec_file3(cmd: Ptr[char]) -> bool:
+    """Handle wc, stat, mv commands. Returns True if handled."""
+
+    if shell_starts_with("wc"):
         arg18: Ptr[char] = shell_get_arg()
         if arg18[0] == '\0':
             shell_newline()
@@ -853,7 +783,9 @@ def shell_exec():
                 shell_puts("No such file: ")
                 shell_puts(arg18)
                 shell_newline()
-    elif shell_starts_with("stat"):
+        return True
+
+    if shell_starts_with("stat"):
         arg19: Ptr[char] = shell_get_arg()
         if arg19[0] == '\0':
             shell_newline()
@@ -882,38 +814,301 @@ def shell_exec():
                 shell_puts("No such file: ")
                 shell_puts(arg19)
                 shell_newline()
+        return True
 
-    # Text processing: cal, rev, nl, xxd, grep, sort, uniq, tr
-    elif shell_starts_with("cal"):
+    if shell_starts_with("mv"):
+        arg20: Ptr[char] = shell_get_arg()
+        if arg20[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: mv <src> <dst>")
+            shell_newline()
+        else:
+            i: int32 = 0
+            while arg20[i] != '\0' and arg20[i] != ' ':
+                i = i + 1
+            if arg20[i] == ' ':
+                arg20[i] = '\0'
+                dst: Ptr[char] = &arg20[i + 1]
+                while dst[0] == ' ':
+                    dst = &dst[1]
+                if dst[0] != '\0':
+                    shell_build_path(arg20)
+                    strcpy(&shell_src_path[0], &shell_path_buf[0])
+                    if ramfs_exists(&shell_src_path[0]) and not ramfs_isdir(&shell_src_path[0]):
+                        bytes_read: int32 = ramfs_read(&shell_src_path[0], &shell_read_buf[0], 511)
+                        if bytes_read >= 0:
+                            # Copy uint8 buffer to char buffer
+                            j: int32 = 0
+                            while j < bytes_read:
+                                shell_copy_buf[j] = cast[char](shell_read_buf[j])
+                                j = j + 1
+                            shell_copy_buf[bytes_read] = '\0'
+                            shell_build_path(dst)
+                            if not ramfs_exists(&shell_path_buf[0]):
+                                ramfs_create(&shell_path_buf[0], False)
+                            ramfs_write(&shell_path_buf[0], &shell_copy_buf[0])
+                            ramfs_delete(&shell_src_path[0])
+                            shell_newline()
+                            shell_puts("Moved ")
+                            shell_puts(&shell_src_path[0])
+                            shell_puts(" -> ")
+                            shell_puts(&shell_path_buf[0])
+                            shell_newline()
+                        else:
+                            shell_newline()
+                            shell_puts("Failed to read source")
+                            shell_newline()
+                    else:
+                        shell_newline()
+                        shell_puts("Source not found: ")
+                        shell_puts(arg20)
+                        shell_newline()
+                else:
+                    shell_newline()
+                    shell_puts("Usage: mv <src> <dst>")
+                    shell_newline()
+            else:
+                shell_newline()
+                shell_puts("Usage: mv <src> <dst>")
+                shell_newline()
+        return True
+
+    return False
+
+def shell_exec_util(cmd: Ptr[char]) -> bool:
+    """Handle utility commands. Returns True if handled."""
+
+    if strcmp(cmd, "true") == 0:
+        return True
+
+    if strcmp(cmd, "false") == 0:
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "yes") == 0:
+        shell_newline()
+        shell_puts("y")
+        shell_newline()
+        return True
+
+    if shell_starts_with("sleep"):
+        arg10: Ptr[char] = shell_get_arg()
+        if arg10[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: sleep <seconds>")
+            shell_newline()
+        else:
+            secs: int32 = atoi(arg10)
+            if secs > 0 and secs <= 60:
+                shell_newline()
+                shell_puts("Sleeping for ")
+                shell_puts(shell_int_to_str(secs))
+                shell_puts(" seconds...")
+                shell_newline()
+                timer_delay_ms(secs * 1000)
+                shell_puts("Done.")
+                shell_newline()
+            else:
+                shell_newline()
+                shell_puts("Invalid sleep time (1-60)")
+                shell_newline()
+        return True
+
+    if strcmp(cmd, "reboot") == 0:
+        shell_newline()
+        shell_puts("Rebooting...")
+        shell_newline()
+        timer_delay_ms(1000)
+        NVIC_AIRCR: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](0xE000ED0C)
+        NVIC_AIRCR[0] = 0x05FA0004
+        while True:
+            pass
+
+    if strcmp(cmd, "halt") == 0 or strcmp(cmd, "poweroff") == 0 or strcmp(cmd, "exit") == 0:
+        shell_newline()
+        shell_puts("System halted.")
+        shell_newline()
+        SEMIHOST_EXIT: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](0xE000EDF0)
+        SEMIHOST_EXIT[0] = 0x20026
+        while True:
+            pass
+
+    if shell_starts_with("seq"):
+        arg11: Ptr[char] = shell_get_arg()
+        if arg11[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: seq [start] end")
+            shell_newline()
+        else:
+            start: int32 = 1
+            end: int32 = 0
+            i: int32 = 0
+            while arg11[i] != '\0' and arg11[i] != ' ':
+                i = i + 1
+            if arg11[i] == ' ':
+                arg11[i] = '\0'
+                start = atoi(arg11)
+                end = atoi(&arg11[i + 1])
+            else:
+                end = atoi(arg11)
+            shell_newline()
+            j: int32 = start
+            while j <= end:
+                shell_puts(shell_int_to_str(j))
+                shell_newline()
+                j = j + 1
+        return True
+
+    if shell_starts_with("factor"):
+        arg12: Ptr[char] = shell_get_arg()
+        if arg12[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: factor <number>")
+            shell_newline()
+        else:
+            n: int32 = atoi(arg12)
+            shell_newline()
+            shell_puts(shell_int_to_str(n))
+            shell_puts(": ")
+            if n >= 2:
+                while n % 2 == 0:
+                    shell_puts("2 ")
+                    n = n / 2
+                i: int32 = 3
+                while i * i <= n:
+                    while n % i == 0:
+                        shell_puts(shell_int_to_str(i))
+                        shell_putc(' ')
+                        n = n / i
+                    i = i + 2
+                if n > 1:
+                    shell_puts(shell_int_to_str(n))
+            shell_newline()
+        return True
+
+    if strcmp(cmd, "fortune") == 0:
+        shell_newline()
+        fortunes: Array[10, Ptr[char]]
+        fortunes[0] = "The best way to predict the future is to invent it."
+        fortunes[1] = "In theory, there is no difference between theory and practice."
+        fortunes[2] = "Simplicity is the ultimate sophistication."
+        fortunes[3] = "First, solve the problem. Then, write the code."
+        fortunes[4] = "Talk is cheap. Show me the code."
+        fortunes[5] = "The only way to go fast is to go well."
+        fortunes[6] = "Any fool can write code that a computer can understand."
+        fortunes[7] = "Debugging is twice as hard as writing the code."
+        fortunes[8] = "It works on my machine."
+        fortunes[9] = "There are only two hard things: cache invalidation and naming."
+        idx: int32 = heap_used() % 10
+        shell_puts(fortunes[idx])
+        shell_newline()
+        return True
+
+    if shell_starts_with("basename"):
+        arg13: Ptr[char] = shell_get_arg()
+        if arg13[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: basename <path>")
+            shell_newline()
+        else:
+            i: int32 = strlen(arg13) - 1
+            while i >= 0 and arg13[i] != '/':
+                i = i - 1
+            shell_newline()
+            shell_puts(&arg13[i + 1])
+            shell_newline()
+        return True
+
+    if shell_starts_with("dirname"):
+        arg14: Ptr[char] = shell_get_arg()
+        if arg14[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: dirname <path>")
+            shell_newline()
+        else:
+            i: int32 = strlen(arg14) - 1
+            while i > 0 and arg14[i] != '/':
+                i = i - 1
+            shell_newline()
+            if i == 0:
+                if arg14[0] == '/':
+                    shell_putc('/')
+                else:
+                    shell_putc('.')
+            else:
+                arg14[i] = '\0'
+                shell_puts(arg14)
+            shell_newline()
+        return True
+
+    if shell_starts_with("banner"):
+        arg15: Ptr[char] = shell_get_arg()
+        if arg15[0] == '\0':
+            shell_newline()
+            shell_puts("Usage: banner <text>")
+            shell_newline()
+        else:
+            shell_newline()
+            line: int32 = 0
+            while line < 5:
+                i: int32 = 0
+                while arg15[i] != '\0':
+                    c: char = arg15[i]
+                    j: int32 = 0
+                    while j < 5:
+                        if c >= 'a' and c <= 'z':
+                            shell_putc(cast[char](cast[int32](c) - 32))
+                        elif c == ' ':
+                            shell_putc(' ')
+                        else:
+                            shell_putc(c)
+                        j = j + 1
+                    shell_putc(' ')
+                    i = i + 1
+                shell_newline()
+                line = line + 1
+        return True
+
+    if shell_starts_with("cal"):
         shell_newline()
         shell_puts("    January 2025\r\nSu Mo Tu We Th Fr Sa\r\n          1  2  3  4\r\n 5  6  7  8  9 10 11\r\n12 13 14 15 16 17 18\r\n19 20 21 22 23 24 25\r\n26 27 28 29 30 31")
         shell_newline()
+        return True
 
-    elif shell_starts_with("rev") or shell_starts_with("nl") or shell_starts_with("xxd"):
-        shell_newline()
-        shell_puts("Use graphical DE for text tools")
-        shell_newline()
+    return False
 
-    elif shell_starts_with("tac") or shell_starts_with("grep") or shell_starts_with("sort") or shell_starts_with("uniq") or shell_starts_with("tr"):
-        shell_newline()
-        shell_puts("Not implemented in text mode")
-        shell_newline()
+# ============================================================================
+# Main shell_exec dispatcher - calls smaller functions to avoid branch issues
+# ============================================================================
 
-    # Job control commands (simplified - full state tracking has known issues)
-    elif strcmp(cmd, "jobs") == 0:
-        shell_newline()
-        shell_puts("[1]   Running                 main.py &")
-        shell_newline()
-    elif strcmp(cmd, "fg") == 0:
-        shell_newline()
-        shell_puts("main.py: already running")
-        shell_newline()
-    elif strcmp(cmd, "bg") == 0:
-        shell_newline()
-        shell_puts("bg: job already in background")
-        shell_newline()
+def shell_exec():
+    global shell_cmd_pos
 
+    shell_cmd[shell_cmd_pos] = '\0'
+
+    if shell_cmd_pos == 0:
+        shell_prompt()
+        return
+
+    cmd: Ptr[char] = &shell_cmd[0]
+
+    # Try each handler in turn - each returns True if it handled the command
+    if shell_exec_job(cmd):
+        pass
+    elif shell_exec_basic(cmd):
+        pass
+    elif shell_exec_file(cmd):
+        pass
+    elif shell_exec_sys(cmd):
+        pass
+    elif shell_exec_file2(cmd):
+        pass
+    elif shell_exec_file3(cmd):
+        pass
+    elif shell_exec_util(cmd):
+        pass
     else:
+        # Unknown command
         shell_newline()
         shell_puts("Unknown: ")
         shell_puts(cmd)

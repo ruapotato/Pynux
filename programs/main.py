@@ -6,9 +6,9 @@
 #   user_main() - called once at startup (like Arduino setup())
 #   user_tick() - called repeatedly from main loop (like Arduino loop())
 #
-# Output works in both graphical and text modes.
+# Output works in both graphical and text modes via console abstraction.
 
-from lib.io import print_str, print_int
+from lib.io import console_puts, console_print_int
 from kernel.timer import timer_get_ticks
 
 # State for tick function
@@ -16,7 +16,7 @@ last_print_time: int32 = 0
 
 # Called once at startup
 def user_main():
-    print_str("main.py: Uptime monitor started\n")
+    console_puts("main.py: Uptime monitor started\n")
 
 # Called repeatedly from main loop (non-blocking!)
 def user_tick():
@@ -29,6 +29,6 @@ def user_tick():
         last_print_time = ticks
         secs: int32 = ticks / 1000
 
-        print_str("Uptime: ")
-        print_int(secs)
-        print_str("s\n")
+        console_puts("Uptime: ")
+        console_print_int(secs)
+        console_puts("s\n")

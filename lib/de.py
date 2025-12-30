@@ -4,6 +4,7 @@
 # Features: Top menu bar, bottom taskbar panel, draggable windows
 
 from lib.io import uart_putc, uart_getc, uart_available, print_str, print_int
+from lib.io import console_set_mode, console_flush, console_has_output
 from lib.vtnext import vtn_init, vtn_clear, vtn_rect, vtn_textline
 from lib.vtnext import vtn_clear_rect, vtn_present, vtn_flush
 from lib.vtnext import vtn_line, vtn_text, vtn_rect_outline
@@ -147,6 +148,7 @@ MAX_JOBS: int32 = 8
 job_names: Array[256, char]  # 8 jobs * 32 chars each
 job_status: Array[8, int32]  # 0=free, 1=running, 2=done
 job_count: int32 = 0
+main_job_id: int32 = -1  # Job ID for main.py
 
 JOB_FREE: int32 = 0
 JOB_RUNNING: int32 = 1
@@ -1006,8 +1008,10 @@ def term_exec_cmd(idx: int32):
     if pos == 0:
         term_print_prompt(idx)
         return
-    # Dispatch
-    if strcmp(cmd, "help") == 0:
+    # Dispatch - jobs first to avoid branch distance issues
+    if strcmp(cmd, "jobs") == 0:
+        cmd_jobs(idx)
+    elif strcmp(cmd, "help") == 0:
         cmd_help(idx)
     elif strcmp(cmd, "clear") == 0:
         term_init_win(idx)
@@ -1085,8 +1089,6 @@ def term_exec_cmd(idx: int32):
         term_puts_idx(idx, "\nroot wheel\n")
     elif strcmp(cmd, "printenv") == 0:
         term_puts_idx(idx, "\nHOME=/home\nUSER=root\nSHELL=/bin/psh\nPATH=/bin\n")
-    elif strcmp(cmd, "jobs") == 0:
-        cmd_jobs(idx)
     else:
         term_puts_idx(idx, "\nCommand not found: ")
         term_puts_idx(idx, cmd)
@@ -1920,8 +1922,18 @@ def de_init():
         term_puts_idx(0, "Welcome to Pynux!\n")
         term_puts_idx(0, "GNOME 2/MATE-style Desktop Environment\n\n")
         # Run user main.py startup (user_tick runs in main loop)
-        term_puts_idx(0, "[1] main.py &\n")
+        # Register main.py as a background job
+        global main_job_id
+        main_job_id = job_add("main.py")
+        term_puts_idx(0, "[")
+        term_puts_idx(0, int_to_str(main_job_id + 1))
+        term_puts_idx(0, "] main.py &\n")
+        # Set console to buffered mode for DE
+        console_set_mode(1)
         user_main()
+        # Flush any output from user_main to terminal
+        if console_has_output():
+            term_puts_idx(0, console_flush())
         term_puts_idx(0, "\nClick 'Applications' or press ESC ESC for menu\n")
         term_puts_idx(0, "Type 'help' for available commands\n\n")
         term_print_prompt(0)
@@ -1939,6 +1951,11 @@ def de_main():
 
         # Call user tick function (cooperative multitasking)
         user_tick()
+
+        # Flush any output from user_tick to terminal 0
+        if console_has_output():
+            term_puts_idx(0, console_flush())
+            win_dirty[0] = True
 
         if uart_available():
             c: char = uart_getc()

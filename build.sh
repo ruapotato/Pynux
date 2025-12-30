@@ -54,6 +54,7 @@ sources = [
     ("kernel/ramfs.py", "ramfs"),
     ("lib/memory.py", "memory"),
     ("lib/string.py", "string"),
+    ("lib/io.py", "iolib"),
     ("lib/vtnext.py", "vtnext"),
     ("lib/de.py", "de"),
     ("lib/shell.py", "shell"),
@@ -101,7 +102,7 @@ $AS $ASFLAGS -o "$BUILD_DIR/io.o" "$RUNTIME_DIR/io.s"
 echo "  runtime/io.s"
 
 # Compiled Pynux files
-for name in kernel timer ramfs memory string vtnext de shell; do
+for name in kernel timer ramfs memory string iolib vtnext de shell; do
     $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
     echo "  build/${name}.s"
 done
@@ -122,7 +123,7 @@ echo "[3/4] Linking..."
 # Build list of object files
 OBJS="$BUILD_DIR/startup.o $BUILD_DIR/io.o"
 OBJS="$OBJS $BUILD_DIR/kernel.o $BUILD_DIR/timer.o $BUILD_DIR/ramfs.o"
-OBJS="$OBJS $BUILD_DIR/memory.o $BUILD_DIR/string.o"
+OBJS="$OBJS $BUILD_DIR/memory.o $BUILD_DIR/string.o $BUILD_DIR/iolib.o"
 OBJS="$OBJS $BUILD_DIR/vtnext.o $BUILD_DIR/de.o $BUILD_DIR/shell.o"
 
 # Add user program objects

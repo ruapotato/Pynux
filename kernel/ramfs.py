@@ -9,7 +9,7 @@ from lib.string import strcmp, strcpy, strlen, strrchr
 # Maximum files and directories
 MAX_FILES: int32 = 64
 MAX_PATH: int32 = 128
-MAX_FILE_SIZE: int32 = 4096
+MAX_FILE_SIZE: int32 = 512
 MAX_NAME: int32 = 32
 
 # File types

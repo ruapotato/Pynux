@@ -9,7 +9,8 @@ Pynux is a Python-syntax systems language that compiles to native ARM. Run `cat`
 - **Python syntax** you already know
 - **Compiles to native ARM** Thumb-2 (Cortex-M)
 - **Graphical desktop** - Multi-window DE over VTNext protocol
-- **Not interpreted** - Real compiled code
+- **Job control** - Background tasks with `jobs`, `fg`, `bg`
+- **User programs** - `programs/main.py` runs at boot like CircuitPython
 
 ## Quick Start
 
@@ -19,6 +20,9 @@ Pynux is a Python-syntax systems language that compiles to native ARM. Run `cat`
 
 # Run in QEMU with VTNext graphical desktop
 ./boot_vm.sh
+
+# Run in text mode
+./boot_vm.sh --shell
 ```
 
 ## Desktop Environment
@@ -46,8 +50,8 @@ Pynux includes a graphical desktop environment with:
 │ Menu                                                    │
 ├─────────────────────────────────────────────────────────┤
 │ ┌─ Terminal 1 ────────────────────────────────────────┐ │
-│ │ Pynux Desktop Environment                          │ │
-│ │ ESC=Menu TAB=Switch Ctrl+S=Save(editor)            │ │
+│ │ [1] main.py &                                       │ │
+│ │ main.py: Uptime monitor started                     │ │
 │ │                                                     │ │
 │ │ pynux:/> ls                                         │ │
 │ │ dev/  etc/  home/  tmp/                             │ │
@@ -60,31 +64,51 @@ Pynux includes a graphical desktop environment with:
 │ │ home/               │ └─────────────────────────────┘ │
 │ └─────────────────────┘                                 │
 ├─────────────────────────────────────────────────────────┤
-│ Heap: 1234/16384 | Win: 3 | F1:Menu F2:Switch          │
+│ Heap: 2080/16384 | Win: 3 | F1:Menu F2:Switch          │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ## Shell Commands
 
 ### File Operations
-`ls` `cat` `cp` `rm` `mkdir` `touch` `stat` `pwd` `cd`
+`ls` `cat` `cp` `mv` `rm` `mkdir` `touch` `write` `head` `tail` `wc` `stat` `pwd` `cd`
 
 ### System
-`uname` `hostname` `whoami` `id` `uptime` `free` `ps` `df` `env`
+`uname` `hostname` `whoami` `uptime` `free` `date` `printenv` `arch` `tty` `groups`
+
+### Job Control
+`jobs` `fg` `bg`
 
 ### Utilities
-`echo` `write` `clear` `help` `date`
+`echo` `seq` `factor` `true` `false` `yes` `clear` `help` `version`
 
-## Example
+## User Programs
+
+Create `programs/main.py` to run code at boot:
 
 ```python
-# hello.py
-from lib.io import print_str
+# programs/main.py
+from lib.io import console_puts, console_print_int
+from kernel.timer import timer_get_ticks
 
-def main() -> int32:
-    print_str("Hello from Pynux!\n")
-    return 0
+last_print_time: int32 = 0
+
+def user_main():
+    console_puts("Hello from main.py!\n")
+
+def user_tick():
+    global last_print_time
+    ticks: int32 = timer_get_ticks()
+    if ticks - last_print_time >= 5000:
+        last_print_time = ticks
+        console_puts("Uptime: ")
+        console_print_int(ticks / 1000)
+        console_puts("s\n")
 ```
+
+- `user_main()` - Called once at startup
+- `user_tick()` - Called repeatedly (cooperative multitasking)
+- Shows as `[1] main.py &` in job list
 
 ## Target Hardware
 
@@ -100,7 +124,8 @@ def main() -> int32:
 compiler/       # Python 3.10+ compiler (runs on host)
 runtime/        # ARM assembly startup code
 kernel/         # Kernel, RAMFS, timer
-lib/            # Standard library (io, string, memory, vtnext, de)
+lib/            # Standard library (io, string, memory, vtnext, de, shell)
+programs/       # User programs (main.py runs at boot)
 vtnext/         # Graphical terminal renderer (pygame)
 ```
 
@@ -113,8 +138,8 @@ sudo apt install gcc-arm-none-eabi qemu-system-arm python3-pygame
 # Build
 ./build.sh
 
-# Run (text mode - press 's' at boot)
-./build.sh --run
+# Run (text mode)
+./boot_vm.sh --shell
 
 # Run (graphical mode)
 ./boot_vm.sh
@@ -123,7 +148,8 @@ sudo apt install gcc-arm-none-eabi qemu-system-arm python3-pygame
 ## Memory
 
 - 16KB heap (bump allocator)
-- ~62KB code
+- ~82KB code
+- 512 bytes max file size
 - RAMFS for files
 
 ## License
