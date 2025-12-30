@@ -439,6 +439,10 @@ class Parser:
         if self.match(TokenType.NONE):
             return NoneLiteral(self.make_span(tok))
 
+        # self keyword as identifier
+        if self.match(TokenType.SELF):
+            return Identifier("self", self.make_span(tok))
+
         # Identifier or type cast
         if self.check(TokenType.IDENT):
             name = self.advance().value
@@ -495,15 +499,18 @@ class Parser:
 
             first = self.parse_expression()
 
-            # Check for list comprehension: [expr for var in iterable]
+            # Check for list comprehension: [expr for var in iterable if condition]
             if self.match(TokenType.FOR):
                 var_tok = self.expect(TokenType.IDENT)
                 var_name = var_tok.value
                 self.expect(TokenType.IN)
-                iterable = self.parse_expression()
+                # Use parse_or() instead of parse_expression() to avoid consuming
+                # the 'if' as part of a ternary expression
+                iterable = self.parse_or()
                 condition = None
                 if self.match(TokenType.IF):
-                    condition = self.parse_expression()
+                    # Same for condition - don't let it consume tokens beyond
+                    condition = self.parse_or()
                 self.expect(TokenType.RBRACKET)
                 return ListComprehension(first, var_name, iterable, condition, self.make_span(tok))
 
@@ -756,6 +763,35 @@ class Parser:
             self.expect(TokenType.NEWLINE)
             return RaiseStmt(exc, self.make_span(tok))
 
+        # Yield statement
+        if self.match(TokenType.YIELD):
+            value = None
+            if not self.check(TokenType.NEWLINE):
+                value = self.parse_expression()
+            self.expect(TokenType.NEWLINE)
+            return YieldStmt(value, self.make_span(tok))
+
+        # With statement
+        if self.match(TokenType.WITH):
+            items = []
+            # Parse context managers
+            ctx_expr = self.parse_expression()
+            var_name = None
+            if self.match(TokenType.AS):
+                var_name = self.expect(TokenType.IDENT).value
+            items.append(WithItem(ctx_expr, var_name))
+
+            # Multiple context managers separated by comma
+            while self.match(TokenType.COMMA):
+                ctx_expr = self.parse_expression()
+                var_name = None
+                if self.match(TokenType.AS):
+                    var_name = self.expect(TokenType.IDENT).value
+                items.append(WithItem(ctx_expr, var_name))
+
+            body = self.parse_block()
+            return WithStmt(items, body, self.make_span(tok))
+
         # Variable declaration or expression statement
         # Check for: name: type = value  or  name = value  or  a, b = value
         if self.check(TokenType.IDENT):
@@ -945,10 +981,33 @@ class Parser:
                 self.expect(TokenType.NEWLINE)
                 continue
 
-            # Method
+            # Decorated method
+            method_decorators = []
+            while self.match(TokenType.AT):
+                # Accept decorator name as IDENT or special decorator keywords
+                if self.check(TokenType.IDENT):
+                    dec_name = self.advance().value
+                elif self.check(TokenType.STATICMETHOD):
+                    dec_name = self.advance().value
+                elif self.check(TokenType.CLASSMETHOD):
+                    dec_name = self.advance().value
+                elif self.check(TokenType.PROPERTY):
+                    dec_name = self.advance().value
+                else:
+                    raise ParseError("Expected decorator name", self.current())
+                self.expect(TokenType.NEWLINE)
+                self.skip_newlines()
+                method_decorators.append(dec_name)
+
+            # Method (with or without decorators)
             if self.check(TokenType.DEF):
-                methods.append(self.parse_function())
+                method = self.parse_function(method_decorators)
+                methods.append(method)
                 continue
+
+            # If we parsed decorators but next isn't def, that's an error
+            if method_decorators:
+                raise ParseError("Expected method after decorator", self.current())
 
             # Field: name: type = default
             if self.check(TokenType.IDENT):

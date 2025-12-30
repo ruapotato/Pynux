@@ -113,6 +113,8 @@ class ARMCodeGen:
         self.array_element_sizes: dict[str, int] = {}  # Array name -> element size
         self.structs: dict[str, StructInfo] = {}  # Struct/class definitions
         self.global_var_types: dict[str, Type] = {}  # Global variable types
+        self.class_bases: dict[str, str] = {}  # Class name -> parent class name
+        self.properties: dict[str, str] = {}  # "Class.prop" -> method name
 
     def emit(self, line: str) -> None:
         """Emit a line of assembly."""
@@ -253,6 +255,11 @@ class ARMCodeGen:
                     # Call runtime function with obj as first arg
                     all_args = [obj] + args
                     self.gen_call(Identifier(string_methods[method]), all_args)
+                elif isinstance(obj, Identifier) and obj.name in self.structs:
+                    # Static method call: ClassName.method(args)
+                    class_name = obj.name
+                    func_name = f"{class_name}_{method}"
+                    self.gen_call(Identifier(func_name), args)
                 else:
                     # Generic method call - treat as function with obj as first arg
                     all_args = [obj] + args
@@ -343,8 +350,9 @@ class ARMCodeGen:
                 self.gen_expr(else_e)
                 self.emit(f"{end_label}:")
 
-            case LambdaExpr():
-                raise CodeGenError("Lambda expressions not yet supported in ARM codegen")
+            case LambdaExpr(params=params, body=body):
+                # Generate lambda as anonymous function
+                self.gen_lambda(params, body)
 
             case SizeOfExpr(target_type=t):
                 size = self.get_type_size(t)
@@ -567,11 +575,47 @@ class ARMCodeGen:
 
     def gen_call(self, func: Expr, args: list[Expr]) -> None:
         """Generate function call."""
+        # Handle method calls on class names (static/class methods)
+        if isinstance(func, MemberExpr):
+            if isinstance(func.obj, Identifier):
+                class_name = func.obj.name
+                method_name = func.member
+                # Check if this is a known class
+                if class_name in self.structs:
+                    # Generate call to Class_method
+                    full_name = f"{class_name}_{method_name}"
+                    if len(args) > 4:
+                        raise CodeGenError("More than 4 arguments not yet supported")
+                    for arg in reversed(args):
+                        self.gen_expr(arg)
+                        self.emit("    push {r0}")
+                    for i in range(len(args)):
+                        self.emit(f"    pop {{r{i}}}")
+                    self.emit(f"    bl {full_name}")
+                    return
+            raise CodeGenError(f"Unsupported member call: {func}")
+
         # Get function name
         if isinstance(func, Identifier):
             func_name = func.name
         else:
             raise CodeGenError("Indirect function calls not yet supported")
+
+        # Check if this is a class instantiation (constructor call)
+        if func_name in self.structs:
+            struct = self.structs[func_name]
+            # Allocate memory for the struct on the stack (for now)
+            # Return a pointer to the struct
+            # For simplicity, we'll just allocate a local struct and return its address
+            self.emit(f"    @ Allocate {func_name} instance ({struct.total_size} bytes)")
+            self.emit(f"    sub sp, sp, #{struct.total_size}")
+            self.emit("    mov r0, sp")
+            # Initialize to zero
+            if struct.total_size <= 16:
+                self.emit("    movs r1, #0")
+                for i in range(0, struct.total_size, 4):
+                    self.emit(f"    str r1, [sp, #{i}]")
+            return
 
         # Handle built-in functions specially
         if func_name == "print":
@@ -797,18 +841,50 @@ class ARMCodeGen:
 
     def gen_member_access(self, obj: Expr, member: str) -> None:
         """Generate struct field access."""
-        # Get object address
+        # Get object address and type
+        var_type = None
         if isinstance(obj, Identifier):
             if obj.name in self.ctx.locals:
                 var = self.ctx.locals[obj.name]
-                self.emit(f"    add r0, r7, #{var.offset}")
                 var_type = var.var_type
             else:
-                self.emit(f"    ldr r0, ={obj.name}")
                 var_type = self.global_var_types.get(obj.name)
+
+        # Check if this is a property access
+        if var_type and hasattr(var_type, 'name'):
+            class_name = var_type.name
+            prop_key = f"{class_name}.{member}"
+            if prop_key in self.properties:
+                # This is a property - call the getter method
+                # First get the object pointer for 'self' parameter
+                if isinstance(obj, Identifier):
+                    if obj.name in self.ctx.locals:
+                        var = self.ctx.locals[obj.name]
+                        # Load the pointer to the struct instance
+                        self.emit(f"    ldr r0, [r7, #{var.offset}]")
+                    else:
+                        self.emit(f"    ldr r0, ={obj.name}")
+                else:
+                    self.gen_expr(obj)
+                # Call the property getter
+                method_name = self.properties[prop_key]
+                self.emit(f"    bl {method_name}")
+                return
+
+        # Get object address for field access - if the local is a class instance,
+        # it stores a pointer that we need to dereference
+        if isinstance(obj, Identifier):
+            if obj.name in self.ctx.locals:
+                var = self.ctx.locals[obj.name]
+                if var_type and hasattr(var_type, 'name') and var_type.name in self.structs:
+                    # Load pointer to struct instance
+                    self.emit(f"    ldr r0, [r7, #{var.offset}]")
+                else:
+                    self.emit(f"    add r0, r7, #{var.offset}")
+            else:
+                self.emit(f"    ldr r0, ={obj.name}")
         else:
             self.gen_expr(obj)
-            var_type = None
 
         # Get struct info and field offset
         if var_type and hasattr(var_type, 'name') and var_type.name in self.structs:
@@ -832,17 +908,23 @@ class ARMCodeGen:
 
     def gen_member_addr(self, obj: Expr, member: str) -> None:
         """Generate address of struct field."""
+        var_type = None
         if isinstance(obj, Identifier):
             if obj.name in self.ctx.locals:
                 var = self.ctx.locals[obj.name]
-                self.emit(f"    add r0, r7, #{var.offset}")
                 var_type = var.var_type
+                # If the variable holds a pointer to a struct (class instance),
+                # load the pointer first, then add offset
+                if var_type and hasattr(var_type, 'name') and var_type.name in self.structs:
+                    # Load the pointer value from local variable
+                    self.emit(f"    ldr r0, [r7, #{var.offset}]")
+                else:
+                    self.emit(f"    add r0, r7, #{var.offset}")
             else:
                 self.emit(f"    ldr r0, ={obj.name}")
                 var_type = self.global_var_types.get(obj.name)
         else:
             self.gen_expr(obj)
-            var_type = None
 
         # Add field offset
         if var_type and hasattr(var_type, 'name') and var_type.name in self.structs:
@@ -1057,6 +1139,57 @@ class ARMCodeGen:
         self.emit(f"{end_label}:")
         self.emit("    pop {r0}")  # Return list pointer
 
+    def gen_lambda(self, params: list[str], body: Expr) -> None:
+        """Generate lambda expression as anonymous function."""
+        # Generate unique function name
+        lambda_name = f"__lambda_{self.string_counter}"
+        self.string_counter += 1
+
+        # Save current context
+        saved_ctx = self.ctx
+
+        # Create new context for lambda
+        self.ctx = FunctionContext(lambda_name)
+
+        # Emit lambda function
+        self.emit("")
+        self.emit(f"    .type {lambda_name}, %function")
+        self.emit(f"{lambda_name}:")
+        self.emit("    push {r7, lr}")
+        self.emit("    mov r7, sp")
+
+        # Reserve space for locals (will be fixed up)
+        stack_reserve_idx = len(self.output)
+        self.emit("    sub sp, sp, #0  @ placeholder")
+
+        # Store parameters as locals
+        for i, param in enumerate(params):
+            var = self.ctx.alloc_local(param)
+            if i < 4:
+                self.emit(f"    str r{i}, [r7, #{var.offset}]")
+
+        # Generate body expression
+        self.gen_expr(body)
+
+        # Return - result is in r0
+        self.emit("    mov sp, r7")
+        self.emit("    pop {r7, pc}")
+
+        # Fix up stack reservation
+        stack_size = (self.ctx.stack_size + 7) & ~7
+        if stack_size > 0:
+            self.output[stack_reserve_idx] = f"    sub sp, sp, #{stack_size}"
+        else:
+            self.output[stack_reserve_idx] = "    @ no locals"
+
+        self.emit(f"    .size {lambda_name}, . - {lambda_name}")
+
+        # Restore context
+        self.ctx = saved_ctx
+
+        # Load lambda function address
+        self.emit(f"    ldr r0, ={lambda_name}")
+
     # -------------------------------------------------------------------------
     # Statement generation
     # -------------------------------------------------------------------------
@@ -1146,6 +1279,12 @@ class ARMCodeGen:
 
             case RaiseStmt(exception=exc):
                 self.gen_raise(exc)
+
+            case YieldStmt(value=value):
+                self.gen_yield(value)
+
+            case WithStmt(items=items, body=body):
+                self.gen_with(items, body)
 
             case _:
                 raise CodeGenError(f"Unsupported statement: {type(stmt).__name__}")
@@ -1615,6 +1754,71 @@ class ARMCodeGen:
             # Re-raise current exception
             self.emit("    bl __pynux_reraise")
 
+    def gen_yield(self, value: Optional[Expr]) -> None:
+        """Generate yield statement for generators."""
+        # Simple implementation: generators are not true coroutines
+        # Instead, we store the yielded value in a generator state object
+        # and return to the caller
+
+        if value:
+            self.gen_expr(value)
+        else:
+            self.emit("    movs r0, #0")
+
+        # Store value in generator state
+        self.emit("    @ yield value in r0")
+        # For now, just store in a global generator state
+        # A proper implementation would use a state machine
+        self.emit("    ldr r1, =__generator_value")
+        self.emit("    str r0, [r1]")
+
+        # Set generator state to "yielded"
+        self.emit("    ldr r1, =__generator_state")
+        self.emit("    movs r0, #1")  # 1 = yielded
+        self.emit("    str r0, [r1]")
+
+        # Return to caller (generator will be resumed later)
+        self.emit("    mov sp, r7")
+        self.emit("    pop {r7, pc}")
+
+    def gen_with(self, items: list, body: list) -> None:
+        """Generate with statement for context managers."""
+        # For each context manager:
+        # 1. Evaluate the expression
+        # 2. Call __enter__ method
+        # 3. Store result in variable (if 'as' clause present)
+        # 4. Execute body
+        # 5. Call __exit__ method (even if exception)
+
+        exit_vars = []  # Store context manager objects for __exit__ calls
+
+        for item in items:
+            # Evaluate context expression
+            self.gen_expr(item.context)
+            self.emit("    push {r0}")  # Save context manager
+
+            # Call __enter__ (context manager is on stack)
+            self.emit("    ldr r0, [sp]")
+            # Assume __enter__ is at offset 0 in vtable
+            # For now, just call a convention: ClassName___enter__
+            self.emit("    bl __pynux_context_enter")
+
+            # Store result in variable if 'as' clause
+            if item.var:
+                var = self.ctx.alloc_local(item.var)
+                self.emit(f"    str r0, [r7, #{var.offset}]")
+
+            exit_vars.append(item)
+
+        # Execute body
+        for s in body:
+            self.gen_stmt(s)
+
+        # Call __exit__ for each context manager (in reverse order)
+        for item in reversed(exit_vars):
+            self.emit("    pop {r0}")  # Get context manager
+            self.emit("    bl __pynux_context_exit")
+
     # -------------------------------------------------------------------------
     # Declaration generation
     # -------------------------------------------------------------------------
@@ -1670,9 +1874,21 @@ class ARMCodeGen:
 
     def gen_class(self, cls: ClassDef) -> None:
         """Generate code for a class definition."""
-        # Calculate field offsets
+        # Handle class inheritance - inherit fields from parent classes
         fields = []
         offset = 0
+
+        # First, copy fields from parent classes
+        for base_name in cls.bases:
+            if base_name in self.structs:
+                parent = self.structs[base_name]
+                for field_name, field_type, field_offset in parent.fields:
+                    fields.append((field_name, field_type, offset + field_offset))
+                offset += parent.total_size
+                # Align to 4 bytes
+                offset = (offset + 3) & ~3
+
+        # Then add this class's own fields
         for field in cls.fields:
             size = self.get_type_size(field.field_type)
             fields.append((field.name, field.field_type, offset))
@@ -1682,14 +1898,39 @@ class ARMCodeGen:
 
         self.structs[cls.name] = StructInfo(cls.name, fields, offset)
 
+        # Store parent class for method resolution
+        if cls.bases:
+            self.class_bases[cls.name] = cls.bases[0]  # Single inheritance for now
+
         # Generate methods
         for method in cls.methods:
+            # Check for decorators
+            is_static = "staticmethod" in method.decorators
+            is_classmethod = "classmethod" in method.decorators
+            is_property = "property" in method.decorators
+
             # Rename method to include class name
             method_name = f"{cls.name}_{method.name}"
-            # Add 'self' as first parameter if not already there
-            if not method.params or method.params[0].name != "self":
-                self_param = Parameter("self", Type(cls.name))
-                method.params.insert(0, self_param)
+
+            # Handle self/cls parameter based on decorator
+            if is_static:
+                # Static method - no self parameter
+                pass
+            elif is_classmethod:
+                # Class method - 'cls' as first parameter
+                if not method.params or method.params[0].name != "cls":
+                    cls_param = Parameter("cls", Type(cls.name))
+                    method.params.insert(0, cls_param)
+            else:
+                # Regular method - 'self' as first parameter
+                if not method.params or method.params[0].name != "self":
+                    self_param = Parameter("self", Type(cls.name))
+                    method.params.insert(0, self_param)
+
+            # For @property, also generate getter name without underscore
+            if is_property:
+                # Store property info for later access
+                self.properties[f"{cls.name}.{method.name}"] = method_name
 
             # Save original name and generate
             orig_name = method.name

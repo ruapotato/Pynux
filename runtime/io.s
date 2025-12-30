@@ -898,6 +898,54 @@ __pynux_reraise:
     b __pynux_raise
     .size __pynux_reraise, . - __pynux_reraise
 
+@ ============================================================================
+@ Generator Support
+@ ============================================================================
+
+@ void* __pynux_generator_next(void* gen)
+@ Get next value from generator, returns 0 if exhausted
+    .global __pynux_generator_next
+    .type __pynux_generator_next, %function
+__pynux_generator_next:
+    push {lr}
+    @ Check if generator is exhausted
+    ldr r1, =__generator_state
+    ldr r1, [r1]
+    cmp r1, #2          @ 2 = exhausted
+    beq .gen_exhausted
+    @ Resume generator - for now just return the yielded value
+    ldr r0, =__generator_value
+    ldr r0, [r0]
+    pop {pc}
+.gen_exhausted:
+    movs r0, #0
+    pop {pc}
+    .size __pynux_generator_next, . - __pynux_generator_next
+
+@ ============================================================================
+@ Context Manager Support
+@ ============================================================================
+
+@ void* __pynux_context_enter(void* ctx)
+@ Call context manager __enter__ method
+    .global __pynux_context_enter
+    .type __pynux_context_enter, %function
+__pynux_context_enter:
+    @ Simple implementation: just return the context manager itself
+    @ A real implementation would call obj.__enter__()
+    bx lr
+    .size __pynux_context_enter, . - __pynux_context_enter
+
+@ void __pynux_context_exit(void* ctx)
+@ Call context manager __exit__ method
+    .global __pynux_context_exit
+    .type __pynux_context_exit, %function
+__pynux_context_exit:
+    @ Simple implementation: no-op
+    @ A real implementation would call obj.__exit__(None, None, None)
+    bx lr
+    .size __pynux_context_exit, . - __pynux_context_exit
+
     .section .rodata
 .raise_msg:
     .asciz "Exception raised\n"
@@ -912,6 +960,15 @@ __pynux_reraise:
     .section .data
 _heap_ptr:
     .long _heap_start
+
+@ Generator state storage
+    .global __generator_state
+__generator_state:
+    .long 0            @ 0 = not started, 1 = yielded, 2 = exhausted
+
+    .global __generator_value
+__generator_value:
+    .long 0            @ Last yielded value
 
     .section .bss
     .global _heap_start

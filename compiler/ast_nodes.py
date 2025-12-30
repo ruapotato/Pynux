@@ -483,11 +483,34 @@ class RaiseStmt:
     span: Optional[Span] = None
 
 
+@dataclass
+class YieldStmt:
+    """Yield statement for generators: yield value"""
+    value: Optional[Expr] = None
+    span: Optional[Span] = None
+
+
+@dataclass
+class WithItem:
+    """Context manager item: expr as var"""
+    context: Expr
+    var: Optional[str] = None
+    span: Optional[Span] = None
+
+
+@dataclass
+class WithStmt:
+    """With statement: with expr as var: ..."""
+    items: list[WithItem]
+    body: list['Stmt']
+    span: Optional[Span] = None
+
+
 # Type alias for statements
 Stmt = (VarDecl | Assignment | ExprStmt | ReturnStmt | IfStmt |
         WhileStmt | ForStmt | ForUnpackStmt | BreakStmt | ContinueStmt |
         PassStmt | DeferStmt | AssertStmt | GlobalStmt | TupleUnpackAssign |
-        TryStmt | RaiseStmt)
+        TryStmt | RaiseStmt | YieldStmt | WithStmt)
 
 
 # Declarations
