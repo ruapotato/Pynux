@@ -844,6 +844,23 @@ def shell_exec():
                 shell_puts("No such file: ")
                 shell_puts(arg19)
                 shell_newline()
+
+    # Text processing: cal, rev, nl, xxd, grep, sort, uniq, tr
+    elif shell_starts_with("cal"):
+        shell_newline()
+        shell_puts("    January 2025\r\nSu Mo Tu We Th Fr Sa\r\n          1  2  3  4\r\n 5  6  7  8  9 10 11\r\n12 13 14 15 16 17 18\r\n19 20 21 22 23 24 25\r\n26 27 28 29 30 31")
+        shell_newline()
+
+    elif shell_starts_with("rev") or shell_starts_with("nl") or shell_starts_with("xxd"):
+        shell_newline()
+        shell_puts("Use graphical DE for text tools")
+        shell_newline()
+
+    elif shell_starts_with("tac") or shell_starts_with("grep") or shell_starts_with("sort") or shell_starts_with("uniq") or shell_starts_with("tr"):
+        shell_newline()
+        shell_puts("Not implemented in text mode")
+        shell_newline()
+
     else:
         shell_newline()
         shell_puts("Unknown: ")

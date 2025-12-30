@@ -983,6 +983,269 @@ def exec_cmd():
         term_puts("\nramfs on / type ramfs (rw)\n")
     elif strcmp(cmd, "umount") == 0:
         term_puts("\numount: cannot unmount /: device is busy\n")
+    elif cmd_starts_with("expr") or cmd_starts_with("calc"):
+        # Simple expression evaluator: expr <num> <op> <num>
+        arg20: Ptr[char] = cmd_get_arg()
+        if arg20[0] == '\0':
+            term_puts("\nUsage: expr <num> <op> <num>\n")
+        else:
+            # Parse: num op num
+            num1: int32 = atoi(arg20)
+            # Find operator
+            i: int32 = 0
+            while arg20[i] != '\0' and arg20[i] != ' ':
+                i = i + 1
+            while arg20[i] == ' ':
+                i = i + 1
+            op: char = arg20[i]
+            # Find second number
+            i = i + 1
+            while arg20[i] == ' ':
+                i = i + 1
+            num2: int32 = atoi(&arg20[i])
+            result: int32 = 0
+            valid: bool = True
+            if op == '+':
+                result = num1 + num2
+            elif op == '-':
+                result = num1 - num2
+            elif op == '*':
+                result = num1 * num2
+            elif op == '/':
+                if num2 != 0:
+                    result = num1 / num2
+                else:
+                    term_puts("\nDivision by zero\n")
+                    valid = False
+            elif op == '%':
+                if num2 != 0:
+                    result = num1 % num2
+                else:
+                    valid = False
+            else:
+                term_puts("\nUnknown operator: ")
+                term_putc(op)
+                term_putc('\n')
+                valid = False
+            if valid:
+                term_putc('\n')
+                term_puts(int_to_str(result))
+                term_putc('\n')
+    elif cmd_starts_with("which") or cmd_starts_with("type"):
+        arg21: Ptr[char] = cmd_get_arg()
+        if arg21[0] == '\0':
+            term_puts("\nUsage: which <command>\n")
+        else:
+            term_putc('\n')
+            term_puts(arg21)
+            term_puts(": shell built-in\n")
+    elif strcmp(cmd, "history") == 0:
+        term_puts("\nNo history available (single-line buffer)\n")
+    elif strcmp(cmd, "alias") == 0:
+        term_puts("\nNo aliases defined\n")
+    elif strcmp(cmd, "unalias") == 0:
+        term_puts("\nunalias: no aliases to remove\n")
+    elif strcmp(cmd, "export") == 0:
+        term_puts("\nexport: no environment to modify\n")
+    elif strcmp(cmd, "set") == 0:
+        term_puts("\nPOSIXLY_CORRECT=y\n")
+        term_puts("PATH=/bin\n")
+        term_puts("HOME=/home\n")
+        term_puts("PWD=")
+        term_puts(&cwd[0])
+        term_putc('\n')
+    elif strcmp(cmd, "unset") == 0:
+        term_puts("\nunset: cannot unset in this shell\n")
+    elif strcmp(cmd, "source") == 0 or strcmp(cmd, ".") == 0:
+        term_puts("\nUsage: source <file> (not implemented)\n")
+    elif cmd_starts_with("test") or cmd_buffer[0] == '[':
+        term_puts("\ntest: not implemented\n")
+    elif cmd_starts_with("printf"):
+        arg22: Ptr[char] = cmd_get_arg()
+        term_putc('\n')
+        term_puts(arg22)
+    elif strcmp(cmd, "read") == 0:
+        term_puts("\nread: not implemented\n")
+    elif strcmp(cmd, "exec") == 0:
+        term_puts("\nexec: not implemented\n")
+    elif strcmp(cmd, "wait") == 0:
+        term_puts("\nwait: no jobs to wait for\n")
+    elif strcmp(cmd, "jobs") == 0:
+        term_puts("\njobs: no background jobs\n")
+    elif strcmp(cmd, "fg") == 0:
+        term_puts("\nfg: no foreground jobs\n")
+    elif strcmp(cmd, "bg") == 0:
+        term_puts("\nbg: no background jobs\n")
+    elif strcmp(cmd, "time") == 0:
+        term_puts("\nreal 0m0.000s\nuser 0m0.000s\nsys  0m0.000s\n")
+    elif strcmp(cmd, "times") == 0:
+        term_puts("\n0m0.000s 0m0.000s\n")
+    elif strcmp(cmd, "ulimit") == 0:
+        term_puts("\nunlimited\n")
+    elif strcmp(cmd, "umask") == 0:
+        term_puts("\n0022\n")
+    elif strcmp(cmd, "getconf") == 0:
+        term_puts("\nUsage: getconf <name>\n")
+    elif strcmp(cmd, "locale") == 0:
+        term_puts("\nLANG=C\n")
+        term_puts("LC_ALL=C\n")
+    elif strcmp(cmd, "mesg") == 0:
+        term_puts("\nis y\n")
+    elif strcmp(cmd, "stty") == 0:
+        term_puts("\nspeed 115200 baud\n")
+        term_puts("rows 24; columns 80;\n")
+    elif strcmp(cmd, "tput") == 0:
+        term_putc('\n')
+    elif strcmp(cmd, "pathchk") == 0:
+        term_puts("\npathchk: no arguments\n")
+    elif strcmp(cmd, "link") == 0 or strcmp(cmd, "ln") == 0:
+        term_puts("\nlink: not supported on ramfs\n")
+    elif strcmp(cmd, "unlink") == 0:
+        term_puts("\nunlink: use rm instead\n")
+    elif strcmp(cmd, "readlink") == 0:
+        term_puts("\nreadlink: no symlinks on ramfs\n")
+    elif strcmp(cmd, "realpath") == 0:
+        arg23: Ptr[char] = cmd_get_arg()
+        if arg23[0] == '\0':
+            term_puts("\nUsage: realpath <path>\n")
+        else:
+            build_path(arg23)
+            term_putc('\n')
+            term_puts(&path_buf[0])
+            term_putc('\n')
+    elif cmd_starts_with("mktemp"):
+        term_puts("\n/tmp/tmp.XXXXXX\n")
+    elif strcmp(cmd, "install") == 0:
+        term_puts("\ninstall: no destination specified\n")
+    elif strcmp(cmd, "shred") == 0:
+        term_puts("\nshred: not implemented (ramfs)\n")
+    elif strcmp(cmd, "truncate") == 0:
+        term_puts("\ntruncate: not implemented\n")
+
+    # ========================================================================
+    # Text processing commands
+    # ========================================================================
+
+    elif cmd_starts_with("cal"):
+        # cal - display calendar (January 2025)
+        term_puts("\n    January 2025\nSu Mo Tu We Th Fr Sa\n")
+        term_puts("          1  2  3  4\n")
+        term_puts(" 5  6  7  8  9 10 11\n")
+        term_puts("12 13 14 15 16 17 18\n")
+        term_puts("19 20 21 22 23 24 25\n")
+        term_puts("26 27 28 29 30 31\n")
+
+    elif cmd_starts_with("rev"):
+        # rev <file> - reverse characters in each line
+        arg_rev: Ptr[char] = cmd_get_arg()
+        if arg_rev[0] == '\0':
+            term_puts("\nUsage: rev <file>\n")
+        else:
+            build_path(arg_rev)
+            if not ramfs_exists(&path_buf[0]):
+                term_puts("\nrev: file not found\n")
+            else:
+                sz_rev: int32 = ramfs_read(&path_buf[0], &read_buf[0], 512)
+                term_putc('\n')
+                ls_r: int32 = 0
+                i_rev: int32 = 0
+                j_rev: int32 = 0
+                while i_rev <= sz_rev:
+                    if i_rev == sz_rev or read_buf[i_rev] == 10:
+                        j_rev = i_rev - 1
+                        while j_rev >= ls_r:
+                            term_putc(cast[char](read_buf[j_rev]))
+                            j_rev = j_rev - 1
+                        term_putc('\n')
+                        ls_r = i_rev + 1
+                    i_rev = i_rev + 1
+
+    elif cmd_starts_with("tac"):
+        # tac - reverse file (stub)
+        term_puts("\ntac: use rev for line reversal\n")
+
+    elif cmd_starts_with("nl"):
+        # nl <file> - number lines
+        arg_nl: Ptr[char] = cmd_get_arg()
+        if arg_nl[0] == '\0':
+            term_puts("\nUsage: nl <file>\n")
+        else:
+            build_path(arg_nl)
+            if not ramfs_exists(&path_buf[0]):
+                term_puts("\nnl: file not found\n")
+            else:
+                sz_nl: int32 = ramfs_read(&path_buf[0], &read_buf[0], 512)
+                term_putc('\n')
+                ln: int32 = 1
+                term_puts(int_to_str(ln))
+                term_putc('\t')
+                i_nl: int32 = 0
+                while i_nl < sz_nl:
+                    if read_buf[i_nl] == 10:
+                        term_putc('\n')
+                        ln = ln + 1
+                        if i_nl < sz_nl - 1:
+                            term_puts(int_to_str(ln))
+                            term_putc('\t')
+                    else:
+                        term_putc(cast[char](read_buf[i_nl]))
+                    i_nl = i_nl + 1
+
+    elif cmd_starts_with("grep"):
+        # grep <pattern> <file>
+        term_puts("\ngrep: use cat and visual search\n")
+
+    elif cmd_starts_with("sort"):
+        # sort - alphabetical sort (stub)
+        term_puts("\nsort: not implemented\n")
+
+    elif cmd_starts_with("uniq"):
+        # uniq - filter duplicates (stub)
+        term_puts("\nuniq: not implemented\n")
+
+    elif cmd_starts_with("tr"):
+        # tr - translate (stub)
+        term_puts("\ntr: not implemented\n")
+
+    elif cmd_starts_with("xxd"):
+        # xxd <file> - hex dump
+        arg_xxd: Ptr[char] = cmd_get_arg()
+        if arg_xxd[0] == '\0':
+            term_puts("\nUsage: xxd <file>\n")
+        else:
+            build_path(arg_xxd)
+            if not ramfs_exists(&path_buf[0]):
+                term_puts("\nxxd: file not found\n")
+            else:
+                sz_xxd: int32 = ramfs_read(&path_buf[0], &read_buf[0], 128)
+                term_putc('\n')
+                hx: Ptr[char] = "0123456789abcdef"
+                i_x: int32 = 0
+                j_x: int32 = 0
+                b_x: int32 = 0
+                while i_x < sz_xxd:
+                    term_putc(hx[(i_x >> 4) & 15])
+                    term_putc(hx[i_x & 15])
+                    term_puts(": ")
+                    j_x = 0
+                    while j_x < 8 and i_x + j_x < sz_xxd:
+                        b_x = cast[int32](read_buf[i_x + j_x])
+                        term_putc(hx[(b_x >> 4) & 15])
+                        term_putc(hx[b_x & 15])
+                        term_putc(' ')
+                        j_x = j_x + 1
+                    term_putc(' ')
+                    j_x = 0
+                    while j_x < 8 and i_x + j_x < sz_xxd:
+                        b_x = cast[int32](read_buf[i_x + j_x])
+                        if b_x >= 32 and b_x < 127:
+                            term_putc(cast[char](b_x))
+                        else:
+                            term_putc('.')
+                        j_x = j_x + 1
+                    term_putc('\n')
+                    i_x = i_x + 8
+
     else:
         term_puts("\nUnknown command: ")
         term_puts(cmd)
