@@ -14,6 +14,9 @@ from tests.test_ramfs import test_ramfs_main
 from tests.test_devfs import test_devfs_main
 from tests.test_memory import test_memory_main
 from tests.test_timer import test_timer_main
+from tests.test_trace import test_trace_main
+from tests.test_profiler import test_profiler_main
+from tests.test_memtrack import test_memtrack_main
 
 # ============================================================================
 # Test Runner State
@@ -174,6 +177,96 @@ def run_suite_timer():
     print_int(failed)
     print_str(" failed\n")
 
+def run_suite_trace():
+    """Run Trace tests and track results."""
+    global _suites_passed, _suites_failed
+    global _total_tests_passed, _total_tests_failed
+
+    print_str("\n============================================================\n")
+    print_str("  TRACE TESTS\n")
+    print_str("============================================================\n")
+
+    reset_counters()
+    result: int32 = test_trace_main()
+
+    passed: int32 = get_passed()
+    failed: int32 = get_failed()
+
+    _total_tests_passed = _total_tests_passed + passed
+    _total_tests_failed = _total_tests_failed + failed
+
+    if result == 0 and failed == 0:
+        _suites_passed = _suites_passed + 1
+        print_str("\n[SUITE PASSED] TRACE: ")
+    else:
+        _suites_failed = _suites_failed + 1
+        print_str("\n[SUITE FAILED] TRACE: ")
+
+    print_int(passed)
+    print_str(" passed, ")
+    print_int(failed)
+    print_str(" failed\n")
+
+def run_suite_profiler():
+    """Run Profiler tests and track results."""
+    global _suites_passed, _suites_failed
+    global _total_tests_passed, _total_tests_failed
+
+    print_str("\n============================================================\n")
+    print_str("  PROFILER TESTS\n")
+    print_str("============================================================\n")
+
+    reset_counters()
+    result: int32 = test_profiler_main()
+
+    passed: int32 = get_passed()
+    failed: int32 = get_failed()
+
+    _total_tests_passed = _total_tests_passed + passed
+    _total_tests_failed = _total_tests_failed + failed
+
+    if result == 0 and failed == 0:
+        _suites_passed = _suites_passed + 1
+        print_str("\n[SUITE PASSED] PROFILER: ")
+    else:
+        _suites_failed = _suites_failed + 1
+        print_str("\n[SUITE FAILED] PROFILER: ")
+
+    print_int(passed)
+    print_str(" passed, ")
+    print_int(failed)
+    print_str(" failed\n")
+
+def run_suite_memtrack():
+    """Run Memtrack tests and track results."""
+    global _suites_passed, _suites_failed
+    global _total_tests_passed, _total_tests_failed
+
+    print_str("\n============================================================\n")
+    print_str("  MEMTRACK TESTS\n")
+    print_str("============================================================\n")
+
+    reset_counters()
+    result: int32 = test_memtrack_main()
+
+    passed: int32 = get_passed()
+    failed: int32 = get_failed()
+
+    _total_tests_passed = _total_tests_passed + passed
+    _total_tests_failed = _total_tests_failed + failed
+
+    if result == 0 and failed == 0:
+        _suites_passed = _suites_passed + 1
+        print_str("\n[SUITE PASSED] MEMTRACK: ")
+    else:
+        _suites_failed = _suites_failed + 1
+        print_str("\n[SUITE FAILED] MEMTRACK: ")
+
+    print_int(passed)
+    print_str(" passed, ")
+    print_int(failed)
+    print_str(" failed\n")
+
 def print_banner():
     """Print test banner."""
     print_str("\n")
@@ -181,7 +274,7 @@ def print_banner():
     print_str("#                                                          #\n")
     print_str("#        PYNUX COMPREHENSIVE TEST SUITE                    #\n")
     print_str("#                                                          #\n")
-    print_str("#  Testing: Scheduler, Shell, IPC, Memory, Timer, FS       #\n")
+    print_str("#  Testing: IPC, Memory, Timer, FS, Trace, Profiler        #\n")
     print_str("#                                                          #\n")
     print_str("############################################################\n")
 
@@ -241,6 +334,11 @@ def run_tests_main():
     # Filesystem tests
     run_suite_ramfs()
     run_suite_devfs()
+
+    # Debug/profiling tests
+    run_suite_trace()
+    run_suite_profiler()
+    run_suite_memtrack()
 
     print_final_results()
 

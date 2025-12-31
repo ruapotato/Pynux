@@ -73,13 +73,13 @@ sources = [
     ("lib/math.py", "mathlib"),
     ("lib/sensors.py", "sensors"),
     ("lib/motors.py", "motors"),
-    # Hardware libraries (i2c/spi conflict with peripherals.py - skip for now)
-    # ("lib/i2c.py", "i2c"),
-    # ("lib/spi.py", "spi"),
-    # Debug/profiling libraries (trace/profiler/memtrack have symbol conflicts)
-    # ("lib/trace.py", "trace"),
-    # ("lib/profiler.py", "profiler"),
-    # ("lib/memtrack.py", "memtrack"),
+    # Hardware libraries
+    ("lib/i2c.py", "i2c"),
+    ("lib/spi.py", "spi"),
+    # Debug/profiling libraries
+    ("lib/trace.py", "trace"),
+    ("lib/profiler.py", "profiler"),
+    ("lib/memtrack.py", "memtrack"),
     ("lib/breakpoint.py", "breakpoint"),
     # Graphics library (sprite conflicts with draw, text has ARM limits)
     ("lib/gfx/color.py", "gfx_color"),
@@ -181,8 +181,14 @@ for name in memory string iolib peripherals vtnext de shell widgets devtools mat
     echo "  build/${name}.s"
 done
 
-# Debug/profiling libraries (only breakpoint - others have conflicts)
-for name in breakpoint; do
+# Hardware libraries
+for name in i2c spi; do
+    $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
+    echo "  build/${name}.s"
+done
+
+# Debug/profiling libraries
+for name in trace profiler memtrack breakpoint; do
     $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
     echo "  build/${name}.s"
 done
@@ -231,8 +237,10 @@ OBJS="$OBJS $BUILD_DIR/boot.o $BUILD_DIR/debug.o $BUILD_DIR/firmware.o $BUILD_DI
 OBJS="$OBJS $BUILD_DIR/memory.o $BUILD_DIR/string.o $BUILD_DIR/iolib.o $BUILD_DIR/peripherals.o"
 OBJS="$OBJS $BUILD_DIR/vtnext.o $BUILD_DIR/de.o $BUILD_DIR/shell.o $BUILD_DIR/widgets.o $BUILD_DIR/devtools.o"
 OBJS="$OBJS $BUILD_DIR/mathlib.o $BUILD_DIR/sensors.o $BUILD_DIR/motors.o"
-# Debug/profiling libraries (only breakpoint)
-OBJS="$OBJS $BUILD_DIR/breakpoint.o"
+# Hardware libraries
+OBJS="$OBJS $BUILD_DIR/i2c.o $BUILD_DIR/spi.o"
+# Debug/profiling libraries
+OBJS="$OBJS $BUILD_DIR/trace.o $BUILD_DIR/profiler.o $BUILD_DIR/memtrack.o $BUILD_DIR/breakpoint.o"
 # Graphics library (core modules only)
 OBJS="$OBJS $BUILD_DIR/gfx_color.o $BUILD_DIR/gfx_framebuffer.o $BUILD_DIR/gfx_draw.o"
 # Network stack
