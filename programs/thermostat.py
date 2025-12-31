@@ -6,8 +6,8 @@
 from lib.io import console_puts, console_print_int
 from lib.sensors import temp_read, sensors_init_all, sensors_seed
 from lib.motors import dc_init, dc_set_speed
-from lib.pid import pid_init, pid_set_setpoint, pid_update, pid_reset
-from lib.pid import pid_set_limits, pid_set_gains, pid_get_error
+from lib.pid import pid_global_init, pid_global_set_setpoint, pid_global_update, pid_global_reset
+from lib.pid import pid_global_set_limits, pid_global_set_gains, pid_global_get_error
 from kernel.timer import timer_get_ticks, timer_delay_ms
 
 # State
@@ -29,9 +29,9 @@ def thermostat_init():
 
     # Initialize PID controller
     # Gains scaled by 100: Kp=150, Ki=10, Kd=50
-    pid_init(150, 10, 50)
-    pid_set_setpoint(target_temp)
-    pid_set_limits(0, 100)  # Fan speed 0-100%
+    pid_global_init(150, 10, 50)
+    pid_global_set_setpoint(target_temp)
+    pid_global_set_limits(0, 100)  # Fan speed 0-100%
 
     console_puts("  Target: ")
     console_print_int(target_temp / 100)
@@ -54,14 +54,14 @@ def thermostat_update():
     current: int32 = temp_read()
 
     # Update PID controller
-    output: int32 = pid_update(current)
+    output: int32 = pid_global_update(current)
     fan_speed = output
 
     # Apply to fan
     dc_set_speed(0, fan_speed)
 
     # Display status
-    error: int32 = pid_get_error()
+    error: int32 = pid_global_get_error()
 
     console_puts("Temp: ")
     console_print_int(current / 100)
@@ -81,8 +81,8 @@ def thermostat_set_target(temp_c: int32):
     """Set target temperature in centidegrees."""
     global target_temp
     target_temp = temp_c
-    pid_set_setpoint(target_temp)
-    pid_reset()  # Reset integral term
+    pid_global_set_setpoint(target_temp)
+    pid_global_reset()  # Reset integral term
 
     console_puts("New target: ")
     console_print_int(temp_c / 100)

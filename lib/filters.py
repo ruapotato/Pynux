@@ -1078,3 +1078,91 @@ def hysteresis_set_params(hys: Ptr[int32], threshold: int32, hysteresis: int32):
 #     target_speed: int32 = get_target()
 #     safe_speed: int32 = slew_update(motor_slew, target_speed)
 #     set_motor(safe_speed)
+
+# ============================================================================
+# Simple Global API for Tests
+# ============================================================================
+# These functions provide a simpler API using global filter instances.
+# They match the signatures expected by test files.
+
+# Global filter instances
+_global_lpf: Ptr[int32] = cast[Ptr[int32]](0)
+_global_mavg: Ptr[int32] = cast[Ptr[int32]](0)
+_global_kalman: Ptr[int32] = cast[Ptr[int32]](0)
+
+# --- Low-Pass Filter Simple API ---
+
+def lpf_init(alpha: int32):
+    """Initialize global LPF with alpha value (0-100)."""
+    global _global_lpf
+    if _global_lpf != cast[Ptr[int32]](0):
+        lpf_destroy(_global_lpf)
+    # Convert alpha percentage to cutoff ratio (alpha/100 in fixed point)
+    cutoff: int32 = alpha * 655  # Scale to ~16.16 FP range
+    _global_lpf = lpf_create(cutoff)
+
+def lpf_simple_update(value: int32) -> int32:
+    """Update global LPF with new value."""
+    if _global_lpf == cast[Ptr[int32]](0):
+        return value
+    return lpf_update(_global_lpf, value)
+
+def lpf_simple_reset():
+    """Reset global LPF."""
+    if _global_lpf != cast[Ptr[int32]](0):
+        lpf_reset(_global_lpf)
+
+def lpf_simple_get_value() -> int32:
+    """Get current value from global LPF."""
+    if _global_lpf == cast[Ptr[int32]](0):
+        return 0
+    return lpf_get_value(_global_lpf)
+
+# --- Moving Average Simple API ---
+
+def mavg_init(window_size: int32):
+    """Initialize global moving average with window size."""
+    global _global_mavg
+    if _global_mavg != cast[Ptr[int32]](0):
+        ma_destroy(_global_mavg)
+    _global_mavg = ma_create(window_size)
+
+def mavg_update(value: int32) -> int32:
+    """Update global moving average with new value."""
+    if _global_mavg == cast[Ptr[int32]](0):
+        return value
+    return ma_update(_global_mavg, value)
+
+def mavg_reset():
+    """Reset global moving average."""
+    if _global_mavg != cast[Ptr[int32]](0):
+        ma_reset(_global_mavg)
+
+def mavg_get_value() -> int32:
+    """Get current value from global moving average."""
+    if _global_mavg == cast[Ptr[int32]](0):
+        return 0
+    return ma_get_value(_global_mavg)
+
+# --- Kalman Filter Simple API ---
+
+def kalman_init(process_noise: int32, measurement_noise: int32):
+    """Initialize global Kalman filter with Q and R values."""
+    global _global_kalman
+    if _global_kalman != cast[Ptr[int32]](0):
+        kalman_destroy(_global_kalman)
+    # Convert to fixed-point (scale by ~655 for FP16.16)
+    q_fp: int32 = process_noise * 655
+    r_fp: int32 = measurement_noise * 655
+    _global_kalman = kalman_create(r_fp, q_fp)
+
+def kalman_simple_update(measurement: int32) -> int32:
+    """Update global Kalman filter with new measurement."""
+    if _global_kalman == cast[Ptr[int32]](0):
+        return measurement
+    return kalman_update(_global_kalman, measurement)
+
+def kalman_simple_reset():
+    """Reset global Kalman filter."""
+    if _global_kalman != cast[Ptr[int32]](0):
+        kalman_reset(_global_kalman)

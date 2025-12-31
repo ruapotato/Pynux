@@ -625,3 +625,83 @@ def fsm_is_in_state(fsm: Ptr[int32], state_id: int32) -> bool:
 #
 #   # Initialize
 #   fsm_init(fsm, 0)  # Start locked
+
+# ============================================================================
+# Global Instance API (for simple single-FSM use)
+# ============================================================================
+
+# Global FSM instance
+_global_fsm: Ptr[int32] = cast[Ptr[int32]](0)
+
+def _ensure_global_fsm():
+    """Create global FSM if not exists."""
+    global _global_fsm
+    if _global_fsm == cast[Ptr[int32]](0):
+        _global_fsm = fsm_create()
+
+def fsm_global_init(initial_state: int32):
+    """Initialize the global FSM with initial state."""
+    _ensure_global_fsm()
+    # Set initial state directly (current_state is at index 0)
+    _global_fsm[0] = initial_state
+    _global_fsm[3] = 0  # state_enter_time
+    _global_fsm[4] = 0  # current_tick
+
+def fsm_global_add_transition(from_state: int32, event: int32, to_state: int32):
+    """Add a transition to the global FSM (from_state, event, to_state)."""
+    _ensure_global_fsm()
+    fsm_add_transition(_global_fsm, from_state, to_state, event, 0, 0)
+
+def fsm_global_process_event(event: int32) -> int32:
+    """Process event on global FSM, returns new state."""
+    _ensure_global_fsm()
+    fsm_process_event(_global_fsm, event)
+    return _global_fsm[0]  # current_state at index 0
+
+def fsm_global_get_state() -> int32:
+    """Get current state of global FSM."""
+    if _global_fsm == cast[Ptr[int32]](0):
+        return -1
+    return _global_fsm[0]  # current_state at index 0
+
+def fsm_global_set_state(state: int32):
+    """Set current state of global FSM."""
+    _ensure_global_fsm()
+    _global_fsm[0] = state  # current_state at index 0
+
+def fsm_global_reset():
+    """Reset global FSM to initial state."""
+    _ensure_global_fsm()
+    _global_fsm[0] = 0  # Reset to state 0
+    _global_fsm[3] = 0  # state_enter_time
+    _global_fsm[4] = 0  # current_tick
+
+# ============================================================================
+# Simple Aliases for Test Compatibility
+# ============================================================================
+# These functions provide a simpler API using the global instance.
+# They match the signatures expected by test files.
+
+def fsm_simple_init(initial_state: int32):
+    """Initialize FSM with initial state (uses global instance)."""
+    fsm_global_init(initial_state)
+
+def fsm_add_transition_simple(from_state: int32, event: int32, to_state: int32):
+    """Add a transition (uses global instance)."""
+    fsm_global_add_transition(from_state, event, to_state)
+
+def fsm_process_event_simple(event: int32) -> int32:
+    """Process event, returns new state (uses global instance)."""
+    return fsm_global_process_event(event)
+
+def fsm_simple_get_state() -> int32:
+    """Get current state (uses global instance)."""
+    return fsm_global_get_state()
+
+def fsm_simple_set_state(state: int32):
+    """Set current state (uses global instance)."""
+    fsm_global_set_state(state)
+
+def fsm_simple_reset():
+    """Reset FSM (uses global instance)."""
+    fsm_global_reset()

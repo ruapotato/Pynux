@@ -4,8 +4,8 @@
 # Demonstrates: FSM library, GPIO, timer
 
 from lib.io import console_puts, console_print_int
-from lib.fsm import fsm_init, fsm_add_transition, fsm_process_event
-from lib.fsm import fsm_get_state, fsm_set_state
+from lib.fsm import fsm_global_init, fsm_global_add_transition, fsm_global_process_event
+from lib.fsm import fsm_global_get_state, fsm_global_set_state
 from lib.peripherals import gpio_init, gpio_write
 from kernel.timer import timer_get_ticks, timer_delay_ms
 
@@ -91,35 +91,35 @@ def traffic_init():
     gpio_init(PIN_GREEN, 1)   # Output
 
     # Initialize FSM starting at RED
-    fsm_init(STATE_RED)
+    fsm_global_init(STATE_RED)
 
     # Add state transitions
     # RED -> timer -> RED_YELLOW (prepare to go)
-    fsm_add_transition(STATE_RED, EVENT_TIMER, STATE_RED_YELLOW)
+    fsm_global_add_transition(STATE_RED, EVENT_TIMER, STATE_RED_YELLOW)
 
     # RED_YELLOW -> timer -> GREEN
-    fsm_add_transition(STATE_RED_YELLOW, EVENT_TIMER, STATE_GREEN)
+    fsm_global_add_transition(STATE_RED_YELLOW, EVENT_TIMER, STATE_GREEN)
 
     # GREEN -> timer -> YELLOW (prepare to stop)
-    fsm_add_transition(STATE_GREEN, EVENT_TIMER, STATE_YELLOW)
+    fsm_global_add_transition(STATE_GREEN, EVENT_TIMER, STATE_YELLOW)
 
     # YELLOW -> timer -> RED
-    fsm_add_transition(STATE_YELLOW, EVENT_TIMER, STATE_RED)
+    fsm_global_add_transition(STATE_YELLOW, EVENT_TIMER, STATE_RED)
 
     # Emergency: any state -> RED
-    fsm_add_transition(STATE_RED_YELLOW, EVENT_EMERGENCY, STATE_RED)
-    fsm_add_transition(STATE_GREEN, EVENT_EMERGENCY, STATE_RED)
-    fsm_add_transition(STATE_YELLOW, EVENT_EMERGENCY, STATE_RED)
+    fsm_global_add_transition(STATE_RED_YELLOW, EVENT_EMERGENCY, STATE_RED)
+    fsm_global_add_transition(STATE_GREEN, EVENT_EMERGENCY, STATE_RED)
+    fsm_global_add_transition(STATE_YELLOW, EVENT_EMERGENCY, STATE_RED)
 
     # Pedestrian button: extend RED or shorten GREEN
-    fsm_add_transition(STATE_GREEN, EVENT_PEDESTRIAN, STATE_YELLOW)
+    fsm_global_add_transition(STATE_GREEN, EVENT_PEDESTRIAN, STATE_YELLOW)
 
     traffic_on_state_enter(STATE_RED)
     console_puts("Traffic Light: Ready\n")
 
 def traffic_tick():
     """Process timer tick - advances FSM when appropriate."""
-    state: int32 = fsm_get_state()
+    state: int32 = fsm_global_get_state()
     elapsed: int32 = timer_get_ticks() - state_enter_time
 
     # State durations (ms)
@@ -135,23 +135,23 @@ def traffic_tick():
 
     if elapsed >= duration:
         old_state: int32 = state
-        new_state: int32 = fsm_process_event(EVENT_TIMER)
+        new_state: int32 = fsm_global_process_event(EVENT_TIMER)
         if new_state != old_state:
             traffic_on_state_enter(new_state)
 
 def traffic_emergency():
     """Handle emergency event."""
     console_puts("\n!!! EMERGENCY !!!\n")
-    old_state: int32 = fsm_get_state()
-    new_state: int32 = fsm_process_event(EVENT_EMERGENCY)
+    old_state: int32 = fsm_global_get_state()
+    new_state: int32 = fsm_global_process_event(EVENT_EMERGENCY)
     if new_state != old_state:
         traffic_on_state_enter(new_state)
 
 def traffic_pedestrian():
     """Handle pedestrian button press."""
     console_puts("\n[Pedestrian button pressed]\n")
-    old_state: int32 = fsm_get_state()
-    new_state: int32 = fsm_process_event(EVENT_PEDESTRIAN)
+    old_state: int32 = fsm_global_get_state()
+    new_state: int32 = fsm_global_process_event(EVENT_PEDESTRIAN)
     if new_state != old_state:
         traffic_on_state_enter(new_state)
 
@@ -169,7 +169,7 @@ def statemachine_main(argc: int32, argv: Ptr[Ptr[char]]) -> int32:
         traffic_tick()
 
         # Track cycle completion (back to RED)
-        if fsm_get_state() == STATE_RED and ticks > 0:
+        if fsm_global_get_state() == STATE_RED and ticks > 0:
             prev_ticks: int32 = ticks - 1
             if prev_ticks > 0:
                 cycles = cycles + 1

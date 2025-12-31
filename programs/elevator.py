@@ -4,7 +4,7 @@
 # Demonstrates FSM, sensors, motors, and real-time control.
 
 from lib.io import console_puts, console_print_int
-from lib.fsm import fsm_init, fsm_add_transition, fsm_process_event, fsm_get_state
+from lib.fsm import fsm_global_init, fsm_global_add_transition, fsm_global_process_event, fsm_global_get_state
 from lib.motors import dc_init, dc_set_speed, dc_brake
 from kernel.timer import timer_get_ticks, timer_delay_ms
 
@@ -151,36 +151,36 @@ def elevator_init():
     dc_init(0)
 
     # Initialize FSM
-    fsm_init(STATE_IDLE)
+    fsm_global_init(STATE_IDLE)
 
     # Define transitions
     # IDLE
-    fsm_add_transition(STATE_IDLE, EVENT_CALL_UP, STATE_MOVING_UP)
-    fsm_add_transition(STATE_IDLE, EVENT_CALL_DOWN, STATE_MOVING_DOWN)
-    fsm_add_transition(STATE_IDLE, EVENT_FLOOR_REACHED, STATE_DOOR_OPENING)
+    fsm_global_add_transition(STATE_IDLE, EVENT_CALL_UP, STATE_MOVING_UP)
+    fsm_global_add_transition(STATE_IDLE, EVENT_CALL_DOWN, STATE_MOVING_DOWN)
+    fsm_global_add_transition(STATE_IDLE, EVENT_FLOOR_REACHED, STATE_DOOR_OPENING)
 
     # MOVING_UP
-    fsm_add_transition(STATE_MOVING_UP, EVENT_FLOOR_REACHED, STATE_DOOR_OPENING)
-    fsm_add_transition(STATE_MOVING_UP, EVENT_EMERGENCY_STOP, STATE_EMERGENCY)
+    fsm_global_add_transition(STATE_MOVING_UP, EVENT_FLOOR_REACHED, STATE_DOOR_OPENING)
+    fsm_global_add_transition(STATE_MOVING_UP, EVENT_EMERGENCY_STOP, STATE_EMERGENCY)
 
     # MOVING_DOWN
-    fsm_add_transition(STATE_MOVING_DOWN, EVENT_FLOOR_REACHED, STATE_DOOR_OPENING)
-    fsm_add_transition(STATE_MOVING_DOWN, EVENT_EMERGENCY_STOP, STATE_EMERGENCY)
+    fsm_global_add_transition(STATE_MOVING_DOWN, EVENT_FLOOR_REACHED, STATE_DOOR_OPENING)
+    fsm_global_add_transition(STATE_MOVING_DOWN, EVENT_EMERGENCY_STOP, STATE_EMERGENCY)
 
     # DOOR_OPENING
-    fsm_add_transition(STATE_DOOR_OPENING, EVENT_DOOR_OPENED, STATE_DOOR_OPEN)
-    fsm_add_transition(STATE_DOOR_OPENING, EVENT_EMERGENCY_STOP, STATE_EMERGENCY)
+    fsm_global_add_transition(STATE_DOOR_OPENING, EVENT_DOOR_OPENED, STATE_DOOR_OPEN)
+    fsm_global_add_transition(STATE_DOOR_OPENING, EVENT_EMERGENCY_STOP, STATE_EMERGENCY)
 
     # DOOR_OPEN
-    fsm_add_transition(STATE_DOOR_OPEN, EVENT_TIMEOUT, STATE_DOOR_CLOSING)
-    fsm_add_transition(STATE_DOOR_OPEN, EVENT_EMERGENCY_STOP, STATE_EMERGENCY)
+    fsm_global_add_transition(STATE_DOOR_OPEN, EVENT_TIMEOUT, STATE_DOOR_CLOSING)
+    fsm_global_add_transition(STATE_DOOR_OPEN, EVENT_EMERGENCY_STOP, STATE_EMERGENCY)
 
     # DOOR_CLOSING
-    fsm_add_transition(STATE_DOOR_CLOSING, EVENT_DOOR_CLOSED, STATE_IDLE)
-    fsm_add_transition(STATE_DOOR_CLOSING, EVENT_EMERGENCY_STOP, STATE_EMERGENCY)
+    fsm_global_add_transition(STATE_DOOR_CLOSING, EVENT_DOOR_CLOSED, STATE_IDLE)
+    fsm_global_add_transition(STATE_DOOR_CLOSING, EVENT_EMERGENCY_STOP, STATE_EMERGENCY)
 
     # EMERGENCY
-    fsm_add_transition(STATE_EMERGENCY, EVENT_EMERGENCY_CLEAR, STATE_IDLE)
+    fsm_global_add_transition(STATE_EMERGENCY, EVENT_EMERGENCY_CLEAR, STATE_IDLE)
 
     current_floor = 1
     target_floor = 1
@@ -191,7 +191,7 @@ def elevator_tick():
     """Process one tick of elevator logic."""
     global current_floor, target_floor
 
-    state: int32 = fsm_get_state()
+    state: int32 = fsm_global_get_state()
     old_state: int32 = state
     new_state: int32 = state
 
@@ -199,11 +199,11 @@ def elevator_tick():
         # Check for pending calls
         target_floor = find_next_target()
         if target_floor > current_floor:
-            new_state = fsm_process_event(EVENT_CALL_UP)
+            new_state = fsm_global_process_event(EVENT_CALL_UP)
         elif target_floor < current_floor:
-            new_state = fsm_process_event(EVENT_CALL_DOWN)
+            new_state = fsm_global_process_event(EVENT_CALL_DOWN)
         elif has_call(current_floor):
-            new_state = fsm_process_event(EVENT_FLOOR_REACHED)
+            new_state = fsm_global_process_event(EVENT_FLOOR_REACHED)
 
     elif state == STATE_MOVING_UP:
         # Simulate reaching next floor
@@ -213,7 +213,7 @@ def elevator_tick():
         console_puts("\n")
 
         if current_floor >= target_floor or has_call(current_floor):
-            new_state = fsm_process_event(EVENT_FLOOR_REACHED)
+            new_state = fsm_global_process_event(EVENT_FLOOR_REACHED)
 
     elif state == STATE_MOVING_DOWN:
         current_floor = current_floor - 1
@@ -222,21 +222,21 @@ def elevator_tick():
         console_puts("\n")
 
         if current_floor <= target_floor or has_call(current_floor):
-            new_state = fsm_process_event(EVENT_FLOOR_REACHED)
+            new_state = fsm_global_process_event(EVENT_FLOOR_REACHED)
 
     elif state == STATE_DOOR_OPENING:
         # Simulate door opening
-        new_state = fsm_process_event(EVENT_DOOR_OPENED)
+        new_state = fsm_global_process_event(EVENT_DOOR_OPENED)
 
     elif state == STATE_DOOR_OPEN:
         # Check timeout
         elapsed: int32 = timer_get_ticks() - door_timer
         if elapsed >= DOOR_OPEN_TIME:
-            new_state = fsm_process_event(EVENT_TIMEOUT)
+            new_state = fsm_global_process_event(EVENT_TIMEOUT)
 
     elif state == STATE_DOOR_CLOSING:
         # Simulate door closing
-        new_state = fsm_process_event(EVENT_DOOR_CLOSED)
+        new_state = fsm_global_process_event(EVENT_DOOR_CLOSED)
 
     if new_state != old_state:
         on_state_enter(new_state)

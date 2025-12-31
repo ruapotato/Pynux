@@ -7,47 +7,48 @@ from lib.io import print_str, print_int, print_hex, print_newline, uart_putc
 from lib.memory import HEAP_START, HEAP_SIZE, HEADER_SIZE
 
 # ============================================================================
-# Unit Test Framework
+# Simple Inline Test Framework (for production code assertions)
+# Note: For full test suites, use tests/framework.py instead
 # ============================================================================
 
 # Test state
-_test_name: Ptr[char] = Ptr[char](0)
-_test_pass_count: int32 = 0
-_test_fail_count: int32 = 0
-_test_active: bool = False
+_dev_test_name: Ptr[char] = Ptr[char](0)
+_dev_test_pass_count: int32 = 0
+_dev_test_fail_count: int32 = 0
+_dev_test_active: bool = False
 
-def test_start(name: Ptr[char]):
+def dev_test_start(name: Ptr[char]):
     """Begin a test suite with the given name."""
-    global _test_name, _test_pass_count, _test_fail_count, _test_active
-    _test_name = name
-    _test_pass_count = 0
-    _test_fail_count = 0
-    _test_active = True
+    global _dev_test_name, _dev_test_pass_count, _dev_test_fail_count, _dev_test_active
+    _dev_test_name = name
+    _dev_test_pass_count = 0
+    _dev_test_fail_count = 0
+    _dev_test_active = True
     print_str("=== Test Suite: ")
     print_str(name)
     print_str(" ===")
     print_newline()
 
-def test_end() -> bool:
+def dev_test_end() -> bool:
     """End test suite and report results. Returns True if all passed."""
-    global _test_active
-    _test_active = False
+    global _dev_test_active
+    _dev_test_active = False
     print_newline()
     print_str("--- Results: ")
-    print_str(_test_name)
+    print_str(_dev_test_name)
     print_str(" ---")
     print_newline()
     print_str("  Passed: ")
-    print_int(_test_pass_count)
+    print_int(_dev_test_pass_count)
     print_newline()
     print_str("  Failed: ")
-    print_int(_test_fail_count)
+    print_int(_dev_test_fail_count)
     print_newline()
-    total: int32 = _test_pass_count + _test_fail_count
+    total: int32 = _dev_test_pass_count + _dev_test_fail_count
     print_str("  Total:  ")
     print_int(total)
     print_newline()
-    if _test_fail_count == 0:
+    if _dev_test_fail_count == 0:
         print_str("  Status: PASS")
         print_newline()
         return True
@@ -56,100 +57,100 @@ def test_end() -> bool:
         print_newline()
         return False
 
-def _test_record_pass():
+def _dev_record_pass():
     """Record a passing test."""
-    global _test_pass_count
-    _test_pass_count = _test_pass_count + 1
+    global _dev_test_pass_count
+    _dev_test_pass_count = _dev_test_pass_count + 1
     uart_putc('.')
 
-def _test_record_fail(msg: Ptr[char]):
+def _dev_record_fail(msg: Ptr[char]):
     """Record a failing test with message."""
-    global _test_fail_count
-    _test_fail_count = _test_fail_count + 1
+    global _dev_test_fail_count
+    _dev_test_fail_count = _dev_test_fail_count + 1
     print_newline()
     print_str("  FAIL: ")
     print_str(msg)
     print_newline()
 
-def test_assert(cond: bool, msg: Ptr[char]):
+def dev_assert(cond: bool, msg: Ptr[char]):
     """Assert a condition is true."""
     if cond:
-        _test_record_pass()
+        _dev_record_pass()
     else:
-        _test_record_fail(msg)
+        _dev_record_fail(msg)
 
-def test_assert_eq(a: int32, b: int32, msg: Ptr[char]):
+def dev_assert_eq(a: int32, b: int32, msg: Ptr[char]):
     """Assert two integers are equal."""
     if a == b:
-        _test_record_pass()
+        _dev_record_pass()
     else:
-        _test_record_fail(msg)
+        _dev_record_fail(msg)
         print_str("    Expected: ")
         print_int(b)
         print_str(", Got: ")
         print_int(a)
         print_newline()
 
-def test_assert_neq(a: int32, b: int32, msg: Ptr[char]):
+def dev_assert_neq(a: int32, b: int32, msg: Ptr[char]):
     """Assert two integers are not equal."""
     if a != b:
-        _test_record_pass()
+        _dev_record_pass()
     else:
-        _test_record_fail(msg)
+        _dev_record_fail(msg)
         print_str("    Values should differ but both are: ")
         print_int(a)
         print_newline()
 
-def test_assert_gt(a: int32, b: int32, msg: Ptr[char]):
+def dev_assert_gt(a: int32, b: int32, msg: Ptr[char]):
     """Assert a > b."""
     if a > b:
-        _test_record_pass()
+        _dev_record_pass()
     else:
-        _test_record_fail(msg)
+        _dev_record_fail(msg)
         print_str("    Expected ")
         print_int(a)
         print_str(" > ")
         print_int(b)
         print_newline()
 
-def test_assert_lt(a: int32, b: int32, msg: Ptr[char]):
+def dev_assert_lt(a: int32, b: int32, msg: Ptr[char]):
     """Assert a < b."""
     if a < b:
-        _test_record_pass()
+        _dev_record_pass()
     else:
-        _test_record_fail(msg)
+        _dev_record_fail(msg)
         print_str("    Expected ")
         print_int(a)
         print_str(" < ")
         print_int(b)
         print_newline()
 
-def test_assert_ptr_not_null(p: Ptr[uint8], msg: Ptr[char]):
+def dev_assert_ptr_not_null(p: Ptr[uint8], msg: Ptr[char]):
     """Assert pointer is not null."""
     if cast[uint32](p) != 0:
-        _test_record_pass()
+        _dev_record_pass()
     else:
-        _test_record_fail(msg)
+        _dev_record_fail(msg)
         print_str("    Pointer is NULL")
         print_newline()
 
-def test_assert_ptr_null(p: Ptr[uint8], msg: Ptr[char]):
+def dev_assert_ptr_null(p: Ptr[uint8], msg: Ptr[char]):
     """Assert pointer is null."""
     if cast[uint32](p) == 0:
-        _test_record_pass()
+        _dev_record_pass()
     else:
-        _test_record_fail(msg)
+        _dev_record_fail(msg)
         print_str("    Pointer should be NULL but is: 0x")
         print_hex(cast[uint32](p))
         print_newline()
 
-def test_get_pass_count() -> int32:
+def dev_get_pass_count() -> int32:
     """Get number of passed tests."""
-    return _test_pass_count
+    return _dev_test_pass_count
 
-def test_get_fail_count() -> int32:
+def dev_get_fail_count() -> int32:
     """Get number of failed tests."""
-    return _test_fail_count
+    return _dev_test_fail_count
 
 # ============================================================================
 # Memory Debugger

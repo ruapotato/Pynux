@@ -601,3 +601,89 @@ def pid_autotune_step(pid: Ptr[int32], input: int32, output_high: int32,
 #
 #     # Wait for next sample
 #     delay_ms(1000)
+
+# ============================================================================
+# Global Instance API (for simple single-PID use)
+# ============================================================================
+
+# Global PID controller instance
+_global_pid: Ptr[int32] = cast[Ptr[int32]](0)
+
+def _ensure_global_pid():
+    """Create global PID if not exists."""
+    global _global_pid
+    if _global_pid == cast[Ptr[int32]](0):
+        _global_pid = pid_create()
+
+def pid_global_init(kp: int32, ki: int32, kd: int32):
+    """Initialize global PID with gains (scaled by 100)."""
+    _ensure_global_pid()
+    pid_set_gains_scaled(_global_pid, kp, ki, kd)
+    pid_set_output_limits(_global_pid, -32767, 32767)
+    pid_set_integral_limits(_global_pid, -1000000, 1000000)
+
+def pid_global_set_setpoint(setpoint: int32):
+    """Set global PID setpoint."""
+    _ensure_global_pid()
+    _global_pid[PID_SETPOINT_OFFSET // 4] = setpoint
+
+def pid_global_set_limits(min_out: int32, max_out: int32):
+    """Set global PID output limits."""
+    _ensure_global_pid()
+    pid_set_output_limits(_global_pid, min_out, max_out)
+
+def pid_global_set_gains(kp: int32, ki: int32, kd: int32):
+    """Set global PID gains (scaled by 100)."""
+    _ensure_global_pid()
+    pid_set_gains_scaled(_global_pid, kp, ki, kd)
+
+def pid_global_update(input_val: int32) -> int32:
+    """Compute global PID output."""
+    if _global_pid == cast[Ptr[int32]](0):
+        return 0
+    return pid_compute(_global_pid, input_val)
+
+def pid_global_get_error() -> int32:
+    """Get current error from global PID."""
+    if _global_pid == cast[Ptr[int32]](0):
+        return 0
+    return _global_pid[PID_PREV_ERROR_OFFSET // 4]
+
+def pid_global_reset():
+    """Reset global PID controller."""
+    if _global_pid != cast[Ptr[int32]](0):
+        pid_reset(_global_pid)
+
+# ============================================================================
+# Simple Aliases for Test Compatibility
+# ============================================================================
+# These functions provide a simpler API using the global instance.
+# They match the signatures expected by test files.
+
+def pid_simple_init(kp: int32, ki: int32, kd: int32):
+    """Initialize PID with gains (scaled by 100) - uses global instance."""
+    pid_global_init(kp, ki, kd)
+
+def pid_simple_set_setpoint(setpoint: int32):
+    """Set target setpoint - uses global instance."""
+    pid_global_set_setpoint(setpoint)
+
+def pid_simple_set_limits(min_out: int32, max_out: int32):
+    """Set output limits - uses global instance."""
+    pid_global_set_limits(min_out, max_out)
+
+def pid_simple_update(input_val: int32) -> int32:
+    """Compute PID output - uses global instance."""
+    return pid_global_update(input_val)
+
+def pid_simple_get_error() -> int32:
+    """Get current error - uses global instance."""
+    return pid_global_get_error()
+
+def pid_simple_reset():
+    """Reset PID controller - uses global instance."""
+    pid_global_reset()
+
+def pid_simple_set_gains(kp: int32, ki: int32, kd: int32):
+    """Set PID gains (scaled by 100) - uses global instance."""
+    pid_global_set_gains(kp, ki, kd)

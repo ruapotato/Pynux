@@ -444,6 +444,14 @@ def get_tests_total() -> int32:
     """Get total number of tests run."""
     return _tests_passed + _tests_failed + _tests_skipped
 
+def get_passed() -> int32:
+    """Alias for get_tests_passed (backward compatible)."""
+    return _tests_passed
+
+def get_failed() -> int32:
+    """Alias for get_tests_failed (backward compatible)."""
+    return _tests_failed
+
 # ============================================================================
 # Backwards Compatibility with test_framework.py
 # ============================================================================

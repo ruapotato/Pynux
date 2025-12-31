@@ -187,34 +187,40 @@ sources = [
 ]
 
 # Add user programs from programs/ folder
-# Exclude programs that use unimplemented APIs or have conflicts
-excluded_programs = ["thermostat", "statemachine", "elevator", "run_tests"]
 user_programs = []
 for prog_path in sorted(glob.glob("programs/*.py")):
     name = os.path.basename(prog_path).replace(".py", "")
-    if name in excluded_programs:
-        continue
     sources.append((prog_path, f"prog_{name}"))
     user_programs.append(name)
 
 if user_programs:
     print(f"  Found user programs: {', '.join(user_programs)}")
 
-# Test framework is disabled due to conflicts with lib/devtools.py
-# Tests should import from tests.test_framework instead which uses devtools
-# if os.path.exists("tests/framework.py"):
-#     sources.append(("tests/framework.py", "tests_framework"))
-#     print(f"  Found test framework: tests/framework.py")
+# Add test framework
+if os.path.exists("tests/framework.py"):
+    sources.append(("tests/framework.py", "tests_framework"))
+    print(f"  Found test framework: tests/framework.py")
 
-# Test files are disabled due to conflicts between tests/framework.py and lib/devtools.py
-# The test files use functions from tests.test_framework which duplicates devtools.py
-# TODO: Refactor tests to use lib/devtools.py instead
+# Add test files from tests/ folder
+excluded_tests = ["test_compiler.py", "test_integration.py", "test_all.py",
+                  "test_process.py", "test_sync.py",
+                  "test_boot.py", "test_gfx.py",
+                  "test_scheduler.py", "test_shell.py"]
 test_files = []
-# for test_path in sorted(glob.glob("tests/test_*.py")):
-#     name = os.path.basename(test_path)
-#     ...
-# if test_files:
-#     print(f"  Found test files: {', '.join(test_files)}")
+for test_path in sorted(glob.glob("tests/test_*.py")):
+    name = os.path.basename(test_path)
+    if name in excluded_tests:
+        continue
+    with open(test_path) as f:
+        first_line = f.readline().strip()
+    if first_line.startswith("#!/"):
+        continue
+    name = name.replace(".py", "")
+    sources.append((test_path, f"tests_{name}"))
+    test_files.append(name)
+
+if test_files:
+    print(f"  Found test files: {', '.join(test_files)}")
 
 for src_path, name in sources:
     try:
@@ -313,11 +319,11 @@ if [ -f "$BUILD_DIR/user_programs.txt" ]; then
     done < "$BUILD_DIR/user_programs.txt"
 fi
 
-# Test framework disabled (uses lib/devtools instead)
-# if [ -f "$BUILD_DIR/tests_framework.s" ]; then
-#     $AS $ASFLAGS -o "$BUILD_DIR/tests_framework.o" "$BUILD_DIR/tests_framework.s"
-#     echo "  build/tests_framework.s"
-# fi
+# Test framework
+if [ -f "$BUILD_DIR/tests_framework.s" ]; then
+    $AS $ASFLAGS -o "$BUILD_DIR/tests_framework.o" "$BUILD_DIR/tests_framework.s"
+    echo "  build/tests_framework.s"
+fi
 
 # Test files
 if [ -f "$BUILD_DIR/test_files.txt" ]; then
@@ -375,10 +381,10 @@ if [ -f "$BUILD_DIR/user_programs.txt" ]; then
     done < "$BUILD_DIR/user_programs.txt"
 fi
 
-# Test framework disabled (uses lib/devtools instead)
-# if [ -f "$BUILD_DIR/tests_framework.o" ]; then
-#     OBJS="$OBJS $BUILD_DIR/tests_framework.o"
-# fi
+# Test framework
+if [ -f "$BUILD_DIR/tests_framework.o" ]; then
+    OBJS="$OBJS $BUILD_DIR/tests_framework.o"
+fi
 
 # Test files
 if [ -f "$BUILD_DIR/test_files.txt" ]; then
