@@ -158,7 +158,7 @@ def test_realloc_preserves():
 
     free(new_ptr)
 
-def test_heap_stats():
+def test_kernel_heap_stats():
     """Test heap statistics functions."""
     heap_init()
 
@@ -354,7 +354,7 @@ def run_kernel_tests():
     test_run("alloc_multiple", test_alloc_multiple)
     test_run("calloc_zeroed", test_calloc_zeroed)
     test_run("realloc_preserves", test_realloc_preserves)
-    test_run("heap_stats", test_heap_stats)
+    test_run("heap_stats", test_kernel_heap_stats)
 
     # Process tests
     test_section("Process Creation")

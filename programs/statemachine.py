@@ -28,7 +28,7 @@ PIN_GREEN: int32 = 2
 # Timing (in ticks for demo)
 state_enter_time: int32 = 0
 
-def state_name(state: int32) -> Ptr[char]:
+def traffic_state_name(state: int32) -> Ptr[char]:
     """Get human-readable state name."""
     if state == STATE_RED:
         return "RED"
@@ -62,14 +62,14 @@ def set_lights(red: int32, yellow: int32, green: int32):
         console_puts("-")
     console_puts("]\n")
 
-def on_state_enter(state: int32):
+def traffic_on_state_enter(state: int32):
     """Called when entering a new state."""
     global state_enter_time
 
     state_enter_time = timer_get_ticks()
 
     console_puts("\n-> Entering state: ")
-    console_puts(state_name(state))
+    console_puts(traffic_state_name(state))
     console_puts("\n")
 
     if state == STATE_RED:
@@ -114,7 +114,7 @@ def traffic_init():
     # Pedestrian button: extend RED or shorten GREEN
     fsm_add_transition(STATE_GREEN, EVENT_PEDESTRIAN, STATE_YELLOW)
 
-    on_state_enter(STATE_RED)
+    traffic_on_state_enter(STATE_RED)
     console_puts("Traffic Light: Ready\n")
 
 def traffic_tick():
@@ -137,7 +137,7 @@ def traffic_tick():
         old_state: int32 = state
         new_state: int32 = fsm_process_event(EVENT_TIMER)
         if new_state != old_state:
-            on_state_enter(new_state)
+            traffic_on_state_enter(new_state)
 
 def traffic_emergency():
     """Handle emergency event."""
@@ -145,7 +145,7 @@ def traffic_emergency():
     old_state: int32 = fsm_get_state()
     new_state: int32 = fsm_process_event(EVENT_EMERGENCY)
     if new_state != old_state:
-        on_state_enter(new_state)
+        traffic_on_state_enter(new_state)
 
 def traffic_pedestrian():
     """Handle pedestrian button press."""
@@ -153,7 +153,7 @@ def traffic_pedestrian():
     old_state: int32 = fsm_get_state()
     new_state: int32 = fsm_process_event(EVENT_PEDESTRIAN)
     if new_state != old_state:
-        on_state_enter(new_state)
+        traffic_on_state_enter(new_state)
 
 def statemachine_main(argc: int32, argv: Ptr[Ptr[char]]) -> int32:
     """Standalone demo mode."""

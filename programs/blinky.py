@@ -10,6 +10,7 @@
 
 from kernel.timer import timer_get_ticks, timer_delay_ms
 from lib.io import console_puts, console_print_int
+from lib.peripherals import mmio_read, mmio_write, TARGET_QEMU, TARGET_RP2040, TARGET_STM32F4
 
 # ============================================================================
 # Target-specific GPIO Configuration
@@ -30,23 +31,6 @@ STM32_RCC_AHB1ENR: uint32 = 0x30
 STM32_GPIO_MODER: uint32 = 0x00
 STM32_GPIO_ODR: uint32 = 0x14
 STM32_LED_PIN: uint32 = 13  # PC13 for Blue Pill
-
-# Target detection (set by build system or runtime)
-TARGET_QEMU: uint32 = 0
-TARGET_RP2040: uint32 = 1
-TARGET_STM32F4: uint32 = 2
-
-# ============================================================================
-# Memory-Mapped I/O
-# ============================================================================
-
-def mmio_read(addr: uint32) -> uint32:
-    ptr: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](addr)
-    return ptr[0]
-
-def mmio_write(addr: uint32, val: uint32):
-    ptr: Ptr[volatile uint32] = cast[Ptr[volatile uint32]](addr)
-    ptr[0] = val
 
 # ============================================================================
 # LED Initialization
@@ -153,22 +137,10 @@ def blinky_tick():
 # Standalone Test Entry Point
 # ============================================================================
 
-def blinky_main():
-    """Standalone blinky test - runs forever."""
-    # Default to QEMU for safety
+def blinky_main(argc: int32, argv: Ptr[Ptr[char]]) -> int32:
+    """Standalone blinky entry point."""
     blinky_init(TARGET_QEMU)
-
     console_puts("Running blinky loop...\n")
-
-    # Run forever
     while True:
         blinky_tick()
-
-# For integration with user_main/user_tick
-def user_main():
-    """Called once at startup."""
-    blinky_init(TARGET_QEMU)
-
-def user_tick():
-    """Called repeatedly from main loop."""
-    blinky_tick()
+    return 0

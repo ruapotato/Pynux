@@ -70,7 +70,7 @@ def test_gpio_write_read():
     val = gpio_read(0, 5)
     test_assert_eq(cast[int32](val), 0, "write low reads back 0")
 
-def test_gpio_toggle():
+def test_hal_gpio_toggle():
     """Test GPIO toggle."""
     gpio_init(0)
 
@@ -163,7 +163,7 @@ def test_delay_us_basic():
     timer_delay_us(1000)  # 1ms in us
     test_pass("delay_us(1000) completes")
 
-def test_delay_zero():
+def test_hal_delay_zero():
     """Test zero-length delays don't hang."""
     timer_init_poll()
 
@@ -189,7 +189,7 @@ def test_delay_timing():
     # Ticks should have advanced (may not be exactly 10 in QEMU)
     test_assert_ge(after, before, "ticks advance during delay")
 
-def test_delay_ordering():
+def test_hal_delay_ordering():
     """Test that longer delays take longer."""
     timer_init_poll()
 
@@ -369,7 +369,7 @@ def test_adc_init():
     adc_init(12)  # 12-bit resolution
     test_pass("adc_init 12-bit completes")
 
-def test_adc_read():
+def test_hal_adc_read():
     """Test ADC read (simulation returns whatever hardware has)."""
     adc_init(12)
 
@@ -406,7 +406,7 @@ def run_hal_tests():
     test_run("gpio_init", test_gpio_init)
     test_run("gpio_direction", test_gpio_direction)
     test_run("gpio_write_read", test_gpio_write_read)
-    test_run("gpio_toggle", test_gpio_toggle)
+    test_run("gpio_toggle", test_hal_gpio_toggle)
     test_run("gpio_port_operations", test_gpio_port_operations)
     test_run("gpio_multiple_pins", test_gpio_multiple_pins)
 
@@ -414,9 +414,9 @@ def run_hal_tests():
     test_section("Timer Delays")
     test_run("delay_ms_basic", test_delay_ms_basic)
     test_run("delay_us_basic", test_delay_us_basic)
-    test_run("delay_zero", test_delay_zero)
+    test_run("delay_zero", test_hal_delay_zero)
     test_run("delay_timing", test_delay_timing)
-    test_run("delay_ordering", test_delay_ordering)
+    test_run("delay_ordering", test_hal_delay_ordering)
 
     # UART tests
     test_section("UART")
@@ -446,7 +446,7 @@ def run_hal_tests():
     # ADC tests
     test_section("ADC")
     test_run("adc_init", test_adc_init)
-    test_run("adc_read", test_adc_read)
+    test_run("adc_read", test_hal_adc_read)
     test_run("adc_mv", test_adc_mv)
 
     return test_summary()

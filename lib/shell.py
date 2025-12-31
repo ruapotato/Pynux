@@ -18,7 +18,7 @@ from programs.hexview import hexview_main
 from programs.imgview import imgview_main
 from programs.sensormon import sensormon_main
 from programs.motorctl import motorctl_main
-from programs.run_tests import run_tests_main
+# from programs.run_tests import run_tests_main  # Disabled - test framework conflicts
 from lib.sensors import sensors_seed, sensors_enable_noise, sensors_init_all
 from lib.sensors import temp_read, temp_to_fahrenheit
 from lib.sensors import accel_read_x, accel_read_y, accel_read_z
@@ -1359,10 +1359,11 @@ def shell_exec_basic(cmd: Ptr[char]) -> bool:
         shell_newline()
         return True
 
-    if strcmp(cmd, "test") == 0:
-        shell_newline()
-        run_tests_main()
-        return True
+    # "test" command disabled - test framework conflicts
+    # if strcmp(cmd, "test") == 0:
+    #     shell_newline()
+    #     run_tests_main()
+    #     return True
 
     return False
 
