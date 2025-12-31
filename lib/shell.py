@@ -112,6 +112,14 @@ shell_tab_prefix: Array[64, char]
 shell_tab_match: Array[64, char]
 shell_tab_dir: Array[256, char]
 
+# Pipe and redirect buffers
+shell_pipe_buf: Array[4096, char]   # Buffer for piped output
+shell_pipe_pos: int32 = 0           # Current position in pipe buffer
+shell_pipe_mode: int32 = 0          # 0=normal, 1=capturing, 2=reading from pipe
+shell_redir_file: Array[256, char]  # Redirect filename
+shell_redir_mode: int32 = 0         # 0=none, 1=write, 2=append, 3=read
+shell_cmd2_buf: Array[256, char]    # Second command buffer for pipes
+
 # Job control
 # Job states: 0 = stopped, 1 = running (background), 2 = running (foreground), 3 = terminated
 SHELL_JOB_STOPPED: int32 = 0
@@ -2938,26 +2946,115 @@ def shell_expand_alias(cmd: Ptr[char]) -> bool:
         i = i + 1
     return False
 
-def shell_exec():
-    global shell_cmd_pos, shell_cursor_pos
+# ============================================================================
+# Pipe and Redirect Support
+# ============================================================================
 
-    shell_cmd[shell_cmd_pos] = '\0'
+def shell_pipe_reset():
+    """Reset pipe buffer for new capture."""
+    global shell_pipe_pos, shell_pipe_mode
+    shell_pipe_pos = 0
+    shell_pipe_mode = 0
+    shell_pipe_buf[0] = '\0'
 
-    if shell_cmd_pos == 0:
-        shell_prompt()
-        shell_cursor_pos = 0
-        return
+def shell_pipe_putc(c: char):
+    """Add character to pipe buffer (when capturing)."""
+    global shell_pipe_pos
+    if shell_pipe_pos < 4095:
+        shell_pipe_buf[shell_pipe_pos] = c
+        shell_pipe_pos = shell_pipe_pos + 1
+        shell_pipe_buf[shell_pipe_pos] = '\0'
 
-    cmd: Ptr[char] = &shell_cmd[0]
+def shell_pipe_puts(s: Ptr[char]):
+    """Add string to pipe buffer (when capturing)."""
+    i: int32 = 0
+    while s[i] != '\0':
+        shell_pipe_putc(s[i])
+        i = i + 1
 
-    # Save to history and reset navigation
-    history_add(cmd)
-    history_reset_pos()
+def shell_output_char(c: char):
+    """Output a character - to pipe buffer if capturing, else to UART."""
+    global shell_pipe_mode
+    if shell_pipe_mode == 1:
+        shell_pipe_putc(c)
+    else:
+        uart_putc(c)
 
-    # Expand aliases before execution
-    shell_expand_alias(cmd)
+def shell_output_str(s: Ptr[char]):
+    """Output a string - to pipe buffer if capturing, else to UART."""
+    global shell_pipe_mode
+    if shell_pipe_mode == 1:
+        shell_pipe_puts(s)
+    else:
+        shell_puts(s)
 
-    # Try each handler in turn - each returns True if it handled the command
+def shell_find_pipe(cmd: Ptr[char]) -> int32:
+    """Find pipe character in command. Returns position or -1."""
+    i: int32 = 0
+    while cmd[i] != '\0':
+        if cmd[i] == '|':
+            return i
+        i = i + 1
+    return -1
+
+def shell_find_redir(cmd: Ptr[char]) -> int32:
+    """Find redirect operator in command. Returns position or -1.
+    Sets shell_redir_mode: 1=>, 2=>>, 3=<"""
+    global shell_redir_mode
+    i: int32 = 0
+    while cmd[i] != '\0':
+        if cmd[i] == '>':
+            if cmd[i + 1] == '>':
+                shell_redir_mode = 2  # append
+                return i
+            shell_redir_mode = 1  # write
+            return i
+        if cmd[i] == '<':
+            shell_redir_mode = 3  # read
+            return i
+        i = i + 1
+    shell_redir_mode = 0
+    return -1
+
+def shell_find_bg(cmd: Ptr[char]) -> bool:
+    """Check if command ends with &. Returns True if background."""
+    i: int32 = strlen(cmd) - 1
+    # Skip trailing whitespace
+    while i >= 0 and (cmd[i] == ' ' or cmd[i] == '\t'):
+        i = i - 1
+    if i >= 0 and cmd[i] == '&':
+        cmd[i] = '\0'  # Remove the &
+        return True
+    return False
+
+def shell_parse_redir_file(cmd: Ptr[char], pos: int32):
+    """Parse the filename after a redirect operator."""
+    global shell_redir_mode
+    # Skip the operator
+    i: int32 = pos + 1
+    if shell_redir_mode == 2:  # >>
+        i = i + 1
+    # Skip whitespace
+    while cmd[i] == ' ' or cmd[i] == '\t':
+        i = i + 1
+    # Copy filename
+    j: int32 = 0
+    while cmd[i] != '\0' and cmd[i] != ' ' and cmd[i] != '\t' and j < 255:
+        shell_redir_file[j] = cmd[i]
+        i = i + 1
+        j = j + 1
+    shell_redir_file[j] = '\0'
+
+def shell_exec_with_capture(cmd: Ptr[char]):
+    """Execute a command with output captured to pipe buffer."""
+    global shell_pipe_mode
+    shell_pipe_mode = 1  # Capture mode
+    shell_exec_single(cmd)
+    shell_pipe_mode = 0  # Normal mode
+
+def shell_exec_single(cmd: Ptr[char]):
+    """Execute a single command (no pipes/redirects)."""
+    # Try each handler in turn
     if shell_exec_builtin(cmd):
         pass
     elif shell_exec_job(cmd):
@@ -2983,11 +3080,321 @@ def shell_exec():
     elif shell_exec_hw(cmd):
         pass
     else:
-        # Unknown command
+        shell_output_str("Unknown: ")
+        shell_output_str(cmd)
+        shell_output_char('\n')
+
+def shell_exec_pipe(cmd1: Ptr[char], cmd2: Ptr[char]):
+    """Execute cmd1 | cmd2 - pipe output of cmd1 to cmd2."""
+    global shell_pipe_mode
+
+    # Reset pipe buffer
+    shell_pipe_reset()
+
+    # Execute first command with capture
+    shell_pipe_mode = 1
+    shell_exec_single(cmd1)
+    shell_pipe_mode = 0
+
+    # Now execute second command
+    # For commands that read input, they should check shell_pipe_buf
+    # For now, we'll print the captured output (simple cat-like behavior)
+    # In a real implementation, commands would read from the pipe
+    shell_newline()
+
+    # Check if cmd2 is a filter command that can use piped input
+    if shell_starts_with_str(cmd2, "grep "):
+        # grep can filter the pipe buffer
+        shell_grep_pipe(cmd2)
+    elif shell_starts_with_str(cmd2, "wc"):
+        # wc can count the pipe buffer
+        shell_wc_pipe()
+    elif shell_starts_with_str(cmd2, "head"):
+        # head can show first lines of pipe
+        shell_head_pipe(cmd2)
+    elif shell_starts_with_str(cmd2, "tail"):
+        # tail can show last lines of pipe
+        shell_tail_pipe(cmd2)
+    elif strcmp(cmd2, "cat") == 0:
+        # cat just outputs the pipe buffer
+        shell_puts(&shell_pipe_buf[0])
+    else:
+        # Default: just run the second command and show pipe output before it
+        shell_puts(&shell_pipe_buf[0])
+        shell_exec_single(cmd2)
+
+def shell_starts_with_str(s: Ptr[char], prefix: Ptr[char]) -> bool:
+    """Check if string starts with prefix."""
+    i: int32 = 0
+    while prefix[i] != '\0':
+        if s[i] != prefix[i]:
+            return False
+        i = i + 1
+    return True
+
+def shell_grep_pipe(cmd: Ptr[char]):
+    """Grep through pipe buffer."""
+    # Get pattern from command
+    i: int32 = 5  # Skip "grep "
+    while cmd[i] == ' ':
+        i = i + 1
+    # Copy pattern
+    j: int32 = 0
+    while cmd[i] != '\0' and cmd[i] != ' ' and j < 63:
+        shell_grep_pat[j] = cmd[i]
+        i = i + 1
+        j = j + 1
+    shell_grep_pat[j] = '\0'
+
+    # Search through pipe buffer line by line
+    pos: int32 = 0
+    line_start: int32 = 0
+    while shell_pipe_buf[pos] != '\0':
+        if shell_pipe_buf[pos] == '\n' or shell_pipe_buf[pos + 1] == '\0':
+            # End of line - check for match
+            # Copy line to line buffer
+            k: int32 = 0
+            m: int32 = line_start
+            while m <= pos and k < 255:
+                shell_line_buf[k] = shell_pipe_buf[m]
+                k = k + 1
+                m = m + 1
+            shell_line_buf[k] = '\0'
+
+            # Check if pattern is in line
+            if shell_str_contains(&shell_line_buf[0], &shell_grep_pat[0]):
+                shell_puts(&shell_line_buf[0])
+                if shell_pipe_buf[pos] != '\n':
+                    shell_newline()
+
+            line_start = pos + 1
+        pos = pos + 1
+
+def shell_str_contains(s: Ptr[char], pat: Ptr[char]) -> bool:
+    """Check if string contains pattern."""
+    pat_len: int32 = strlen(pat)
+    if pat_len == 0:
+        return True
+    i: int32 = 0
+    while s[i] != '\0':
+        j: int32 = 0
+        while pat[j] != '\0' and s[i + j] == pat[j]:
+            j = j + 1
+        if pat[j] == '\0':
+            return True
+        i = i + 1
+    return False
+
+def shell_wc_pipe():
+    """Count lines, words, chars in pipe buffer."""
+    lines: int32 = 0
+    words: int32 = 0
+    chars: int32 = 0
+    in_word: bool = False
+
+    i: int32 = 0
+    while shell_pipe_buf[i] != '\0':
+        chars = chars + 1
+        if shell_pipe_buf[i] == '\n':
+            lines = lines + 1
+        if shell_pipe_buf[i] == ' ' or shell_pipe_buf[i] == '\t' or shell_pipe_buf[i] == '\n':
+            in_word = False
+        elif not in_word:
+            in_word = True
+            words = words + 1
+        i = i + 1
+
+    shell_puts("  ")
+    shell_puts(shell_int_to_str(lines))
+    shell_puts("  ")
+    shell_puts(shell_int_to_str(words))
+    shell_puts("  ")
+    shell_puts(shell_int_to_str(chars))
+    shell_newline()
+
+def shell_head_pipe(cmd: Ptr[char]):
+    """Show first N lines of pipe buffer."""
+    n: int32 = 10  # Default
+    # Parse -n option
+    i: int32 = 4  # Skip "head"
+    while cmd[i] == ' ':
+        i = i + 1
+    if cmd[i] == '-' and cmd[i + 1] == 'n':
+        i = i + 2
+        while cmd[i] == ' ':
+            i = i + 1
+        n = atoi(&cmd[i])
+        if n <= 0:
+            n = 10
+
+    lines: int32 = 0
+    pos: int32 = 0
+    while shell_pipe_buf[pos] != '\0' and lines < n:
+        shell_putc(shell_pipe_buf[pos])
+        if shell_pipe_buf[pos] == '\n':
+            lines = lines + 1
+        pos = pos + 1
+
+def shell_tail_pipe(cmd: Ptr[char]):
+    """Show last N lines of pipe buffer."""
+    n: int32 = 10  # Default
+    # Parse -n option
+    i: int32 = 4  # Skip "tail"
+    while cmd[i] == ' ':
+        i = i + 1
+    if cmd[i] == '-' and cmd[i + 1] == 'n':
+        i = i + 2
+        while cmd[i] == ' ':
+            i = i + 1
+        n = atoi(&cmd[i])
+        if n <= 0:
+            n = 10
+
+    # Count total lines
+    total_lines: int32 = 0
+    pos: int32 = 0
+    while shell_pipe_buf[pos] != '\0':
+        if shell_pipe_buf[pos] == '\n':
+            total_lines = total_lines + 1
+        pos = pos + 1
+
+    # Find start position (skip first total-n lines)
+    skip: int32 = total_lines - n
+    if skip < 0:
+        skip = 0
+
+    lines: int32 = 0
+    pos = 0
+    while shell_pipe_buf[pos] != '\0' and lines < skip:
+        if shell_pipe_buf[pos] == '\n':
+            lines = lines + 1
+        pos = pos + 1
+
+    # Output rest
+    while shell_pipe_buf[pos] != '\0':
+        shell_putc(shell_pipe_buf[pos])
+        pos = pos + 1
+
+def shell_exec_redir(cmd: Ptr[char], pos: int32):
+    """Execute command with redirect."""
+    global shell_redir_mode
+
+    # Terminate command at redirect operator
+    cmd[pos] = '\0'
+
+    # Parse the filename
+    shell_parse_redir_file(&shell_cmd[0], pos)
+
+    if shell_redir_mode == 1 or shell_redir_mode == 2:
+        # Output redirect (> or >>)
+        shell_pipe_reset()
+        shell_pipe_mode = 1
+        shell_exec_single(cmd)
+        shell_pipe_mode = 0
+
+        # Build full path for output file
+        shell_build_path(&shell_redir_file[0])
+
+        # Create file if it doesn't exist
+        if not ramfs_exists(&shell_path_buf[0]):
+            ramfs_create(&shell_path_buf[0], False)
+
+        if shell_redir_mode == 2:
+            # Append mode - read existing content first
+            existing_size: int32 = ramfs_size(&shell_path_buf[0])
+            if existing_size > 0:
+                # Read existing
+                ramfs_read(&shell_path_buf[0], cast[Ptr[uint8]](&shell_copy_buf[0]), 511)
+                shell_copy_buf[existing_size] = '\0'
+                # Append new content
+                i: int32 = 0
+                while shell_pipe_buf[i] != '\0' and existing_size + i < 511:
+                    shell_copy_buf[existing_size + i] = shell_pipe_buf[i]
+                    i = i + 1
+                shell_copy_buf[existing_size + i] = '\0'
+                ramfs_write(&shell_path_buf[0], &shell_copy_buf[0])
+            else:
+                ramfs_write(&shell_path_buf[0], &shell_pipe_buf[0])
+        else:
+            # Write mode - overwrite
+            ramfs_write(&shell_path_buf[0], &shell_pipe_buf[0])
+
         shell_newline()
-        shell_puts("Unknown: ")
+    elif shell_redir_mode == 3:
+        # Input redirect (<) - not fully implemented yet
+        shell_newline()
+        shell_puts("Input redirect not yet implemented")
+        shell_newline()
+
+def shell_exec():
+    global shell_cmd_pos, shell_cursor_pos
+
+    shell_cmd[shell_cmd_pos] = '\0'
+
+    if shell_cmd_pos == 0:
+        shell_prompt()
+        shell_cursor_pos = 0
+        return
+
+    cmd: Ptr[char] = &shell_cmd[0]
+
+    # Save to history and reset navigation
+    history_add(cmd)
+    history_reset_pos()
+
+    # Expand aliases before execution
+    shell_expand_alias(cmd)
+
+    # Check for background execution (&)
+    is_bg: bool = shell_find_bg(cmd)
+    if is_bg:
+        shell_newline()
+        shell_puts("[bg] ")
         shell_puts(cmd)
         shell_newline()
+        # For now, just run normally (true background requires process model)
+
+    # Check for pipes (|)
+    pipe_pos: int32 = shell_find_pipe(cmd)
+    if pipe_pos >= 0:
+        # Split into two commands
+        cmd[pipe_pos] = '\0'
+        # Skip whitespace after pipe
+        i: int32 = pipe_pos + 1
+        while cmd[i] == ' ' or cmd[i] == '\t':
+            i = i + 1
+        # Copy second command to buffer
+        j: int32 = 0
+        while cmd[i] != '\0' and j < 255:
+            shell_cmd2_buf[j] = cmd[i]
+            i = i + 1
+            j = j + 1
+        shell_cmd2_buf[j] = '\0'
+        # Trim first command
+        i = pipe_pos - 1
+        while i >= 0 and (cmd[i] == ' ' or cmd[i] == '\t'):
+            cmd[i] = '\0'
+            i = i - 1
+        # Execute pipe
+        shell_exec_pipe(cmd, &shell_cmd2_buf[0])
+        shell_newline()
+        shell_prompt()
+        shell_cmd_pos = 0
+        shell_cursor_pos = 0
+        return
+
+    # Check for redirects (>, >>, <)
+    redir_pos: int32 = shell_find_redir(cmd)
+    if redir_pos >= 0:
+        shell_exec_redir(cmd, redir_pos)
+        shell_newline()
+        shell_prompt()
+        shell_cmd_pos = 0
+        shell_cursor_pos = 0
+        return
+
+    # Normal execution - try each handler
+    shell_exec_single(cmd)
 
     shell_newline()
     shell_prompt()

@@ -185,6 +185,20 @@ def job_done(jid: int32):
 def job_get_name(jid: int32) -> Ptr[char]:
     return &job_names[jid * 32]
 
+def job_kill(jid: int32) -> bool:
+    """Kill a job by ID. Returns True if job was running."""
+    if jid >= 0 and jid < MAX_JOBS:
+        if job_status[jid] == JOB_RUNNING:
+            job_status[jid] = JOB_DONE
+            return True
+    return False
+
+def job_is_running(jid: int32) -> bool:
+    """Check if a job is running."""
+    if jid >= 0 and jid < MAX_JOBS:
+        return job_status[jid] == JOB_RUNNING
+    return False
+
 def job_clear_done():
     """Clear all done jobs."""
     global job_count
@@ -600,8 +614,8 @@ def cmd_starts_with(idx: int32, prefix: Ptr[char]) -> bool:
 def cmd_help(idx: int32):
     term_puts_idx(idx, "\nCommands: help clear ls cd cat mkdir touch rm mv cp\n")
     term_puts_idx(idx, "echo pwd write uname free whoami hostname date uptime\n")
-    term_puts_idx(idx, "id env ps df stat head tail wc sleep hello jobs\n")
-    term_puts_idx(idx, "true false arch tty groups printenv\n")
+    term_puts_idx(idx, "id env ps df stat head tail wc sleep hello\n")
+    term_puts_idx(idx, "jobs kill main true false arch tty groups printenv\n")
     term_puts_idx(idx, "Apps: calc clock hexview imgview\n")
 
 def cmd_ls(idx: int32):
@@ -1003,9 +1017,232 @@ def cmd_jobs(idx: int32):
     # Clear done jobs after display
     job_clear_done()
 
+def cmd_kill(idx: int32):
+    """Kill a background job."""
+    arg: Ptr[char] = cmd_get_arg(idx)
+    term_puts_idx(idx, "\n")
+    # Parse job number - accept %1, 1, or just "kill" for job 1
+    job_num: int32 = 1
+    if arg[0] == '%':
+        job_num = atoi(&arg[1])
+    elif arg[0] >= '0' and arg[0] <= '9':
+        job_num = atoi(arg)
+    # Convert to 0-indexed
+    jid: int32 = job_num - 1
+    if jid >= 0 and jid < MAX_JOBS:
+        if job_kill(jid):
+            term_puts_idx(idx, "[")
+            term_puts_idx(idx, int_to_str(job_num))
+            term_puts_idx(idx, "]   Terminated              ")
+            term_puts_idx(idx, job_get_name(jid))
+            term_putc_idx(idx, '\n')
+        else:
+            term_puts_idx(idx, "kill: job ")
+            term_puts_idx(idx, int_to_str(job_num))
+            term_puts_idx(idx, " not running\n")
+    else:
+        term_puts_idx(idx, "kill: no such job\n")
+
+def cmd_main(idx: int32):
+    """Start or restart main.py as background job."""
+    global main_job_id
+    term_puts_idx(idx, "\n")
+    # Check if already running
+    if job_is_running(main_job_id):
+        term_puts_idx(idx, "main.py is already running\n")
+        return
+    # Register as new job
+    main_job_id = job_add("main.py")
+    if main_job_id < 0:
+        term_puts_idx(idx, "Error: too many jobs\n")
+        return
+    term_puts_idx(idx, "[")
+    term_puts_idx(idx, int_to_str(main_job_id + 1))
+    term_puts_idx(idx, "] main.py &\n")
+    # Set console to buffered mode for DE
+    console_set_mode(1)
+    user_main()
+    # Flush any output
+    if console_has_output():
+        term_puts_idx(idx, console_flush())
+
 # ============================================================================
 # Terminal command execution
 # ============================================================================
+
+def term_dispatch_job(idx: int32) -> bool:
+    """Handle job control commands. Returns True if handled."""
+    cmd: Ptr[char] = term_get_cmd_buf(idx)
+    if strcmp(cmd, "jobs") == 0:
+        cmd_jobs(idx)
+        return True
+    if cmd_starts_with(idx, "kill"):
+        cmd_kill(idx)
+        return True
+    if strcmp(cmd, "main") == 0:
+        cmd_main(idx)
+        return True
+    return False
+
+def term_dispatch_file(idx: int32) -> bool:
+    """Handle file commands. Returns True if handled."""
+    cmd: Ptr[char] = term_get_cmd_buf(idx)
+    if cmd_starts_with(idx, "ls"):
+        cmd_ls(idx)
+        return True
+    if cmd_starts_with(idx, "cd"):
+        cmd_cd(idx)
+        return True
+    if cmd_starts_with(idx, "cat"):
+        cmd_cat(idx)
+        return True
+    if cmd_starts_with(idx, "mkdir"):
+        cmd_mkdir(idx)
+        return True
+    if cmd_starts_with(idx, "touch"):
+        cmd_touch(idx)
+        return True
+    if cmd_starts_with(idx, "rm"):
+        cmd_rm(idx)
+        return True
+    if cmd_starts_with(idx, "head"):
+        cmd_head(idx)
+        return True
+    if cmd_starts_with(idx, "tail"):
+        cmd_tail(idx)
+        return True
+    if cmd_starts_with(idx, "wc"):
+        cmd_wc(idx)
+        return True
+    if cmd_starts_with(idx, "mv"):
+        cmd_mv(idx)
+        return True
+    if cmd_starts_with(idx, "cp"):
+        cmd_cp(idx)
+        return True
+    if cmd_starts_with(idx, "stat"):
+        cmd_stat(idx)
+        return True
+    if cmd_starts_with(idx, "write"):
+        cmd_write(idx)
+        return True
+    if strcmp(cmd, "pwd") == 0:
+        cmd_pwd(idx)
+        return True
+    return False
+
+def term_dispatch_sys(idx: int32) -> bool:
+    """Handle system info commands. Returns True if handled."""
+    cmd: Ptr[char] = term_get_cmd_buf(idx)
+    if cmd_starts_with(idx, "uname"):
+        cmd_uname(idx)
+        return True
+    if strcmp(cmd, "free") == 0:
+        cmd_free(idx)
+        return True
+    if strcmp(cmd, "whoami") == 0:
+        term_puts_idx(idx, "\nroot\n")
+        return True
+    if strcmp(cmd, "hostname") == 0:
+        term_puts_idx(idx, "\npynux\n")
+        return True
+    if strcmp(cmd, "date") == 0:
+        term_puts_idx(idx, "\nJan 1 00:00:00 UTC 2025\n")
+        return True
+    if strcmp(cmd, "uptime") == 0:
+        term_puts_idx(idx, "\nup 0 days, 0:00\n")
+        return True
+    if strcmp(cmd, "id") == 0:
+        term_puts_idx(idx, "\nuid=0(root) gid=0(root)\n")
+        return True
+    if strcmp(cmd, "env") == 0:
+        term_puts_idx(idx, "\nHOME=/home\nUSER=root\nSHELL=/bin/psh\n")
+        return True
+    if strcmp(cmd, "ps") == 0:
+        term_puts_idx(idx, "\n  PID CMD\n    1 psh\n")
+        return True
+    if strcmp(cmd, "df") == 0:
+        term_puts_idx(idx, "\nFilesystem  Used  Free\nramfs       ")
+        term_puts_idx(idx, int_to_str(heap_used() / 1024))
+        term_puts_idx(idx, "K   ")
+        term_puts_idx(idx, int_to_str(heap_remaining() / 1024))
+        term_puts_idx(idx, "K\n")
+        return True
+    if strcmp(cmd, "arch") == 0:
+        term_puts_idx(idx, "\narmv7m\n")
+        return True
+    if strcmp(cmd, "tty") == 0:
+        term_puts_idx(idx, "\n/dev/tty\n")
+        return True
+    if strcmp(cmd, "groups") == 0:
+        term_puts_idx(idx, "\nroot wheel\n")
+        return True
+    if strcmp(cmd, "printenv") == 0:
+        term_puts_idx(idx, "\nHOME=/home\nUSER=root\nSHELL=/bin/psh\nPATH=/bin\n")
+        return True
+    return False
+
+def term_dispatch_app(idx: int32) -> bool:
+    """Handle application commands. Returns True if handled."""
+    cmd: Ptr[char] = term_get_cmd_buf(idx)
+    if strcmp(cmd, "hello") == 0:
+        term_putc_idx(idx, '\n')
+        hello_main()
+        return True
+    if strcmp(cmd, "calc") == 0:
+        term_putc_idx(idx, '\n')
+        calc_main()
+        return True
+    if strcmp(cmd, "clock") == 0:
+        term_putc_idx(idx, '\n')
+        clock_main()
+        return True
+    if cmd_starts_with(idx, "hexview"):
+        hv_arg: Ptr[char] = cmd_get_arg(idx)
+        if hv_arg[0] == '\0':
+            term_puts_idx(idx, "\nUsage: hexview <file>\n")
+        else:
+            term_putc_idx(idx, '\n')
+            build_path(term_get_cwd(idx), hv_arg)
+            hexview_main(&path_buf[0])
+        return True
+    if cmd_starts_with(idx, "imgview"):
+        iv_arg: Ptr[char] = cmd_get_arg(idx)
+        if iv_arg[0] == '\0':
+            term_puts_idx(idx, "\nUsage: imgview <file.bmp>\n")
+        else:
+            term_putc_idx(idx, '\n')
+            build_path(term_get_cwd(idx), iv_arg)
+            imgview_main(&path_buf[0])
+        return True
+    return False
+
+def term_dispatch_misc(idx: int32) -> bool:
+    """Handle misc commands. Returns True if handled."""
+    cmd: Ptr[char] = term_get_cmd_buf(idx)
+    if strcmp(cmd, "help") == 0:
+        cmd_help(idx)
+        return True
+    if strcmp(cmd, "clear") == 0:
+        term_init_win(idx)
+        win_dirty[idx] = True
+        return True
+    if cmd_starts_with(idx, "echo"):
+        cmd_echo(idx)
+        return True
+    if cmd_starts_with(idx, "sleep"):
+        cmd_sleep(idx)
+        return True
+    if strcmp(cmd, "true") == 0:
+        cmd_true(idx)
+        return True
+    if strcmp(cmd, "false") == 0:
+        cmd_false(idx)
+        return True
+    if strcmp(cmd, "yes") == 0:
+        term_puts_idx(idx, "\ny\n")
+        return True
+    return False
 
 def term_exec_cmd(idx: int32):
     cmd: Ptr[char] = term_get_cmd_buf(idx)
@@ -1014,110 +1251,19 @@ def term_exec_cmd(idx: int32):
     if pos == 0:
         term_print_prompt(idx)
         return
-    # Dispatch - jobs first to avoid branch distance issues
-    if strcmp(cmd, "jobs") == 0:
-        cmd_jobs(idx)
-    elif strcmp(cmd, "help") == 0:
-        cmd_help(idx)
-    elif strcmp(cmd, "clear") == 0:
-        term_init_win(idx)
-        win_dirty[idx] = True
-    elif cmd_starts_with(idx, "ls"):
-        cmd_ls(idx)
-    elif cmd_starts_with(idx, "cd"):
-        cmd_cd(idx)
-    elif cmd_starts_with(idx, "cat"):
-        cmd_cat(idx)
-    elif cmd_starts_with(idx, "mkdir"):
-        cmd_mkdir(idx)
-    elif cmd_starts_with(idx, "touch"):
-        cmd_touch(idx)
-    elif cmd_starts_with(idx, "rm"):
-        cmd_rm(idx)
-    elif cmd_starts_with(idx, "echo"):
-        cmd_echo(idx)
-    elif strcmp(cmd, "pwd") == 0:
-        cmd_pwd(idx)
-    elif cmd_starts_with(idx, "write"):
-        cmd_write(idx)
-    elif cmd_starts_with(idx, "uname"):
-        cmd_uname(idx)
-    elif strcmp(cmd, "free") == 0:
-        cmd_free(idx)
-    elif strcmp(cmd, "whoami") == 0:
-        term_puts_idx(idx, "\nroot\n")
-    elif strcmp(cmd, "hostname") == 0:
-        term_puts_idx(idx, "\npynux\n")
-    elif strcmp(cmd, "date") == 0:
-        term_puts_idx(idx, "\nJan 1 00:00:00 UTC 2025\n")
-    elif strcmp(cmd, "uptime") == 0:
-        term_puts_idx(idx, "\nup 0 days, 0:00\n")
-    elif strcmp(cmd, "id") == 0:
-        term_puts_idx(idx, "\nuid=0(root) gid=0(root)\n")
-    elif strcmp(cmd, "env") == 0:
-        term_puts_idx(idx, "\nHOME=/home\nUSER=root\nSHELL=/bin/psh\n")
-    elif strcmp(cmd, "ps") == 0:
-        term_puts_idx(idx, "\n  PID CMD\n    1 psh\n")
-    elif strcmp(cmd, "df") == 0:
-        term_puts_idx(idx, "\nFilesystem  Used  Free\nramfs       ")
-        term_puts_idx(idx, int_to_str(heap_used() / 1024))
-        term_puts_idx(idx, "K   ")
-        term_puts_idx(idx, int_to_str(heap_remaining() / 1024))
-        term_puts_idx(idx, "K\n")
-    elif cmd_starts_with(idx, "stat"):
-        cmd_stat(idx)
-    elif strcmp(cmd, "hello") == 0:
-        term_putc_idx(idx, '\n')
-        hello_main()
-    elif strcmp(cmd, "calc") == 0:
-        term_putc_idx(idx, '\n')
-        calc_main()
-    elif strcmp(cmd, "clock") == 0:
-        term_putc_idx(idx, '\n')
-        clock_main()
-    elif cmd_starts_with(idx, "hexview"):
-        hv_arg: Ptr[char] = cmd_get_arg(idx)
-        if hv_arg[0] == '\0':
-            term_puts_idx(idx, "\nUsage: hexview <file>\n")
-        else:
-            term_putc_idx(idx, '\n')
-            build_path(term_get_cwd(idx), hv_arg)
-            hexview_main(&path_buf[0])
-    elif cmd_starts_with(idx, "imgview"):
-        iv_arg: Ptr[char] = cmd_get_arg(idx)
-        if iv_arg[0] == '\0':
-            term_puts_idx(idx, "\nUsage: imgview <file.bmp>\n")
-        else:
-            term_putc_idx(idx, '\n')
-            build_path(term_get_cwd(idx), iv_arg)
-            imgview_main(&path_buf[0])
-    elif cmd_starts_with(idx, "head"):
-        cmd_head(idx)
-    elif cmd_starts_with(idx, "tail"):
-        cmd_tail(idx)
-    elif cmd_starts_with(idx, "wc"):
-        cmd_wc(idx)
-    elif cmd_starts_with(idx, "mv"):
-        cmd_mv(idx)
-    elif cmd_starts_with(idx, "cp"):
-        cmd_cp(idx)
-    elif cmd_starts_with(idx, "sleep"):
-        cmd_sleep(idx)
-    elif strcmp(cmd, "true") == 0:
-        cmd_true(idx)
-    elif strcmp(cmd, "false") == 0:
-        cmd_false(idx)
-    elif strcmp(cmd, "arch") == 0:
-        term_puts_idx(idx, "\narmv7m\n")
-    elif strcmp(cmd, "tty") == 0:
-        term_puts_idx(idx, "\n/dev/tty\n")
-    elif strcmp(cmd, "yes") == 0:
-        term_puts_idx(idx, "\ny\n")
-    elif strcmp(cmd, "groups") == 0:
-        term_puts_idx(idx, "\nroot wheel\n")
-    elif strcmp(cmd, "printenv") == 0:
-        term_puts_idx(idx, "\nHOME=/home\nUSER=root\nSHELL=/bin/psh\nPATH=/bin\n")
-    else:
+    # Dispatch to grouped handlers to avoid branch distance issues
+    handled: bool = False
+    if not handled:
+        handled = term_dispatch_job(idx)
+    if not handled:
+        handled = term_dispatch_file(idx)
+    if not handled:
+        handled = term_dispatch_sys(idx)
+    if not handled:
+        handled = term_dispatch_app(idx)
+    if not handled:
+        handled = term_dispatch_misc(idx)
+    if not handled:
         term_puts_idx(idx, "\nCommand not found: ")
         term_puts_idx(idx, cmd)
         term_putc_idx(idx, '\n')
@@ -1980,8 +2126,9 @@ def de_main():
         # Update timer (must be called regularly for timer_get_ticks to work)
         timer_tick()
 
-        # Call user tick function (cooperative multitasking)
-        user_tick()
+        # Call user tick function only if main.py job is still running
+        if job_is_running(main_job_id):
+            user_tick()
 
         # Flush any output from user_tick to terminal 0
         if console_has_output():
