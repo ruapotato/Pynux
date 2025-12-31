@@ -3651,6 +3651,376 @@ def shell_is_assignment(cmd: Ptr[char]) -> bool:
 
     return True
 
+# ============================================================================
+# Control Flow (if/for/while)
+# ============================================================================
+
+# Control flow state
+CF_NONE: int32 = 0
+CF_IF: int32 = 1
+CF_FOR: int32 = 2
+CF_WHILE: int32 = 3
+
+shell_cf_mode: int32 = 0          # Current control flow mode
+shell_cf_depth: int32 = 0         # Nesting depth
+shell_cf_cond: bool = False       # Condition result (for if/while)
+shell_cf_skip: bool = False       # Skip execution (else branch, false condition)
+shell_cf_body: Array[2048, char]  # Buffer for loop/if body
+shell_cf_body_pos: int32 = 0      # Position in body buffer
+shell_cf_var: Array[32, char]     # For loop variable name
+shell_cf_list: Array[512, char]   # For loop list of items
+shell_cf_list_pos: int32 = 0      # Current position in list
+
+def shell_cf_reset():
+    """Reset control flow state."""
+    global shell_cf_mode, shell_cf_depth, shell_cf_cond, shell_cf_skip
+    global shell_cf_body_pos, shell_cf_list_pos
+    shell_cf_mode = CF_NONE
+    shell_cf_depth = 0
+    shell_cf_cond = False
+    shell_cf_skip = False
+    shell_cf_body_pos = 0
+    shell_cf_list_pos = 0
+
+def shell_cf_add_line(line: Ptr[char]):
+    """Add a line to the control flow body."""
+    global shell_cf_body_pos
+    i: int32 = 0
+    while line[i] != '\0' and shell_cf_body_pos < 2040:
+        shell_cf_body[shell_cf_body_pos] = line[i]
+        shell_cf_body_pos = shell_cf_body_pos + 1
+        i = i + 1
+    if shell_cf_body_pos < 2040:
+        shell_cf_body[shell_cf_body_pos] = '\n'
+        shell_cf_body_pos = shell_cf_body_pos + 1
+    shell_cf_body[shell_cf_body_pos] = '\0'
+
+def shell_skip_space(s: Ptr[char]) -> Ptr[char]:
+    """Skip leading whitespace."""
+    while s[0] == ' ' or s[0] == '\t':
+        s = &s[1]
+    return s
+
+def shell_get_next_word(list_ptr: Ptr[char], pos: Ptr[int32], word: Ptr[char], max_len: int32) -> bool:
+    """Get next word from space-separated list. Returns False if no more words."""
+    # Skip leading spaces
+    while list_ptr[pos[0]] == ' ' or list_ptr[pos[0]] == '\t':
+        pos[0] = pos[0] + 1
+
+    if list_ptr[pos[0]] == '\0':
+        return False
+
+    # Copy word
+    wi: int32 = 0
+    while list_ptr[pos[0]] != '\0' and list_ptr[pos[0]] != ' ' and list_ptr[pos[0]] != '\t' and wi < max_len - 1:
+        word[wi] = list_ptr[pos[0]]
+        wi = wi + 1
+        pos[0] = pos[0] + 1
+    word[wi] = '\0'
+    return True
+
+def shell_eval_condition(cond: Ptr[char]) -> bool:
+    """Evaluate a simple condition for if/while.
+    Supports: -e file, -d dir, -z str, -n str, str = str, str != str"""
+    cond = shell_skip_space(cond)
+
+    if shell_starts_with_str(cond, "-e "):
+        # File exists
+        cond = shell_skip_space(&cond[3])
+        return ramfs_exists(cond)
+    elif shell_starts_with_str(cond, "-d "):
+        # Directory exists
+        cond = shell_skip_space(&cond[3])
+        return ramfs_isdir(cond)
+    elif shell_starts_with_str(cond, "-z "):
+        # String is empty
+        cond = shell_skip_space(&cond[3])
+        return cond[0] == '\0'
+    elif shell_starts_with_str(cond, "-n "):
+        # String is not empty
+        cond = shell_skip_space(&cond[3])
+        return cond[0] != '\0'
+    else:
+        # Check for = or !=
+        left: Array[64, char]
+        right: Array[64, char]
+        i: int32 = 0
+
+        # Get left operand
+        while cond[i] != '\0' and cond[i] != '=' and cond[i] != '!' and cond[i] != ' ' and i < 63:
+            left[i] = cond[i]
+            i = i + 1
+        left[i] = '\0'
+
+        # Skip spaces
+        while cond[i] == ' ':
+            i = i + 1
+
+        if cond[i] == '!' and cond[i+1] == '=':
+            # Not equal
+            i = i + 2
+            while cond[i] == ' ':
+                i = i + 1
+            j: int32 = 0
+            while cond[i] != '\0' and cond[i] != ' ' and j < 63:
+                right[j] = cond[i]
+                j = j + 1
+                i = i + 1
+            right[j] = '\0'
+            return strcmp(&left[0], &right[0]) != 0
+        elif cond[i] == '=':
+            # Equal
+            i = i + 1
+            if cond[i] == '=':
+                i = i + 1  # Skip second = if present
+            while cond[i] == ' ':
+                i = i + 1
+            j2: int32 = 0
+            while cond[i] != '\0' and cond[i] != ' ' and j2 < 63:
+                right[j2] = cond[i]
+                j2 = j2 + 1
+                i = i + 1
+            right[j2] = '\0'
+            return strcmp(&left[0], &right[0]) == 0
+        else:
+            # Just check if non-empty (truthy)
+            return left[0] != '\0'
+
+def shell_parse_for(cmd: Ptr[char]) -> bool:
+    """Parse 'for VAR in LIST' and set up state. Returns True if valid."""
+    global shell_cf_mode, shell_cf_depth, shell_cf_list_pos
+
+    cmd = shell_skip_space(cmd)
+    if not shell_starts_with_str(cmd, "for "):
+        return False
+
+    cmd = shell_skip_space(&cmd[4])
+
+    # Get variable name
+    i: int32 = 0
+    while cmd[i] != '\0' and cmd[i] != ' ' and i < 31:
+        shell_cf_var[i] = cmd[i]
+        i = i + 1
+    shell_cf_var[i] = '\0'
+
+    cmd = &cmd[i]
+    cmd = shell_skip_space(cmd)
+
+    # Expect 'in'
+    if not shell_starts_with_str(cmd, "in "):
+        return False
+
+    cmd = shell_skip_space(&cmd[3])
+
+    # Rest is the list (until ; or end)
+    j: int32 = 0
+    while cmd[j] != '\0' and cmd[j] != ';' and j < 511:
+        shell_cf_list[j] = cmd[j]
+        j = j + 1
+    shell_cf_list[j] = '\0'
+
+    shell_cf_mode = CF_FOR
+    shell_cf_depth = 1
+    shell_cf_list_pos = 0
+    shell_cf_body_pos = 0
+    return True
+
+def shell_parse_if(cmd: Ptr[char]) -> bool:
+    """Parse 'if CONDITION' and evaluate. Returns True if valid."""
+    global shell_cf_mode, shell_cf_depth, shell_cf_cond, shell_cf_skip
+
+    cmd = shell_skip_space(cmd)
+    if not shell_starts_with_str(cmd, "if "):
+        return False
+
+    cmd = shell_skip_space(&cmd[3])
+
+    # Remove 'then' if present at end
+    cond_end: int32 = strlen(cmd)
+    if cond_end > 5:
+        if shell_starts_with_str(&cmd[cond_end - 4], "then"):
+            cond_end = cond_end - 4
+            while cond_end > 0 and (cmd[cond_end-1] == ' ' or cmd[cond_end-1] == ';'):
+                cond_end = cond_end - 1
+            cmd[cond_end] = '\0'
+
+    shell_cf_cond = shell_eval_condition(cmd)
+    shell_cf_skip = not shell_cf_cond
+    shell_cf_mode = CF_IF
+    shell_cf_depth = 1
+    shell_cf_body_pos = 0
+    return True
+
+def shell_parse_while(cmd: Ptr[char]) -> bool:
+    """Parse 'while CONDITION' and set up state. Returns True if valid."""
+    global shell_cf_mode, shell_cf_depth, shell_cf_cond, shell_cf_skip
+
+    cmd = shell_skip_space(cmd)
+    if not shell_starts_with_str(cmd, "while "):
+        return False
+
+    cmd = shell_skip_space(&cmd[6])
+
+    # Store condition for re-evaluation
+    i: int32 = 0
+    while cmd[i] != '\0' and cmd[i] != ';' and i < 511:
+        shell_cf_list[i] = cmd[i]  # Reuse list buffer for condition
+        i = i + 1
+    shell_cf_list[i] = '\0'
+
+    # Remove 'do' if present
+    if i > 3 and shell_starts_with_str(&shell_cf_list[i-2], "do"):
+        i = i - 2
+        while i > 0 and (shell_cf_list[i-1] == ' ' or shell_cf_list[i-1] == ';'):
+            i = i - 1
+        shell_cf_list[i] = '\0'
+
+    shell_cf_cond = shell_eval_condition(&shell_cf_list[0])
+    shell_cf_skip = not shell_cf_cond
+    shell_cf_mode = CF_WHILE
+    shell_cf_depth = 1
+    shell_cf_body_pos = 0
+    return True
+
+def shell_exec_body():
+    """Execute accumulated body commands."""
+    pos: int32 = 0
+    line_start: int32 = 0
+    line: Array[256, char]
+
+    while pos <= shell_cf_body_pos:
+        if shell_cf_body[pos] == '\n' or shell_cf_body[pos] == '\0':
+            # Extract line
+            li: int32 = 0
+            while line_start < pos and li < 255:
+                line[li] = shell_cf_body[line_start]
+                li = li + 1
+                line_start = line_start + 1
+            line[li] = '\0'
+            line_start = pos + 1
+
+            # Execute if non-empty
+            if line[0] != '\0':
+                shell_exec_single(&line[0])
+
+        if shell_cf_body[pos] == '\0':
+            break
+        pos = pos + 1
+
+def shell_run_for_iteration():
+    """Run one iteration of for loop with current variable value."""
+    global shell_cf_list_pos
+
+    word: Array[64, char]
+    if shell_get_next_word(&shell_cf_list[0], &shell_cf_list_pos, &word[0], 64):
+        # Set variable
+        env_set(&shell_cf_var[0], &word[0])
+        # Execute body
+        shell_exec_body()
+        return True
+    return False
+
+def shell_handle_control_flow(cmd: Ptr[char]) -> bool:
+    """Handle control flow keywords. Returns True if handled."""
+    global shell_cf_mode, shell_cf_depth, shell_cf_cond, shell_cf_skip
+    global shell_cf_body_pos, shell_cf_list_pos
+
+    cmd = shell_skip_space(cmd)
+
+    # Check for control flow start
+    if shell_cf_mode == CF_NONE:
+        if shell_starts_with_str(cmd, "if "):
+            shell_parse_if(cmd)
+            shell_newline()
+            return True
+        elif shell_starts_with_str(cmd, "for "):
+            shell_parse_for(cmd)
+            shell_newline()
+            return True
+        elif shell_starts_with_str(cmd, "while "):
+            shell_parse_while(cmd)
+            shell_newline()
+            return True
+        return False
+
+    # Handle keywords within control flow
+    if shell_starts_with_str(cmd, "then"):
+        # Just continue collecting
+        shell_newline()
+        return True
+    elif shell_starts_with_str(cmd, "do"):
+        # Just continue collecting
+        shell_newline()
+        return True
+    elif shell_starts_with_str(cmd, "elif "):
+        if shell_cf_mode == CF_IF:
+            if shell_cf_cond:
+                # Already executed true branch, skip elif
+                shell_cf_skip = True
+            else:
+                # Evaluate elif condition
+                shell_cf_cond = shell_eval_condition(&cmd[5])
+                shell_cf_skip = not shell_cf_cond
+            shell_newline()
+            return True
+    elif shell_starts_with_str(cmd, "else"):
+        if shell_cf_mode == CF_IF:
+            if shell_cf_cond:
+                # True branch was taken, skip else
+                shell_cf_skip = True
+            else:
+                # Execute else
+                shell_cf_skip = False
+            shell_newline()
+            return True
+    elif shell_starts_with_str(cmd, "fi"):
+        if shell_cf_mode == CF_IF:
+            shell_cf_depth = shell_cf_depth - 1
+            if shell_cf_depth == 0:
+                shell_cf_reset()
+            shell_newline()
+            return True
+    elif shell_starts_with_str(cmd, "done"):
+        if shell_cf_mode == CF_FOR:
+            # Try next iteration
+            if shell_run_for_iteration():
+                # More iterations
+                shell_newline()
+                return True
+            else:
+                # Done with for loop
+                shell_cf_reset()
+                shell_newline()
+                return True
+        elif shell_cf_mode == CF_WHILE:
+            # Re-evaluate condition
+            shell_cf_cond = shell_eval_condition(&shell_cf_list[0])
+            if shell_cf_cond:
+                # Run body again
+                shell_exec_body()
+                shell_cf_body_pos = 0  # Reset for new iteration
+                shell_newline()
+                return True
+            else:
+                # Done with while loop
+                shell_cf_reset()
+                shell_newline()
+                return True
+
+    # Add line to body if in control flow
+    if shell_cf_mode != CF_NONE:
+        if not shell_cf_skip:
+            if shell_cf_mode == CF_IF:
+                # Execute immediately for if
+                shell_exec_single(cmd)
+            else:
+                # Store for for/while
+                shell_cf_add_line(cmd)
+        shell_newline()
+        return True
+
+    return False
+
 def shell_exec():
     global shell_cmd_pos, shell_cursor_pos
 
@@ -3669,6 +4039,13 @@ def shell_exec():
 
     # Expand aliases before execution
     shell_expand_alias(cmd)
+
+    # Handle control flow (if/for/while)
+    if shell_handle_control_flow(cmd):
+        shell_prompt()
+        shell_cmd_pos = 0
+        shell_cursor_pos = 0
+        return
 
     # Expand variables ($VAR, ${VAR})
     shell_expand_vars(cmd)
