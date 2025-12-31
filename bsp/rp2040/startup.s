@@ -5,6 +5,12 @@
 @   2. boot2 configures XIP flash and jumps to _reset
 @   3. _reset initializes clocks, RAM, and calls kernel_main
 @
+@ Multicore support:
+@   - Core 0: Runs full initialization and kernel_main
+@   - Core 1: Stays in ROM sleep state until launched via FIFO
+@   - Core 1 launch: Send sequence (0,0,1,VTOR,SP,entry) via FIFO
+@   - Core 1 entry via multicore_launch_core1() in HAL
+@
 @ Clock configuration:
 @   - XOSC: 12MHz crystal
 @   - PLL_SYS: 125MHz (12MHz * 125 / 6 / 2)
@@ -115,12 +121,29 @@ _vectors:
 @ ============================================================================
 @ Reset Handler
 @ ============================================================================
+@
+@ On RP2040, both cores execute _reset on power-up, but the ROM bootloader
+@ ensures only Core 0 actually runs the application. Core 1 is held in a
+@ sleep loop in the ROM waiting for commands via the inter-core FIFO.
+@
+@ When Core 1 is launched via multicore_launch_core1(), the bootrom sets
+@ up the stack pointer and vector table, then jumps to the entry point.
+@ Core 1 enters with interrupts disabled.
 
     .section .text
     .align 2
     .global _reset
     .thumb_func
 _reset:
+    @ Check which core we are running on
+    @ SIO_CPUID at 0xD0000000 returns 0 for Core 0, 1 for Core 1
+    ldr r0, =0xD0000000         @ SIO_BASE
+    ldr r0, [r0, #0]            @ CPUID offset 0x000
+    cmp r0, #0
+    bne core1_entry             @ Branch if Core 1
+
+    @ === Core 0 initialization path ===
+
     @ Disable interrupts during init
     cpsid i
 
@@ -173,6 +196,83 @@ data_done:
 halt:
     wfi
     b halt
+
+@ ============================================================================
+@ Core 1 Entry Point
+@ ============================================================================
+@
+@ When Core 1 is launched, the bootrom has already set up:
+@   - Stack pointer (from launch sequence)
+@   - VTOR (from launch sequence)
+@ The entry point function address was also provided in the sequence.
+@
+@ However, if Core 1 somehow ends up here (e.g., via reset), we need to
+@ either go back to the bootrom's wait loop or handle it gracefully.
+@
+@ The RP2040 bootrom has a "multicore launch" protocol where Core 1 sits
+@ in a loop reading from the FIFO, waiting for a specific sequence.
+@ After power-on, Core 1 is already in this state in ROM.
+@
+@ If we get here as Core 1, it means we were launched but something went
+@ wrong, or the code jumped here unexpectedly. We'll wait in a low-power
+@ loop for the watchdog or debugger intervention.
+
+    .align 2
+    .thumb_func
+core1_entry:
+    @ Core 1 reached _reset unexpectedly
+    @ This shouldn't happen during normal multicore_launch_core1() usage
+    @ because the bootrom sets up entry point directly to user function.
+    @
+    @ If we're here, either:
+    @ 1. A bug caused Core 1 to execute _reset
+    @ 2. This is during initial power-on (Core 1 goes to ROM, not here)
+    @
+    @ Safe behavior: wait for events in low-power state
+core1_wait:
+    wfe                         @ Wait for event
+    b core1_wait
+
+@ ============================================================================
+@ Core 1 Wrapper Entry (called from multicore module)
+@ ============================================================================
+@
+@ This wrapper can be used when launching Core 1 to set up a consistent
+@ environment before calling the user's entry function.
+
+    .align 2
+    .global _core1_entry_wrapper
+    .thumb_func
+_core1_entry_wrapper:
+    @ r0 = pointer to user's entry function
+    @ Stack and VTOR already configured by bootrom
+
+    @ Enable interrupts for Core 1
+    cpsie i
+
+    @ Call the user's entry function
+    @ The function pointer is passed in r4 by the launch sequence
+    blx r4
+
+    @ If the entry function returns, halt Core 1
+core1_halt:
+    @ Disable interrupts
+    cpsid i
+
+    @ Clear any pending FIFO data
+    ldr r0, =0xD0000000         @ SIO_BASE
+core1_drain:
+    ldr r1, [r0, #0x50]         @ FIFO_ST
+    lsrs r1, r1, #1             @ Check VLD bit (bit 0)
+    bcc core1_drained           @ No more data
+    ldr r1, [r0, #0x58]         @ FIFO_RD - discard
+    b core1_drain
+core1_drained:
+
+    @ Wait forever
+core1_halt_loop:
+    wfe
+    b core1_halt_loop
 
 @ ============================================================================
 @ Clock Initialization - Configure for 125MHz

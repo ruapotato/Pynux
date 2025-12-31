@@ -6,27 +6,59 @@
  *   SRAM2: 0x2001C000 - 0x2001FFFF (16KB, overlaps end of SRAM1)
  *   CCM:   0x10000000 - 0x1000FFFF (64KB, core coupled memory)
  *
+ * Flash Layout for Dual-Bank Firmware Update:
+ *   0x08000000 - 0x08003FFF  Bootloader (16KB - Sector 0)
+ *   0x08004000 - 0x0807FFFF  Bank 0 - Application (496KB)
+ *   0x08080000 - 0x080FBFFF  Bank 1 - Update slot (496KB)
+ *   0x080FC000 - 0x080FFFFF  Config/metadata (16KB - last sector)
+ *
  * Note: This targets F405/F407. For F401 (256KB flash, 64KB RAM),
  *       modify the MEMORY section accordingly.
  */
 
 MEMORY
 {
-    /* Main flash */
-    FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 1024K
+    /* Bootloader region (16KB - Sector 0) */
+    BOOTLOADER (rx) : ORIGIN = 0x08000000, LENGTH = 16K
+
+    /* Bank 0 - Primary application */
+    BANK0 (rx)      : ORIGIN = 0x08004000, LENGTH = 496K
+
+    /* Bank 1 - Secondary/update slot */
+    BANK1 (rx)      : ORIGIN = 0x08080000, LENGTH = 496K
+
+    /* Configuration and metadata */
+    CONFIG (rx)     : ORIGIN = 0x080FC000, LENGTH = 16K
+
+    /* For backward compatibility, FLASH points to Bank 0 */
+    FLASH (rx)      : ORIGIN = 0x08004000, LENGTH = 496K
 
     /* Main SRAM (SRAM1 + SRAM2 contiguous) */
-    RAM (rwx)   : ORIGIN = 0x20000000, LENGTH = 128K
+    RAM (rwx)       : ORIGIN = 0x20000000, LENGTH = 128K
 
     /* Core Coupled Memory - fast, no DMA access */
-    CCM (rwx)   : ORIGIN = 0x10000000, LENGTH = 64K
+    CCM (rwx)       : ORIGIN = 0x10000000, LENGTH = 64K
+
+    /* Backup SRAM (4KB, battery-backed) */
+    BKPSRAM (rwx)   : ORIGIN = 0x40024000, LENGTH = 4K
 }
 
 ENTRY(_reset)
 
 SECTIONS
 {
-    /* Vector table at start of flash */
+    /* Bootloader section */
+    .bootloader : {
+        . = ALIGN(4);
+        __bootloader_start = .;
+        KEEP(*(.bootloader.vectors))
+        KEEP(*(.bootloader.text))
+        KEEP(*(.bootloader.rodata))
+        . = ALIGN(4);
+        __bootloader_end = .;
+    } > BOOTLOADER
+
+    /* Vector table at start of application flash */
     .vectors : {
         . = ALIGN(4);
         __vectors_start = .;
@@ -174,3 +206,33 @@ PROVIDE(SYSTICK_BASE    = 0xE000E010);
 PROVIDE(NVIC_BASE       = 0xE000E100);
 PROVIDE(FPU_BASE        = 0xE000EF30);
 PROVIDE(MPU_BASE        = 0xE000ED90);
+
+/* Bootloader Memory Layout Symbols */
+PROVIDE(__bootloader_base = 0x08000000);
+PROVIDE(__bootloader_size = 16K);
+PROVIDE(__bank0_base     = 0x08004000);
+PROVIDE(__bank0_size     = 496K);
+PROVIDE(__bank1_base     = 0x08080000);
+PROVIDE(__bank1_size     = 496K);
+PROVIDE(__config_base    = 0x080FC000);
+PROVIDE(__config_size    = 16K);
+PROVIDE(__bkpsram_base   = 0x40024000);
+PROVIDE(__bkpsram_size   = 4K);
+
+/* Application Header Offset (after vector table) */
+PROVIDE(__app_header_offset = 0x100);
+
+/* Flash Sector Layout (for erase operations)
+ * Sector 0:  16KB  0x08000000 - 0x08003FFF (Bootloader)
+ * Sector 1:  16KB  0x08004000 - 0x08007FFF
+ * Sector 2:  16KB  0x08008000 - 0x0800BFFF
+ * Sector 3:  16KB  0x0800C000 - 0x0800FFFF
+ * Sector 4:  64KB  0x08010000 - 0x0801FFFF
+ * Sector 5: 128KB  0x08020000 - 0x0803FFFF
+ * Sector 6: 128KB  0x08040000 - 0x0805FFFF
+ * Sector 7: 128KB  0x08060000 - 0x0807FFFF (End of Bank 0)
+ * Sector 8: 128KB  0x08080000 - 0x0809FFFF (Start of Bank 1)
+ * Sector 9: 128KB  0x080A0000 - 0x080BFFFF
+ * Sector10: 128KB  0x080C0000 - 0x080DFFFF
+ * Sector11: 128KB  0x080E0000 - 0x080FFFFF (End of Bank 1 + Config)
+ */

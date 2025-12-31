@@ -192,6 +192,11 @@ for prog_path in sorted(glob.glob("programs/*.py")):
 if user_programs:
     print(f"  Found user programs: {', '.join(user_programs)}")
 
+# Add test framework (new unified framework for QEMU tests)
+if os.path.exists("tests/framework.py"):
+    sources.append(("tests/framework.py", "tests_framework"))
+    print(f"  Found test framework: tests/framework.py")
+
 # Add test files from tests/ folder
 excluded_tests = ["test_compiler.py", "test_integration.py", "test_all.py",
                   "test_process.py", "test_sync.py",
