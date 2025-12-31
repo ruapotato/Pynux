@@ -15,8 +15,10 @@ This guide covers deploying Pynux on real hardware targets.
 ### QEMU (Development)
 
 ```bash
-./build.sh
-./build.sh --run
+./build.sh --run                    # Interactive shell
+./build.sh --test --run             # Run 266 tests
+./build.sh --demo --run             # Run demo programs
+./scripts/debug.sh                  # GDB debugging
 ```
 
 ### RP2040 (Raspberry Pi Pico)
@@ -25,8 +27,14 @@ This guide covers deploying Pynux on real hardware targets.
 # Build
 ./build.sh --target=rp2040
 
-# Flash (hold BOOTSEL while connecting USB)
-./build.sh --target=rp2040 --flash
+# Flash - Option 1: Using picotool
+./scripts/flash-rp2040.sh
+
+# Flash - Option 2: UF2 drag-and-drop
+# Hold BOOTSEL, plug in USB, drag pynux.uf2 to RPI-RP2 drive
+
+# Debug (requires Pico Debug Probe or CMSIS-DAP)
+./scripts/debug.sh --rp2040
 ```
 
 ### STM32F4
@@ -35,9 +43,33 @@ This guide covers deploying Pynux on real hardware targets.
 # Build
 ./build.sh --target=stm32f4
 
-# Flash (requires ST-Link or compatible)
-./build.sh --target=stm32f4 --flash
+# Flash - Option 1: Using st-flash
+./scripts/flash-stm32f4.sh
+
+# Flash - Option 2: Using OpenOCD
+./scripts/flash-stm32f4.sh --openocd
+
+# Debug (requires ST-Link)
+./scripts/debug.sh --stm32f4
 ```
+
+## Required Tools
+
+### RP2040
+
+| Tool | Install | Purpose |
+|------|---------|---------|
+| picotool | `sudo apt install picotool` | Flash via USB |
+| elf2uf2 | Pico SDK | Create UF2 files |
+| OpenOCD | `sudo apt install openocd` | Debug |
+
+### STM32F4
+
+| Tool | Install | Purpose |
+|------|---------|---------|
+| st-flash | `sudo apt install stlink-tools` | Flash via ST-Link |
+| OpenOCD | `sudo apt install openocd` | Flash/Debug |
+| GDB | `sudo apt install gdb-arm-none-eabi` | Debug |
 
 ## Hardware Validation
 

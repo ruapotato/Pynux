@@ -19,11 +19,11 @@ Pynux is a Python-syntax systems language that compiles to native ARM Thumb-2. W
 # Install dependencies
 sudo apt install gcc-arm-none-eabi qemu-system-arm python3
 
-# Build
-./build.sh
+# Build and run tests (266 tests)
+./build.sh --test --run
 
-# Run tests
-./boot_vm.sh --shell   # Watch 266 tests pass
+# Build and run interactive shell
+./build.sh --run
 
 # Run graphical mode (requires pygame)
 pip install pygame
@@ -212,24 +212,60 @@ cat /dev/gpio/pin0
 
 ## Testing
 
-Pynux has comprehensive tests:
+Pynux has comprehensive tests - 266 tests across 8 suites:
 
 ```bash
-./boot_vm.sh --shell
-# Runs automatically, shows:
-# Test Suites: 8 passed
-# Individual Tests: 266 passed
+# Run all tests in QEMU
+./build.sh --test --run
+
+# Or use the CI script
+./scripts/ci-test.sh
+
+# Run demo programs
+./build.sh --demo --run
 ```
 
-Test suites cover:
-- IPC (pipes, message queues)
-- Memory management
-- Timer operations
-- RAM filesystem
-- Device filesystem
-- Event tracing
-- Profiler
-- Memory tracking
+### Test Suites
+
+| Suite | Tests | Coverage |
+|-------|-------|----------|
+| IPC | 30 | Pipes, message queues |
+| Memory | 36 | Allocation, free, heap |
+| Timer | 22 | Delays, tick counting |
+| RAMFS | 41 | File/directory operations |
+| DevFS | 30 | Device registration, I/O |
+| Trace | 30 | Event logging, filters |
+| Profiler | 30 | Function timing |
+| Memtrack | 47 | Leak detection |
+
+### Demo Programs
+
+```bash
+./build.sh --demo --run
+```
+
+- **Elevator** - FSM-based floor control system
+- **Traffic Light** - State machine with timed transitions
+- **Thermostat** - PID temperature controller
+
+## CI/CD
+
+GitHub Actions runs on every push/PR:
+
+```yaml
+# .github/workflows/ci.yml
+- Build and test in QEMU (266 tests)
+- Build firmware for RP2040
+- Build firmware for STM32F4
+- Upload firmware artifacts
+```
+
+Run locally:
+```bash
+./scripts/ci-test.sh           # Full test suite
+./scripts/ci-test.sh --demo    # Demo verification
+./scripts/ci-test.sh --quick   # Quick smoke test
+```
 
 ## Project Structure
 
@@ -240,6 +276,8 @@ kernel/         # Kernel, scheduler, filesystem
 lib/            # 30+ libraries
 programs/       # User programs (main.py runs at boot)
 tests/          # Test suites (266 tests)
+scripts/        # CI, flashing, and debug tools
+bsp/            # Board support packages (RP2040, STM32F4)
 vtnext/         # Graphical terminal (pygame)
 ```
 
@@ -247,27 +285,53 @@ vtnext/         # Graphical terminal (pygame)
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| QEMU mps2-an385 | **Working** | Primary development target |
-| RP2040 (Pico) | Experimental | BSP ready, needs hardware testing |
-| STM32F4 | Experimental | BSP ready, needs hardware testing |
+| QEMU mps2-an385 | **Working** | Primary development target, 266 tests pass |
+| RP2040 (Pico) | Experimental | BSP ready, flash scripts included |
+| STM32F4 | Experimental | BSP ready, flash scripts included |
 
-### Building for Hardware Targets
+### QEMU (Development)
 
 ```bash
-# Default: QEMU (recommended for development)
-./build.sh
-./build.sh --run                    # Build and run in QEMU
-
-# RP2040 (Raspberry Pi Pico) - EXPERIMENTAL
-./build.sh --target=rp2040          # Build for Pico
-./build.sh --target=rp2040 --flash  # Build and flash (hold BOOTSEL)
-
-# STM32F4 - EXPERIMENTAL
-./build.sh --target=stm32f4         # Build for STM32F4
-./build.sh --target=stm32f4 --flash # Build and flash via ST-Link
+./build.sh --run                    # Interactive shell
+./build.sh --test --run             # Run test suite
+./build.sh --demo --run             # Run demos
+./scripts/debug.sh                  # GDB debugging
 ```
 
-> **Note:** Hardware targets are experimental. The BSP (linker scripts, startup code, clock configuration) is complete, but has not been tested on real hardware yet. QEMU remains the recommended development environment.
+### RP2040 (Raspberry Pi Pico)
+
+```bash
+# Build
+./build.sh --target=rp2040
+
+# Flash (requires picotool or drag-and-drop UF2)
+./scripts/flash-rp2040.sh
+
+# Debug (requires SWD debugger + OpenOCD)
+./scripts/debug.sh --rp2040
+```
+
+### STM32F4
+
+```bash
+# Build
+./build.sh --target=stm32f4
+
+# Flash (requires st-flash or OpenOCD)
+./scripts/flash-stm32f4.sh
+
+# Debug (requires ST-Link)
+./scripts/debug.sh --stm32f4
+```
+
+### Hardware Requirements
+
+| Target | Debugger | Flash Tool |
+|--------|----------|------------|
+| RP2040 | Pico Debug Probe / CMSIS-DAP | picotool or UF2 |
+| STM32F4 | ST-Link V2 | st-flash or OpenOCD |
+
+> **Note:** Hardware targets are experimental. Thoroughly tested in QEMU (266 tests), but hardware testing is ongoing.
 
 ## Memory Usage
 
