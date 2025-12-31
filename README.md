@@ -110,6 +110,95 @@ def user_tick():
 - `user_tick()` - Called repeatedly (cooperative multitasking)
 - Shows as `[1] main.py &` in job list
 
+## Device Filesystem (devfs)
+
+Pynux exposes hardware as virtual files under `/dev/`, following the Unix philosophy. Read sensors and control actuators using standard file operations.
+
+### Reading Devices
+
+```bash
+# Read temperature sensor
+cat /dev/sensors/temp0
+> 23.45
+
+# Read GPIO pin state
+cat /dev/gpio/pin3
+> 1
+
+# Read accelerometer
+cat /dev/sensors/accel0
+> X=0 Y=0 Z=980
+```
+
+### Writing Devices
+
+```bash
+# Set GPIO pin high
+echo 1 > /dev/gpio/pin3
+
+# Set servo angle
+echo 90 > /dev/motors/servo0
+
+# Set DC motor speed
+echo 50 > /dev/motors/dc0
+```
+
+### Driver Configuration
+
+Create driver config files in `/etc/drivers/` to auto-load hardware:
+
+```ini
+# /etc/drivers/sensors.conf
+[temp]
+id=0
+pin=4
+name=temp0
+
+[light]
+id=0
+pin=5
+name=light0
+```
+
+```ini
+# /etc/drivers/motors.conf
+[servo]
+id=0
+pin=9
+name=servo0
+
+[dc]
+id=0
+pin1=10
+pin2=11
+pwm=12
+name=motor0
+```
+
+### Supported Device Types
+
+| Type | Path | Read | Write |
+|------|------|------|-------|
+| GPIO | /dev/gpio/pinN | 0/1 | 0/1/high/low |
+| Temperature | /dev/sensors/tempN | XX.XX (C) | - |
+| Accelerometer | /dev/sensors/accelN | X=n Y=n Z=n | - |
+| Light | /dev/sensors/lightN | 0-65535 | - |
+| Humidity | /dev/sensors/humidN | XX.X (%) | - |
+| Pressure | /dev/sensors/pressN | XXXXX (Pa) | - |
+| Servo | /dev/motors/servoN | angle | 0-180 |
+| Stepper | /dev/motors/stepperN | position | steps |
+| DC Motor | /dev/motors/dcN | speed% | -100 to 100 |
+
+### Shell Commands
+
+```bash
+# List loaded drivers
+drivers list
+
+# Reload drivers from /etc/drivers/
+drivers reload
+```
+
 ## Target Hardware
 
 | Platform | Status | Notes |

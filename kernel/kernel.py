@@ -7,6 +7,7 @@ from lib.io import print_str, print_int, print_newline, uart_init, uart_availabl
 from lib.memory import heap_init
 from kernel.ramfs import ramfs_init, ramfs_create, ramfs_write
 from kernel.timer import timer_init
+from kernel.devfs import devfs_init
 from lib.vtnext import vtn_probe
 from lib.de import de_main
 from lib.shell import shell_main
@@ -88,6 +89,11 @@ def kernel_init():
     ramfs_write("/etc/motd", "Welcome to Pynux!\n")
     ramfs_create("/etc/hostname", False)
     ramfs_write("/etc/hostname", "pynux\n")
+    print_str("OK\n")
+
+    # Initialize device filesystem and load drivers
+    print_str("[kernel] DevFS init... ")
+    devfs_init()
     print_str("OK\n")
 
     # Mark initialization complete with proper synchronization

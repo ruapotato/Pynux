@@ -7,6 +7,8 @@ from lib.io import uart_putc, uart_getc, uart_available, print_str, print_int
 from lib.string import strcmp, strlen, strcpy, strcat, memset, atoi
 from kernel.ramfs import ramfs_readdir, ramfs_create, ramfs_delete
 from kernel.ramfs import ramfs_read, ramfs_write, ramfs_exists, ramfs_isdir, ramfs_size
+from kernel.devfs import devfs_find_by_path, devfs_read, devfs_write, devfs_list_drivers
+from kernel.devfs import devfs_scan_drivers, devfs_get_count, devfs_get_path, devfs_get_type
 from lib.memory import heap_remaining, heap_total, heap_used
 from kernel.timer import timer_delay_ms, timer_tick
 from programs.main import user_main, user_tick
@@ -507,7 +509,46 @@ def shell_exec_basic(cmd: Ptr[char]) -> bool:
     if shell_starts_with("echo"):
         arg: Ptr[char] = shell_get_arg()
         shell_newline()
-        shell_puts(arg)
+
+        # Check for redirection: echo VALUE > /path
+        redir_pos: int32 = -1
+        i: int32 = 0
+        while arg[i] != '\0':
+            if arg[i] == '>':
+                redir_pos = i
+                break
+            i = i + 1
+
+        if redir_pos > 0:
+            # Extract value (before >)
+            value_buf: Array[64, char]
+            j: int32 = 0
+            while j < redir_pos and j < 63:
+                value_buf[j] = arg[j]
+                j = j + 1
+            # Trim trailing spaces
+            while j > 0 and value_buf[j - 1] == ' ':
+                j = j - 1
+            value_buf[j] = '\0'
+
+            # Extract path (after >)
+            k: int32 = redir_pos + 1
+            while arg[k] == ' ':
+                k = k + 1
+            shell_build_path(&arg[k])
+
+            # Check if device file
+            dev_idx: int32 = devfs_find_by_path(&shell_path_buf[0])
+            if dev_idx >= 0:
+                devfs_write(dev_idx, &value_buf[0])
+                shell_puts("OK")
+            else:
+                # Write to regular file
+                ramfs_write(&shell_path_buf[0], &value_buf[0])
+                shell_puts("OK")
+        else:
+            # No redirection, just print
+            shell_puts(arg)
         shell_newline()
         return True
 
@@ -664,15 +705,23 @@ def shell_exec_file(cmd: Ptr[char]) -> bool:
             shell_newline()
         else:
             shell_build_path(arg2)
-            if ramfs_exists(&shell_path_buf[0]) and not ramfs_isdir(&shell_path_buf[0]):
+            shell_newline()
+
+            # Check if it's a device file
+            dev_idx: int32 = devfs_find_by_path(&shell_path_buf[0])
+            if dev_idx >= 0:
+                # Device file - use devfs
+                dev_data: Ptr[char] = devfs_read(dev_idx)
+                shell_puts(dev_data)
                 shell_newline()
+            elif ramfs_exists(&shell_path_buf[0]) and not ramfs_isdir(&shell_path_buf[0]):
+                # Regular file - use ramfs
                 bytes_read: int32 = ramfs_read(&shell_path_buf[0], &shell_read_buf[0], 511)
                 if bytes_read > 0:
                     shell_read_buf[bytes_read] = 0
                     shell_puts(cast[Ptr[char]](&shell_read_buf[0]))
                 shell_newline()
             else:
-                shell_newline()
                 shell_puts("No such file: ")
                 shell_puts(arg2)
                 shell_newline()
@@ -1989,6 +2038,68 @@ def shell_exec_hw(cmd: Ptr[char]) -> bool:
             shell_puts(shell_int_to_str(speed))
             shell_puts("%")
         shell_newline()
+        return True
+
+    # drivers - list or reload device drivers
+    if strcmp(cmd, "drivers") == 0 or shell_starts_with("drivers"):
+        shell_newline()
+        arg: Ptr[char] = shell_get_arg()
+        if strlen(arg) == 0 or strcmp(arg, "list") == 0:
+            shell_puts("=== Device Drivers ===")
+            shell_newline()
+            cnt: int32 = devfs_get_count()
+            if cnt == 0:
+                shell_puts("  (no drivers loaded)")
+                shell_newline()
+            else:
+                i: int32 = 0
+                while i < cnt:
+                    shell_puts("  ")
+                    shell_puts(devfs_get_path(i))
+                    dtype: int32 = devfs_get_type(i)
+                    shell_puts(" (")
+                    if dtype == 1:
+                        shell_puts("gpio")
+                    elif dtype == 2:
+                        shell_puts("temp")
+                    elif dtype == 3:
+                        shell_puts("accel")
+                    elif dtype == 4:
+                        shell_puts("light")
+                    elif dtype == 5:
+                        shell_puts("humid")
+                    elif dtype == 6:
+                        shell_puts("press")
+                    elif dtype == 7:
+                        shell_puts("servo")
+                    elif dtype == 8:
+                        shell_puts("stepper")
+                    elif dtype == 9:
+                        shell_puts("dc")
+                    elif dtype == 10:
+                        shell_puts("adc")
+                    elif dtype == 11:
+                        shell_puts("pwm")
+                    else:
+                        shell_puts("unknown")
+                    shell_puts(")")
+                    shell_newline()
+                    i = i + 1
+                shell_puts("Total: ")
+                shell_puts(shell_int_to_str(cnt))
+                shell_puts(" driver(s)")
+                shell_newline()
+        elif strcmp(arg, "reload") == 0:
+            shell_puts("Reloading drivers...")
+            shell_newline()
+            devfs_scan_drivers()
+            shell_puts("Done. ")
+            shell_puts(shell_int_to_str(devfs_get_count()))
+            shell_puts(" driver(s) loaded")
+            shell_newline()
+        else:
+            shell_puts("Usage: drivers [list|reload]")
+            shell_newline()
         return True
 
     return False
