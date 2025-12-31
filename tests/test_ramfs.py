@@ -357,7 +357,7 @@ def test_edge_cases():
 # Main
 # ============================================================================
 
-def main() -> int32:
+def test_ramfs_main() -> int32:
     print_str("\n=== Pynux RAM Filesystem Tests ===\n")
 
     # Initialize filesystem

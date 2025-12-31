@@ -244,7 +244,7 @@ def test_intuitive_process_api():
 # Main
 # ============================================================================
 
-def main() -> int32:
+def test_process_main() -> int32:
     print_str("\n=== Pynux Process Management Tests ===\n")
 
     test_create_process()

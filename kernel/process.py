@@ -18,6 +18,8 @@ SYS_KILL: int32 = 4
 SYS_WAIT: int32 = 5
 SYS_GETPRIORITY: int32 = 6
 SYS_SETPRIORITY: int32 = 7
+SYS_GETTIMESLICE: int32 = 8
+SYS_SETTIMESLICE: int32 = 9
 
 # Signals
 SYS_SIGNAL: int32 = 10
@@ -60,12 +62,25 @@ MAX_SIGNALS: int32 = 32
 # ============================================================================
 MAX_PROCESSES: int32 = 16
 STACK_SIZE: int32 = 1024        # Per-process stack size
-DEFAULT_PRIORITY: int32 = 10
 MAX_PIPES: int32 = 8
 MAX_MESSAGE_QUEUES: int32 = 4
 PIPE_BUFFER_SIZE: int32 = 256
 MQ_MAX_MESSAGES: int32 = 8
 MQ_MAX_MSG_SIZE: int32 = 64
+
+# ============================================================================
+# Priority and Scheduling Configuration
+# ============================================================================
+# Priority range: 0-31, higher value = higher priority
+MIN_PRIORITY: int32 = 0
+MAX_PRIORITY: int32 = 31
+DEFAULT_PRIORITY: int32 = 16
+NUM_PRIORITY_LEVELS: int32 = 32
+
+# Time slicing configuration
+DEFAULT_TIMESLICE: int32 = 10   # Default time quantum in ticks
+MIN_TIMESLICE: int32 = 1
+MAX_TIMESLICE: int32 = 100
 
 # ============================================================================
 # Process Control Block (PCB) - stored in BSS
@@ -74,7 +89,9 @@ MQ_MAX_MSG_SIZE: int32 = 64
 # - pid: Process ID
 # - state: Current process state
 # - stack_ptr: Saved stack pointer (sp)
-# - priority: Process priority (lower = higher priority)
+# - priority: Process priority (0-31, higher value = more important)
+# - timeslice: Configured time quantum in ticks
+# - ticks_remaining: Remaining ticks before preemption
 # - entry_func: Entry function pointer
 # - stack_base: Base of allocated stack
 # - pending_signals: Bitmask of pending signals
@@ -89,6 +106,10 @@ proc_entry: Array[16, uint32]
 proc_stack_base: Array[16, uint32]
 proc_pending_signals: Array[16, uint32]
 
+# Time slicing: timeslice quota and remaining ticks for each process
+proc_timeslice: Array[16, int32]        # Configured time quantum
+proc_ticks_remaining: Array[16, int32]  # Remaining ticks before preemption
+
 # Signal handlers: 16 processes x 32 signals = 512 entries
 # Indexed as: proc_id * MAX_SIGNALS + signal_num
 signal_handlers: Array[512, uint32]
@@ -97,11 +118,33 @@ signal_handlers: Array[512, uint32]
 # Indexed as: proc_id * 8 + register_index
 proc_saved_regs: Array[128, uint32]
 
+# ============================================================================
+# Ready Queue Structure - Priority-based with round-robin per level
+# ============================================================================
+# For each priority level (0-31), we maintain a circular queue of process slots
+# ready_queue[priority][position] = process slot index
+# We use arrays to implement the queues:
+#   - ready_queue: 32 priority levels x 16 max entries per level = 512 entries
+#   - ready_head: head index for each priority level
+#   - ready_tail: tail index for each priority level
+#   - ready_count: number of entries at each priority level
+
+ready_queue: Array[512, int32]          # 32 levels x 16 slots
+ready_head: Array[32, int32]            # Head index per priority
+ready_tail: Array[32, int32]            # Tail index per priority
+ready_count: Array[32, int32]           # Count per priority
+
+# Bitmap of non-empty priority levels for fast highest-priority lookup
+# Each bit represents whether that priority level has any ready tasks
+ready_bitmap: uint32 = 0
+
 # Scheduler state
 current_pid: int32 = -1
+current_slot: int32 = -1                # Cache the current process slot
 next_pid: int32 = 0
 scheduler_running: bool = False
 proc_count: int32 = 0
+scheduler_locked: bool = False          # Prevent nested scheduling
 
 # ============================================================================
 # Pipe structures - stored in BSS
@@ -141,7 +184,8 @@ mq_buffers: Array[2048, uint8]
 
 def process_init():
     """Initialize the process subsystem."""
-    global current_pid, next_pid, scheduler_running, proc_count, next_fd
+    global current_pid, current_slot, next_pid, scheduler_running, proc_count
+    global next_fd, ready_bitmap, scheduler_locked
 
     state: int32 = critical_enter()
 
@@ -155,6 +199,8 @@ def process_init():
         proc_entry[i] = 0
         proc_stack_base[i] = 0
         proc_pending_signals[i] = 0
+        proc_timeslice[i] = DEFAULT_TIMESLICE
+        proc_ticks_remaining[i] = 0
         i = i + 1
 
     # Clear signal handlers
@@ -168,6 +214,22 @@ def process_init():
     while i < 128:
         proc_saved_regs[i] = 0
         i = i + 1
+
+    # Initialize ready queues for all priority levels
+    i = 0
+    while i < NUM_PRIORITY_LEVELS:
+        ready_head[i] = 0
+        ready_tail[i] = 0
+        ready_count[i] = 0
+        i = i + 1
+
+    # Clear ready queue entries
+    i = 0
+    while i < 512:
+        ready_queue[i] = -1
+        i = i + 1
+
+    ready_bitmap = 0
 
     # Clear pipes
     i = 0
@@ -190,8 +252,10 @@ def process_init():
         i = i + 1
 
     current_pid = -1
+    current_slot = -1
     next_pid = 0
     scheduler_running = False
+    scheduler_locked = False
     proc_count = 0
     next_fd = 3
 
@@ -235,6 +299,10 @@ def process_create(entry_func: Ptr[void]) -> int32:
     proc_stack_base[slot] = cast[uint32](stack)
     proc_pending_signals[slot] = 0
 
+    # Initialize timeslice
+    proc_timeslice[slot] = DEFAULT_TIMESLICE
+    proc_ticks_remaining[slot] = DEFAULT_TIMESLICE
+
     # Set up initial stack pointer (stack grows down)
     # ARM Cortex-M requires 8-byte aligned stack
     stack_top: uint32 = cast[uint32](stack) + STACK_SIZE
@@ -269,6 +337,81 @@ def process_create(entry_func: Ptr[void]) -> int32:
         proc_saved_regs[slot * 8 + i] = 0
         i = i + 1
 
+    # Add to ready queue at default priority
+    sched_add_ready_internal(slot, DEFAULT_PRIORITY)
+
+    proc_count = proc_count + 1
+
+    critical_exit(state)
+    return pid
+
+def process_create_with_priority(entry_func: Ptr[void], priority: int32) -> int32:
+    """Create a new process with specified priority. Returns pid or -1 on error."""
+    global next_pid, proc_count
+
+    # Validate priority
+    if priority < MIN_PRIORITY or priority > MAX_PRIORITY:
+        priority = DEFAULT_PRIORITY
+
+    state: int32 = critical_enter()
+
+    # Find free slot
+    slot: int32 = find_free_slot()
+    if slot < 0:
+        critical_exit(state)
+        return -1
+
+    # Allocate stack
+    stack: Ptr[uint8] = alloc(STACK_SIZE)
+    if cast[uint32](stack) == 0:
+        critical_exit(state)
+        return -1
+
+    # Initialize process
+    pid: int32 = next_pid
+    next_pid = next_pid + 1
+
+    proc_pid[slot] = pid
+    proc_state[slot] = PROC_STATE_READY
+    proc_priority[slot] = priority
+    proc_entry[slot] = cast[uint32](entry_func)
+    proc_stack_base[slot] = cast[uint32](stack)
+    proc_pending_signals[slot] = 0
+
+    # Initialize timeslice
+    proc_timeslice[slot] = DEFAULT_TIMESLICE
+    proc_ticks_remaining[slot] = DEFAULT_TIMESLICE
+
+    # Set up initial stack pointer (stack grows down)
+    stack_top: uint32 = cast[uint32](stack) + STACK_SIZE
+    stack_top = stack_top & ~7  # Align to 8 bytes
+
+    # Reserve space for hardware-pushed context (8 words = 32 bytes)
+    stack_top = stack_top - 32
+
+    # Initialize hardware exception frame
+    hw_frame: Ptr[uint32] = cast[Ptr[uint32]](stack_top)
+    hw_frame[0] = 0                          # R0
+    hw_frame[1] = 0                          # R1
+    hw_frame[2] = 0                          # R2
+    hw_frame[3] = 0                          # R3
+    hw_frame[4] = 0                          # R12
+    hw_frame[5] = cast[uint32](&process_exit_wrapper)  # LR - return to exit wrapper
+    hw_frame[6] = cast[uint32](entry_func) | 1  # PC (entry point, Thumb bit set)
+    hw_frame[7] = 0x01000000                 # xPSR (Thumb bit set)
+
+    # Save initial stack pointer (after hardware frame)
+    proc_stack_ptr[slot] = stack_top
+
+    # Initialize saved registers (R4-R11) to zero
+    i: int32 = 0
+    while i < 8:
+        proc_saved_regs[slot * 8 + i] = 0
+        i = i + 1
+
+    # Add to ready queue at specified priority
+    sched_add_ready_internal(slot, priority)
+
     proc_count = proc_count + 1
 
     critical_exit(state)
@@ -280,7 +423,7 @@ def process_exit_wrapper():
 
 def process_exit():
     """Terminate the current process."""
-    global current_pid, proc_count
+    global current_pid, current_slot, proc_count
 
     if current_pid < 0:
         return
@@ -288,8 +431,15 @@ def process_exit():
     state: int32 = critical_enter()
 
     # Find current process slot
-    slot: int32 = find_proc_slot(current_pid)
+    slot: int32 = current_slot
+    if slot < 0:
+        slot = find_proc_slot(current_pid)
+
     if slot >= 0:
+        # Remove from ready queue if somehow still there
+        if proc_state[slot] == PROC_STATE_READY:
+            sched_remove_internal(slot, proc_priority[slot])
+
         # Free stack
         if proc_stack_base[slot] != 0:
             free(cast[Ptr[uint8]](proc_stack_base[slot]))
@@ -300,15 +450,14 @@ def process_exit():
         proc_pid[slot] = -1
         proc_count = proc_count - 1
 
+    # Clear current process
+    current_pid = -1
+    current_slot = -1
+
     critical_exit(state)
 
     # Yield to let scheduler pick next process
-    process_yield()
-
-def process_yield():
-    """Cooperative yield - give up CPU to scheduler."""
-    # Trigger PendSV for context switch
-    trigger_pendsv()
+    proc_yield()
 
 def find_proc_slot(pid: int32) -> int32:
     """Find the slot index for a given pid. Returns -1 if not found."""
@@ -319,27 +468,369 @@ def find_proc_slot(pid: int32) -> int32:
         i = i + 1
     return -1
 
-def process_get_priority(pid: int32) -> int32:
-    """Get process priority. Returns -1 if process not found."""
-    slot: int32 = find_proc_slot(pid)
-    if slot < 0:
-        return -1
-    return proc_priority[slot]
-
-def process_set_priority(pid: int32, priority: int32) -> bool:
-    """Set process priority. Returns True on success."""
-    slot: int32 = find_proc_slot(pid)
-    if slot < 0:
-        return False
-    proc_priority[slot] = priority
-    return True
-
 def process_getpid() -> int32:
     """Get current process ID."""
     return current_pid
 
 # ============================================================================
-# Scheduler - Round Robin
+# Priority Management API
+# ============================================================================
+
+def proc_get_priority(pid: int32) -> int32:
+    """Get process priority (0-31, higher = more important). Returns -1 if not found."""
+    slot: int32 = find_proc_slot(pid)
+    if slot < 0:
+        return -1
+    return proc_priority[slot]
+
+def proc_set_priority(pid: int32, priority: int32) -> bool:
+    """Set process priority (0-31, higher = more important). Returns True on success.
+
+    If the process is in the ready queue, it will be moved to the new priority level.
+    """
+    # Validate priority range
+    if priority < MIN_PRIORITY or priority > MAX_PRIORITY:
+        return False
+
+    slot: int32 = find_proc_slot(pid)
+    if slot < 0:
+        return False
+
+    state: int32 = critical_enter()
+
+    old_priority: int32 = proc_priority[slot]
+
+    # If priority unchanged, nothing to do
+    if old_priority == priority:
+        critical_exit(state)
+        return True
+
+    # If process is in ready state, move it between priority queues
+    if proc_state[slot] == PROC_STATE_READY:
+        # Remove from old priority queue
+        sched_remove_internal(slot, old_priority)
+        # Update priority
+        proc_priority[slot] = priority
+        # Add to new priority queue
+        sched_add_ready_internal(slot, priority)
+    else:
+        # Just update the priority field
+        proc_priority[slot] = priority
+
+    critical_exit(state)
+    return True
+
+# Backwards-compatible aliases
+def process_get_priority(pid: int32) -> int32:
+    """Alias for proc_get_priority for backward compatibility."""
+    return proc_get_priority(pid)
+
+def process_set_priority(pid: int32, priority: int32) -> bool:
+    """Alias for proc_set_priority for backward compatibility."""
+    return proc_set_priority(pid, priority)
+
+# ============================================================================
+# Time Slice Management
+# ============================================================================
+
+def proc_set_timeslice(pid: int32, ticks: int32) -> bool:
+    """Set the time slice (quantum) for a process. Returns True on success.
+
+    Args:
+        pid: Process ID
+        ticks: Number of timer ticks for the time quantum (1-100)
+    """
+    if ticks < MIN_TIMESLICE or ticks > MAX_TIMESLICE:
+        return False
+
+    slot: int32 = find_proc_slot(pid)
+    if slot < 0:
+        return False
+
+    state: int32 = critical_enter()
+    proc_timeslice[slot] = ticks
+    critical_exit(state)
+    return True
+
+def proc_get_timeslice(pid: int32) -> int32:
+    """Get the time slice (quantum) for a process. Returns -1 if not found."""
+    slot: int32 = find_proc_slot(pid)
+    if slot < 0:
+        return -1
+    return proc_timeslice[slot]
+
+# ============================================================================
+# Preemption and Yield
+# ============================================================================
+
+def proc_yield():
+    """Voluntarily give up the CPU to allow other tasks to run.
+
+    The current task will be moved to the back of its priority queue
+    and the scheduler will pick the next task.
+    """
+    global current_slot
+
+    if current_pid < 0:
+        return
+
+    state: int32 = critical_enter()
+
+    slot: int32 = current_slot
+    if slot < 0:
+        slot = find_proc_slot(current_pid)
+
+    if slot >= 0 and proc_state[slot] == PROC_STATE_RUNNING:
+        # Reset timeslice for next run
+        proc_ticks_remaining[slot] = proc_timeslice[slot]
+        # Move to ready state and add to back of queue
+        proc_state[slot] = PROC_STATE_READY
+        sched_add_ready_internal(slot, proc_priority[slot])
+
+    critical_exit(state)
+
+    # Trigger context switch
+    trigger_pendsv()
+
+# Backwards-compatible alias
+def process_yield():
+    """Alias for proc_yield for backward compatibility."""
+    proc_yield()
+
+# ============================================================================
+# Ready Queue Management (Internal Functions)
+# ============================================================================
+
+def sched_add_ready_internal(slot: int32, priority: int32):
+    """Internal: Add a process slot to the ready queue at given priority.
+
+    Must be called with interrupts disabled.
+    """
+    global ready_bitmap
+
+    if priority < 0 or priority >= NUM_PRIORITY_LEVELS:
+        return
+    if slot < 0 or slot >= MAX_PROCESSES:
+        return
+
+    # Check if queue is full
+    if ready_count[priority] >= MAX_PROCESSES:
+        return
+
+    # Calculate queue base for this priority level
+    queue_base: int32 = priority * MAX_PROCESSES
+
+    # Add to tail of queue
+    tail_pos: int32 = ready_tail[priority]
+    ready_queue[queue_base + tail_pos] = slot
+
+    # Advance tail (circular)
+    ready_tail[priority] = (tail_pos + 1) % MAX_PROCESSES
+    ready_count[priority] = ready_count[priority] + 1
+
+    # Set bit in bitmap to indicate this priority has tasks
+    ready_bitmap = ready_bitmap | cast[uint32](1 << priority)
+
+def sched_remove_internal(slot: int32, priority: int32):
+    """Internal: Remove a process slot from the ready queue at given priority.
+
+    Must be called with interrupts disabled.
+    """
+    global ready_bitmap
+
+    if priority < 0 or priority >= NUM_PRIORITY_LEVELS:
+        return
+    if slot < 0 or slot >= MAX_PROCESSES:
+        return
+    if ready_count[priority] == 0:
+        return
+
+    queue_base: int32 = priority * MAX_PROCESSES
+    count: int32 = ready_count[priority]
+    head: int32 = ready_head[priority]
+
+    # Search for the slot in the queue
+    i: int32 = 0
+    found_idx: int32 = -1
+    while i < count:
+        pos: int32 = (head + i) % MAX_PROCESSES
+        if ready_queue[queue_base + pos] == slot:
+            found_idx = i
+            break
+        i = i + 1
+
+    if found_idx < 0:
+        return  # Not found
+
+    # Shift remaining elements forward
+    i = found_idx
+    while i < count - 1:
+        src_pos: int32 = (head + i + 1) % MAX_PROCESSES
+        dst_pos: int32 = (head + i) % MAX_PROCESSES
+        ready_queue[queue_base + dst_pos] = ready_queue[queue_base + src_pos]
+        i = i + 1
+
+    # Decrease tail and count
+    ready_tail[priority] = (ready_tail[priority] - 1 + MAX_PROCESSES) % MAX_PROCESSES
+    ready_count[priority] = ready_count[priority] - 1
+
+    # Clear bitmap bit if queue is now empty
+    if ready_count[priority] == 0:
+        ready_bitmap = ready_bitmap & ~cast[uint32](1 << priority)
+
+def sched_pop_highest() -> int32:
+    """Internal: Pop the highest priority ready task from the queue.
+
+    Returns the slot index of the highest priority ready task, or -1 if none.
+    Must be called with interrupts disabled.
+    """
+    global ready_bitmap
+
+    if ready_bitmap == 0:
+        return -1
+
+    # Find highest priority with tasks (highest bit set)
+    # Priority 31 is highest, priority 0 is lowest
+    priority: int32 = MAX_PRIORITY
+    while priority >= 0:
+        mask: uint32 = cast[uint32](1 << priority)
+        if (ready_bitmap & mask) != 0:
+            break
+        priority = priority - 1
+
+    if priority < 0:
+        return -1
+
+    # Pop from head of this priority's queue
+    queue_base: int32 = priority * MAX_PROCESSES
+    head: int32 = ready_head[priority]
+    slot: int32 = ready_queue[queue_base + head]
+
+    # Advance head
+    ready_head[priority] = (head + 1) % MAX_PROCESSES
+    ready_count[priority] = ready_count[priority] - 1
+
+    # Clear bitmap bit if queue is now empty
+    if ready_count[priority] == 0:
+        ready_bitmap = ready_bitmap & ~cast[uint32](1 << priority)
+
+    return slot
+
+# ============================================================================
+# Scheduler Public API
+# ============================================================================
+
+def sched_add_ready(pid: int32):
+    """Add a process to the ready queue based on its priority.
+
+    This should be called when a process becomes ready to run
+    (e.g., after creation, after unblocking from I/O, etc.)
+    """
+    slot: int32 = find_proc_slot(pid)
+    if slot < 0:
+        return
+
+    state: int32 = critical_enter()
+
+    # Only add if not already ready/running
+    if proc_state[slot] != PROC_STATE_READY and proc_state[slot] != PROC_STATE_RUNNING:
+        proc_state[slot] = PROC_STATE_READY
+        proc_ticks_remaining[slot] = proc_timeslice[slot]
+        sched_add_ready_internal(slot, proc_priority[slot])
+
+    critical_exit(state)
+
+def sched_remove(pid: int32):
+    """Remove a process from the scheduler (ready queue).
+
+    This should be called when a process blocks or terminates.
+    """
+    slot: int32 = find_proc_slot(pid)
+    if slot < 0:
+        return
+
+    state: int32 = critical_enter()
+
+    if proc_state[slot] == PROC_STATE_READY:
+        sched_remove_internal(slot, proc_priority[slot])
+
+    critical_exit(state)
+
+def sched_schedule() -> int32:
+    """Select the next task to run. Returns the PID of the selected task, or -1 if none.
+
+    This function picks the highest priority ready task. Among tasks of equal
+    priority, it uses round-robin scheduling (tasks are at the front of queue).
+    """
+    global current_pid, current_slot, scheduler_locked
+
+    if scheduler_locked:
+        return current_pid
+
+    state: int32 = critical_enter()
+    scheduler_locked = True
+
+    # Get highest priority ready task
+    next_slot: int32 = sched_pop_highest()
+
+    if next_slot >= 0:
+        proc_state[next_slot] = PROC_STATE_RUNNING
+        proc_ticks_remaining[next_slot] = proc_timeslice[next_slot]
+        current_pid = proc_pid[next_slot]
+        current_slot = next_slot
+    else:
+        current_pid = -1
+        current_slot = -1
+
+    scheduler_locked = False
+    critical_exit(state)
+
+    return current_pid
+
+def sched_tick():
+    """Handle a timer tick for preemptive scheduling.
+
+    This function should be called from the timer interrupt handler.
+    It decrements the current task's remaining timeslice and triggers
+    preemption when the timeslice expires.
+    """
+    global current_slot
+
+    if current_pid < 0:
+        return
+
+    if not scheduler_running:
+        return
+
+    state: int32 = critical_enter()
+
+    slot: int32 = current_slot
+    if slot < 0:
+        slot = find_proc_slot(current_pid)
+        current_slot = slot
+
+    if slot >= 0 and proc_state[slot] == PROC_STATE_RUNNING:
+        # Decrement timeslice counter
+        proc_ticks_remaining[slot] = proc_ticks_remaining[slot] - 1
+
+        if proc_ticks_remaining[slot] <= 0:
+            # Time quantum expired - preempt
+            # Reset timeslice for next run
+            proc_ticks_remaining[slot] = proc_timeslice[slot]
+            # Move to back of ready queue
+            proc_state[slot] = PROC_STATE_READY
+            sched_add_ready_internal(slot, proc_priority[slot])
+
+            critical_exit(state)
+
+            # Trigger context switch
+            trigger_pendsv()
+            return
+
+    critical_exit(state)
+
+# ============================================================================
+# Scheduler Start and Legacy Functions
 # ============================================================================
 
 def scheduler_start():
@@ -351,48 +842,32 @@ def scheduler_start():
 
     scheduler_running = True
 
-    # Find first ready process and start it
-    schedule_next()
+    # Select and run first task
+    sched_schedule()
 
 def schedule_next():
-    """Select next process to run using round-robin scheduling."""
-    global current_pid
+    """Legacy function: Select next process to run.
+
+    This now uses the priority-based scheduler internally.
+    """
+    global current_pid, current_slot
 
     if proc_count == 0:
         current_pid = -1
+        current_slot = -1
         return
 
     state: int32 = critical_enter()
 
-    # Find current slot
-    current_slot: int32 = -1
-    if current_pid >= 0:
-        current_slot = find_proc_slot(current_pid)
-        if current_slot >= 0 and proc_state[current_slot] == PROC_STATE_RUNNING:
-            proc_state[current_slot] = PROC_STATE_READY
-
-    # Round-robin: start from next slot after current
-    start: int32 = 0
-    if current_slot >= 0:
-        start = (current_slot + 1) % MAX_PROCESSES
-
-    # Find next ready process
-    i: int32 = 0
-    found: int32 = -1
-    while i < MAX_PROCESSES:
-        slot: int32 = (start + i) % MAX_PROCESSES
-        if proc_state[slot] == PROC_STATE_READY:
-            found = slot
-            break
-        i = i + 1
-
-    if found >= 0:
-        proc_state[found] = PROC_STATE_RUNNING
-        current_pid = proc_pid[found]
-    else:
-        current_pid = -1
+    # If current process is still running, put it back in ready queue
+    if current_slot >= 0 and proc_state[current_slot] == PROC_STATE_RUNNING:
+        proc_state[current_slot] = PROC_STATE_READY
+        sched_add_ready_internal(current_slot, proc_priority[current_slot])
 
     critical_exit(state)
+
+    # Use new scheduler to pick next task
+    sched_schedule()
 
 # ============================================================================
 # Context Switch (called from PendSV handler)
@@ -400,10 +875,16 @@ def schedule_next():
 
 def context_switch_out(sp: uint32) -> uint32:
     """Save context of current process. Called from PendSV with current SP."""
+    global current_slot
+
     if current_pid < 0:
         return sp
 
-    slot: int32 = find_proc_slot(current_pid)
+    slot: int32 = current_slot
+    if slot < 0:
+        slot = find_proc_slot(current_pid)
+        current_slot = slot
+
     if slot < 0:
         return sp
 
@@ -414,14 +895,20 @@ def context_switch_out(sp: uint32) -> uint32:
 
 def context_switch_in() -> uint32:
     """Load context of next process. Returns new SP."""
-    # Select next process
+    global current_slot
+
+    # Select next process using the priority scheduler
     schedule_next()
 
     if current_pid < 0:
         # No process to run, return to idle
         return 0
 
-    slot: int32 = find_proc_slot(current_pid)
+    slot: int32 = current_slot
+    if slot < 0:
+        slot = find_proc_slot(current_pid)
+        current_slot = slot
+
     if slot < 0:
         return 0
 
@@ -487,6 +974,8 @@ def signal_send(pid: int32, sig: int32) -> bool:
     # If process is blocked, make it ready to handle signal
     if proc_state[slot] == PROC_STATE_BLOCKED:
         proc_state[slot] = PROC_STATE_READY
+        proc_ticks_remaining[slot] = proc_timeslice[slot]
+        sched_add_ready_internal(slot, proc_priority[slot])
 
     critical_exit(state)
     return True
@@ -830,10 +1319,19 @@ def syscall_dispatch(num: int32, arg1: int32, arg2: int32, arg3: int32) -> int32
         result = 0
 
     elif num == SYS_GETPRIORITY:
-        result = process_get_priority(arg1)
+        result = proc_get_priority(arg1)
 
     elif num == SYS_SETPRIORITY:
-        if process_set_priority(arg1, arg2):
+        if proc_set_priority(arg1, arg2):
+            result = 0
+        else:
+            result = -1
+
+    elif num == SYS_GETTIMESLICE:
+        result = proc_get_timeslice(arg1)
+
+    elif num == SYS_SETTIMESLICE:
+        if proc_set_timeslice(arg1, arg2):
             result = 0
         else:
             result = -1
@@ -918,8 +1416,44 @@ def process_dump():
             print_int(proc_state[i])
             print_str(" prio=")
             print_int(proc_priority[i])
+            print_str(" slice=")
+            print_int(proc_timeslice[i])
+            print_str("/")
+            print_int(proc_ticks_remaining[i])
             print_str("\n")
         i = i + 1
     print_str("[process] Current PID: ")
     print_int(current_pid)
+    print_str("\n")
+    print_str("[process] Ready bitmap: ")
+    print_int(cast[int32](ready_bitmap))
+    print_str("\n")
+
+def sched_dump():
+    """Dump scheduler ready queue state for debugging."""
+    print_str("[sched] Ready queue state:\n")
+    print_str("  Bitmap: 0x")
+    # Print bitmap in hex (simplified - just print decimal)
+    print_int(cast[int32](ready_bitmap))
+    print_str("\n")
+
+    # Show non-empty priority levels
+    prio: int32 = MAX_PRIORITY
+    while prio >= 0:
+        if ready_count[prio] > 0:
+            print_str("  Prio ")
+            print_int(prio)
+            print_str(": count=")
+            print_int(ready_count[prio])
+            print_str(" head=")
+            print_int(ready_head[prio])
+            print_str(" tail=")
+            print_int(ready_tail[prio])
+            print_str("\n")
+        prio = prio - 1
+
+    print_str("[sched] Current: PID=")
+    print_int(current_pid)
+    print_str(" slot=")
+    print_int(current_slot)
     print_str("\n")

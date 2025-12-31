@@ -11,6 +11,22 @@ from kernel.process import (pipe_create, pipe_read, pipe_write, pipe_close,
                              mq_create, mq_send, mq_receive, mq_close,
                              MAX_PIPES, MAX_MESSAGE_QUEUES)
 
+# Helper: unpack read fd from pipe_create result (low 16 bits)
+def pipe_get_read_fd(pfd: int32) -> int32:
+    return pfd & 65535  # 0xFFFF
+
+# Helper: unpack write fd from pipe_create result (high 16 bits)
+def pipe_get_write_fd(pfd: int32) -> int32:
+    return (pfd >> 16) & 65535  # 0xFFFF
+
+# Helper: close both ends of a pipe
+def pipe_close_both(pfd: int32):
+    if pfd >= 0:
+        read_fd: int32 = pipe_get_read_fd(pfd)
+        write_fd: int32 = pipe_get_write_fd(pfd)
+        pipe_close(read_fd)
+        pipe_close(write_fd)
+
 # ============================================================================
 # Pipe Creation Tests
 # ============================================================================
@@ -25,7 +41,7 @@ def test_pipe_create():
 
     # Clean up
     if fd >= 0:
-        pipe_close(fd)
+        pipe_close_both(fd)
 
 def test_create_multiple_pipes():
     """Test creating multiple pipes."""
@@ -51,7 +67,7 @@ def test_create_multiple_pipes():
     i = 0
     while i < 5:
         if fds[i] >= 0:
-            pipe_close(fds[i])
+            pipe_close_both(fds[i])
         i = i + 1
 
 def test_pipe_limit():
@@ -77,7 +93,7 @@ def test_pipe_limit():
     i = 0
     while i < MAX_PIPES + 2:
         if fds[i] >= 0:
-            pipe_close(fds[i])
+            pipe_close_both(fds[i])
         i = i + 1
 
 # ============================================================================
@@ -88,10 +104,13 @@ def test_pipe_write_read():
     """Test basic pipe write and read."""
     print_section("Pipe I/O")
 
-    fd: int32 = pipe_create()
-    if fd < 0:
+    pfd: int32 = pipe_create()
+    if pfd < 0:
         test_fail("create pipe for I/O test")
         return
+
+    read_fd: int32 = pipe_get_read_fd(pfd)
+    write_fd: int32 = pipe_get_write_fd(pfd)
 
     # Write some data
     write_buf: Array[16, uint8]
@@ -101,12 +120,12 @@ def test_pipe_write_read():
     write_buf[3] = 'l'
     write_buf[4] = 'o'
 
-    written: int32 = pipe_write(fd, &write_buf[0], 5)
+    written: int32 = pipe_write(write_fd, &write_buf[0], 5)
     assert_eq(written, 5, "write 5 bytes")
 
     # Read it back
     read_buf: Array[16, uint8]
-    read_len: int32 = pipe_read(fd, &read_buf[0], 16)
+    read_len: int32 = pipe_read(read_fd, &read_buf[0], 16)
     assert_eq(read_len, 5, "read returns 5 bytes")
 
     # Verify content
@@ -115,32 +134,35 @@ def test_pipe_write_read():
                    read_buf[4] == 'o')
     assert_true(matched, "read content matches written")
 
-    pipe_close(fd)
+    pipe_close_both(pfd)
 
 def test_pipe_multiple_writes():
     """Test multiple writes to a pipe."""
-    fd: int32 = pipe_create()
-    if fd < 0:
+    pfd: int32 = pipe_create()
+    if pfd < 0:
         test_fail("create pipe for multi-write")
         return
+
+    read_fd: int32 = pipe_get_read_fd(pfd)
+    write_fd: int32 = pipe_get_write_fd(pfd)
 
     buf: Array[8, uint8]
 
     # Write "AB"
     buf[0] = 'A'
     buf[1] = 'B'
-    written1: int32 = pipe_write(fd, &buf[0], 2)
+    written1: int32 = pipe_write(write_fd, &buf[0], 2)
 
     # Write "CD"
     buf[0] = 'C'
     buf[1] = 'D'
-    written2: int32 = pipe_write(fd, &buf[0], 2)
+    written2: int32 = pipe_write(write_fd, &buf[0], 2)
 
     assert_eq(written1 + written2, 4, "total bytes written")
 
     # Read all
     read_buf: Array[16, uint8]
-    total_read: int32 = pipe_read(fd, &read_buf[0], 16)
+    total_read: int32 = pipe_read(read_fd, &read_buf[0], 16)
     assert_eq(total_read, 4, "read all written bytes")
 
     # Should be ABCD
@@ -148,14 +170,16 @@ def test_pipe_multiple_writes():
                    read_buf[2] == 'C' and read_buf[3] == 'D')
     assert_true(matched, "FIFO order preserved")
 
-    pipe_close(fd)
+    pipe_close_both(pfd)
 
 def test_pipe_buffer_full():
     """Test pipe behavior when buffer fills up."""
-    fd: int32 = pipe_create()
-    if fd < 0:
+    pfd: int32 = pipe_create()
+    if pfd < 0:
         test_fail("create pipe for buffer test")
         return
+
+    write_fd: int32 = pipe_get_write_fd(pfd)
 
     # Fill buffer with data
     data: Array[64, uint8]
@@ -169,7 +193,7 @@ def test_pipe_buffer_full():
 
     # Keep writing until buffer is full
     while attempts < 20:
-        written: int32 = pipe_write(fd, &data[0], 64)
+        written: int32 = pipe_write(write_fd, &data[0], 64)
         if written <= 0:
             break
         total_written = total_written + written
@@ -183,22 +207,24 @@ def test_pipe_buffer_full():
     print_str(" bytes before full)")
     print_newline()
 
-    pipe_close(fd)
+    pipe_close_both(pfd)
 
 def test_pipe_empty_read():
     """Test reading from empty pipe."""
-    fd: int32 = pipe_create()
-    if fd < 0:
+    pfd: int32 = pipe_create()
+    if pfd < 0:
         test_fail("create pipe for empty read")
         return
+
+    read_fd: int32 = pipe_get_read_fd(pfd)
 
     buf: Array[16, uint8]
     # Read from empty pipe - should return 0 or block
     # In non-blocking mode, should return 0
-    read_len: int32 = pipe_read(fd, &buf[0], 16)
+    read_len: int32 = pipe_read(read_fd, &buf[0], 16)
     assert_eq(read_len, 0, "empty pipe read returns 0")
 
-    pipe_close(fd)
+    pipe_close_both(pfd)
 
 # ============================================================================
 # Message Queue Tests
@@ -346,32 +372,35 @@ def test_intuitive_pipe_api():
     """Test that pipe API is intuitive."""
     print_section("Intuitive IPC API")
 
-    # pipe_create should return usable fd
-    fd: int32 = pipe_create()
-    if fd >= 0:
+    # pipe_create should return usable fd (pfd read|write)
+    pfd: int32 = pipe_create()
+    if pfd >= 0:
         test_pass("pipe_create returns usable fd")
     else:
         test_fail("pipe_create should return >= 0")
         return
 
+    read_fd: int32 = pipe_get_read_fd(pfd)
+    write_fd: int32 = pipe_get_write_fd(pfd)
+
     # write returns number of bytes written
     buf: Array[4, uint8]
     buf[0] = 'X'
-    written: int32 = pipe_write(fd, &buf[0], 1)
+    written: int32 = pipe_write(write_fd, &buf[0], 1)
     if written == 1:
         test_pass("pipe_write returns bytes written")
     else:
         test_fail("pipe_write should return byte count")
 
     # read returns number of bytes read
-    read_len: int32 = pipe_read(fd, &buf[0], 4)
+    read_len: int32 = pipe_read(read_fd, &buf[0], 4)
     if read_len == 1:
         test_pass("pipe_read returns bytes read")
     else:
         test_fail("pipe_read should return byte count")
 
     # close should work without errors
-    pipe_close(fd)
+    pipe_close_both(pfd)
     test_pass("pipe_close works")
 
 def test_intuitive_mq_api():
@@ -407,7 +436,7 @@ def test_intuitive_mq_api():
 # Main
 # ============================================================================
 
-def main() -> int32:
+def test_ipc_main() -> int32:
     print_str("\n=== Pynux IPC Tests ===\n")
 
     test_pipe_create()

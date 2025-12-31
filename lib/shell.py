@@ -18,6 +18,7 @@ from programs.hexview import hexview_main
 from programs.imgview import imgview_main
 from programs.sensormon import sensormon_main
 from programs.motorctl import motorctl_main
+from programs.run_tests import run_tests_main
 from lib.sensors import sensors_seed, sensors_enable_noise, sensors_init_all
 from lib.sensors import temp_read, temp_to_fahrenheit
 from lib.sensors import accel_read_x, accel_read_y, accel_read_z
@@ -31,15 +32,43 @@ from lib.math import abs_int
 shell_cmd: Array[256, char]
 shell_cmd_pos: int32 = 0
 
-# Command history (10 commands, 256 chars each)
-HISTORY_SIZE: int32 = 10
-shell_history: Array[2560, char]  # 10 * 256
+# Command history - circular buffer (configurable, default 20)
+HISTORY_SIZE: int32 = 20
+HISTORY_CMD_LEN: int32 = 256
+shell_history: Array[5120, char]  # 20 * 256
 shell_history_count: int32 = 0
-shell_history_pos: int32 = 0  # Current position when navigating
+shell_history_pos: int32 = 0  # Current position when navigating (-1 = current line)
 shell_history_idx: int32 = 0  # Next write position (circular)
+
+# Saved current line when navigating history
+shell_saved_line: Array[256, char]
+shell_saved_line_len: int32 = 0
 
 # Escape sequence state for arrow keys (using array for reliable global storage)
 shell_esc: Array[4, int32]  # [0]=state: 0=normal, 1=got ESC, 2=got [
+
+# Line editing - cursor position (separate from cmd_pos which is length)
+shell_cursor_pos: int32 = 0  # Position within the line (0 to shell_cmd_pos)
+
+# Alias storage (up to 16 aliases, name=64 chars, value=128 chars)
+ALIAS_MAX: int32 = 16
+ALIAS_NAME_LEN: int32 = 64
+ALIAS_VALUE_LEN: int32 = 128
+shell_alias_names: Array[1024, char]   # 16 * 64
+shell_alias_values: Array[2048, char]  # 16 * 128
+shell_alias_count: int32 = 0
+
+# Environment variables (up to 16 vars)
+ENV_MAX: int32 = 16
+ENV_NAME_LEN: int32 = 64
+ENV_VALUE_LEN: int32 = 128
+shell_env_names: Array[1024, char]   # 16 * 64
+shell_env_values: Array[2048, char]  # 16 * 128
+shell_env_count: int32 = 0
+
+# Command list for tab completion
+shell_commands: Array[64, Ptr[char]]
+shell_cmd_count: int32 = 0
 
 # Current directory
 shell_cwd: Array[128, char]
@@ -206,7 +235,7 @@ def str_contains(haystack: Ptr[char], needle: Ptr[char]) -> bool:
 # ============================================================================
 
 def history_add(cmd: Ptr[char]):
-    """Add command to history."""
+    """Add command to history (circular buffer)."""
     global shell_history_count, shell_history_idx
 
     # Don't add empty commands
@@ -216,14 +245,14 @@ def history_add(cmd: Ptr[char]):
     # Don't add if same as previous command
     if shell_history_count > 0:
         prev_idx: int32 = (shell_history_idx - 1 + HISTORY_SIZE) % HISTORY_SIZE
-        prev_base: int32 = prev_idx * 256
+        prev_base: int32 = prev_idx * HISTORY_CMD_LEN
         if strcmp(cmd, &shell_history[prev_base]) == 0:
             return
 
     # Copy command to history at current index
-    base: int32 = shell_history_idx * 256
+    base: int32 = shell_history_idx * HISTORY_CMD_LEN
     i: int32 = 0
-    while i < 255 and cmd[i] != '\0':
+    while i < (HISTORY_CMD_LEN - 1) and cmd[i] != '\0':
         shell_history[base + i] = cmd[i]
         i = i + 1
     shell_history[base + i] = '\0'
@@ -242,27 +271,77 @@ def history_get(index: int32) -> Ptr[char]:
 
     # Calculate actual position (going backwards from last)
     pos: int32 = (shell_history_idx - 1 - index + HISTORY_SIZE) % HISTORY_SIZE
-    base: int32 = pos * 256
+    base: int32 = pos * HISTORY_CMD_LEN
     return &shell_history[base]
+
+def history_search(prefix: Ptr[char]) -> Ptr[char]:
+    """Search history for command starting with prefix. Returns NULL if not found."""
+    if prefix[0] == '\0':
+        return Ptr[char](0)
+
+    prefix_len: int32 = strlen(prefix)
+    i: int32 = 0
+    while i < shell_history_count:
+        cmd: Ptr[char] = history_get(i)
+        if cmd != Ptr[char](0):
+            # Check if cmd starts with prefix
+            is_match: bool = True
+            j: int32 = 0
+            while j < prefix_len:
+                if cmd[j] != prefix[j]:
+                    is_match = False
+                    break
+                j = j + 1
+            if is_match:
+                return cmd
+        i = i + 1
+    return Ptr[char](0)
 
 def history_reset_pos():
     """Reset history navigation position."""
     global shell_history_pos
     shell_history_pos = -1
 
+def history_save_current():
+    """Save current command line before history navigation."""
+    global shell_saved_line_len
+    i: int32 = 0
+    while i < shell_cmd_pos and i < 255:
+        shell_saved_line[i] = shell_cmd[i]
+        i = i + 1
+    shell_saved_line[i] = '\0'
+    shell_saved_line_len = shell_cmd_pos
+
+def history_restore_saved():
+    """Restore saved command line after history navigation."""
+    global shell_cmd_pos, shell_cursor_pos
+    i: int32 = 0
+    while i < shell_saved_line_len and i < 255:
+        shell_cmd[i] = shell_saved_line[i]
+        i = i + 1
+    shell_cmd[i] = '\0'
+    shell_cmd_pos = shell_saved_line_len
+    shell_cursor_pos = shell_saved_line_len
+
 def shell_clear_line():
     """Clear current command line on screen."""
-    global shell_cmd_pos
+    global shell_cmd_pos, shell_cursor_pos
     # Move cursor to start of input and clear to end of line
-    while shell_cmd_pos > 0:
+    # First move cursor to end if not already there
+    while shell_cursor_pos < shell_cmd_pos:
+        shell_putc(shell_cmd[shell_cursor_pos])
+        shell_cursor_pos = shell_cursor_pos + 1
+    # Then move back to start
+    while shell_cursor_pos > 0:
         shell_putc('\b')
-        shell_cmd_pos = shell_cmd_pos - 1
+        shell_cursor_pos = shell_cursor_pos - 1
     # VT100: clear from cursor to end of line
     shell_puts("\x1b[K")
+    shell_cmd_pos = 0
 
 def shell_set_cmd(s: Ptr[char]):
     """Set command buffer and display it."""
-    global shell_cmd_pos
+    global shell_cmd_pos, shell_cursor_pos
     # NULL check to prevent crash
     if cast[uint32](s) == 0:
         return
@@ -274,18 +353,328 @@ def shell_set_cmd(s: Ptr[char]):
         i = i + 1
     shell_cmd[i] = '\0'
     shell_cmd_pos = i
+    shell_cursor_pos = i
+
+def shell_redraw_line():
+    """Redraw the entire command line, restoring cursor position."""
+    # Move to start
+    i: int32 = 0
+    while i < shell_cursor_pos:
+        shell_putc('\b')
+        i = i + 1
+    # Clear to end and redraw
+    shell_puts("\x1b[K")
+    i = 0
+    while i < shell_cmd_pos:
+        shell_putc(shell_cmd[i])
+        i = i + 1
+    # Move cursor back to its position
+    i = shell_cmd_pos
+    while i > shell_cursor_pos:
+        shell_putc('\b')
+        i = i - 1
+
+# ============================================================================
+# Line editing functions
+# ============================================================================
+
+def line_insert_char(pos: int32, ch: char) -> int32:
+    """Insert character at position. Returns new position or -1 on error."""
+    global shell_cmd_pos, shell_cursor_pos
+    if shell_cmd_pos >= 255:
+        return -1  # Buffer full
+
+    # Shift characters right from pos
+    i: int32 = shell_cmd_pos
+    while i > pos:
+        shell_cmd[i] = shell_cmd[i - 1]
+        i = i - 1
+    shell_cmd[pos] = ch
+    shell_cmd_pos = shell_cmd_pos + 1
+    shell_cmd[shell_cmd_pos] = '\0'
+
+    # Display: print from cursor to end, then move back
+    i = pos
+    while i < shell_cmd_pos:
+        shell_putc(shell_cmd[i])
+        i = i + 1
+    # Move cursor back to after inserted char
+    i = shell_cmd_pos
+    while i > pos + 1:
+        shell_putc('\b')
+        i = i - 1
+    shell_cursor_pos = pos + 1
+    return pos + 1
+
+def line_delete_char(pos: int32) -> int32:
+    """Delete character at position. Returns position or -1 on error."""
+    global shell_cmd_pos, shell_cursor_pos
+    if pos < 0 or pos >= shell_cmd_pos:
+        return -1  # Invalid position
+
+    # Shift characters left
+    i: int32 = pos
+    while i < shell_cmd_pos - 1:
+        shell_cmd[i] = shell_cmd[i + 1]
+        i = i + 1
+    shell_cmd_pos = shell_cmd_pos - 1
+    shell_cmd[shell_cmd_pos] = '\0'
+
+    # Redraw from cursor position
+    i = pos
+    while i < shell_cmd_pos:
+        shell_putc(shell_cmd[i])
+        i = i + 1
+    shell_putc(' ')  # Clear last char
+    # Move cursor back
+    i = shell_cmd_pos + 1
+    while i > pos:
+        shell_putc('\b')
+        i = i - 1
+    shell_cursor_pos = pos
+    return pos
+
+def line_move_left() -> bool:
+    """Move cursor left. Returns True if moved."""
+    global shell_cursor_pos
+    if shell_cursor_pos > 0:
+        shell_cursor_pos = shell_cursor_pos - 1
+        shell_puts("\x1b[D")  # VT100 cursor left
+        return True
+    return False
+
+def line_move_right() -> bool:
+    """Move cursor right. Returns True if moved."""
+    global shell_cursor_pos
+    if shell_cursor_pos < shell_cmd_pos:
+        shell_puts("\x1b[C")  # VT100 cursor right
+        shell_cursor_pos = shell_cursor_pos + 1
+        return True
+    return False
+
+def line_move_home():
+    """Move cursor to start of line."""
+    global shell_cursor_pos
+    while shell_cursor_pos > 0:
+        shell_puts("\x1b[D")
+        shell_cursor_pos = shell_cursor_pos - 1
+
+def line_move_end():
+    """Move cursor to end of line."""
+    global shell_cursor_pos
+    while shell_cursor_pos < shell_cmd_pos:
+        shell_puts("\x1b[C")
+        shell_cursor_pos = shell_cursor_pos + 1
+
+# ============================================================================
+# Tab completion functions
+# ============================================================================
+
+# Static command list for completion
+shell_builtin_cmds: Array[80, Ptr[char]]
+shell_builtin_count: int32 = 0
+
+def shell_init_commands():
+    """Initialize list of shell commands for tab completion."""
+    global shell_builtin_count
+    shell_builtin_cmds[0] = "help"
+    shell_builtin_cmds[1] = "history"
+    shell_builtin_cmds[2] = "clear"
+    shell_builtin_cmds[3] = "alias"
+    shell_builtin_cmds[4] = "unalias"
+    shell_builtin_cmds[5] = "echo"
+    shell_builtin_cmds[6] = "export"
+    shell_builtin_cmds[7] = "pwd"
+    shell_builtin_cmds[8] = "cd"
+    shell_builtin_cmds[9] = "ls"
+    shell_builtin_cmds[10] = "cat"
+    shell_builtin_cmds[11] = "mkdir"
+    shell_builtin_cmds[12] = "touch"
+    shell_builtin_cmds[13] = "rm"
+    shell_builtin_cmds[14] = "cp"
+    shell_builtin_cmds[15] = "mv"
+    shell_builtin_cmds[16] = "head"
+    shell_builtin_cmds[17] = "tail"
+    shell_builtin_cmds[18] = "wc"
+    shell_builtin_cmds[19] = "stat"
+    shell_builtin_cmds[20] = "grep"
+    shell_builtin_cmds[21] = "find"
+    shell_builtin_cmds[22] = "sed"
+    shell_builtin_cmds[23] = "write"
+    shell_builtin_cmds[24] = "uname"
+    shell_builtin_cmds[25] = "free"
+    shell_builtin_cmds[26] = "whoami"
+    shell_builtin_cmds[27] = "hostname"
+    shell_builtin_cmds[28] = "date"
+    shell_builtin_cmds[29] = "uptime"
+    shell_builtin_cmds[30] = "id"
+    shell_builtin_cmds[31] = "env"
+    shell_builtin_cmds[32] = "printenv"
+    shell_builtin_cmds[33] = "jobs"
+    shell_builtin_cmds[34] = "fg"
+    shell_builtin_cmds[35] = "bg"
+    shell_builtin_cmds[36] = "kill"
+    shell_builtin_cmds[37] = "sleep"
+    shell_builtin_cmds[38] = "reboot"
+    shell_builtin_cmds[39] = "halt"
+    shell_builtin_cmds[40] = "sensors"
+    shell_builtin_cmds[41] = "servo"
+    shell_builtin_cmds[42] = "stepper"
+    shell_builtin_cmds[43] = "motor"
+    shell_builtin_cmds[44] = "drivers"
+    shell_builtin_cmds[45] = "sensormon"
+    shell_builtin_cmds[46] = "motorctl"
+    shell_builtin_cmds[47] = "version"
+    shell_builtin_cmds[48] = "calc"
+    shell_builtin_cmds[49] = "clock"
+    shell_builtin_cmds[50] = "hexview"
+    shell_builtin_cmds[51] = "imgview"
+    shell_builtin_cmds[52] = "seq"
+    shell_builtin_cmds[53] = "factor"
+    shell_builtin_cmds[54] = "fortune"
+    shell_builtin_cmds[55] = "basename"
+    shell_builtin_cmds[56] = "dirname"
+    shell_builtin_cmds[57] = "banner"
+    shell_builtin_cmds[58] = "cal"
+    shell_builtin_cmds[59] = "df"
+    shell_builtin_cmds[60] = "ps"
+    shell_builtin_cmds[61] = "dmesg"
+    shell_builtin_cmds[62] = "lscpu"
+    shell_builtin_cmds[63] = "reset"
+    shell_builtin_cmds[64] = "test"
+    shell_builtin_count = 65
+
+def complete_command(partial: Ptr[char]) -> Ptr[char]:
+    """Find first command matching partial. Returns NULL if none."""
+    partial_len: int32 = strlen(partial)
+    if partial_len == 0:
+        return Ptr[char](0)
+
+    i: int32 = 0
+    while i < shell_builtin_count:
+        cmd: Ptr[char] = shell_builtin_cmds[i]
+        # Check if cmd starts with partial
+        is_match: bool = True
+        j: int32 = 0
+        while j < partial_len:
+            if cmd[j] != partial[j]:
+                is_match = False
+                break
+            j = j + 1
+        if is_match:
+            return cmd
+        i = i + 1
+    return Ptr[char](0)
+
+def complete_path(partial: Ptr[char]) -> Ptr[char]:
+    """Complete a file path. Returns matching path or NULL."""
+    # Determine directory to search and file prefix
+    dir_path: Ptr[char] = &shell_cwd[0]
+    file_prefix: Ptr[char] = partial
+
+    # Check if partial contains /
+    last_slash: int32 = -1
+    i: int32 = 0
+    while partial[i] != '\0':
+        if partial[i] == '/':
+            last_slash = i
+        i = i + 1
+
+    if last_slash >= 0:
+        strcpy(&shell_tab_dir[0], partial)
+        shell_tab_dir[last_slash + 1] = '\0'
+        shell_build_path(&shell_tab_dir[0])
+        dir_path = &shell_path_buf[0]
+        file_prefix = &partial[last_slash + 1]
+
+    # Find first match
+    idx: int32 = 0
+    result: int32 = ramfs_readdir(dir_path, idx, &shell_name_buf[0])
+    file_prefix_len: int32 = strlen(file_prefix)
+    while result >= 0:
+        is_match: bool = True
+        j: int32 = 0
+        while j < file_prefix_len:
+            if shell_name_buf[j] != file_prefix[j]:
+                is_match = False
+                break
+            j = j + 1
+        if is_match:
+            strcpy(&shell_tab_match[0], &shell_name_buf[0])
+            return &shell_tab_match[0]
+        idx = idx + 1
+        result = ramfs_readdir(dir_path, idx, &shell_name_buf[0])
+    return Ptr[char](0)
+
+def list_completions(partial: Ptr[char], is_command: bool):
+    """List all completions for partial. Shows commands or paths."""
+    partial_len: int32 = strlen(partial)
+
+    if is_command:
+        # List matching commands
+        i: int32 = 0
+        while i < shell_builtin_count:
+            cmd: Ptr[char] = shell_builtin_cmds[i]
+            is_match: bool = True
+            j: int32 = 0
+            while j < partial_len:
+                if cmd[j] != partial[j]:
+                    is_match = False
+                    break
+                j = j + 1
+            if is_match:
+                shell_puts(cmd)
+                shell_puts("  ")
+            i = i + 1
+    else:
+        # List matching paths
+        dir_path: Ptr[char] = &shell_cwd[0]
+        file_prefix: Ptr[char] = partial
+
+        last_slash: int32 = -1
+        i: int32 = 0
+        while partial[i] != '\0':
+            if partial[i] == '/':
+                last_slash = i
+            i = i + 1
+
+        if last_slash >= 0:
+            strcpy(&shell_tab_dir[0], partial)
+            shell_tab_dir[last_slash + 1] = '\0'
+            shell_build_path(&shell_tab_dir[0])
+            dir_path = &shell_path_buf[0]
+            file_prefix = &partial[last_slash + 1]
+
+        idx: int32 = 0
+        result: int32 = ramfs_readdir(dir_path, idx, &shell_name_buf[0])
+        file_prefix_len: int32 = strlen(file_prefix)
+        while result >= 0:
+            is_match: bool = True
+            j: int32 = 0
+            while j < file_prefix_len:
+                if shell_name_buf[j] != file_prefix[j]:
+                    is_match = False
+                    break
+                j = j + 1
+            if is_match:
+                shell_puts(&shell_name_buf[0])
+                if result == 1:
+                    shell_putc('/')
+                shell_puts("  ")
+            idx = idx + 1
+            result = ramfs_readdir(dir_path, idx, &shell_name_buf[0])
 
 def shell_tab_complete():
-    """Handle tab completion for file/directory names."""
-    global shell_cmd_pos
+    """Handle tab completion for commands and file/directory names."""
+    global shell_cmd_pos, shell_cursor_pos
 
     # Find start of current word
-    word_start: int32 = shell_cmd_pos
+    word_start: int32 = shell_cursor_pos
     while word_start > 0 and shell_cmd[word_start - 1] != ' ':
         word_start = word_start - 1
 
     # Extract current word as prefix
-    prefix_len: int32 = shell_cmd_pos - word_start
+    prefix_len: int32 = shell_cursor_pos - word_start
     if prefix_len > 63:
         prefix_len = 63
     i: int32 = 0
@@ -294,7 +683,72 @@ def shell_tab_complete():
         i = i + 1
     shell_tab_prefix[prefix_len] = '\0'
 
-    # Determine directory to search and file prefix
+    # Determine if completing command (first word) or path
+    is_first_word: bool = (word_start == 0)
+
+    # For commands, try command completion first
+    if is_first_word:
+        # Count command matches
+        cmd_match_count: int32 = 0
+        cmd_match: Ptr[char] = Ptr[char](0)
+        ci: int32 = 0
+        while ci < shell_builtin_count:
+            cmd: Ptr[char] = shell_builtin_cmds[ci]
+            is_match: bool = True
+            cj: int32 = 0
+            while cj < prefix_len:
+                if cmd[cj] != shell_tab_prefix[cj]:
+                    is_match = False
+                    break
+                cj = cj + 1
+            if is_match:
+                cmd_match_count = cmd_match_count + 1
+                cmd_match = cmd
+            ci = ci + 1
+
+        if cmd_match_count == 1:
+            # Single command match - complete it
+            match_len: int32 = strlen(cmd_match)
+            add_len: int32 = match_len - prefix_len
+            # Move to end of current position if not there
+            while shell_cursor_pos < shell_cmd_pos:
+                shell_putc(shell_cmd[shell_cursor_pos])
+                shell_cursor_pos = shell_cursor_pos + 1
+            # Add remaining characters
+            cj: int32 = 0
+            while cj < add_len and shell_cmd_pos < 255:
+                shell_cmd[shell_cmd_pos] = cmd_match[prefix_len + cj]
+                shell_putc(cmd_match[prefix_len + cj])
+                shell_cmd_pos = shell_cmd_pos + 1
+                shell_cursor_pos = shell_cursor_pos + 1
+                cj = cj + 1
+            # Add space
+            if shell_cmd_pos < 255:
+                shell_cmd[shell_cmd_pos] = ' '
+                shell_putc(' ')
+                shell_cmd_pos = shell_cmd_pos + 1
+                shell_cursor_pos = shell_cursor_pos + 1
+            shell_cmd[shell_cmd_pos] = '\0'
+            return
+        elif cmd_match_count > 1:
+            # Multiple command matches - show them
+            shell_newline()
+            list_completions(&shell_tab_prefix[0], True)
+            shell_newline()
+            shell_prompt()
+            # Re-display current command
+            ck: int32 = 0
+            while ck < shell_cmd_pos:
+                shell_putc(shell_cmd[ck])
+                ck = ck + 1
+            # Move cursor back to position
+            ck = shell_cmd_pos
+            while ck > shell_cursor_pos:
+                shell_putc('\b')
+                ck = ck - 1
+            return
+
+    # Path completion (for non-commands or if no command match)
     dir_path: Ptr[char] = &shell_cwd[0]
     file_prefix: Ptr[char] = &shell_tab_prefix[0]
 
@@ -341,12 +795,18 @@ def shell_tab_complete():
         match_len: int32 = strlen(&shell_tab_match[0])
         add_len: int32 = match_len - prefix_file_len
 
+        # Move cursor to end first if not there
+        while shell_cursor_pos < shell_cmd_pos:
+            shell_putc(shell_cmd[shell_cursor_pos])
+            shell_cursor_pos = shell_cursor_pos + 1
+
         # Add remaining characters to command
         j: int32 = 0
         while j < add_len and shell_cmd_pos < 255:
             shell_cmd[shell_cmd_pos] = shell_tab_match[prefix_file_len + j]
             shell_putc(shell_tab_match[prefix_file_len + j])
             shell_cmd_pos = shell_cmd_pos + 1
+            shell_cursor_pos = shell_cursor_pos + 1
             j = j + 1
         shell_cmd[shell_cmd_pos] = '\0'
 
@@ -364,12 +824,14 @@ def shell_tab_complete():
                 shell_cmd[shell_cmd_pos] = '/'
                 shell_putc('/')
                 shell_cmd_pos = shell_cmd_pos + 1
+                shell_cursor_pos = shell_cursor_pos + 1
                 shell_cmd[shell_cmd_pos] = '\0'
         else:
             if shell_cmd_pos < 255:
                 shell_cmd[shell_cmd_pos] = ' '
                 shell_putc(' ')
                 shell_cmd_pos = shell_cmd_pos + 1
+                shell_cursor_pos = shell_cursor_pos + 1
                 shell_cmd[shell_cmd_pos] = '\0'
 
     elif match_count > 1:
@@ -401,6 +863,11 @@ def shell_tab_complete():
         while i < shell_cmd_pos:
             shell_putc(shell_cmd[i])
             i = i + 1
+        # Move cursor back to position
+        i = shell_cmd_pos
+        while i > shell_cursor_pos:
+            shell_putc('\b')
+            i = i - 1
 
 # ============================================================================
 # Shell command handlers - split into small functions to avoid branch distance
@@ -451,52 +918,352 @@ def shell_exec_job(cmd: Ptr[char]) -> bool:
 
     return False
 
+# ============================================================================
+# Alias and environment variable functions
+# ============================================================================
+
+def alias_find(name: Ptr[char]) -> int32:
+    """Find alias by name, returns index or -1."""
+    i: int32 = 0
+    while i < shell_alias_count:
+        base: int32 = i * ALIAS_NAME_LEN
+        if strcmp(name, &shell_alias_names[base]) == 0:
+            return i
+        i = i + 1
+    return -1
+
+def alias_get(name: Ptr[char]) -> Ptr[char]:
+    """Get alias value by name, returns NULL if not found."""
+    idx: int32 = alias_find(name)
+    if idx < 0:
+        return Ptr[char](0)
+    base: int32 = idx * ALIAS_VALUE_LEN
+    return &shell_alias_values[base]
+
+def alias_set(name: Ptr[char], value: Ptr[char]) -> bool:
+    """Set or update an alias. Returns True on success."""
+    global shell_alias_count
+    idx: int32 = alias_find(name)
+    if idx >= 0:
+        # Update existing
+        base: int32 = idx * ALIAS_VALUE_LEN
+        strcpy(&shell_alias_values[base], value)
+        return True
+    # Add new
+    if shell_alias_count >= ALIAS_MAX:
+        return False
+    name_base: int32 = shell_alias_count * ALIAS_NAME_LEN
+    value_base: int32 = shell_alias_count * ALIAS_VALUE_LEN
+    strcpy(&shell_alias_names[name_base], name)
+    strcpy(&shell_alias_values[value_base], value)
+    shell_alias_count = shell_alias_count + 1
+    return True
+
+def alias_remove(name: Ptr[char]) -> bool:
+    """Remove an alias. Returns True if found and removed."""
+    global shell_alias_count
+    idx: int32 = alias_find(name)
+    if idx < 0:
+        return False
+    # Shift remaining aliases down
+    i: int32 = idx
+    while i < shell_alias_count - 1:
+        src_name: int32 = (i + 1) * ALIAS_NAME_LEN
+        dst_name: int32 = i * ALIAS_NAME_LEN
+        src_val: int32 = (i + 1) * ALIAS_VALUE_LEN
+        dst_val: int32 = i * ALIAS_VALUE_LEN
+        strcpy(&shell_alias_names[dst_name], &shell_alias_names[src_name])
+        strcpy(&shell_alias_values[dst_val], &shell_alias_values[src_val])
+        i = i + 1
+    shell_alias_count = shell_alias_count - 1
+    return True
+
+def env_find(name: Ptr[char]) -> int32:
+    """Find environment variable by name, returns index or -1."""
+    i: int32 = 0
+    while i < shell_env_count:
+        base: int32 = i * ENV_NAME_LEN
+        if strcmp(name, &shell_env_names[base]) == 0:
+            return i
+        i = i + 1
+    return -1
+
+def env_get(name: Ptr[char]) -> Ptr[char]:
+    """Get environment variable value by name, returns NULL if not found."""
+    idx: int32 = env_find(name)
+    if idx < 0:
+        return Ptr[char](0)
+    base: int32 = idx * ENV_VALUE_LEN
+    return &shell_env_values[base]
+
+def env_set(name: Ptr[char], value: Ptr[char]) -> bool:
+    """Set or update an environment variable. Returns True on success."""
+    global shell_env_count
+    idx: int32 = env_find(name)
+    if idx >= 0:
+        # Update existing
+        base: int32 = idx * ENV_VALUE_LEN
+        strcpy(&shell_env_values[base], value)
+        return True
+    # Add new
+    if shell_env_count >= ENV_MAX:
+        return False
+    name_base: int32 = shell_env_count * ENV_NAME_LEN
+    value_base: int32 = shell_env_count * ENV_VALUE_LEN
+    strcpy(&shell_env_names[name_base], name)
+    strcpy(&shell_env_values[value_base], value)
+    shell_env_count = shell_env_count + 1
+    return True
+
+def shell_exec_builtin(cmd: Ptr[char]) -> bool:
+    """Handle built-in shell commands (alias, export, history, etc.)."""
+    global shell_alias_count, shell_env_count
+
+    # history command - show command history
+    if strcmp(cmd, "history") == 0:
+        shell_newline()
+        i: int32 = shell_history_count - 1
+        num: int32 = 1
+        while i >= 0:
+            hist_cmd: Ptr[char] = history_get(i)
+            if hist_cmd != Ptr[char](0):
+                shell_puts("  ")
+                shell_puts(shell_int_to_str(num))
+                shell_puts("  ")
+                shell_puts(hist_cmd)
+                shell_newline()
+            i = i - 1
+            num = num + 1
+        return True
+
+    # alias - show all aliases or set one
+    if shell_starts_with("alias") or strcmp(cmd, "alias") == 0:
+        arg: Ptr[char] = shell_get_arg()
+        shell_newline()
+        if arg[0] == '\0':
+            # Show all aliases
+            if shell_alias_count == 0:
+                shell_puts("No aliases defined")
+            else:
+                i: int32 = 0
+                while i < shell_alias_count:
+                    name_base: int32 = i * ALIAS_NAME_LEN
+                    value_base: int32 = i * ALIAS_VALUE_LEN
+                    shell_puts("alias ")
+                    shell_puts(&shell_alias_names[name_base])
+                    shell_puts("='")
+                    shell_puts(&shell_alias_values[value_base])
+                    shell_puts("'")
+                    shell_newline()
+                    i = i + 1
+        else:
+            # Parse name=value
+            eq_pos: int32 = -1
+            i: int32 = 0
+            while arg[i] != '\0':
+                if arg[i] == '=':
+                    eq_pos = i
+                    break
+                i = i + 1
+            if eq_pos > 0:
+                # Extract name
+                alias_name_buf: Array[64, char]
+                j: int32 = 0
+                while j < eq_pos and j < 63:
+                    alias_name_buf[j] = arg[j]
+                    j = j + 1
+                alias_name_buf[j] = '\0'
+                # Extract value (skip quotes if present)
+                value_ptr: Ptr[char] = &arg[eq_pos + 1]
+                if value_ptr[0] == '\'' or value_ptr[0] == '"':
+                    value_ptr = &value_ptr[1]
+                    vlen: int32 = strlen(value_ptr)
+                    if vlen > 0 and (value_ptr[vlen - 1] == '\'' or value_ptr[vlen - 1] == '"'):
+                        value_ptr[vlen - 1] = '\0'
+                if alias_set(&alias_name_buf[0], value_ptr):
+                    shell_puts("alias ")
+                    shell_puts(&alias_name_buf[0])
+                    shell_puts(" set")
+                else:
+                    shell_puts("error: too many aliases")
+            else:
+                # Just name - show specific alias
+                val: Ptr[char] = alias_get(arg)
+                if val != Ptr[char](0):
+                    shell_puts("alias ")
+                    shell_puts(arg)
+                    shell_puts("='")
+                    shell_puts(val)
+                    shell_puts("'")
+                else:
+                    shell_puts("alias: ")
+                    shell_puts(arg)
+                    shell_puts(" not found")
+        shell_newline()
+        return True
+
+    # unalias - remove alias
+    if shell_starts_with("unalias"):
+        arg: Ptr[char] = shell_get_arg()
+        shell_newline()
+        if arg[0] == '\0':
+            shell_puts("Usage: unalias name")
+        else:
+            if alias_remove(arg):
+                shell_puts("alias ")
+                shell_puts(arg)
+                shell_puts(" removed")
+            else:
+                shell_puts("unalias: ")
+                shell_puts(arg)
+                shell_puts(" not found")
+        shell_newline()
+        return True
+
+    # export - set environment variable
+    if shell_starts_with("export"):
+        arg: Ptr[char] = shell_get_arg()
+        shell_newline()
+        if arg[0] == '\0':
+            # Show all env vars
+            if shell_env_count == 0:
+                shell_puts("No exported variables")
+            else:
+                i: int32 = 0
+                while i < shell_env_count:
+                    name_base: int32 = i * ENV_NAME_LEN
+                    value_base: int32 = i * ENV_VALUE_LEN
+                    shell_puts("export ")
+                    shell_puts(&shell_env_names[name_base])
+                    shell_puts("=")
+                    shell_puts(&shell_env_values[value_base])
+                    shell_newline()
+                    i = i + 1
+        else:
+            # Parse VAR=value
+            eq_pos: int32 = -1
+            i: int32 = 0
+            while arg[i] != '\0':
+                if arg[i] == '=':
+                    eq_pos = i
+                    break
+                i = i + 1
+            if eq_pos > 0:
+                # Extract name
+                env_name_buf: Array[64, char]
+                j: int32 = 0
+                while j < eq_pos and j < 63:
+                    env_name_buf[j] = arg[j]
+                    j = j + 1
+                env_name_buf[j] = '\0'
+                # Extract value
+                value_ptr: Ptr[char] = &arg[eq_pos + 1]
+                if env_set(&env_name_buf[0], value_ptr):
+                    shell_puts(&env_name_buf[0])
+                    shell_puts("=")
+                    shell_puts(value_ptr)
+                else:
+                    shell_puts("error: too many variables")
+            else:
+                shell_puts("Usage: export VAR=value")
+        shell_newline()
+        return True
+
+    return False
+
 def shell_exec_basic(cmd: Ptr[char]) -> bool:
     """Handle basic shell commands. Returns True if handled."""
 
-    if strcmp(cmd, "help") == 0:
+    # Enhanced help with optional command argument
+    if shell_starts_with("help") or strcmp(cmd, "help") == 0:
+        arg: Ptr[char] = shell_get_arg()
         shell_newline()
+        if arg[0] != '\0':
+            # Show help for specific command
+            if strcmp(arg, "history") == 0:
+                shell_puts("history - Show command history")
+                shell_newline()
+                shell_puts("  Displays the last ")
+                shell_puts(shell_int_to_str(HISTORY_SIZE))
+                shell_puts(" commands")
+                shell_newline()
+                shell_puts("  Use Up/Down arrows to navigate history")
+            elif strcmp(arg, "alias") == 0:
+                shell_puts("alias [name[=value]]")
+                shell_newline()
+                shell_puts("  With no args: show all aliases")
+                shell_newline()
+                shell_puts("  With name: show specific alias")
+                shell_newline()
+                shell_puts("  With name=value: create/update alias")
+            elif strcmp(arg, "unalias") == 0:
+                shell_puts("unalias name - Remove an alias")
+            elif strcmp(arg, "export") == 0:
+                shell_puts("export [VAR=value]")
+                shell_newline()
+                shell_puts("  With no args: show exported variables")
+                shell_newline()
+                shell_puts("  With VAR=value: set variable")
+            elif strcmp(arg, "echo") == 0:
+                shell_puts("echo text - Print text to output")
+                shell_newline()
+                shell_puts("  echo value > /path - Write to file/device")
+            elif strcmp(arg, "clear") == 0:
+                shell_puts("clear - Clear the terminal screen")
+            elif strcmp(arg, "cd") == 0:
+                shell_puts("cd [dir] - Change directory")
+                shell_newline()
+                shell_puts("  cd     - Go to root")
+                shell_newline()
+                shell_puts("  cd ..  - Go up one level")
+            elif strcmp(arg, "ls") == 0:
+                shell_puts("ls [-l] [path] - List directory")
+                shell_newline()
+                shell_puts("  -l  Long format with sizes")
+            else:
+                shell_puts("No specific help for: ")
+                shell_puts(arg)
+            shell_newline()
+            return True
+
+        # General help
         shell_puts("Pynux Text Shell Commands:")
         shell_newline()
-        shell_puts("  help       - Show this help")
+        shell_puts("Built-in:")
+        shell_newline()
+        shell_puts("  help [cmd] - Show help (detail for cmd)")
+        shell_newline()
+        shell_puts("  history    - Show command history")
+        shell_newline()
+        shell_puts("  alias      - Manage command aliases")
+        shell_newline()
+        shell_puts("  unalias    - Remove alias")
+        shell_newline()
+        shell_puts("  export     - Set environment variable")
+        shell_newline()
+        shell_puts("  echo       - Print text")
         shell_newline()
         shell_puts("  clear      - Clear screen")
         shell_newline()
-        shell_puts("  pwd        - Print working directory")
+        shell_puts("File System:")
         shell_newline()
-        shell_puts("  ls         - List directory")
+        shell_puts("  pwd ls cd cat mkdir touch rm cp mv")
         shell_newline()
-        shell_puts("  cd <dir>   - Change directory")
+        shell_puts("  head tail wc stat grep find sed")
         shell_newline()
-        shell_puts("  cat <file> - Show file contents")
+        shell_puts("System:")
         shell_newline()
-        shell_puts("  mkdir <n>  - Create directory")
-        shell_newline()
-        shell_puts("  touch <n>  - Create empty file")
-        shell_newline()
-        shell_puts("  rm <name>  - Remove file/dir")
-        shell_newline()
-        shell_puts("  echo <txt> - Print text")
-        shell_newline()
-        shell_puts("  uname [-a] - System name")
-        shell_newline()
-        shell_puts("  free       - Memory usage")
-        shell_newline()
-        shell_puts("  jobs/fg/bg - Job control")
-        shell_newline()
-        shell_puts("  version    - Show version")
+        shell_puts("  uname free jobs fg bg kill ps")
         shell_newline()
         shell_puts("Hardware:")
         shell_newline()
-        shell_puts("  sensors    - Read all sensors")
+        shell_puts("  sensors servo stepper motor drivers")
         shell_newline()
-        shell_puts("  servo N A  - Set servo N to angle A")
+        shell_puts("Apps: calc clock sensormon motorctl")
         shell_newline()
-        shell_puts("  stepper N S- Move stepper N by S steps")
+        shell_puts("Line editing: Left/Right, Home/End, Del/Bksp")
         shell_newline()
-        shell_puts("  motor N S  - Set motor N to speed S")
-        shell_newline()
-        shell_puts("Apps: calc, clock, sensormon, motorctl")
+        shell_puts("Tab completion for commands and files")
         shell_newline()
         return True
 
@@ -590,6 +1357,11 @@ def shell_exec_basic(cmd: Ptr[char]) -> bool:
         shell_newline()
         shell_puts("Image Viewer (text mode not supported, requires VTNext)")
         shell_newline()
+        return True
+
+    if strcmp(cmd, "test") == 0:
+        shell_newline()
+        run_tests_main()
         return True
 
     return False
@@ -2108,13 +2880,72 @@ def shell_exec_hw(cmd: Ptr[char]) -> bool:
 # Main shell_exec dispatcher - calls smaller functions to avoid branch issues
 # ============================================================================
 
+def shell_expand_alias(cmd: Ptr[char]) -> bool:
+    """Check if command is an alias and expand it. Returns True if expanded."""
+    global shell_cmd_pos, shell_cursor_pos
+    # Find the command name (first word)
+    cmd_len: int32 = 0
+    while cmd[cmd_len] != '\0' and cmd[cmd_len] != ' ':
+        cmd_len = cmd_len + 1
+
+    # Check each alias
+    i: int32 = 0
+    while i < shell_alias_count:
+        name_base: int32 = i * ALIAS_NAME_LEN
+        alias_name: Ptr[char] = &shell_alias_names[name_base]
+        alias_len: int32 = strlen(alias_name)
+
+        if alias_len == cmd_len:
+            # Compare command to alias name
+            is_match: bool = True
+            j: int32 = 0
+            while j < alias_len:
+                if cmd[j] != alias_name[j]:
+                    is_match = False
+                    break
+                j = j + 1
+
+            if is_match:
+                # Found alias - expand it
+                value_base: int32 = i * ALIAS_VALUE_LEN
+                alias_val: Ptr[char] = &shell_alias_values[value_base]
+                val_len: int32 = strlen(alias_val)
+
+                # Build expanded command: alias_value + rest of original command
+                expanded: Array[256, char]
+                k: int32 = 0
+                # Copy alias value
+                while k < val_len and k < 255:
+                    expanded[k] = alias_val[k]
+                    k = k + 1
+                # Copy rest of original command (after the alias name)
+                rest_start: int32 = cmd_len
+                while cmd[rest_start] != '\0' and k < 255:
+                    expanded[k] = cmd[rest_start]
+                    k = k + 1
+                    rest_start = rest_start + 1
+                expanded[k] = '\0'
+
+                # Copy back to cmd buffer
+                k = 0
+                while expanded[k] != '\0' and k < 255:
+                    shell_cmd[k] = expanded[k]
+                    k = k + 1
+                shell_cmd[k] = '\0'
+                shell_cmd_pos = k
+                shell_cursor_pos = k
+                return True
+        i = i + 1
+    return False
+
 def shell_exec():
-    global shell_cmd_pos
+    global shell_cmd_pos, shell_cursor_pos
 
     shell_cmd[shell_cmd_pos] = '\0'
 
     if shell_cmd_pos == 0:
         shell_prompt()
+        shell_cursor_pos = 0
         return
 
     cmd: Ptr[char] = &shell_cmd[0]
@@ -2123,8 +2954,13 @@ def shell_exec():
     history_add(cmd)
     history_reset_pos()
 
+    # Expand aliases before execution
+    shell_expand_alias(cmd)
+
     # Try each handler in turn - each returns True if it handled the command
-    if shell_exec_job(cmd):
+    if shell_exec_builtin(cmd):
+        pass
+    elif shell_exec_job(cmd):
         pass
     elif shell_exec_basic(cmd):
         pass
@@ -2156,29 +2992,58 @@ def shell_exec():
     shell_newline()
     shell_prompt()
     shell_cmd_pos = 0
+    shell_cursor_pos = 0
 
 def shell_input(c: char):
-    global shell_cmd_pos
+    global shell_cmd_pos, shell_cursor_pos
     global job1_state
     global shell_history_pos
     global shell_fg_mode
 
-    # Handle escape sequences for arrow keys
+    # Handle escape sequences for arrow keys and special keys
     if shell_esc[0] == 1:
         # Got ESC, expecting [
         if c == '[':
             shell_esc[0] = 2
             return
+        elif c == 'O':
+            # ESC O prefix for some Home/End sequences
+            shell_esc[0] = 3
+            return
         else:
             shell_esc[0] = 0
             # Fall through to process char normally
 
+    if shell_esc[0] == 3:
+        # ESC O sequence (alternate Home/End)
+        shell_esc[0] = 0
+        if c == 'H':
+            # Home
+            line_move_home()
+            return
+        elif c == 'F':
+            # End
+            line_move_end()
+            return
+        return
+
     if shell_esc[0] == 2:
-        # Got ESC [, expecting A/B/C/D
+        # Got ESC [, expecting A/B/C/D or special sequences
+        # Check for numeric prefix (for sequences like ESC[3~ for Delete)
+        code2: int32 = cast[int32](c) & 0xFF
+        if code2 >= 48 and code2 <= 57:
+            # Digit - store it and wait for ~
+            shell_esc[1] = code2 - 48
+            shell_esc[0] = 4
+            return
+
         shell_esc[0] = 0
         if c == 'A':
-            # Up arrow - previous command
+            # Up arrow - previous command in history
             if shell_history_count > 0:
+                # Save current line when first navigating
+                if shell_history_pos == -1:
+                    history_save_current()
                 if shell_history_pos < shell_history_count - 1:
                     shell_history_pos = shell_history_pos + 1
                 hist_cmd: Ptr[char] = history_get(shell_history_pos)
@@ -2186,40 +3051,128 @@ def shell_input(c: char):
                     shell_set_cmd(hist_cmd)
             return
         elif c == 'B':
-            # Down arrow - next command
+            # Down arrow - next command in history
             if shell_history_pos > 0:
                 shell_history_pos = shell_history_pos - 1
                 hist_cmd2: Ptr[char] = history_get(shell_history_pos)
                 if hist_cmd2 != Ptr[char](0):
                     shell_set_cmd(hist_cmd2)
             elif shell_history_pos == 0:
+                # Restore original line
                 shell_history_pos = -1
+                history_restore_saved()
                 shell_clear_line()
+                # Redisplay saved line
+                i: int32 = 0
+                while i < shell_cmd_pos:
+                    shell_putc(shell_cmd[i])
+                    i = i + 1
+                shell_cursor_pos = shell_cmd_pos
             return
-        # C=right, D=left - ignore for now
+        elif c == 'C':
+            # Right arrow - move cursor right
+            line_move_right()
+            return
+        elif c == 'D':
+            # Left arrow - move cursor left
+            line_move_left()
+            return
+        elif c == 'H':
+            # Home key (ESC[H)
+            line_move_home()
+            return
+        elif c == 'F':
+            # End key (ESC[F)
+            line_move_end()
+            return
         return
+
+    if shell_esc[0] == 4:
+        # Got ESC [ digit, expecting ~ or more digits
+        if c == '~':
+            # Complete sequence
+            shell_esc[0] = 0
+            num: int32 = shell_esc[1]
+            if num == 1:
+                # ESC[1~ = Home
+                line_move_home()
+            elif num == 3:
+                # ESC[3~ = Delete
+                if shell_cursor_pos < shell_cmd_pos:
+                    line_delete_char(shell_cursor_pos)
+            elif num == 4:
+                # ESC[4~ = End
+                line_move_end()
+            return
+        else:
+            # Unexpected - reset
+            shell_esc[0] = 0
+            return
 
     # Check for ESC start (use numeric comparison to avoid signedness issues)
     code: int32 = cast[int32](c) & 0xFF
     if code == 27:
         shell_esc[0] = 1
+        shell_esc[1] = 0
         return
 
     if c == '\r' or c == '\n':
+        # Move cursor to end before executing
+        line_move_end()
         shell_newline()
         shell_exec()
         return
 
+    # Backspace - delete character before cursor
     if c == '\x7f' or c == '\b':
-        if shell_cmd_pos > 0:
-            shell_cmd_pos = shell_cmd_pos - 1
-            # VT100 backspace: move left, space, move left
-            shell_puts("\b \b")
+        if shell_cursor_pos > 0:
+            shell_cursor_pos = shell_cursor_pos - 1
+            line_delete_char(shell_cursor_pos)
         return
 
-    # TAB - filename completion
+    # TAB - filename/command completion
     if c == '\t':
         shell_tab_complete()
+        return
+
+    # Ctrl+A - move to beginning of line
+    if c == '\x01':
+        line_move_home()
+        return
+
+    # Ctrl+E - move to end of line
+    if c == '\x05':
+        line_move_end()
+        return
+
+    # Ctrl+K - delete from cursor to end of line
+    if c == '\x0b':
+        if shell_cursor_pos < shell_cmd_pos:
+            # Clear characters from cursor to end
+            shell_puts("\x1b[K")
+            shell_cmd_pos = shell_cursor_pos
+            shell_cmd[shell_cmd_pos] = '\0'
+        return
+
+    # Ctrl+U - delete entire line
+    if c == '\x15':
+        shell_clear_line()
+        return
+
+    # Ctrl+W - delete word before cursor
+    if c == '\x17':
+        # Find start of previous word
+        word_start: int32 = shell_cursor_pos
+        # Skip spaces
+        while word_start > 0 and shell_cmd[word_start - 1] == ' ':
+            word_start = word_start - 1
+        # Skip word
+        while word_start > 0 and shell_cmd[word_start - 1] != ' ':
+            word_start = word_start - 1
+        # Delete from word_start to cursor_pos
+        while shell_cursor_pos > word_start:
+            shell_cursor_pos = shell_cursor_pos - 1
+            line_delete_char(shell_cursor_pos)
         return
 
     # Ctrl+C - cancel current command line or stop foreground job
@@ -2233,6 +3186,7 @@ def shell_input(c: char):
             shell_puts("[1]+  Stopped                 main.py")
             shell_newline()
         shell_cmd_pos = 0
+        shell_cursor_pos = 0
         history_reset_pos()
         shell_prompt()
         return
@@ -2246,30 +3200,70 @@ def shell_input(c: char):
             shell_puts("[1]+  Stopped                 main.py")
             shell_newline()
         shell_cmd_pos = 0
+        shell_cursor_pos = 0
         history_reset_pos()
         shell_prompt()
         return
 
-    # Regular char - reset history position
-    history_reset_pos()
-    if shell_cmd_pos < 255:
-        shell_cmd[shell_cmd_pos] = c
-        shell_cmd_pos = shell_cmd_pos + 1
-        shell_putc(c)
+    # Ctrl+L - clear screen and redisplay prompt
+    if c == '\x0c':
+        shell_puts("\x1b[2J\x1b[H")
+        shell_prompt()
+        # Redisplay current line
+        i: int32 = 0
+        while i < shell_cmd_pos:
+            shell_putc(shell_cmd[i])
+            i = i + 1
+        # Move cursor back to position
+        i = shell_cmd_pos
+        while i > shell_cursor_pos:
+            shell_putc('\b')
+            i = i - 1
+        return
+
+    # Regular printable char - insert at cursor position
+    code3: int32 = cast[int32](c) & 0xFF
+    if code3 >= 32 and code3 < 127:
+        history_reset_pos()
+        if shell_cursor_pos == shell_cmd_pos:
+            # At end of line - simple append
+            if shell_cmd_pos < 255:
+                shell_cmd[shell_cmd_pos] = c
+                shell_cmd_pos = shell_cmd_pos + 1
+                shell_cursor_pos = shell_cursor_pos + 1
+                shell_cmd[shell_cmd_pos] = '\0'
+                shell_putc(c)
+        else:
+            # In middle of line - insert
+            line_insert_char(shell_cursor_pos, c)
 
 def shell_init():
+    global shell_cmd_pos, shell_cursor_pos, shell_history_pos
+    global shell_alias_count, shell_env_count
     shell_cwd[0] = '/'
     shell_cwd[1] = '\0'
     shell_cmd_pos = 0
+    shell_cursor_pos = 0
+    shell_history_pos = -1
+    shell_alias_count = 0
+    shell_env_count = 0
+    # Initialize command list for tab completion
+    shell_init_commands()
+    # Set default environment variables
+    env_set("HOME", "/home")
+    env_set("USER", "root")
+    env_set("SHELL", "/bin/psh")
+    env_set("PATH", "/bin")
+    env_set("TERM", "vt100")
 
 def shell_main():
     global job1_state
     shell_init()
 
     shell_newline()
-    shell_puts("Pynux Text Shell")
+    shell_puts("Pynux Text Shell v0.2")
     shell_newline()
-    shell_puts("Type 'help' for commands")
+    shell_puts("Type 'help' for commands, Tab for completion")
     shell_newline()
     shell_newline()
 

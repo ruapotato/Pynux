@@ -126,6 +126,10 @@ def ramfs_lookup(path: Ptr[char]) -> int32:
 
 # Create file or directory
 def ramfs_create(path: Ptr[char], is_dir: bool) -> int32:
+    # Reject empty paths
+    if strlen(path) == 0:
+        return -1
+
     state: int32 = critical_enter()
 
     # Check if already exists

@@ -460,7 +460,7 @@ def test_alloc_stress():
 # Main
 # ============================================================================
 
-def main() -> int32:
+def test_memory_main() -> int32:
     print_str("\n=== Pynux Memory Management Tests ===\n")
 
     heap_init()
