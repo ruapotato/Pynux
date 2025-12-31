@@ -10,6 +10,10 @@ from kernel.ramfs import ramfs_read, ramfs_write, ramfs_exists, ramfs_isdir, ram
 from lib.memory import heap_remaining, heap_total, heap_used
 from kernel.timer import timer_delay_ms, timer_tick
 from programs.main import user_main, user_tick
+from programs.calc import calc_main
+from programs.clock import clock_main
+from programs.hexview import hexview_main
+from programs.imgview import imgview_main
 
 # Command buffer
 shell_cmd: Array[256, char]
@@ -470,6 +474,8 @@ def shell_exec_basic(cmd: Ptr[char]) -> bool:
         shell_newline()
         shell_puts("  version    - Show version")
         shell_newline()
+        shell_puts("Apps: calc, clock, hexview, imgview")
+        shell_newline()
         return True
 
     if strcmp(cmd, "pwd") == 0:
@@ -499,6 +505,30 @@ def shell_exec_basic(cmd: Ptr[char]) -> bool:
 
     if strcmp(cmd, "reset") == 0:
         shell_puts("\x1b[2J\x1b[H")
+        return True
+
+    if strcmp(cmd, "calc") == 0:
+        shell_newline()
+        shell_puts("Calculator (text mode not supported, requires VTNext)")
+        shell_newline()
+        return True
+
+    if strcmp(cmd, "clock") == 0:
+        shell_newline()
+        shell_puts("Clock (text mode not supported, requires VTNext)")
+        shell_newline()
+        return True
+
+    if shell_starts_with("hexview"):
+        shell_newline()
+        shell_puts("Hex Viewer (text mode not supported, requires VTNext)")
+        shell_newline()
+        return True
+
+    if shell_starts_with("imgview"):
+        shell_newline()
+        shell_puts("Image Viewer (text mode not supported, requires VTNext)")
+        shell_newline()
         return True
 
     return False

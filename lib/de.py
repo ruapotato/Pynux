@@ -15,6 +15,10 @@ from lib.memory import heap_remaining, heap_total, heap_used
 from kernel.timer import timer_delay_ms, timer_tick
 from programs.hello import hello_main
 from programs.main import user_main, user_tick
+from programs.calc import calc_main
+from programs.clock import clock_main
+from programs.hexview import hexview_main
+from programs.imgview import imgview_main
 
 # ============================================================================
 # Screen and color constants - GNOME 2/MATE style
@@ -598,6 +602,7 @@ def cmd_help(idx: int32):
     term_puts_idx(idx, "echo pwd write uname free whoami hostname date uptime\n")
     term_puts_idx(idx, "id env ps df stat head tail wc sleep hello jobs\n")
     term_puts_idx(idx, "true false arch tty groups printenv\n")
+    term_puts_idx(idx, "Apps: calc clock hexview imgview\n")
 
 def cmd_ls(idx: int32):
     cwd: Ptr[char] = term_get_cwd(idx)
@@ -1064,6 +1069,18 @@ def term_exec_cmd(idx: int32):
     elif strcmp(cmd, "hello") == 0:
         term_putc_idx(idx, '\n')
         hello_main()
+    elif strcmp(cmd, "calc") == 0:
+        term_putc_idx(idx, '\n')
+        calc_main()
+    elif strcmp(cmd, "clock") == 0:
+        term_putc_idx(idx, '\n')
+        clock_main()
+    elif cmd_starts_with(idx, "hexview"):
+        term_putc_idx(idx, '\n')
+        hexview_main()
+    elif cmd_starts_with(idx, "imgview"):
+        term_putc_idx(idx, '\n')
+        imgview_main()
     elif cmd_starts_with(idx, "head"):
         cmd_head(idx)
     elif cmd_starts_with(idx, "tail"):
