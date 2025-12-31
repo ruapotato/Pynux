@@ -1,14 +1,58 @@
 # Pynux Peripherals Library
 #
-# Hardware abstraction layer for ARM Cortex-M3 peripherals.
+# Hardware abstraction layer for ARM Cortex-M peripherals.
 # Provides GPIO, SPI, I2C, PWM, and ADC interfaces.
 #
-# Note: For QEMU MPS2-AN385, these are abstraction layers with
-# placeholder base addresses that would work on real hardware.
+# Target Support:
+#   - QEMU MPS2-AN385 (simulation with generic register layout)
+#   - RP2040 (Raspberry Pi Pico) - use lib/hal/rp2040.py
+#   - STM32F4 - use lib/hal/stm32f4.py
+#
+# This file provides the QEMU simulation implementation. For real hardware,
+# include the target-specific HAL module which overrides these addresses
+# and provides proper register access patterns.
 
 # ============================================================================
-# Base Addresses
+# Target Configuration
 # ============================================================================
+# These can be overridden by target-specific HAL modules.
+# The linker scripts (bsp/*.ld) provide actual hardware addresses as symbols.
+
+# Target identifier (0=QEMU, 1=RP2040, 2=STM32F4)
+TARGET_QEMU: uint32 = 0
+TARGET_RP2040: uint32 = 1
+TARGET_STM32F4: uint32 = 2
+
+# Current target - set by BSP initialization
+_current_target: uint32 = 0  # Default to QEMU
+
+# ============================================================================
+# Base Addresses (QEMU MPS2-AN385 defaults)
+# ============================================================================
+# Note: These are simulation addresses. Real hardware addresses:
+#
+# RP2040:
+#   GPIO (SIO):  0xD0000000  (set/clear via SIO)
+#   IO_BANK0:    0x40014000  (function select)
+#   SPI0:        0x4003C000
+#   SPI1:        0x40040000
+#   I2C0:        0x40044000
+#   I2C1:        0x40048000
+#   PWM:         0x40050000
+#   ADC:         0x4004C000
+#
+# STM32F4:
+#   GPIOA:       0x40020000
+#   GPIOB:       0x40020400
+#   GPIOC:       0x40020800
+#   GPIOD:       0x40020C00
+#   SPI1:        0x40013000
+#   SPI2:        0x40003800
+#   I2C1:        0x40005400
+#   I2C2:        0x40005800
+#   TIM1 (PWM):  0x40010000
+#   TIM2 (PWM):  0x40000000
+#   ADC1:        0x40012000
 
 GPIO_BASE: uint32 = 0x40010000
 SPI_BASE: uint32 = 0x40020000
@@ -692,8 +736,22 @@ PWM_CTRL_CENTER_ALIGN: uint32 = 0x04
 # PWM channel stride
 PWM_CHANNEL_STRIDE: uint32 = 0x20
 
-# System clock assumed to be 25MHz for MPS2-AN385
+# System clock frequency (target-dependent)
+# QEMU MPS2-AN385: 25MHz
+# RP2040:          125MHz
+# STM32F4:         168MHz (or 84MHz for APB1 timers)
 PWM_SYSCLK: uint32 = 25000000
+
+def set_system_clock(freq_hz: uint32):
+    """Set system clock frequency for PWM calculations.
+
+    Should be called by BSP initialization with correct frequency.
+
+    Args:
+        freq_hz: System clock in Hz (e.g., 125000000 for RP2040)
+    """
+    global PWM_SYSCLK
+    PWM_SYSCLK = freq_hz
 
 # Internal state for simulation
 _pwm_enabled: Array[8, bool]
