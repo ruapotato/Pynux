@@ -52,12 +52,16 @@ sources = [
     ("kernel/kernel.py", "kernel"),
     ("kernel/timer.py", "timer"),
     ("kernel/ramfs.py", "ramfs"),
+    ("kernel/process.py", "process"),
     ("lib/memory.py", "memory"),
     ("lib/string.py", "string"),
     ("lib/io.py", "iolib"),
+    ("lib/peripherals.py", "peripherals"),
     ("lib/vtnext.py", "vtnext"),
     ("lib/de.py", "de"),
     ("lib/shell.py", "shell"),
+    ("lib/widgets.py", "widgets"),
+    ("lib/devtools.py", "devtools"),
 ]
 
 # Add user programs from programs/ folder
@@ -102,7 +106,7 @@ $AS $ASFLAGS -o "$BUILD_DIR/io.o" "$RUNTIME_DIR/io.s"
 echo "  runtime/io.s"
 
 # Compiled Pynux files
-for name in kernel timer ramfs memory string iolib vtnext de shell; do
+for name in kernel timer ramfs process memory string iolib peripherals vtnext de shell widgets devtools; do
     $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
     echo "  build/${name}.s"
 done
@@ -122,9 +126,9 @@ echo "[3/4] Linking..."
 
 # Build list of object files
 OBJS="$BUILD_DIR/startup.o $BUILD_DIR/io.o"
-OBJS="$OBJS $BUILD_DIR/kernel.o $BUILD_DIR/timer.o $BUILD_DIR/ramfs.o"
-OBJS="$OBJS $BUILD_DIR/memory.o $BUILD_DIR/string.o $BUILD_DIR/iolib.o"
-OBJS="$OBJS $BUILD_DIR/vtnext.o $BUILD_DIR/de.o $BUILD_DIR/shell.o"
+OBJS="$OBJS $BUILD_DIR/kernel.o $BUILD_DIR/timer.o $BUILD_DIR/ramfs.o $BUILD_DIR/process.o"
+OBJS="$OBJS $BUILD_DIR/memory.o $BUILD_DIR/string.o $BUILD_DIR/iolib.o $BUILD_DIR/peripherals.o"
+OBJS="$OBJS $BUILD_DIR/vtnext.o $BUILD_DIR/de.o $BUILD_DIR/shell.o $BUILD_DIR/widgets.o $BUILD_DIR/devtools.o"
 
 # Add user program objects
 if [ -f "$BUILD_DIR/user_programs.txt" ]; then

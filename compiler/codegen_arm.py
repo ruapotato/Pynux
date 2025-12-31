@@ -1221,6 +1221,135 @@ class ARMCodeGen:
             self.gen_builtin_sorted(args)
             return
 
+        # Math builtins - dispatch to lib/math.py functions
+        elif func_name == "sqrt":
+            # Integer square root
+            self.gen_expr(args[0])
+            self.emit("    bl isqrt")
+            return
+
+        elif func_name == "abs":
+            # Absolute value
+            self.gen_expr(args[0])
+            self.emit("    bl abs_int")
+            return
+
+        elif func_name == "pow":
+            # Integer power: pow(base, exp)
+            self.gen_expr(args[1])
+            self.emit("    push {r0}")
+            self.gen_expr(args[0])
+            self.emit("    pop {r1}")
+            self.emit("    bl pow_int")
+            return
+
+        elif func_name == "min":
+            # min of two integers
+            self.gen_expr(args[1])
+            self.emit("    push {r0}")
+            self.gen_expr(args[0])
+            self.emit("    pop {r1}")
+            self.emit("    bl min_int")
+            return
+
+        elif func_name == "max":
+            # max of two integers
+            self.gen_expr(args[1])
+            self.emit("    push {r0}")
+            self.gen_expr(args[0])
+            self.emit("    pop {r1}")
+            self.emit("    bl max_int")
+            return
+
+        elif func_name == "clamp":
+            # clamp(x, lo, hi)
+            self.gen_expr(args[2])
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])
+            self.emit("    push {r0}")
+            self.gen_expr(args[0])
+            self.emit("    pop {r1}")
+            self.emit("    pop {r2}")
+            self.emit("    bl clamp")
+            return
+
+        elif func_name == "sign":
+            # sign(x) -> -1, 0, or 1
+            self.gen_expr(args[0])
+            self.emit("    bl sign")
+            return
+
+        elif func_name == "gcd":
+            # Greatest common divisor
+            self.gen_expr(args[1])
+            self.emit("    push {r0}")
+            self.gen_expr(args[0])
+            self.emit("    pop {r1}")
+            self.emit("    bl gcd")
+            return
+
+        elif func_name == "lcm":
+            # Least common multiple
+            self.gen_expr(args[1])
+            self.emit("    push {r0}")
+            self.gen_expr(args[0])
+            self.emit("    pop {r1}")
+            self.emit("    bl lcm")
+            return
+
+        elif func_name == "sin":
+            # Sine in degrees (returns 16.16 fixed-point)
+            self.gen_expr(args[0])
+            self.emit("    bl sin_deg")
+            return
+
+        elif func_name == "cos":
+            # Cosine in degrees (returns 16.16 fixed-point)
+            self.gen_expr(args[0])
+            self.emit("    bl cos_deg")
+            return
+
+        elif func_name == "tan":
+            # Tangent in degrees (returns 16.16 fixed-point)
+            self.gen_expr(args[0])
+            self.emit("    bl tan_deg")
+            return
+
+        elif func_name == "rand":
+            # Random integer (0 to INT_MAX)
+            self.emit("    bl rand")
+            return
+
+        elif func_name == "randint":
+            # Random integer in range [lo, hi]
+            self.gen_expr(args[1])
+            self.emit("    push {r0}")
+            self.gen_expr(args[0])
+            self.emit("    pop {r1}")
+            self.emit("    bl rand_range")
+            return
+
+        elif func_name == "srand":
+            # Set random seed
+            self.gen_expr(args[0])
+            self.emit("    bl srand")
+            return
+
+        elif func_name == "distance":
+            # Distance between two points
+            self.gen_expr(args[3])
+            self.emit("    push {r0}")
+            self.gen_expr(args[2])
+            self.emit("    push {r0}")
+            self.gen_expr(args[1])
+            self.emit("    push {r0}")
+            self.gen_expr(args[0])
+            self.emit("    pop {r1}")
+            self.emit("    pop {r2}")
+            self.emit("    pop {r3}")
+            self.emit("    bl distance")
+            return
+
         # Check if this is an indirect call through a local variable (function pointer)
         is_indirect = func_name in self.ctx.locals
 
@@ -2760,6 +2889,16 @@ class ARMCodeGen:
 
     def gen_for_unpack(self, vars: list[str], iterable: Expr, body: list[Stmt]) -> None:
         """Generate for loop with tuple unpacking."""
+        # Handle enumerate() specially: for i, x in enumerate(list)
+        if isinstance(iterable, CallExpr):
+            if isinstance(iterable.func, Identifier):
+                if iterable.func.name == "enumerate":
+                    self.gen_for_enumerate(vars, iterable.args, body)
+                    return
+                elif iterable.func.name == "zip":
+                    self.gen_for_zip(vars, iterable.args, body)
+                    return
+
         # Allocate loop variables
         loop_vars = [self.ctx.alloc_local(v) for v in vars]
 
@@ -2829,6 +2968,156 @@ class ARMCodeGen:
 
         self.emit(f"{end_label}:")
 
+        self.ctx.pop_loop()
+
+    def gen_for_enumerate(self, vars: list[str], args: list[Expr], body: list[Stmt]) -> None:
+        """Generate for loop with enumerate: for i, x in enumerate(list)."""
+        if len(vars) != 2:
+            raise CodeGenError("enumerate() requires exactly 2 loop variables")
+
+        idx_name, val_name = vars
+        idx_var = self.ctx.alloc_local(idx_name)
+        val_var = self.ctx.alloc_local(val_name)
+
+        # Get the iterable and optional start value
+        iterable_expr = args[0]
+        start_val = args[1] if len(args) > 1 else IntLiteral(0)
+
+        # Allocate internal variables
+        iter_var = self.ctx.alloc_local(f"_enum_iter")
+        len_var = self.ctx.alloc_local(f"_enum_len")
+        internal_idx = self.ctx.alloc_local(f"_enum_idx")
+
+        start_label = self.ctx.new_label("enumfor")
+        end_label = self.ctx.new_label("endenumfor")
+        continue_label = self.ctx.new_label("enumforcont")
+
+        self.ctx.push_loop(start_label, end_label, continue_label)
+
+        # Evaluate iterable (list pointer)
+        self.gen_expr(iterable_expr)
+        self.emit_store_local("r0", iter_var.offset)
+
+        # Get list length (at offset 4 in list struct: [data, len, cap, elem_size])
+        self.emit("    ldr r0, [r0, #4]")
+        self.emit_store_local("r0", len_var.offset)
+
+        # Initialize internal index to 0
+        self.emit("    movs r0, #0")
+        self.emit_store_local("r0", internal_idx.offset)
+
+        # Initialize user index to start value
+        self.gen_expr(start_val)
+        self.emit_store_local("r0", idx_var.offset)
+
+        # Loop start
+        self.emit(f"{start_label}:")
+        self.emit_load_local("r0", internal_idx.offset)
+        self.emit_load_local("r1", len_var.offset)
+        self.emit("    cmp r0, r1")
+        self.emit(f"    bge {end_label}")
+
+        # Load current element: data[idx * elem_size]
+        # Assuming int32 list (elem_size = 4)
+        self.emit_load_local("r0", iter_var.offset)
+        self.emit("    ldr r2, [r0]")  # data pointer
+        self.emit_load_local("r1", internal_idx.offset)
+        self.emit("    lsl r1, r1, #2")  # * 4
+        self.emit("    ldr r0, [r2, r1]")
+        self.emit_store_local("r0", val_var.offset)
+
+        # Body
+        for s in body:
+            self.gen_stmt(s)
+
+        # Continue label
+        self.emit(f"{continue_label}:")
+
+        # Increment both indices
+        self.emit_load_local("r0", internal_idx.offset)
+        self.emit("    add r0, r0, #1")
+        self.emit_store_local("r0", internal_idx.offset)
+
+        self.emit_load_local("r0", idx_var.offset)
+        self.emit("    add r0, r0, #1")
+        self.emit_store_local("r0", idx_var.offset)
+
+        self.emit(f"    b {start_label}")
+
+        self.emit(f"{end_label}:")
+        self.ctx.pop_loop()
+
+    def gen_for_zip(self, vars: list[str], args: list[Expr], body: list[Stmt]) -> None:
+        """Generate for loop with zip: for a, b in zip(list1, list2)."""
+        if len(vars) != len(args):
+            raise CodeGenError(f"zip() with {len(args)} lists requires {len(args)} loop variables")
+
+        # Allocate loop variables
+        loop_vars = [self.ctx.alloc_local(v) for v in vars]
+
+        # Allocate internal variables for each list
+        iter_vars = [self.ctx.alloc_local(f"_zip_iter{i}") for i in range(len(args))]
+        len_vars = [self.ctx.alloc_local(f"_zip_len{i}") for i in range(len(args))]
+        idx_var = self.ctx.alloc_local("_zip_idx")
+        min_len_var = self.ctx.alloc_local("_zip_minlen")
+
+        start_label = self.ctx.new_label("zipfor")
+        end_label = self.ctx.new_label("endzipfor")
+        continue_label = self.ctx.new_label("zipforcont")
+
+        self.ctx.push_loop(start_label, end_label, continue_label)
+
+        # Evaluate each iterable and get its length
+        for i, arg in enumerate(args):
+            self.gen_expr(arg)
+            self.emit_store_local("r0", iter_vars[i].offset)
+            # Get list length
+            self.emit("    ldr r0, [r0, #4]")
+            self.emit_store_local("r0", len_vars[i].offset)
+
+        # Find minimum length
+        self.emit_load_local("r0", len_vars[0].offset)
+        for i in range(1, len(args)):
+            self.emit_load_local("r1", len_vars[i].offset)
+            self.emit("    cmp r0, r1")
+            self.emit("    it gt")
+            self.emit("    movgt r0, r1")
+        self.emit_store_local("r0", min_len_var.offset)
+
+        # Initialize index to 0
+        self.emit("    movs r0, #0")
+        self.emit_store_local("r0", idx_var.offset)
+
+        # Loop start
+        self.emit(f"{start_label}:")
+        self.emit_load_local("r0", idx_var.offset)
+        self.emit_load_local("r1", min_len_var.offset)
+        self.emit("    cmp r0, r1")
+        self.emit(f"    bge {end_label}")
+
+        # Load element from each list
+        for i in range(len(args)):
+            self.emit_load_local("r0", iter_vars[i].offset)
+            self.emit("    ldr r2, [r0]")  # data pointer
+            self.emit_load_local("r1", idx_var.offset)
+            self.emit("    lsl r1, r1, #2")  # * 4
+            self.emit("    ldr r0, [r2, r1]")
+            self.emit_store_local("r0", loop_vars[i].offset)
+
+        # Body
+        for s in body:
+            self.gen_stmt(s)
+
+        # Continue label
+        self.emit(f"{continue_label}:")
+
+        # Increment index
+        self.emit_load_local("r0", idx_var.offset)
+        self.emit("    add r0, r0, #1")
+        self.emit_store_local("r0", idx_var.offset)
+        self.emit(f"    b {start_label}")
+
+        self.emit(f"{end_label}:")
         self.ctx.pop_loop()
 
     def gen_assert(self, cond: Expr, msg: Optional[Expr]) -> None:
