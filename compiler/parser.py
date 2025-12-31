@@ -96,6 +96,16 @@ class Parser:
             self.expect(TokenType.RBRACKET)
             return PointerType(inner, self.make_span(tok))
 
+        # Function pointer type: Fn[ReturnType, ArgType1, ArgType2, ...]
+        if self.match(TokenType.FN):
+            self.expect(TokenType.LBRACKET)
+            return_type = self.parse_type()
+            param_types = []
+            while self.match(TokenType.COMMA):
+                param_types.append(self.parse_type())
+            self.expect(TokenType.RBRACKET)
+            return FunctionPointerType(return_type, param_types, self.make_span(tok))
+
         # List type: List[T]
         if self.match(TokenType.LIST):
             self.expect(TokenType.LBRACKET)

@@ -118,6 +118,7 @@ class ARMCodeGen:
         self.string_counter = 0
         self.ctx: Optional[FunctionContext] = None
         self.extern_funcs: set[str] = set()
+        self.defined_funcs: set[str] = set()  # Track user-defined function names
         self.global_arrays: set[str] = set()  # Track global array names
         self.array_element_sizes: dict[str, int] = {}  # Array name -> element size
         self.structs: dict[str, StructInfo] = {}  # Struct/class definitions
@@ -162,6 +163,10 @@ class ARMCodeGen:
         # Handle pointer types
         if isinstance(t, PointerType):
             return 4  # Pointers are always 4 bytes on ARM
+
+        # Handle function pointer types
+        if isinstance(t, FunctionPointerType):
+            return 4  # Function pointers are 4 bytes on ARM
 
         # Handle tuple types
         if isinstance(t, TupleType):
@@ -321,6 +326,9 @@ class ARMCodeGen:
                         self.emit_load_local("r0", var.offset)
                 elif name in self.global_arrays:
                     # Global array - just load address, don't dereference
+                    self.emit(f"    ldr r0, ={name}")
+                elif name in self.defined_funcs or name in self.extern_funcs:
+                    # Function reference - load address (for function pointers)
                     self.emit(f"    ldr r0, ={name}")
                 else:
                     # Global scalar variable
@@ -803,11 +811,13 @@ class ARMCodeGen:
                     return
             raise CodeGenError(f"Unsupported member call: {func}")
 
-        # Get function name
+        # Get function name or handle indirect call
         if isinstance(func, Identifier):
             func_name = func.name
         else:
-            raise CodeGenError("Indirect function calls not yet supported")
+            # Indirect function call through function pointer
+            self.gen_indirect_call(func, args)
+            return
 
         # Check if this is a class instantiation (constructor call)
         if func_name in self.structs:
@@ -1206,6 +1216,51 @@ class ARMCodeGen:
             self.emit(f"    bl {func_name}")
 
         # Clean up stack args after call
+        if num_stack_args > 0:
+            stack_cleanup = num_stack_args * 4
+            if stack_cleanup <= 508:
+                self.emit(f"    add sp, sp, #{stack_cleanup}")
+            else:
+                self.emit(f"    add.w sp, sp, #{stack_cleanup}")
+
+    def gen_indirect_call(self, func_expr: Expr, args: list[Expr]) -> None:
+        """Generate an indirect function call through a function pointer."""
+        # AAPCS calling convention: first 4 args in r0-r3, rest on stack
+        num_args = len(args)
+        num_stack_args = max(0, num_args - 4)
+
+        # Push arguments beyond the first 4 onto stack (in reverse order)
+        if num_stack_args > 0:
+            for arg in reversed(args[4:]):
+                self.gen_expr(arg)
+                self.emit("    push {r0}")
+
+        # Evaluate arguments r0-r3 and save them
+        first_four = args[:4]
+        for arg in reversed(first_four):
+            self.gen_expr(arg)
+            self.emit("    push {r0}")
+
+        # Now evaluate the function pointer expression
+        # We need to save r4 since we'll use it for the function pointer
+        self.emit("    push {r4}")
+        self.gen_expr(func_expr)
+        self.emit("    mov r4, r0")  # r4 = function pointer
+
+        # Pop arguments into r0-r3
+        for i in range(len(first_four)):
+            self.emit(f"    pop {{r{i}}}")
+
+        # Call through function pointer using blx
+        self.emit("    blx r4")
+
+        # Restore r4
+        self.emit("    push {r0}")  # Save return value
+        self.emit("    ldr r4, [sp, #4]")  # Get old r4 from stack
+        self.emit("    add sp, sp, #4")  # Remove old r4
+        self.emit("    pop {r0}")  # Restore return value
+
+        # Clean up stack arguments
         if num_stack_args > 0:
             stack_cleanup = num_stack_args * 4
             if stack_cleanup <= 508:
@@ -2553,6 +2608,7 @@ class ARMCodeGen:
     def gen_function(self, func: FunctionDef) -> None:
         """Generate code for a function."""
         self.ctx = FunctionContext(func.name)
+        self.defined_funcs.add(func.name)
 
         # Check for @interrupt decorator
         is_interrupt = "interrupt" in func.decorators

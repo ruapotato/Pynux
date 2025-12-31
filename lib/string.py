@@ -47,6 +47,33 @@ def strcat(dst: Ptr[char], src: Ptr[char]) -> Ptr[char]:
     dst[dst_len + i] = '\0'
     return dst
 
+# Concatenate with size limit (safe version)
+# n is the total buffer size of dst (including existing content and null terminator)
+def strncat(dst: Ptr[char], src: Ptr[char], n: int32) -> Ptr[char]:
+    dst_len: int32 = strlen(dst)
+    i: int32 = 0
+    # Leave room for null terminator
+    while src[i] != '\0' and (dst_len + i) < (n - 1):
+        dst[dst_len + i] = src[i]
+        i = i + 1
+    dst[dst_len + i] = '\0'
+    return dst
+
+# Safe string copy with buffer size
+# Returns number of characters copied (not including null), or -1 if truncated
+def strcpy_s(dst: Ptr[char], dst_size: int32, src: Ptr[char]) -> int32:
+    if dst_size <= 0:
+        return -1
+    i: int32 = 0
+    while i < (dst_size - 1) and src[i] != '\0':
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = '\0'
+    # Check if we truncated
+    if src[i] != '\0':
+        return -1
+    return i
+
 # Compare strings
 def strcmp(a: Ptr[char], b: Ptr[char]) -> int32:
     i: int32 = 0

@@ -9,7 +9,7 @@ from lib.string import strcmp, strcpy, strlen, strrchr
 # Maximum files and directories
 MAX_FILES: int32 = 64
 MAX_PATH: int32 = 128
-MAX_FILE_SIZE: int32 = 512
+MAX_FILE_SIZE: int32 = 8192  # 8KB per file
 MAX_NAME: int32 = 32
 
 # File types
@@ -206,10 +206,13 @@ def ramfs_delete(path: Ptr[char]) -> int32:
                 return -1  # Not empty
             i = i + 1
 
-    # Free data if any
+    # Free data if any and clear pointer to prevent double-free
     if file_data[fd] != Ptr[uint8](0):
         free(file_data[fd])
+        file_data[fd] = Ptr[uint8](0)
 
+    # Clear file metadata
+    file_sizes[fd] = 0
     file_types[fd] = FTYPE_FREE
 
     critical_exit(state)
@@ -254,14 +257,14 @@ def ramfs_write(path: Ptr[char], data: Ptr[char]) -> int32:
     if length > MAX_FILE_SIZE:
         length = MAX_FILE_SIZE
 
-    # Allocate/reallocate buffer
+    # Allocate buffer if needed (reuse existing buffer if present)
     if file_data[fd] == Ptr[uint8](0):
         file_data[fd] = alloc(MAX_FILE_SIZE)
-    if file_data[fd] == Ptr[uint8](0):
-        critical_exit(state)
-        return -1
+        if file_data[fd] == Ptr[uint8](0):
+            critical_exit(state)
+            return -1
 
-    # Copy data
+    # Copy data (reuses existing buffer, no leak)
     memcpy(file_data[fd], cast[Ptr[uint8]](data), length)
     file_sizes[fd] = length
 

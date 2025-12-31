@@ -59,6 +59,7 @@ class TokenType(Enum):
 
     # Types
     PTR = auto()
+    FN = auto()  # Function pointer type: Fn[ReturnType, ArgType1, ...]
     LIST = auto()
     DICT = auto()
     TUPLE = auto()
@@ -220,6 +221,7 @@ KEYWORDS: dict[str, TokenType] = {
 
     # Type keywords
     "Ptr": TokenType.PTR,
+    "Fn": TokenType.FN,
     "List": TokenType.LIST,
     "Dict": TokenType.DICT,
     "Tuple": TokenType.TUPLE,

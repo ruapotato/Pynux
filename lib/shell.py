@@ -247,6 +247,9 @@ def shell_clear_line():
 def shell_set_cmd(s: Ptr[char]):
     """Set command buffer and display it."""
     global shell_cmd_pos
+    # NULL check to prevent crash
+    if cast[uint32](s) == 0:
+        return
     shell_clear_line()
     i: int32 = 0
     while i < 255 and s[i] != '\0':

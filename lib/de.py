@@ -226,7 +226,8 @@ term_cwd1: Array[128, char]
 # Editor state
 # ============================================================================
 
-edit_buffer: Array[4096, char]
+EDIT_BUF_SIZE: int32 = 8192  # 8KB editor buffer
+edit_buffer: Array[8192, char]
 edit_size: int32 = 0
 edit_cursor: int32 = 0
 edit_scroll: int32 = 0
@@ -241,8 +242,8 @@ edit_modified: bool = False
 fm_cwd: Array[128, char]
 fm_selection: int32 = 0
 fm_count: int32 = 0
-fm_names: Array[512, char]
-fm_types: Array[16, int32]
+fm_names: Array[1024, char]  # 32 files * 32 chars each
+fm_types: Array[32, int32]   # 32 file type entries
 fm_dirty: bool = False
 
 # ============================================================================
@@ -1109,7 +1110,7 @@ def edit_init():
     edit_modified = False
     edit_filename[0] = '\0'
     i: int32 = 0
-    while i < 4096:
+    while i < EDIT_BUF_SIZE:
         edit_buffer[i] = '\0'
         i = i + 1
 
@@ -1117,7 +1118,7 @@ def edit_load(path: Ptr[char]):
     global edit_size, edit_cursor, edit_scroll, edit_modified
     edit_init()
     if ramfs_exists(path) and not ramfs_isdir(path):
-        sz: int32 = ramfs_read(path, cast[Ptr[uint8]](&edit_buffer[0]), 4095)
+        sz: int32 = ramfs_read(path, cast[Ptr[uint8]](&edit_buffer[0]), EDIT_BUF_SIZE - 1)
         if sz > 0:
             edit_size = sz
         strcpy(&edit_filename[0], path)
@@ -1135,7 +1136,7 @@ def edit_save():
 
 def edit_insert(c: char):
     global edit_size, edit_cursor, edit_modified, edit_dirty
-    if edit_size >= 4095:
+    if edit_size >= EDIT_BUF_SIZE - 1:
         return
     i: int32 = edit_size
     while i > edit_cursor:
@@ -1184,7 +1185,7 @@ def fm_refresh():
     i: int32 = 0
     name: Array[64, char]
     result: int32 = ramfs_readdir(&fm_cwd[0], i, &name[0])
-    while result >= 0 and fm_count < 16:
+    while result >= 0 and fm_count < 32:
         j: int32 = 0
         base: int32 = fm_count * 32
         while j < 31 and name[j] != '\0':
@@ -1198,6 +1199,9 @@ def fm_refresh():
     fm_dirty = True
 
 def fm_get_name(idx: int32) -> Ptr[char]:
+    # Bounds check: max 32 entries
+    if idx < 0 or idx >= 32:
+        return Ptr[char](0)
     return &fm_names[idx * 32]
 
 def fm_enter():
@@ -1748,11 +1752,11 @@ def parse_mouse_escape(c: char) -> int32:
         esc_state = 4
         return 1
     if esc_state == 4:
-        esc_buf[1] = (cv - 33) * 10
+        esc_buf[1] = (cv - 33) * CHAR_W  # X uses character width (10)
         esc_state = 5
         return 1
     if esc_state == 5:
-        esc_buf[2] = (cv - 33) * 10
+        esc_buf[2] = (cv - 33) * CHAR_H  # Y uses character height (16)
         esc_state = 0
         mx: int32 = esc_buf[1]
         my: int32 = esc_buf[2]

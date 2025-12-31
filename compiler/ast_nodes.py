@@ -78,6 +78,19 @@ class PointerType:
 
 
 @dataclass
+class FunctionPointerType:
+    """Function pointer type: Fn[ReturnType, ArgType1, ArgType2, ...]"""
+    return_type: Type
+    param_types: list[Type] = field(default_factory=list)
+    span: Optional[Span] = None
+
+    @property
+    def name(self) -> str:
+        params = ", ".join(t.name for t in self.param_types)
+        return f"Fn[{self.return_type.name}, {params}]" if params else f"Fn[{self.return_type.name}]"
+
+
+@dataclass
 class ArrayType:
     """Fixed-size array: Array[N, T]"""
     size: int
