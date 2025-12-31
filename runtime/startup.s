@@ -311,10 +311,13 @@ _pendsv:
     .size _pendsv, . - _pendsv
 
     .thumb_func
-    .weak _systick
+    .global _systick
     .type _systick, %function
 _systick:
-    b .
+    @ SysTick interrupt handler - increment kernel timer
+    push {lr}
+    bl timer_tick
+    pop {pc}
     .size _systick, . - _systick
 
 @ End of startup.s

@@ -160,6 +160,9 @@ data_done:
     @ Initialize UART for debug output
     bl rp2040_uart_init
 
+    @ Configure SysTick for 1ms ticks at 125MHz
+    bl rp2040_systick_init
+
     @ Enable interrupts
     cpsie i
 
@@ -405,6 +408,27 @@ uart_rx_ready:
     ldr r0, [r1, #0x18]         @ UARTFR
     lsrs r0, r0, #5             @ RXFE bit
     eors r0, r0, #1             @ Invert: 1 if data available
+    bx lr
+
+@ ============================================================================
+@ SysTick Configuration - 1ms ticks at 125MHz
+@ ============================================================================
+
+    .align 2
+    .thumb_func
+    .global rp2040_systick_init
+rp2040_systick_init:
+    @ SysTick reload = 125000 - 1 for 1ms at 125MHz
+    ldr r0, =0xE000E010         @ SysTick base
+    ldr r1, =(125000 - 1)
+    str r1, [r0, #4]            @ LOAD
+
+    movs r1, #0
+    str r1, [r0, #8]            @ VAL (clear current)
+
+    movs r1, #7                 @ CLKSOURCE=1, TICKINT=1, ENABLE=1
+    str r1, [r0, #0]            @ CTRL
+
     bx lr
 
 @ ============================================================================
