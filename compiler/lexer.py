@@ -300,6 +300,7 @@ class Lexer:
         self.column = 1
         self.tokens: list[Token] = []
         self.indent_stack: list[int] = [0]  # Track indentation levels
+        self.paren_depth: int = 0  # Track nesting for implicit line continuation
 
     def current_char(self) -> str:
         """Return current character or empty string at EOF."""
@@ -602,6 +603,10 @@ class Lexer:
 
     def handle_indentation(self) -> None:
         """Handle indentation at start of line, emitting INDENT/DEDENT tokens."""
+        # Skip indentation handling inside parens/brackets/braces (implicit continuation)
+        if self.paren_depth > 0:
+            return
+
         # Count spaces at start of line
         indent = 0
         while self.current_char() == ' ':
@@ -655,7 +660,9 @@ class Lexer:
             # Newlines
             if ch == '\n':
                 self.advance()
-                self.tokens.append(Token(TokenType.NEWLINE, None, start_line, start_col))
+                # Skip NEWLINE tokens inside parens/brackets/braces (implicit continuation)
+                if self.paren_depth == 0:
+                    self.tokens.append(Token(TokenType.NEWLINE, None, start_line, start_col))
                 at_line_start = True
                 continue
 
@@ -663,7 +670,9 @@ class Lexer:
                 self.advance()
                 if self.current_char() == '\n':
                     self.advance()
-                self.tokens.append(Token(TokenType.NEWLINE, None, start_line, start_col))
+                # Skip NEWLINE tokens inside parens/brackets/braces (implicit continuation)
+                if self.paren_depth == 0:
+                    self.tokens.append(Token(TokenType.NEWLINE, None, start_line, start_col))
                 at_line_start = True
                 continue
 
@@ -876,31 +885,40 @@ class Lexer:
 
                 case '(':
                     self.advance()
+                    self.paren_depth += 1
                     self.tokens.append(Token(TokenType.LPAREN, None,
                                            start_line, start_col, self.line, self.column))
 
                 case ')':
                     self.advance()
+                    if self.paren_depth > 0:
+                        self.paren_depth -= 1
                     self.tokens.append(Token(TokenType.RPAREN, None,
                                            start_line, start_col, self.line, self.column))
 
                 case '[':
                     self.advance()
+                    self.paren_depth += 1
                     self.tokens.append(Token(TokenType.LBRACKET, None,
                                            start_line, start_col, self.line, self.column))
 
                 case ']':
                     self.advance()
+                    if self.paren_depth > 0:
+                        self.paren_depth -= 1
                     self.tokens.append(Token(TokenType.RBRACKET, None,
                                            start_line, start_col, self.line, self.column))
 
                 case '{':
                     self.advance()
+                    self.paren_depth += 1
                     self.tokens.append(Token(TokenType.LBRACE, None,
                                            start_line, start_col, self.line, self.column))
 
                 case '}':
                     self.advance()
+                    if self.paren_depth > 0:
+                        self.paren_depth -= 1
                     self.tokens.append(Token(TokenType.RBRACE, None,
                                            start_line, start_col, self.line, self.column))
 

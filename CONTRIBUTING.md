@@ -1,0 +1,384 @@
+# Contributing to Pynux
+
+Thank you for your interest in contributing to Pynux! This guide explains how to set up your development environment, understand the codebase, and submit contributions.
+
+## Project Overview
+
+Pynux is a Python-like systems programming language that compiles to ARM Cortex-M3 assembly. It targets embedded systems and provides direct hardware control with Python-style syntax.
+
+## Project Structure
+
+```
+pynux/
+├── compiler/           # Compiler implementation (Python)
+│   ├── lexer.py       # Tokenizer
+│   ├── parser.py      # Recursive descent parser
+│   ├── ast_nodes.py   # AST node definitions
+│   ├── type_checker.py# Type analysis
+│   └── codegen_arm.py # ARM assembly generator
+├── kernel/            # OS kernel (Pynux source)
+│   ├── process.py     # Process management, signals, IPC
+│   ├── devfs.py       # Device filesystem
+│   ├── ramfs.py       # RAM filesystem
+│   └── timer.py       # Timer subsystem
+├── lib/               # Standard library (Pynux source)
+│   ├── io.py          # Basic I/O
+│   ├── memory.py      # Memory management
+│   ├── string.py      # String operations
+│   └── ...            # Other libraries
+├── apps/              # Applications (Pynux source)
+├── tests/             # Test suite
+├── docs/              # Documentation
+└── build.sh           # Build script
+```
+
+## Development Setup
+
+### Prerequisites
+
+- Python 3.8 or later
+- ARM toolchain (optional, for hardware testing)
+- Git
+
+### Getting Started
+
+```bash
+git clone https://github.com/your-org/pynux.git
+cd pynux
+
+# Run the build to verify setup
+./build.sh
+
+# Run compiler unit tests
+python3 tests/test_compiler.py
+```
+
+## Language Syntax
+
+Pynux uses Python-like syntax with explicit type annotations:
+
+### Types
+
+| Type | Size | Description |
+|------|------|-------------|
+| `int32` | 4 bytes | Signed 32-bit integer |
+| `uint32` | 4 bytes | Unsigned 32-bit integer |
+| `int8` | 1 byte | Signed 8-bit integer |
+| `uint8` | 1 byte | Unsigned 8-bit integer |
+| `bool` | 1 byte | Boolean |
+| `float32` | 4 bytes | 32-bit float |
+| `Ptr[T]` | 4 bytes | Pointer to type T |
+| `Array[N, T]` | N * sizeof(T) | Fixed-size array |
+| `Fn[R, A...]` | 4 bytes | Function pointer |
+
+### Functions
+
+```python
+def function_name(param: type, ...) -> return_type:
+    # function body
+    return value
+```
+
+### Variables
+
+```python
+# Global variable
+counter: int32 = 0
+
+def example():
+    # Local variable
+    local: int32 = 42
+```
+
+### Classes
+
+```python
+class ClassName:
+    field1: type
+    field2: type
+
+    def method(self, param: type) -> return_type:
+        # method body
+```
+
+### Control Flow
+
+```python
+# Conditionals
+if condition:
+    # ...
+elif other_condition:
+    # ...
+else:
+    # ...
+
+# While loops
+while condition:
+    # ...
+
+# For loops (range only)
+i: int32 = 0
+while i < 10:
+    # ...
+    i = i + 1
+```
+
+## Coding Style
+
+### General Guidelines
+
+1. **Use 4 spaces for indentation** (no tabs)
+2. **Maximum line length: 100 characters**
+3. **One blank line between functions**
+4. **Two blank lines between classes**
+
+### Naming Conventions
+
+| Element | Convention | Example |
+|---------|------------|---------|
+| Functions | snake_case | `read_sensor` |
+| Variables | snake_case | `motor_speed` |
+| Classes | PascalCase | `SensorData` |
+| Constants | UPPER_SNAKE | `MAX_BUFFER` |
+| Type parameters | Single uppercase | `T`, `K`, `V` |
+
+### Documentation
+
+Use docstrings for public functions:
+
+```python
+def calculate_checksum(data: Ptr[uint8], length: int32) -> uint8:
+    """Calculate XOR checksum of data buffer.
+
+    Args:
+        data: Pointer to data buffer
+        length: Number of bytes to process
+
+    Returns:
+        XOR checksum value
+    """
+    # implementation
+```
+
+## Adding New Libraries
+
+### 1. Create the Library File
+
+Create a new file in `lib/` with the appropriate name:
+
+```python
+# lib/mylib.py
+
+# Imports from other libraries
+from lib.io import print_str
+from lib.memory import memset
+
+# Constants
+MY_CONSTANT: int32 = 42
+
+# Global state (if needed)
+state_buffer: Array[64, uint8]
+
+# Public functions
+def my_function(param: int32) -> int32:
+    """Public function documentation."""
+    # implementation
+    return result
+```
+
+### 2. Document the API
+
+Add documentation to `docs/API.md`:
+
+```markdown
+## lib/mylib
+
+### my_function
+
+```python
+def my_function(param: int32) -> int32
+```
+
+Description of what the function does.
+```
+
+### 3. Write Tests
+
+Create a test file in `tests/`:
+
+```python
+# tests/test_mylib.py
+
+from lib.mylib import my_function
+
+def test_my_function():
+    result: int32 = my_function(10)
+    if result == expected:
+        test_pass("my_function")
+    else:
+        test_fail("my_function")
+```
+
+## Adding Kernel Features
+
+### Process/IPC Features
+
+Edit `kernel/process.py`:
+
+1. Add constants at the top of the file
+2. Add state arrays if needed
+3. Implement the syscall function
+4. Add cleanup in `proc_cleanup()` if needed
+
+### Device Drivers
+
+Edit `kernel/devfs.py`:
+
+1. Add device type constant (DEV_XXX)
+2. Add read/write handler functions
+3. Register in `devfs_read()`/`devfs_write()` dispatch
+4. Initialize default devices in `devfs_init()`
+
+## Compiler Development
+
+### Lexer (lexer.py)
+
+To add a new token:
+
+1. Add to `TokenType` enum
+2. Add keyword to `KEYWORDS` dict (if applicable)
+3. Add operator pattern (if applicable)
+
+### Parser (parser.py)
+
+To add new syntax:
+
+1. Add AST node class in `ast_nodes.py`
+2. Add parsing method in `Parser` class
+3. Call from appropriate context (statement, expression, etc.)
+
+### Code Generator (codegen_arm.py)
+
+To add code generation for new features:
+
+1. Add visitor method: `gen_XXX(self, node)`
+2. Handle register allocation
+3. Emit ARM assembly
+
+## Testing
+
+### Running Tests
+
+```bash
+# Compiler unit tests
+python3 tests/test_compiler.py
+
+# Build and check for errors
+./build.sh
+```
+
+### Writing Tests
+
+For Pynux code tests (run on target):
+
+```python
+def test_feature():
+    """Test description."""
+    # Setup
+    value: int32 = setup_value()
+
+    # Execute
+    result: int32 = function_under_test(value)
+
+    # Verify
+    if result == expected:
+        test_pass("feature_name")
+    else:
+        test_fail("feature_name")
+```
+
+For compiler tests (Python):
+
+```python
+def test_lexer_feature():
+    """Test lexer feature."""
+    tokens = tokenize("source code")
+    assert condition
+    print("PASS: test_lexer_feature")
+```
+
+## Submitting Contributions
+
+### Before Submitting
+
+1. **Run the build**: `./build.sh` must complete without errors
+2. **Run tests**: All existing tests must pass
+3. **Add tests**: New features should have tests
+4. **Update docs**: Add API documentation for new features
+
+### Pull Request Guidelines
+
+1. **One feature per PR**: Keep changes focused
+2. **Descriptive title**: Summarize the change
+3. **Description**: Explain what and why
+4. **Reference issues**: Link related issues
+
+### Commit Messages
+
+Follow conventional commit format:
+
+```
+type: short description
+
+Longer description if needed.
+
+- Bullet points for details
+- Another detail
+```
+
+Types:
+- `feat`: New feature
+- `fix`: Bug fix
+- `docs`: Documentation only
+- `refactor`: Code restructuring
+- `test`: Adding tests
+- `build`: Build system changes
+
+## Architecture Notes
+
+### Memory Model
+
+- Stack grows downward from 0x20008000
+- Heap starts at end of BSS section
+- No garbage collection (manual memory management)
+
+### Calling Convention
+
+- Arguments in R0-R3, then stack
+- Return value in R0
+- R4-R11 callee-saved
+- R12 (IP) scratch register
+- LR (R14) return address
+- SP (R13) stack pointer
+
+### Hardware Abstraction
+
+All hardware access goes through devfs:
+
+```python
+# Read from device
+value: Ptr[char] = devfs_read(DEV_ADC, 0)
+
+# Write to device
+devfs_write(DEV_GPIO, 0, "1")
+```
+
+## Getting Help
+
+- Check existing documentation in `docs/`
+- Review similar code in the codebase
+- Open an issue for questions or bugs
+
+## License
+
+By contributing to Pynux, you agree that your contributions will be licensed under the same license as the project.

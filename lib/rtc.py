@@ -660,7 +660,7 @@ def rtc_tick():
 
                         # Call alarm callback
                         if _rtc_alarm_callback != Ptr[void](0):
-                            callback_fn: Ptr[def()] = cast[Ptr[def()]](_rtc_alarm_callback)
+                            callback_fn: Fn[void] = cast[Fn[void]](_rtc_alarm_callback)
                             callback_fn()
 
                         return

@@ -27,6 +27,38 @@ class Parser:
         self.tokens = tokens
         self.filename = filename
         self.pos = 0
+        self.errors: list[ParseError] = []  # Collected errors for recovery
+
+    def has_errors(self) -> bool:
+        """Check if any parse errors occurred."""
+        return len(self.errors) > 0
+
+    def synchronize(self) -> None:
+        """Synchronize parser state after an error.
+
+        Skips tokens until we find a likely statement boundary:
+        - Start of new declaration (def, class, import, extern)
+        - Start of new line with valid statement start
+        """
+        self.advance()  # Skip the problematic token
+
+        while not self.check(TokenType.EOF):
+            # If we just passed a newline and see a declaration keyword, we're synced
+            if self.check(TokenType.DEF, TokenType.CLASS, TokenType.FROM,
+                         TokenType.IMPORT, TokenType.EXTERN, TokenType.UNION):
+                return
+
+            # Skip to next newline
+            if self.check(TokenType.NEWLINE):
+                self.advance()
+                self.skip_newlines()
+                # Check if next token starts a valid declaration
+                if self.check(TokenType.DEF, TokenType.CLASS, TokenType.FROM,
+                             TokenType.IMPORT, TokenType.EXTERN, TokenType.UNION,
+                             TokenType.AT, TokenType.IDENT):
+                    return
+            else:
+                self.advance()
 
     def current(self) -> Token:
         """Get current token."""
@@ -1170,67 +1202,81 @@ class Parser:
         return ExternDecl(name, params, return_type, self.make_span(tok))
 
     def parse_program(self) -> Program:
-        """Parse entire program."""
+        """Parse entire program with error recovery."""
         imports = []
         declarations = []
 
         self.skip_newlines()
 
         while not self.check(TokenType.EOF):
-            # Decorators
-            decorators = []
-            while self.match(TokenType.AT):
-                dec_name = self.expect(TokenType.IDENT).value
-                decorators.append(dec_name)
-                self.expect(TokenType.NEWLINE)
-
-            # Import
-            if self.check(TokenType.FROM, TokenType.IMPORT):
-                imports.append(self.parse_import())
-                self.skip_newlines()
-                continue
-
-            # Extern
-            if self.check(TokenType.EXTERN):
-                declarations.append(self.parse_extern())
-                self.skip_newlines()
-                continue
-
-            # Function
-            if self.check(TokenType.DEF):
-                declarations.append(self.parse_function(decorators))
-                self.skip_newlines()
-                continue
-
-            # Class
-            if self.check(TokenType.CLASS):
-                declarations.append(self.parse_class(decorators))
-                self.skip_newlines()
-                continue
-
-            # Union
-            if self.check(TokenType.UNION):
-                declarations.append(self.parse_union(decorators))
-                self.skip_newlines()
-                continue
-
-            # Global variable
-            if self.check(TokenType.IDENT):
-                name = self.advance().value
-                if self.match(TokenType.COLON):
-                    var_type = self.parse_type()
-                    value = None
-                    if self.match(TokenType.ASSIGN):
-                        value = self.parse_expression()
+            try:
+                # Decorators
+                decorators = []
+                while self.match(TokenType.AT):
+                    dec_name = self.expect(TokenType.IDENT).value
+                    decorators.append(dec_name)
                     self.expect(TokenType.NEWLINE)
-                    declarations.append(VarDecl(name, var_type, value))
+
+                # Import
+                if self.check(TokenType.FROM, TokenType.IMPORT):
+                    imports.append(self.parse_import())
                     self.skip_newlines()
                     continue
-                # Back up
-                self.pos -= 1
 
-            raise ParseError(f"Unexpected token at top level: {self.current().type.name}",
-                           self.current())
+                # Extern
+                if self.check(TokenType.EXTERN):
+                    declarations.append(self.parse_extern())
+                    self.skip_newlines()
+                    continue
+
+                # Function
+                if self.check(TokenType.DEF):
+                    declarations.append(self.parse_function(decorators))
+                    self.skip_newlines()
+                    continue
+
+                # Class
+                if self.check(TokenType.CLASS):
+                    declarations.append(self.parse_class(decorators))
+                    self.skip_newlines()
+                    continue
+
+                # Union
+                if self.check(TokenType.UNION):
+                    declarations.append(self.parse_union(decorators))
+                    self.skip_newlines()
+                    continue
+
+                # Global variable
+                if self.check(TokenType.IDENT):
+                    name = self.advance().value
+                    if self.match(TokenType.COLON):
+                        var_type = self.parse_type()
+                        value = None
+                        if self.match(TokenType.ASSIGN):
+                            value = self.parse_expression()
+                        self.expect(TokenType.NEWLINE)
+                        declarations.append(VarDecl(name, var_type, value))
+                        self.skip_newlines()
+                        continue
+                    # Back up
+                    self.pos -= 1
+
+                raise ParseError(f"Unexpected token at top level: {self.current().type.name}",
+                               self.current())
+
+            except ParseError as e:
+                self.errors.append(e)
+                self.synchronize()
+
+        # If we collected errors, raise the first one (for backwards compatibility)
+        # but include info about additional errors
+        if self.errors:
+            if len(self.errors) == 1:
+                raise self.errors[0]
+            else:
+                msg = f"{self.errors[0]}\n  ... and {len(self.errors) - 1} more error(s)"
+                raise ParseError(msg, self.errors[0].token)
 
         return Program(imports, declarations)
 
@@ -1240,6 +1286,23 @@ def parse(source: str, filename: str = "<string>") -> Program:
     tokens = tokenize(source, filename)
     parser = Parser(tokens, filename)
     return parser.parse_program()
+
+
+def parse_with_errors(source: str, filename: str = "<string>") -> tuple[Optional[Program], list[ParseError]]:
+    """Parse source code and return (program, errors) tuple.
+
+    Unlike parse(), this function does not raise on errors.
+    Returns partial AST with collected errors for tooling support.
+    """
+    tokens = tokenize(source, filename)
+    parser = Parser(tokens, filename)
+
+    try:
+        program = parser.parse_program()
+        return (program, [])
+    except ParseError:
+        # Return partial results with all collected errors
+        return (None, parser.errors)
 
 
 if __name__ == "__main__":

@@ -298,8 +298,8 @@ def event_emit(event_id: int32, data: int32):
             if callback_addr != 0:
                 # Cast to function pointer and call
                 # fn(event_id: int32, data: int32)
-                callback: Ptr[fn(int32, int32)] = cast[Ptr[fn(int32, int32)]](callback_addr)
-                callback[0](event_id, data)
+                callback: Fn[void, int32, int32] = cast[Fn[void, int32, int32]](callback_addr)
+                callback(event_id, data)
 
                 # Remove one-shot handlers after calling
                 if (flags & HANDLER_FLAG_ONESHOT) != 0:
@@ -331,8 +331,8 @@ def event_emit_to_priority(event_id: int32, data: int32, max_priority: int32):
             if handler[1] <= max_priority:
                 callback_addr: int32 = handler[0]
                 if callback_addr != 0:
-                    callback: Ptr[fn(int32, int32)] = cast[Ptr[fn(int32, int32)]](callback_addr)
-                    callback[0](event_id, data)
+                    callback: Fn[void, int32, int32] = cast[Fn[void, int32, int32]](callback_addr)
+                    callback(event_id, data)
 
                     if (flags & HANDLER_FLAG_ONESHOT) != 0:
                         handler[0] = 0

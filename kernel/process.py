@@ -455,10 +455,10 @@ def process_check_signals(slot: int32):
                 handler_idx: int32 = slot * MAX_SIGNALS + sig
                 handler: uint32 = signal_handlers[handler_idx]
                 if handler != 0:
-                    # Call handler (simplified - in real OS would set up signal frame)
-                    handler_fn: Ptr[void] = cast[Ptr[void]](handler)
-                    # TODO: Properly invoke handler with signal number
-                    pass
+                    # Call handler with signal number
+                    # Cast to function pointer type and invoke
+                    handler_fn: Fn[void, int32] = cast[Fn[void, int32]](handler)
+                    handler_fn(sig)
                 elif sig == SIGTERM:
                     # Default action for SIGTERM is terminate
                     proc_state[slot] = PROC_STATE_TERMINATED

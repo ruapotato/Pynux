@@ -318,16 +318,16 @@ def _fsm_call_callback(callback: int32, fsm: Ptr[int32]):
     """Call a state callback if not null."""
     if callback != 0:
         # Cast to function pointer and call
-        fn: Ptr[fn(Ptr[int32])] = cast[Ptr[fn(Ptr[int32])]](callback)
-        fn[0](fsm)
+        fn: Fn[void, Ptr[int32]] = cast[Fn[void, Ptr[int32]]](callback)
+        fn(fsm)
 
 def _fsm_call_condition(condition: int32, fsm: Ptr[int32]) -> int32:
     """Call a condition function if not null."""
     if condition == 0:
         return FSM_COND_TRUE
 
-    fn: Ptr[fn(Ptr[int32]) -> int32] = cast[Ptr[fn(Ptr[int32]) -> int32]](condition)
-    return fn[0](fsm)
+    fn: Fn[int32, Ptr[int32]] = cast[Fn[int32, Ptr[int32]]](condition)
+    return fn(fsm)
 
 def _fsm_exit_state(fsm: Ptr[int32], state_id: int32):
     """Exit a state and all parent states if hierarchical."""

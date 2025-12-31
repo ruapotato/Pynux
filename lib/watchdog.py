@@ -324,7 +324,7 @@ def wdt_check() -> bool:
             critical_exit(state)
 
             # Call the warning callback
-            callback_fn: Ptr[def()]  = cast[Ptr[def()]](_wdt_warning_callback)
+            callback_fn: Fn[void] = cast[Fn[void]](_wdt_warning_callback)
             callback_fn()
 
             return True
@@ -463,7 +463,7 @@ def wdt_run_health_checks() -> int32:
     i: int32 = 0
     while i < _health_check_count:
         if _health_checks[i] != Ptr[void](0):
-            check_fn: Ptr[def() -> int32] = cast[Ptr[def() -> int32]](_health_checks[i])
+            check_fn: Fn[int32] = cast[Fn[int32]](_health_checks[i])
             result: int32 = check_fn()
             if result != 0:
                 failed = failed + 1

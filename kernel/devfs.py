@@ -53,6 +53,12 @@ dev_count: int32 = 0
 gpio_states: Array[8, int32]      # 0=low, 1=high
 gpio_modes: Array[8, int32]       # 0=input, 1=output
 
+# PWM state (8 channels)
+pwm_values: Array[8, int32]       # 0-255 duty cycle
+
+# ADC calibration offset (simulated)
+adc_offsets: Array[8, int32]
+
 # Response buffer for device reads
 dev_response: Array[64, char]
 
@@ -193,16 +199,41 @@ def dev_write_dc(id: int32, value: Ptr[char]) -> int32:
 
 def dev_read_adc(id: int32) -> Ptr[char]:
     """Read ADC value (simulated, 0-4095)."""
-    # Simulate ADC based on GPIO state
-    v: int32 = 2048
-    if id < 8:
-        v = gpio_states[id] * 4095
+    if id < 0 or id >= 8:
+        strcpy(&dev_response[0], "error")
+        return &dev_response[0]
+    # Simulate ADC with base value, noise, and calibration
+    base: int32 = 2048
+    if gpio_states[id] == 1:
+        base = 4000  # High when GPIO is high
+    # Add some simulated noise (simple pseudo-random based on id)
+    noise: int32 = ((id * 17 + 13) % 100) - 50
+    v: int32 = base + noise + adc_offsets[id]
+    if v < 0:
+        v = 0
+    if v > 4095:
+        v = 4095
     itoa(v, &dev_response[0])
+    return &dev_response[0]
+
+def dev_read_pwm(id: int32) -> Ptr[char]:
+    """Read PWM duty cycle (0-255)."""
+    if id < 0 or id >= 8:
+        strcpy(&dev_response[0], "error")
+        return &dev_response[0]
+    itoa(pwm_values[id], &dev_response[0])
     return &dev_response[0]
 
 def dev_write_pwm(id: int32, value: Ptr[char]) -> int32:
     """Write PWM duty cycle (0-255)."""
-    # Simulated - would control PWM hardware
+    if id < 0 or id >= 8:
+        return -1
+    duty: int32 = atoi(value)
+    if duty < 0:
+        duty = 0
+    if duty > 255:
+        duty = 255
+    pwm_values[id] = duty
     return 0
 
 # ============================================================================
@@ -238,6 +269,8 @@ def devfs_read(dev_idx: int32) -> Ptr[char]:
         return dev_read_dc(id)
     elif dtype == DEV_ADC:
         return dev_read_adc(id)
+    elif dtype == DEV_PWM:
+        return dev_read_pwm(id)
     else:
         strcpy(&dev_response[0], "error")
         return &dev_response[0]
@@ -541,6 +574,8 @@ def devfs_init():
     while i < 8:
         gpio_states[i] = 0
         gpio_modes[i] = 0  # Input by default
+        pwm_values[i] = 0
+        adc_offsets[i] = 0
         i = i + 1
 
     # Initialize sensors
@@ -582,6 +617,12 @@ def devfs_init():
     devfs_register(DEV_SERVO, 0, 9, "servo0")
     devfs_register(DEV_STEPPER, 0, 10, "stepper0")
     devfs_register(DEV_DC, 0, 11, "dc0")
+    # ADC channels
+    devfs_register(DEV_ADC, 0, 26, "adc0")
+    devfs_register(DEV_ADC, 1, 27, "adc1")
+    # PWM outputs
+    devfs_register(DEV_PWM, 0, 12, "pwm0")
+    devfs_register(DEV_PWM, 1, 13, "pwm1")
 
     # Scan and load additional drivers from config
     devfs_scan_drivers()
