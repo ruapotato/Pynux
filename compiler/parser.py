@@ -1156,12 +1156,33 @@ class Parser:
                 self.expect(TokenType.NEWLINE)
                 return ImportDecl(module, [], None, True, self.make_span(tok))
 
-            # from x import a, b, c
-            names = [self.expect(TokenType.IDENT).value]
+            # from x import (a, b, c) - parenthesized form for multi-line
+            if self.match(TokenType.LPAREN):
+                names = [self.expect(TokenType.IDENT).value]
+                while self.match(TokenType.COMMA):
+                    # Allow trailing comma
+                    if self.check(TokenType.RPAREN):
+                        break
+                    names.append(self.expect(TokenType.IDENT).value)
+                self.expect(TokenType.RPAREN)
+                self.expect(TokenType.NEWLINE)
+                return ImportDecl(module, names, None, False, self.make_span(tok))
+
+            # from x import a, b, c  or  from x import a as b
+            name = self.expect(TokenType.IDENT).value
+            alias = None
+            if self.match(TokenType.AS):
+                alias = self.expect(TokenType.IDENT).value
+            names = [name]
+
             while self.match(TokenType.COMMA):
-                names.append(self.expect(TokenType.IDENT).value)
+                name = self.expect(TokenType.IDENT).value
+                if self.match(TokenType.AS):
+                    # Note: we only track single alias, multiple aliases not fully supported
+                    self.expect(TokenType.IDENT)
+                names.append(name)
             self.expect(TokenType.NEWLINE)
-            return ImportDecl(module, names, None, False, self.make_span(tok))
+            return ImportDecl(module, names, alias, False, self.make_span(tok))
 
         # import module [as alias]
         if self.match(TokenType.IMPORT):
