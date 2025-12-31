@@ -201,3 +201,168 @@ def ptr_list_get(lst: Ptr[int32], index: int32) -> Ptr[uint8]:
     if cast[uint32](ptr) == 0:
         return Ptr[uint8](0)
     return cast[Ptr[uint8]](ptr[0])
+
+# ============================================================================
+# Sorting (insertion sort for simplicity)
+# ============================================================================
+
+def int_list_sort(lst: Ptr[int32]):
+    """Sort int32 list in ascending order using insertion sort."""
+    length: int32 = lst[1]
+    if length < 2:
+        return
+
+    data: Ptr[int32] = cast[Ptr[int32]](lst[0])
+
+    i: int32 = 1
+    while i < length:
+        key: int32 = data[i]
+        j: int32 = i - 1
+
+        while j >= 0 and data[j] > key:
+            data[j + 1] = data[j]
+            j = j - 1
+
+        data[j + 1] = key
+        i = i + 1
+
+def int_list_sort_desc(lst: Ptr[int32]):
+    """Sort int32 list in descending order."""
+    length: int32 = lst[1]
+    if length < 2:
+        return
+
+    data: Ptr[int32] = cast[Ptr[int32]](lst[0])
+
+    i: int32 = 1
+    while i < length:
+        key: int32 = data[i]
+        j: int32 = i - 1
+
+        while j >= 0 and data[j] < key:
+            data[j + 1] = data[j]
+            j = j - 1
+
+        data[j + 1] = key
+        i = i + 1
+
+# Sort static int32 array
+def array_sort(arr: Ptr[int32], length: int32):
+    """Sort static int32 array using insertion sort."""
+    if length < 2:
+        return
+
+    i: int32 = 1
+    while i < length:
+        key: int32 = arr[i]
+        j: int32 = i - 1
+
+        while j >= 0 and arr[j] > key:
+            arr[j + 1] = arr[j]
+            j = j - 1
+
+        arr[j + 1] = key
+        i = i + 1
+
+# ============================================================================
+# List searching
+# ============================================================================
+
+def int_list_find(lst: Ptr[int32], val: int32) -> int32:
+    """Find index of value in list, returns -1 if not found."""
+    length: int32 = lst[1]
+    data: Ptr[int32] = cast[Ptr[int32]](lst[0])
+
+    i: int32 = 0
+    while i < length:
+        if data[i] == val:
+            return i
+        i = i + 1
+    return -1
+
+def int_list_count(lst: Ptr[int32], val: int32) -> int32:
+    """Count occurrences of value in list."""
+    length: int32 = lst[1]
+    data: Ptr[int32] = cast[Ptr[int32]](lst[0])
+    count: int32 = 0
+
+    i: int32 = 0
+    while i < length:
+        if data[i] == val:
+            count = count + 1
+        i = i + 1
+    return count
+
+def int_list_min(lst: Ptr[int32]) -> int32:
+    """Return minimum value in list."""
+    length: int32 = lst[1]
+    if length == 0:
+        return 0
+
+    data: Ptr[int32] = cast[Ptr[int32]](lst[0])
+    result: int32 = data[0]
+
+    i: int32 = 1
+    while i < length:
+        if data[i] < result:
+            result = data[i]
+        i = i + 1
+    return result
+
+def int_list_max(lst: Ptr[int32]) -> int32:
+    """Return maximum value in list."""
+    length: int32 = lst[1]
+    if length == 0:
+        return 0
+
+    data: Ptr[int32] = cast[Ptr[int32]](lst[0])
+    result: int32 = data[0]
+
+    i: int32 = 1
+    while i < length:
+        if data[i] > result:
+            result = data[i]
+        i = i + 1
+    return result
+
+def int_list_sum(lst: Ptr[int32]) -> int32:
+    """Return sum of all values in list."""
+    length: int32 = lst[1]
+    data: Ptr[int32] = cast[Ptr[int32]](lst[0])
+    total: int32 = 0
+
+    i: int32 = 0
+    while i < length:
+        total = total + data[i]
+        i = i + 1
+    return total
+
+# ============================================================================
+# List copying and extending
+# ============================================================================
+
+def list_copy(dst: Ptr[int32], src: Ptr[int32]):
+    """Copy source list to destination (dst must be initialized)."""
+    src_len: int32 = src[1]
+    elem_size: int32 = src[3]
+    src_data: Ptr[uint8] = cast[Ptr[uint8]](src[0])
+
+    # Clear destination
+    list_clear(dst)
+
+    # Copy elements
+    i: int32 = 0
+    while i < src_len:
+        list_push(dst, &src_data[i * elem_size])
+        i = i + 1
+
+def list_extend(dst: Ptr[int32], src: Ptr[int32]):
+    """Extend destination list with elements from source."""
+    src_len: int32 = src[1]
+    elem_size: int32 = src[3]
+    src_data: Ptr[uint8] = cast[Ptr[uint8]](src[0])
+
+    i: int32 = 0
+    while i < src_len:
+        list_push(dst, &src_data[i * elem_size])
+        i = i + 1

@@ -1216,6 +1216,11 @@ class ARMCodeGen:
             self.gen_builtin_reversed(args)
             return
 
+        elif func_name == "sorted":
+            # sorted(array) -> sorted array (in-place)
+            self.gen_builtin_sorted(args)
+            return
+
         # Check if this is an indirect call through a local variable (function pointer)
         is_indirect = func_name in self.ctx.locals
 
@@ -1719,11 +1724,89 @@ class ARMCodeGen:
 
         raise CodeGenError("reversed() requires an array with known size")
 
+    def gen_builtin_sorted(self, args: list[Expr]) -> None:
+        """Generate sorted() - sorts array in-place using insertion sort."""
+        if len(args) != 1:
+            raise CodeGenError("sorted() takes exactly 1 argument")
+
+        arg = args[0]
+
+        if isinstance(arg, Identifier):
+            var_type = None
+            if arg.name in self.ctx.locals:
+                var_type = self.ctx.locals[arg.name].var_type
+            else:
+                var_type = self.global_var_types.get(arg.name)
+
+            if isinstance(var_type, ArrayType):
+                size = var_type.size
+                elem_size = self.get_type_size(var_type.element_type)
+
+                # Only support int32 arrays for now
+                if elem_size != 4:
+                    self.emit("    @ Warning: sorted() only supports int32 arrays")
+                    self.gen_expr(arg)
+                    return
+
+                self.gen_expr(arg)
+                self.emit("    mov r4, r0")  # r4 = array base
+                self.emit(f"    movs r5, #{size}")  # r5 = length
+
+                # Insertion sort
+                outer_label = self.ctx.new_label("sort_outer")
+                inner_label = self.ctx.new_label("sort_inner")
+                inner_done = self.ctx.new_label("sort_inner_done")
+                done_label = self.ctx.new_label("sort_done")
+
+                self.emit("    movs r6, #1")  # i = 1
+                self.emit(f"{outer_label}:")
+                self.emit("    cmp r6, r5")
+                self.emit(f"    bge {done_label}")
+
+                # key = arr[i]
+                self.emit("    lsl r0, r6, #2")
+                self.emit("    ldr r7, [r4, r0]")  # r7 = key
+
+                # j = i - 1
+                self.emit("    sub r8, r6, #1")
+
+                self.emit(f"{inner_label}:")
+                self.emit("    cmp r8, #0")
+                self.emit(f"    blt {inner_done}")
+
+                # if arr[j] <= key, done
+                self.emit("    lsl r0, r8, #2")
+                self.emit("    ldr r1, [r4, r0]")  # arr[j]
+                self.emit("    cmp r1, r7")
+                self.emit(f"    ble {inner_done}")
+
+                # arr[j+1] = arr[j]
+                self.emit("    add r2, r8, #1")
+                self.emit("    lsl r2, r2, #2")
+                self.emit("    str r1, [r4, r2]")
+
+                # j--
+                self.emit("    sub r8, r8, #1")
+                self.emit(f"    b {inner_label}")
+
+                self.emit(f"{inner_done}:")
+                # arr[j+1] = key
+                self.emit("    add r0, r8, #1")
+                self.emit("    lsl r0, r0, #2")
+                self.emit("    str r7, [r4, r0]")
+
+                # i++
+                self.emit("    add r6, r6, #1")
+                self.emit(f"    b {outer_label}")
+
+                self.emit(f"{done_label}:")
+                self.gen_expr(arg)  # Return array pointer
+                return
+
+        raise CodeGenError("sorted() requires an array with known size")
+
     def gen_list_method(self, obj: Expr, method: str, args: list[Expr]) -> None:
         """Generate code for list/array methods like append, pop, etc."""
-        # For static arrays, these methods are limited
-        # We'll implement them for simple cases
-
         var_type = None
         if isinstance(obj, Identifier):
             if obj.name in self.ctx.locals:
@@ -1731,26 +1814,39 @@ class ARMCodeGen:
             else:
                 var_type = self.global_var_types.get(obj.name)
 
-        if method == "clear":
-            # Zero out array
-            if isinstance(var_type, ArrayType):
-                size = var_type.size
-                elem_size = self.get_type_size(var_type.element_type)
-                total_bytes = size * elem_size
+        # Check if this is a dynamic list (Array[4, int32] is the list struct)
+        is_dynamic_list = (isinstance(var_type, ArrayType) and
+                          var_type.size == 4 and
+                          hasattr(var_type.element_type, 'name') and
+                          var_type.element_type.name == 'int32')
 
-                self.gen_expr(obj)  # Get array address
-                self.emit("    mov r4, r0")
-                self.emit("    movs r1, #0")  # Value to set
-                self.emit(f"    ldr r2, ={total_bytes}")  # Count
-                self.emit("    bl memset")
-                self.emit("    movs r0, #0")
+        if method == "append":
+            if is_dynamic_list:
+                # Dynamic list: call list_push(lst, &val)
+                if args:
+                    self.gen_expr(args[0])
+                    self.emit("    push {r0}")  # Push value onto stack
+                    self.emit("    mov r1, sp")  # r1 = address of value
+                    self.gen_expr(obj)          # r0 = list pointer
+                    self.emit("    bl list_push")
+                    self.emit("    add sp, sp, #4")
                 return
+            self.emit("    @ Warning: append() requires dynamic list")
+            self.emit("    movs r0, #0")
+            return
 
         elif method == "pop":
-            # For fixed arrays, we can't actually pop
-            # But we can return the last element (caller must track length)
+            if is_dynamic_list:
+                # Dynamic list: call list_pop
+                self.gen_expr(obj)
+                self.emit("    bl list_pop")
+                # Dereference returned pointer to get value
+                self.emit("    cmp r0, #0")
+                self.emit("    it ne")
+                self.emit("    ldrne r0, [r0]")
+                return
+            # For static arrays with index argument
             if args and isinstance(var_type, ArrayType):
-                # pop(index) - get element at index
                 self.gen_expr(args[0])  # index in r0
                 elem_size = self.get_type_size(var_type.element_type)
 
@@ -1775,8 +1871,63 @@ class ARMCodeGen:
                     self.emit("    ldr r0, [r0]")
                 return
 
-        # For other methods, emit a warning comment and return 0
-        self.emit(f"    @ Warning: list.{method}() not fully implemented for static arrays")
+        elif method == "insert":
+            if is_dynamic_list and len(args) >= 2:
+                # list_insert(lst, index, &elem)
+                self.gen_expr(args[1])  # value
+                self.emit("    push {r0}")
+                self.gen_expr(args[0])  # index
+                self.emit("    push {r0}")
+                self.gen_expr(obj)      # list
+                self.emit("    pop {r1}")   # r1 = index
+                self.emit("    add r2, sp, #0")  # r2 = address of value
+                self.emit("    bl list_insert")
+                self.emit("    add sp, sp, #4")
+                return
+
+        elif method == "remove":
+            if is_dynamic_list and args:
+                # list_remove(lst, index)
+                self.gen_expr(args[0])  # index
+                self.emit("    push {r0}")
+                self.gen_expr(obj)
+                self.emit("    pop {r1}")
+                self.emit("    bl list_remove")
+                return
+
+        elif method == "clear":
+            if is_dynamic_list:
+                self.gen_expr(obj)
+                self.emit("    bl list_clear")
+                return
+            # Static array: zero out
+            if isinstance(var_type, ArrayType):
+                size = var_type.size
+                elem_size = self.get_type_size(var_type.element_type)
+                total_bytes = size * elem_size
+
+                self.gen_expr(obj)
+                self.emit("    movs r1, #0")
+                self.emit(f"    ldr r2, ={total_bytes}")
+                self.emit("    bl memset")
+                self.emit("    movs r0, #0")
+                return
+
+        elif method == "reverse":
+            if is_dynamic_list:
+                self.gen_expr(obj)
+                self.emit("    bl list_reverse")
+                return
+
+        elif method == "len" or method == "__len__":
+            if is_dynamic_list:
+                # Return lst[1] (length field)
+                self.gen_expr(obj)
+                self.emit("    ldr r0, [r0, #4]")
+                return
+
+        # Fallback
+        self.emit(f"    @ Warning: list.{method}() not fully implemented")
         self.emit("    movs r0, #0")
 
     def gen_dict_method(self, obj: Expr, method: str, args: list[Expr]) -> None:
