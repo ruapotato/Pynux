@@ -11,6 +11,18 @@ from kernel.devfs import devfs_init
 from lib.vtnext import vtn_probe
 from lib.de import de_main
 from lib.shell import shell_main
+from programs.run_tests import run_tests_main
+from programs.elevator import elevator_main
+from programs.statemachine import statemachine_main
+from programs.thermostat import thermostat_main
+
+# Test mode flag - set to True to auto-run tests instead of shell
+# Use: ./build.sh --test to enable
+TEST_MODE: bool = False
+
+# Demo mode flag - set to True to run demo programs
+# Use: ./build.sh --demo to enable
+DEMO_MODE: bool = False
 
 # Kernel version
 KERNEL_VERSION_MAJOR: int32 = 0
@@ -141,6 +153,41 @@ def main() -> int32:
     # Flush any pending UART input from boot process
     while uart_available():
         discard: char = uart_getc()
+
+    # Check for test mode
+    if TEST_MODE:
+        print_str("[kernel] Running in TEST MODE\n\n")
+        result: int32 = run_tests_main()
+        print_str("\n[kernel] Tests complete. Halting.\n")
+        # Signal test completion for QEMU runner
+        if result == 0:
+            print_str("[QEMU_EXIT] SUCCESS\n")
+        else:
+            print_str("[QEMU_EXIT] FAILURE\n")
+        # Halt - infinite loop
+        while True:
+            pass
+        return result
+
+    # Check for demo mode
+    if DEMO_MODE:
+        print_str("[kernel] Running DEMO MODE\n\n")
+        argc: int32 = 0
+
+        print_str("=== Demo 1: Elevator Simulator ===\n")
+        elevator_main(argc, cast[Ptr[Ptr[char]]](0))
+
+        print_str("\n=== Demo 2: Traffic Light State Machine ===\n")
+        statemachine_main(argc, cast[Ptr[Ptr[char]]](0))
+
+        print_str("\n=== Demo 3: Thermostat PID Controller ===\n")
+        thermostat_main(argc, cast[Ptr[Ptr[char]]](0))
+
+        print_str("\n[kernel] Demos complete. Halting.\n")
+        print_str("[QEMU_EXIT] SUCCESS\n")
+        while True:
+            pass
+        return 0
 
     # Probe for VTNext renderer
     print_str("[kernel] Probing for VTNext... ")

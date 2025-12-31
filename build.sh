@@ -23,6 +23,8 @@ QEMU="qemu-system-arm"
 TARGET="qemu"
 RUN_AFTER_BUILD=false
 FLASH_AFTER_BUILD=false
+TEST_MODE=false
+DEMO_MODE=false
 
 # ============================================================================
 # Parse Arguments
@@ -34,6 +36,7 @@ print_usage() {
     echo "Options:"
     echo "  --target=TARGET   Build target: qemu (default), rp2040, stm32f4"
     echo "  --run             Run in QEMU after build (qemu target only)"
+    echo "  --test            Build in test mode (auto-run tests on boot)"
     echo "  --flash           Flash to device after build (hardware targets)"
     echo "  --clean           Clean build directory before building"
     echo "  --help            Show this help message"
@@ -43,6 +46,7 @@ print_usage() {
     echo "  $0 --target=rp2040      # Build for Raspberry Pi Pico"
     echo "  $0 --target=stm32f4     # Build for STM32F4 boards"
     echo "  $0 --run                # Build and run in QEMU"
+    echo "  $0 --test --run         # Build test kernel and run tests"
 }
 
 for arg in "$@"; do
@@ -52,6 +56,12 @@ for arg in "$@"; do
             ;;
         --run)
             RUN_AFTER_BUILD=true
+            ;;
+        --test)
+            TEST_MODE=true
+            ;;
+        --demo)
+            DEMO_MODE=true
             ;;
         --flash)
             FLASH_AFTER_BUILD=true
@@ -135,6 +145,8 @@ from compiler.codegen_arm import ARMCodeGen
 # Target-specific configuration
 TARGET = "$TARGET"
 SYSTEM_CLOCK = $SYSTEM_CLOCK
+TEST_MODE = "$TEST_MODE" == "true"
+DEMO_MODE = "$DEMO_MODE" == "true"
 
 # Core system sources
 sources = [
@@ -226,6 +238,17 @@ for src_path, name in sources:
     try:
         with open(src_path) as f:
             source = f.read()
+
+        # Enable test mode in kernel if requested
+        if src_path == "kernel/kernel.py" and TEST_MODE:
+            source = source.replace("TEST_MODE: bool = False", "TEST_MODE: bool = True")
+            print(f"  [TEST MODE ENABLED]")
+
+        # Enable demo mode in kernel if requested
+        if src_path == "kernel/kernel.py" and DEMO_MODE:
+            source = source.replace("DEMO_MODE: bool = False", "DEMO_MODE: bool = True")
+            print(f"  [DEMO MODE ENABLED]")
+
         ast = parse(source, src_path)
         codegen = ARMCodeGen()
         asm = codegen.gen_program(ast)

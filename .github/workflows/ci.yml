@@ -1,0 +1,67 @@
+name: Pynux CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install ARM toolchain
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-arm-none-eabi qemu-system-arm
+
+    - name: Build and run tests
+      run: |
+        chmod +x scripts/ci-test.sh
+        ./scripts/ci-test.sh
+
+    - name: Run demo verification
+      run: |
+        ./scripts/ci-test.sh --demo
+
+  build-hardware-targets:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        target: [rp2040, stm32f4]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install ARM toolchain
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-arm-none-eabi
+
+    - name: Build for ${{ matrix.target }}
+      run: |
+        ./build.sh --target=${{ matrix.target }}
+
+    - name: Upload firmware artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: pynux-${{ matrix.target }}
+        path: |
+          build/pynux.elf
+          build/pynux.bin
