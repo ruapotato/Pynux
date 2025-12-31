@@ -2,7 +2,7 @@
 #
 # Digital clock displaying current uptime.
 
-from lib.vtnext import vtn_rect, vtn_textline, vtn_rect_outline
+from lib.vtnext import vtn_rect, vtn_textline, vtn_rect_outline, vtn_present
 from lib.string import itoa
 from kernel.timer import timer_get_ticks
 
@@ -151,3 +151,6 @@ def clock_handle_click(mx: int32, my: int32) -> bool:
 
 def clock_main():
     clock_init()
+    clock_update()
+    clock_draw()
+    vtn_present()

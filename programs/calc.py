@@ -2,7 +2,7 @@
 #
 # GUI calculator with integer math operations.
 
-from lib.vtnext import vtn_rect, vtn_textline, vtn_rect_outline
+from lib.vtnext import vtn_rect, vtn_textline, vtn_rect_outline, vtn_present
 from lib.string import strlen, itoa
 
 # Calculator State
@@ -264,3 +264,5 @@ def calc_handle_click(mx: int32, my: int32) -> bool:
 
 def calc_main():
     calc_init()
+    calc_draw()
+    vtn_present()

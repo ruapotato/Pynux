@@ -1076,11 +1076,21 @@ def term_exec_cmd(idx: int32):
         term_putc_idx(idx, '\n')
         clock_main()
     elif cmd_starts_with(idx, "hexview"):
-        term_putc_idx(idx, '\n')
-        hexview_main()
+        hv_arg: Ptr[char] = cmd_get_arg(idx)
+        if hv_arg[0] == '\0':
+            term_puts_idx(idx, "\nUsage: hexview <file>\n")
+        else:
+            term_putc_idx(idx, '\n')
+            build_path(term_get_cwd(idx), hv_arg)
+            hexview_main(&path_buf[0])
     elif cmd_starts_with(idx, "imgview"):
-        term_putc_idx(idx, '\n')
-        imgview_main()
+        iv_arg: Ptr[char] = cmd_get_arg(idx)
+        if iv_arg[0] == '\0':
+            term_puts_idx(idx, "\nUsage: imgview <file.bmp>\n")
+        else:
+            term_putc_idx(idx, '\n')
+            build_path(term_get_cwd(idx), iv_arg)
+            imgview_main(&path_buf[0])
     elif cmd_starts_with(idx, "head"):
         cmd_head(idx)
     elif cmd_starts_with(idx, "tail"):
