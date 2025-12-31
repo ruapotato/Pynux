@@ -14,6 +14,16 @@ from programs.calc import calc_main
 from programs.clock import clock_main
 from programs.hexview import hexview_main
 from programs.imgview import imgview_main
+from programs.sensormon import sensormon_main
+from programs.motorctl import motorctl_main
+from lib.sensors import sensors_seed, sensors_enable_noise, sensors_init_all
+from lib.sensors import temp_read, temp_to_fahrenheit
+from lib.sensors import accel_read_x, accel_read_y, accel_read_z
+from lib.sensors import light_read, humid_read, press_read, press_to_altitude
+from lib.motors import servo_init, servo_set_angle, servo_get_angle
+from lib.motors import stepper_init, stepper_steps, stepper_get_position
+from lib.motors import dc_init, dc_set_speed, dc_get_speed, dc_brake
+from lib.math import abs_int
 
 # Command buffer
 shell_cmd: Array[256, char]
@@ -474,7 +484,17 @@ def shell_exec_basic(cmd: Ptr[char]) -> bool:
         shell_newline()
         shell_puts("  version    - Show version")
         shell_newline()
-        shell_puts("Apps: calc, clock, hexview, imgview")
+        shell_puts("Hardware:")
+        shell_newline()
+        shell_puts("  sensors    - Read all sensors")
+        shell_newline()
+        shell_puts("  servo N A  - Set servo N to angle A")
+        shell_newline()
+        shell_puts("  stepper N S- Move stepper N by S steps")
+        shell_newline()
+        shell_puts("  motor N S  - Set motor N to speed S")
+        shell_newline()
+        shell_puts("Apps: calc, clock, sensormon, motorctl")
         shell_newline()
         return True
 
@@ -1758,6 +1778,222 @@ def shell_exec_sed(cmd: Ptr[char]) -> bool:
     return False
 
 # ============================================================================
+# Hardware commands - sensors and motors
+# ============================================================================
+
+# Hardware initialized flag
+_hw_init_done: bool = False
+
+def _hw_ensure_init():
+    """Initialize hardware if not already done."""
+    global _hw_init_done
+    if not _hw_init_done:
+        sensors_seed(12345)
+        sensors_enable_noise(True)
+        sensors_init_all()
+        _hw_init_done = True
+
+def shell_exec_hw(cmd: Ptr[char]) -> bool:
+    """Handle hardware commands. Returns True if handled."""
+
+    # sensormon - run sensor monitor demo
+    if strcmp(cmd, "sensormon") == 0:
+        shell_newline()
+        _hw_ensure_init()
+        sensormon_main(0, cast[Ptr[Ptr[char]]](0))
+        return True
+
+    # motorctl - run motor controller demo
+    if strcmp(cmd, "motorctl") == 0:
+        shell_newline()
+        motorctl_main(0, cast[Ptr[Ptr[char]]](0))
+        return True
+
+    # sensors - quick sensor readout
+    if strcmp(cmd, "sensors") == 0:
+        shell_newline()
+        _hw_ensure_init()
+        shell_puts("=== Sensor Readings ===")
+        shell_newline()
+
+        # Temperature
+        t: int32 = temp_read()
+        shell_puts("Temp: ")
+        shell_puts(shell_int_to_str(t / 100))
+        shell_puts(".")
+        tf: int32 = abs_int(t % 100)
+        if tf < 10:
+            shell_puts("0")
+        shell_puts(shell_int_to_str(tf))
+        shell_puts(" C")
+        shell_newline()
+
+        # Accelerometer
+        shell_puts("Accel: X=")
+        shell_puts(shell_int_to_str(accel_read_x()))
+        shell_puts(" Y=")
+        shell_puts(shell_int_to_str(accel_read_y()))
+        shell_puts(" Z=")
+        shell_puts(shell_int_to_str(accel_read_z()))
+        shell_puts(" mg")
+        shell_newline()
+
+        # Light
+        shell_puts("Light: ")
+        shell_puts(shell_int_to_str(light_read()))
+        shell_newline()
+
+        # Humidity
+        h: int32 = humid_read()
+        shell_puts("Humid: ")
+        shell_puts(shell_int_to_str(h / 10))
+        shell_puts(".")
+        shell_puts(shell_int_to_str(h % 10))
+        shell_puts(" %")
+        shell_newline()
+
+        # Pressure
+        p: int32 = press_read()
+        shell_puts("Press: ")
+        shell_puts(shell_int_to_str(p / 100))
+        shell_puts(" hPa (alt: ")
+        shell_puts(shell_int_to_str(press_to_altitude(p)))
+        shell_puts(" m)")
+        shell_newline()
+
+        return True
+
+    # servo <id> <angle> - set servo angle
+    if shell_starts_with("servo"):
+        arg: Ptr[char] = shell_get_arg()
+        if strlen(arg) == 0:
+            shell_newline()
+            shell_puts("Usage: servo <id> <angle>")
+            shell_newline()
+            shell_puts("  id: 0-7, angle: 0-180")
+            shell_newline()
+            return True
+
+        shell_newline()
+        id: int32 = atoi(arg)
+
+        # Get angle (skip to next space)
+        i: int32 = 0
+        while arg[i] != '\0' and arg[i] != ' ':
+            i = i + 1
+        while arg[i] == ' ':
+            i = i + 1
+
+        if arg[i] == '\0':
+            # Just show current angle
+            shell_puts("Servo ")
+            shell_puts(shell_int_to_str(id))
+            shell_puts(": ")
+            shell_puts(shell_int_to_str(servo_get_angle(id)))
+            shell_puts(" deg")
+        else:
+            angle: int32 = atoi(&arg[i])
+            servo_init(id)
+            servo_set_angle(id, angle)
+            shell_puts("Servo ")
+            shell_puts(shell_int_to_str(id))
+            shell_puts(" -> ")
+            shell_puts(shell_int_to_str(angle))
+            shell_puts(" deg")
+        shell_newline()
+        return True
+
+    # stepper <id> <steps> - move stepper
+    if shell_starts_with("stepper"):
+        arg: Ptr[char] = shell_get_arg()
+        if strlen(arg) == 0:
+            shell_newline()
+            shell_puts("Usage: stepper <id> <steps>")
+            shell_newline()
+            shell_puts("  id: 0-3, steps: +/- integer")
+            shell_newline()
+            return True
+
+        shell_newline()
+        id: int32 = atoi(arg)
+
+        # Get steps
+        i: int32 = 0
+        while arg[i] != '\0' and arg[i] != ' ':
+            i = i + 1
+        while arg[i] == ' ':
+            i = i + 1
+
+        if arg[i] == '\0':
+            # Just show current position
+            shell_puts("Stepper ")
+            shell_puts(shell_int_to_str(id))
+            shell_puts(": pos=")
+            shell_puts(shell_int_to_str(stepper_get_position(id)))
+        else:
+            steps: int32 = atoi(&arg[i])
+            stepper_init(id, 200)
+            stepper_steps(id, steps)
+            shell_puts("Stepper ")
+            shell_puts(shell_int_to_str(id))
+            shell_puts(" moved ")
+            shell_puts(shell_int_to_str(steps))
+            shell_puts(", pos=")
+            shell_puts(shell_int_to_str(stepper_get_position(id)))
+        shell_newline()
+        return True
+
+    # motor <id> <speed> - set DC motor speed
+    if shell_starts_with("motor"):
+        arg: Ptr[char] = shell_get_arg()
+        if strlen(arg) == 0:
+            shell_newline()
+            shell_puts("Usage: motor <id> <speed>")
+            shell_newline()
+            shell_puts("  id: 0-3, speed: -100 to 100")
+            shell_newline()
+            shell_puts("  motor <id> brake - brake motor")
+            shell_newline()
+            return True
+
+        shell_newline()
+        id: int32 = atoi(arg)
+
+        # Get speed or command
+        i: int32 = 0
+        while arg[i] != '\0' and arg[i] != ' ':
+            i = i + 1
+        while arg[i] == ' ':
+            i = i + 1
+
+        if arg[i] == '\0':
+            # Just show current speed
+            shell_puts("Motor ")
+            shell_puts(shell_int_to_str(id))
+            shell_puts(": ")
+            shell_puts(shell_int_to_str(dc_get_speed(id)))
+            shell_puts("%")
+        elif arg[i] == 'b':
+            # Brake
+            dc_brake(id)
+            shell_puts("Motor ")
+            shell_puts(shell_int_to_str(id))
+            shell_puts(" braked")
+        else:
+            speed: int32 = atoi(&arg[i])
+            dc_init(id)
+            dc_set_speed(id, speed)
+            shell_puts("Motor ")
+            shell_puts(shell_int_to_str(id))
+            shell_puts(" -> ")
+            shell_puts(shell_int_to_str(speed))
+            shell_puts("%")
+        shell_newline()
+        return True
+
+    return False
+
+# ============================================================================
 # Main shell_exec dispatcher - calls smaller functions to avoid branch issues
 # ============================================================================
 
@@ -1796,6 +2032,8 @@ def shell_exec():
     elif shell_exec_find(cmd):
         pass
     elif shell_exec_sed(cmd):
+        pass
+    elif shell_exec_hw(cmd):
         pass
     else:
         # Unknown command

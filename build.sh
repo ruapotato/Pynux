@@ -62,6 +62,9 @@ sources = [
     ("lib/shell.py", "shell"),
     ("lib/widgets.py", "widgets"),
     ("lib/devtools.py", "devtools"),
+    ("lib/math.py", "mathlib"),
+    ("lib/sensors.py", "sensors"),
+    ("lib/motors.py", "motors"),
 ]
 
 # Add user programs from programs/ folder
@@ -106,7 +109,7 @@ $AS $ASFLAGS -o "$BUILD_DIR/io.o" "$RUNTIME_DIR/io.s"
 echo "  runtime/io.s"
 
 # Compiled Pynux files
-for name in kernel timer ramfs process memory string iolib peripherals vtnext de shell widgets devtools; do
+for name in kernel timer ramfs process memory string iolib peripherals vtnext de shell widgets devtools mathlib sensors motors; do
     $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
     echo "  build/${name}.s"
 done
@@ -129,6 +132,7 @@ OBJS="$BUILD_DIR/startup.o $BUILD_DIR/io.o"
 OBJS="$OBJS $BUILD_DIR/kernel.o $BUILD_DIR/timer.o $BUILD_DIR/ramfs.o $BUILD_DIR/process.o"
 OBJS="$OBJS $BUILD_DIR/memory.o $BUILD_DIR/string.o $BUILD_DIR/iolib.o $BUILD_DIR/peripherals.o"
 OBJS="$OBJS $BUILD_DIR/vtnext.o $BUILD_DIR/de.o $BUILD_DIR/shell.o $BUILD_DIR/widgets.o $BUILD_DIR/devtools.o"
+OBJS="$OBJS $BUILD_DIR/mathlib.o $BUILD_DIR/sensors.o $BUILD_DIR/motors.o"
 
 # Add user program objects
 if [ -f "$BUILD_DIR/user_programs.txt" ]; then
