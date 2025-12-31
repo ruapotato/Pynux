@@ -94,6 +94,8 @@ case $TARGET in
         SYSTEM_CLOCK=25000000
         QEMU_MACHINE="mps2-an385"
         QEMU_CPU="cortex-m3"
+        LINK_LIBS=""
+        SKIP_TESTS=false
         echo "=== Pynux OS Build (QEMU mps2-an385) ==="
         ;;
     rp2040)
@@ -103,6 +105,10 @@ case $TARGET in
         STARTUP_FILE="bsp/rp2040/startup.s"
         IO_FILE=""  # UART is in startup.s for RP2040
         SYSTEM_CLOCK=125000000
+        # Link libgcc for divide routines (M0+ has no hardware divide)
+        LIBGCC=$(arm-none-eabi-gcc -mcpu=cortex-m0plus -mthumb -print-libgcc-file-name 2>/dev/null || echo "")
+        LINK_LIBS="$LIBGCC"
+        SKIP_TESTS=true  # Tests are designed for QEMU
         echo "=== Pynux OS Build (RP2040 / Raspberry Pi Pico) ==="
         ;;
     stm32f4)
@@ -112,6 +118,9 @@ case $TARGET in
         STARTUP_FILE="bsp/stm32f4/startup.s"
         IO_FILE=""  # UART is in startup.s for STM32F4
         SYSTEM_CLOCK=168000000
+        LIBGCC=$(arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfloat-abi=soft -print-libgcc-file-name 2>/dev/null || echo "")
+        LINK_LIBS="$LIBGCC"
+        SKIP_TESTS=true  # Tests are designed for QEMU
         echo "=== Pynux OS Build (STM32F405/F407) ==="
         ;;
     *)
@@ -147,6 +156,7 @@ TARGET = "$TARGET"
 SYSTEM_CLOCK = $SYSTEM_CLOCK
 TEST_MODE = "$TEST_MODE" == "true"
 DEMO_MODE = "$DEMO_MODE" == "true"
+SKIP_TESTS = "$SKIP_TESTS" == "true"
 
 # Core system sources
 sources = [
@@ -199,40 +209,50 @@ sources = [
 ]
 
 # Add user programs from programs/ folder
+# Some programs are only for QEMU (they use test framework or QEMU-specific features)
+hw_excluded_progs = ["run_tests", "sensormon", "datalogger"] if SKIP_TESTS else []
 user_programs = []
 for prog_path in sorted(glob.glob("programs/*.py")):
     name = os.path.basename(prog_path).replace(".py", "")
+    if name in hw_excluded_progs:
+        continue
     sources.append((prog_path, f"prog_{name}"))
     user_programs.append(name)
 
 if user_programs:
     print(f"  Found user programs: {', '.join(user_programs)}")
+if hw_excluded_progs:
+    print(f"  [SKIPPING programs for hardware: {', '.join(hw_excluded_progs)}]")
 
 # Add test framework
-if os.path.exists("tests/framework.py"):
+# Test framework (skip for hardware targets)
+if not SKIP_TESTS and os.path.exists("tests/framework.py"):
     sources.append(("tests/framework.py", "tests_framework"))
     print(f"  Found test framework: tests/framework.py")
 
-# Add test files from tests/ folder
+# Add test files from tests/ folder (skip for hardware targets)
 excluded_tests = ["test_compiler.py", "test_integration.py", "test_all.py",
                   "test_process.py", "test_sync.py",
                   "test_boot.py", "test_gfx.py",
                   "test_scheduler.py", "test_shell.py"]
 test_files = []
-for test_path in sorted(glob.glob("tests/test_*.py")):
-    name = os.path.basename(test_path)
-    if name in excluded_tests:
-        continue
-    with open(test_path) as f:
-        first_line = f.readline().strip()
-    if first_line.startswith("#!/"):
-        continue
-    name = name.replace(".py", "")
-    sources.append((test_path, f"tests_{name}"))
-    test_files.append(name)
+if not SKIP_TESTS:
+    for test_path in sorted(glob.glob("tests/test_*.py")):
+        name = os.path.basename(test_path)
+        if name in excluded_tests:
+            continue
+        with open(test_path) as f:
+            first_line = f.readline().strip()
+        if first_line.startswith("#!/"):
+            continue
+        name = name.replace(".py", "")
+        sources.append((test_path, f"tests_{name}"))
+        test_files.append(name)
 
-if test_files:
-    print(f"  Found test files: {', '.join(test_files)}")
+    if test_files:
+        print(f"  Found test files: {', '.join(test_files)}")
+else:
+    print("  [SKIPPING TESTS - Hardware target]")
 
 for src_path, name in sources:
     try:
@@ -418,7 +438,12 @@ if [ -f "$BUILD_DIR/test_files.txt" ]; then
     done < "$BUILD_DIR/test_files.txt"
 fi
 
-$LD -T "$LINKER_SCRIPT" -o "$BUILD_DIR/pynux.elf" $OBJS
+# Link with optional libgcc for hardware targets
+if [ -n "$LINK_LIBS" ]; then
+    $LD -T "$LINKER_SCRIPT" -o "$BUILD_DIR/pynux.elf" $OBJS $LINK_LIBS
+else
+    $LD -T "$LINKER_SCRIPT" -o "$BUILD_DIR/pynux.elf" $OBJS
+fi
 echo "  -> build/pynux.elf"
 
 # Create binary

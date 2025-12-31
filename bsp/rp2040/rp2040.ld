@@ -19,23 +19,9 @@
 
 MEMORY
 {
-    /* First 256 bytes reserved for boot2 stage */
-    BOOT2 (rx)       : ORIGIN = 0x10000000, LENGTH = 256
-
-    /* Bootloader region (16KB - 256 bytes for boot2) */
-    BOOTLOADER (rx)  : ORIGIN = 0x10000100, LENGTH = 16K - 256
-
-    /* Bank 0 - Primary application */
-    BANK0 (rx)       : ORIGIN = 0x10004000, LENGTH = 1M + 48K
-
-    /* Bank 1 - Secondary/update slot */
-    BANK1 (rx)       : ORIGIN = 0x10110000, LENGTH = 944K
-
-    /* Configuration and metadata */
-    CONFIG (rx)      : ORIGIN = 0x101FC000, LENGTH = 16K
-
-    /* For backward compatibility, FLASH points to Bank 0 */
-    FLASH (rx)       : ORIGIN = 0x10004000, LENGTH = 1M + 48K
+    /* Simple flash layout for initial bring-up
+     * boot2 is skipped - we'll use a prebuilt one or UF2 loader */
+    FLASH (rx)       : ORIGIN = 0x10000000, LENGTH = 2M
 
     /* SRAM banks 0-3 (striped) + SRAM4 + SRAM5 */
     RAM (rwx)        : ORIGIN = 0x20000000, LENGTH = 264K
@@ -45,25 +31,7 @@ ENTRY(_reset)
 
 SECTIONS
 {
-    /* Boot2 stage - copies from flash, configures XIP */
-    .boot2 : {
-        __boot2_start = .;
-        KEEP(*(.boot2))
-        __boot2_end = .;
-    } > BOOT2
-
-    /* Bootloader section */
-    .bootloader : {
-        . = ALIGN(4);
-        __bootloader_start = .;
-        KEEP(*(.bootloader.vectors))
-        KEEP(*(.bootloader.text))
-        KEEP(*(.bootloader.rodata))
-        . = ALIGN(4);
-        __bootloader_end = .;
-    } > BOOTLOADER
-
-    /* Vector table must be at start of application flash */
+    /* Vector table at start of flash */
     .vectors : {
         . = ALIGN(256);
         __vectors_start = .;

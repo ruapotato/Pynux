@@ -244,7 +244,7 @@ data_done:
     cpsie i
 
     @ Call kernel main
-    bl kernel_main
+    bl main
 
     @ Halt if kernel returns
 halt:
@@ -356,7 +356,9 @@ stm32f4_systick_init:
     .align 2
     .thumb_func
     .global stm32f4_uart_init
+    .global uart_init
 stm32f4_uart_init:
+uart_init:
     push {lr}
 
     @ Enable GPIOA and USART1 clocks
@@ -456,6 +458,157 @@ uart_rx_ready:
     ldr r1, =USART1_BASE
     ldr r0, [r1, #USART_SR]
     ubfx r0, r0, #5, #1         @ RXNE bit
+    bx lr
+
+@ ============================================================================
+@ Print Functions (required by lib/io.py)
+@ ============================================================================
+
+    .align 2
+    .global print_str
+    .thumb_func
+print_str:
+    @ r0 = pointer to null-terminated string
+    push {r4, lr}
+    mov r4, r0
+print_str_loop:
+    ldrb r0, [r4], #1
+    cmp r0, #0
+    beq print_str_done
+    bl uart_putc
+    b print_str_loop
+print_str_done:
+    pop {r4, pc}
+
+    .align 2
+    .global print_int
+    .thumb_func
+print_int:
+    @ r0 = integer to print
+    push {r4-r6, lr}
+    mov r4, r0
+    cmp r4, #0
+    bge print_int_positive
+    @ Negative number
+    mov r0, #'-'
+    bl uart_putc
+    neg r4, r4
+print_int_positive:
+    @ Count digits and push them
+    mov r5, #0                  @ digit count
+    mov r6, r4
+print_int_count:
+    mov r0, r6
+    mov r1, #10
+    udiv r0, r0, r1
+    add r5, r5, #1
+    mov r6, r0
+    cmp r6, #0
+    bne print_int_count
+    @ Now print digits
+    mov r6, r4
+print_int_digit:
+    @ Get rightmost digit
+    mov r0, r6
+    mov r1, #10
+    udiv r2, r0, r1             @ r2 = r6 / 10
+    mls r0, r2, r1, r0          @ r0 = r6 - (r2 * 10) = remainder
+    add r0, r0, #'0'
+    push {r0}
+    mov r6, r2
+    subs r5, r5, #1
+    bne print_int_digit
+    @ Pop and print digits
+    mov r5, r4
+print_int_pop:
+    cmp r5, #0
+    beq print_int_single
+    mov r0, r5
+    mov r1, #10
+    udiv r0, r0, r1
+    cmp r0, #0
+    beq print_int_output
+    mov r5, r0
+    b print_int_pop
+print_int_single:
+    mov r0, #'0'
+    bl uart_putc
+    b print_int_done
+print_int_output:
+    @ Output from stack
+    mov r5, r4
+print_int_out2:
+    cmp r5, #0
+    beq print_int_done
+    pop {r0}
+    bl uart_putc
+    mov r0, r5
+    mov r1, #10
+    udiv r5, r0, r1
+    b print_int_out2
+print_int_done:
+    pop {r4-r6, pc}
+
+    .align 2
+    .global print_hex
+    .thumb_func
+print_hex:
+    @ r0 = value to print in hex
+    push {r4-r5, lr}
+    mov r4, r0
+    mov r0, #'0'
+    bl uart_putc
+    mov r0, #'x'
+    bl uart_putc
+    mov r5, #28                 @ bit position (start from MSB)
+print_hex_loop:
+    lsr r0, r4, r5
+    and r0, r0, #0xF
+    cmp r0, #10
+    blt print_hex_digit
+    add r0, r0, #('a' - 10)
+    b print_hex_out
+print_hex_digit:
+    add r0, r0, #'0'
+print_hex_out:
+    bl uart_putc
+    subs r5, r5, #4
+    bge print_hex_loop
+    pop {r4-r5, pc}
+
+    .align 2
+    .global print_newline
+    .thumb_func
+print_newline:
+    push {lr}
+    mov r0, #'\n'
+    bl uart_putc
+    pop {pc}
+
+    .align 2
+    .global uart_available
+    .thumb_func
+uart_available:
+    @ Check if UART has received data
+    @ Returns 1 if data available, 0 otherwise
+    ldr r1, =USART1_BASE
+    ldr r0, [r1, #USART_SR]
+    ubfx r0, r0, #5, #1         @ RXNE bit
+    bx lr
+
+    .align 2
+    .global __pynux_strlen
+    .thumb_func
+__pynux_strlen:
+    @ r0 = pointer to null-terminated string
+    @ returns length in r0
+    mov r1, r0                  @ save original pointer
+__strlen_loop:
+    ldrb r2, [r0], #1
+    cmp r2, #0
+    bne __strlen_loop
+    sub r0, r0, r1
+    sub r0, r0, #1              @ adjust for post-increment
     bx lr
 
 @ ============================================================================
@@ -612,5 +765,27 @@ _default_handler:
     def_irq_handler _cryp_handler
     def_irq_handler _hash_rng_handler
     def_irq_handler _fpu_handler
+
+@ ============================================================================
+@ Stubs for excluded programs (not available on hardware)
+@ ============================================================================
+
+    .align 2
+    .global run_tests_main
+    .thumb_func
+run_tests_main:
+    bx lr
+
+    .align 2
+    .global sensormon_main
+    .thumb_func
+sensormon_main:
+    bx lr
+
+    .align 2
+    .global datalogger_main
+    .thumb_func
+datalogger_main:
+    bx lr
 
     .end

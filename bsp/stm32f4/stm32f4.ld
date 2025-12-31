@@ -18,47 +18,21 @@
 
 MEMORY
 {
-    /* Bootloader region (16KB - Sector 0) */
-    BOOTLOADER (rx) : ORIGIN = 0x08000000, LENGTH = 16K
-
-    /* Bank 0 - Primary application */
-    BANK0 (rx)      : ORIGIN = 0x08004000, LENGTH = 496K
-
-    /* Bank 1 - Secondary/update slot */
-    BANK1 (rx)      : ORIGIN = 0x08080000, LENGTH = 496K
-
-    /* Configuration and metadata */
-    CONFIG (rx)     : ORIGIN = 0x080FC000, LENGTH = 16K
-
-    /* For backward compatibility, FLASH points to Bank 0 */
-    FLASH (rx)      : ORIGIN = 0x08004000, LENGTH = 496K
+    /* Simple layout for initial bring-up - use full flash/RAM */
+    FLASH (rx)      : ORIGIN = 0x08000000, LENGTH = 1M
 
     /* Main SRAM (SRAM1 + SRAM2 contiguous) */
     RAM (rwx)       : ORIGIN = 0x20000000, LENGTH = 128K
 
     /* Core Coupled Memory - fast, no DMA access */
     CCM (rwx)       : ORIGIN = 0x10000000, LENGTH = 64K
-
-    /* Backup SRAM (4KB, battery-backed) */
-    BKPSRAM (rwx)   : ORIGIN = 0x40024000, LENGTH = 4K
 }
 
 ENTRY(_reset)
 
 SECTIONS
 {
-    /* Bootloader section */
-    .bootloader : {
-        . = ALIGN(4);
-        __bootloader_start = .;
-        KEEP(*(.bootloader.vectors))
-        KEEP(*(.bootloader.text))
-        KEEP(*(.bootloader.rodata))
-        . = ALIGN(4);
-        __bootloader_end = .;
-    } > BOOTLOADER
-
-    /* Vector table at start of application flash */
+    /* Vector table at start of flash */
     .vectors : {
         . = ALIGN(4);
         __vectors_start = .;

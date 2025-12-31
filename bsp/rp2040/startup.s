@@ -190,7 +190,7 @@ data_done:
     cpsie i
 
     @ Call kernel main
-    bl kernel_main
+    bl main
 
     @ Halt if kernel returns
 halt:
@@ -421,7 +421,9 @@ unreset_done:
     .align 2
     .thumb_func
     .global rp2040_uart_init
+    .global uart_init
 rp2040_uart_init:
+uart_init:
     push {lr}
 
     @ Configure GPIO0 (TX) and GPIO1 (RX) for UART
@@ -455,7 +457,7 @@ rp2040_uart_init:
     str r0, [r3, #0x2C]         @ UARTLCR_H
 
     @ Enable UART, TX, RX
-    movs r0, #(1 << 0) | (1 << 8) | (1 << 9)  @ UARTEN, TXE, RXE
+    ldr r0, =0x301              @ UARTEN | TXE | RXE
     str r0, [r3, #0x30]         @ UARTCR
 
     pop {pc}
@@ -497,7 +499,8 @@ uart_tx_ready:
     ldr r1, =0x40034000
     ldr r0, [r1, #0x18]         @ UARTFR
     lsrs r0, r0, #6             @ TXFF bit
-    eors r0, r0, #1             @ Invert: 1 if ready
+    movs r2, #1
+    eors r0, r2                 @ Invert: 1 if ready
     bx lr
 
     .align 2
@@ -507,7 +510,140 @@ uart_rx_ready:
     ldr r1, =0x40034000
     ldr r0, [r1, #0x18]         @ UARTFR
     lsrs r0, r0, #5             @ RXFE bit
-    eors r0, r0, #1             @ Invert: 1 if data available
+    movs r2, #1
+    eors r0, r2                 @ Invert: 1 if data available
+    bx lr
+
+@ ============================================================================
+@ Print Functions (required by lib/io.py)
+@ ============================================================================
+
+    .align 2
+    .global print_str
+    .thumb_func
+print_str:
+    @ r0 = pointer to null-terminated string
+    push {r4, lr}
+    movs r4, r0
+print_str_loop:
+    ldrb r0, [r4]
+    adds r4, r4, #1
+    cmp r0, #0
+    beq print_str_done
+    bl uart_putc
+    b print_str_loop
+print_str_done:
+    pop {r4, pc}
+
+    .align 2
+    .global print_int
+    .thumb_func
+print_int:
+    @ r0 = integer to print (simplified version for M0)
+    push {r4-r7, lr}
+    movs r4, r0
+    cmp r4, #0
+    bge print_int_pos
+    @ Negative
+    movs r0, #'-'
+    bl uart_putc
+    rsbs r4, r4, #0             @ negate
+print_int_pos:
+    @ Simple: convert to decimal string on stack
+    movs r5, #0                 @ digit count
+    movs r6, r4
+    cmp r6, #0
+    bne print_int_loop
+    @ Zero case
+    movs r0, #'0'
+    bl uart_putc
+    b print_int_done
+print_int_loop:
+    @ Get digit: r6 % 10
+    movs r0, r6
+    movs r1, #10
+    bl __aeabi_uidivmod         @ r0 = quotient, r1 = remainder
+    movs r6, r0
+    adds r1, r1, #'0'
+    push {r1}
+    adds r5, r5, #1
+    cmp r6, #0
+    bne print_int_loop
+    @ Pop and print
+print_int_out:
+    cmp r5, #0
+    beq print_int_done
+    pop {r0}
+    bl uart_putc
+    subs r5, r5, #1
+    b print_int_out
+print_int_done:
+    pop {r4-r7, pc}
+
+    .align 2
+    .global print_hex
+    .thumb_func
+print_hex:
+    @ r0 = value to print in hex
+    push {r4-r5, lr}
+    movs r4, r0
+    movs r0, #'0'
+    bl uart_putc
+    movs r0, #'x'
+    bl uart_putc
+    movs r5, #28                @ bit position
+print_hex_loop:
+    movs r0, r4
+    lsrs r0, r5
+    movs r1, #0xF
+    ands r0, r1
+    cmp r0, #10
+    blt print_hex_dig
+    adds r0, r0, #('a' - '0' - 10)
+print_hex_dig:
+    adds r0, r0, #'0'
+    bl uart_putc
+    subs r5, r5, #4
+    bge print_hex_loop
+    pop {r4-r5, pc}
+
+    .align 2
+    .global print_newline
+    .thumb_func
+print_newline:
+    push {lr}
+    movs r0, #'\n'
+    bl uart_putc
+    pop {pc}
+
+    .align 2
+    .global uart_available
+    .thumb_func
+uart_available:
+    @ Check if UART has received data
+    @ Returns 1 if data available, 0 otherwise
+    ldr r1, =0x40034000
+    ldr r0, [r1, #0x18]         @ UARTFR
+    lsrs r0, r0, #5             @ RXFE bit
+    movs r2, #1
+    eors r0, r2                 @ Invert: 1 if data available
+    bx lr
+
+    .align 2
+    .global __pynux_strlen
+    .thumb_func
+__pynux_strlen:
+    @ r0 = pointer to null-terminated string
+    @ returns length in r0
+    movs r1, r0                 @ save original pointer
+__strlen_loop:
+    ldrb r2, [r0]
+    cmp r2, #0
+    beq __strlen_done
+    adds r0, r0, #1
+    b __strlen_loop
+__strlen_done:
+    subs r0, r0, r1             @ length = current - original
     bx lr
 
 @ ============================================================================
@@ -634,6 +770,28 @@ _default_handler:
 
     .global __aeabi_unwind_cpp_pr0
 __aeabi_unwind_cpp_pr0:
+    bx lr
+
+@ ============================================================================
+@ Stubs for excluded programs (not available on hardware)
+@ ============================================================================
+
+    .align 2
+    .global run_tests_main
+    .thumb_func
+run_tests_main:
+    bx lr
+
+    .align 2
+    .global sensormon_main
+    .thumb_func
+sensormon_main:
+    bx lr
+
+    .align 2
+    .global datalogger_main
+    .thumb_func
+datalogger_main:
     bx lr
 
     .end
