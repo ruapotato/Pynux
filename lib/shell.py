@@ -119,6 +119,8 @@ shell_pipe_mode: int32 = 0          # 0=normal, 1=capturing, 2=reading from pipe
 shell_redir_file: Array[256, char]  # Redirect filename
 shell_redir_mode: int32 = 0         # 0=none, 1=write, 2=append, 3=read
 shell_cmd2_buf: Array[256, char]    # Second command buffer for pipes
+shell_expand_buf: Array[512, char]  # Buffer for variable expansion
+shell_var_name: Array[64, char]     # Buffer for parsing variable names
 
 # Job control
 # Job states: 0 = stopped, 1 = running (background), 2 = running (foreground), 3 = terminated
@@ -3326,6 +3328,329 @@ def shell_exec_redir(cmd: Ptr[char], pos: int32):
         shell_puts("Input redirect not yet implemented")
         shell_newline()
 
+# ============================================================================
+# Variable Expansion
+# ============================================================================
+
+def shell_is_var_char(c: char) -> bool:
+    """Check if character is valid in variable name."""
+    if c >= 'a' and c <= 'z':
+        return True
+    if c >= 'A' and c <= 'Z':
+        return True
+    if c >= '0' and c <= '9':
+        return True
+    if c == '_':
+        return True
+    return False
+
+def shell_expand_vars(cmd: Ptr[char]):
+    """Expand $VAR and ${VAR} in command string. Modifies cmd in place."""
+    src: int32 = 0
+    dst: int32 = 0
+
+    while cmd[src] != '\0' and dst < 510:
+        if cmd[src] == '$':
+            # Variable expansion
+            src = src + 1
+            if cmd[src] == '{':
+                # ${VAR} syntax
+                src = src + 1
+                var_start: int32 = 0
+                while cmd[src] != '}' and cmd[src] != '\0' and var_start < 63:
+                    shell_var_name[var_start] = cmd[src]
+                    var_start = var_start + 1
+                    src = src + 1
+                shell_var_name[var_start] = '\0'
+                if cmd[src] == '}':
+                    src = src + 1
+            elif cmd[src] == '$':
+                # $$ - PID (we'll use 1)
+                shell_expand_buf[dst] = '1'
+                dst = dst + 1
+                src = src + 1
+                continue
+            elif cmd[src] == '?':
+                # $? - last exit code (always 0 for now)
+                shell_expand_buf[dst] = '0'
+                dst = dst + 1
+                src = src + 1
+                continue
+            else:
+                # $VAR syntax
+                var_start2: int32 = 0
+                while shell_is_var_char(cmd[src]) and var_start2 < 63:
+                    shell_var_name[var_start2] = cmd[src]
+                    var_start2 = var_start2 + 1
+                    src = src + 1
+                shell_var_name[var_start2] = '\0'
+
+            # Look up variable
+            if shell_var_name[0] != '\0':
+                val: Ptr[char] = env_get(&shell_var_name[0])
+                if val != cast[Ptr[char]](0):
+                    # Copy value to output
+                    vi: int32 = 0
+                    while val[vi] != '\0' and dst < 510:
+                        shell_expand_buf[dst] = val[vi]
+                        dst = dst + 1
+                        vi = vi + 1
+        else:
+            # Regular character
+            shell_expand_buf[dst] = cmd[src]
+            dst = dst + 1
+            src = src + 1
+
+    shell_expand_buf[dst] = '\0'
+
+    # Copy back to cmd
+    i: int32 = 0
+    while shell_expand_buf[i] != '\0' and i < 255:
+        cmd[i] = shell_expand_buf[i]
+        i = i + 1
+    cmd[i] = '\0'
+
+# ============================================================================
+# Globbing Support
+# ============================================================================
+
+shell_glob_buf: Array[1024, char]  # Buffer for expanded globs
+shell_glob_pat: Array[64, char]   # Pattern to match
+
+def shell_glob_match(name: Ptr[char], pattern: Ptr[char]) -> bool:
+    """Match filename against glob pattern with * and ? wildcards."""
+    ni: int32 = 0
+    pi: int32 = 0
+
+    while pattern[pi] != '\0':
+        if pattern[pi] == '*':
+            # * matches zero or more characters
+            pi = pi + 1
+            if pattern[pi] == '\0':
+                return True  # * at end matches everything
+            # Try matching rest of pattern at each position
+            while name[ni] != '\0':
+                if shell_glob_match(&name[ni], &pattern[pi]):
+                    return True
+                ni = ni + 1
+            return False
+        elif pattern[pi] == '?':
+            # ? matches exactly one character
+            if name[ni] == '\0':
+                return False
+            ni = ni + 1
+            pi = pi + 1
+        else:
+            # Regular character - must match exactly
+            if name[ni] != pattern[pi]:
+                return False
+            ni = ni + 1
+            pi = pi + 1
+
+    return name[ni] == '\0'
+
+def shell_has_glob(s: Ptr[char]) -> bool:
+    """Check if string contains glob characters."""
+    i: int32 = 0
+    while s[i] != '\0':
+        if s[i] == '*' or s[i] == '?':
+            return True
+        i = i + 1
+    return False
+
+def shell_expand_glob(pattern: Ptr[char], result: Ptr[char], max_len: int32) -> int32:
+    """Expand glob pattern to matching files. Returns number of matches."""
+    result[0] = '\0'
+    matches: int32 = 0
+    pos: int32 = 0
+
+    # Get directory and file pattern
+    # Find last / in pattern
+    dir_end: int32 = -1
+    i: int32 = 0
+    while pattern[i] != '\0':
+        if pattern[i] == '/':
+            dir_end = i
+        i = i + 1
+
+    # Set up directory to search
+    if dir_end >= 0:
+        # Has directory component
+        j: int32 = 0
+        while j < dir_end:
+            shell_path_buf[j] = pattern[j]
+            j = j + 1
+        shell_path_buf[j] = '\0'
+        # Pattern is everything after last /
+        k: int32 = 0
+        m: int32 = dir_end + 1
+        while pattern[m] != '\0' and k < 63:
+            shell_glob_pat[k] = pattern[m]
+            k = k + 1
+            m = m + 1
+        shell_glob_pat[k] = '\0'
+    else:
+        # No directory - use current directory
+        strcpy(&shell_path_buf[0], &shell_cwd[0])
+        # Pattern is the whole thing
+        k2: int32 = 0
+        while pattern[k2] != '\0' and k2 < 63:
+            shell_glob_pat[k2] = pattern[k2]
+            k2 = k2 + 1
+        shell_glob_pat[k2] = '\0'
+
+    # Search directory
+    name: Array[64, char]
+    idx: int32 = 0
+    ret: int32 = ramfs_readdir(&shell_path_buf[0], idx, &name[0])
+    while ret == 0:
+        if shell_glob_match(&name[0], &shell_glob_pat[0]):
+            # Match found - add to result
+            if matches > 0 and pos < max_len - 1:
+                result[pos] = ' '
+                pos = pos + 1
+            # Add directory prefix if needed
+            if dir_end >= 0:
+                n: int32 = 0
+                while n <= dir_end and pos < max_len - 1:
+                    result[pos] = pattern[n]
+                    pos = pos + 1
+                    n = n + 1
+            # Add filename
+            n2: int32 = 0
+            while name[n2] != '\0' and pos < max_len - 1:
+                result[pos] = name[n2]
+                pos = pos + 1
+                n2 = n2 + 1
+            matches = matches + 1
+        idx = idx + 1
+        ret = ramfs_readdir(&shell_path_buf[0], idx, &name[0])
+
+    result[pos] = '\0'
+    return matches
+
+def shell_expand_globs(cmd: Ptr[char]):
+    """Expand glob patterns in command. Modifies cmd in place."""
+    # Simple implementation: find words with * or ?, expand them
+    src: int32 = 0
+    dst: int32 = 0
+    word_start: int32 = 0
+    in_word: bool = False
+
+    shell_expand_buf[0] = '\0'
+
+    while cmd[src] != '\0' and dst < 500:
+        if cmd[src] == ' ' or cmd[src] == '\t':
+            if in_word:
+                # End of word - check if it had globs
+                cmd[src] = '\0'  # Temporarily terminate
+                if shell_has_glob(&cmd[word_start]):
+                    # Expand glob
+                    matches: int32 = shell_expand_glob(&cmd[word_start], &shell_glob_buf[0], 1000)
+                    if matches > 0:
+                        # Copy expanded result
+                        gi: int32 = 0
+                        while shell_glob_buf[gi] != '\0' and dst < 500:
+                            shell_expand_buf[dst] = shell_glob_buf[gi]
+                            dst = dst + 1
+                            gi = gi + 1
+                    else:
+                        # No matches - copy original
+                        wi: int32 = word_start
+                        while wi < src and dst < 500:
+                            shell_expand_buf[dst] = cmd[wi]
+                            dst = dst + 1
+                            wi = wi + 1
+                else:
+                    # No globs - copy as-is
+                    wi2: int32 = word_start
+                    while wi2 < src and dst < 500:
+                        shell_expand_buf[dst] = cmd[wi2]
+                        dst = dst + 1
+                        wi2 = wi2 + 1
+                cmd[src] = ' '  # Restore space
+                in_word = False
+            # Copy space
+            shell_expand_buf[dst] = cmd[src]
+            dst = dst + 1
+            src = src + 1
+        else:
+            if not in_word:
+                word_start = src
+                in_word = True
+            src = src + 1
+
+    # Handle last word
+    if in_word:
+        if shell_has_glob(&cmd[word_start]):
+            matches2: int32 = shell_expand_glob(&cmd[word_start], &shell_glob_buf[0], 1000)
+            if matches2 > 0:
+                gi2: int32 = 0
+                while shell_glob_buf[gi2] != '\0' and dst < 500:
+                    shell_expand_buf[dst] = shell_glob_buf[gi2]
+                    dst = dst + 1
+                    gi2 = gi2 + 1
+            else:
+                wi3: int32 = word_start
+                while cmd[wi3] != '\0' and dst < 500:
+                    shell_expand_buf[dst] = cmd[wi3]
+                    dst = dst + 1
+                    wi3 = wi3 + 1
+        else:
+            wi4: int32 = word_start
+            while cmd[wi4] != '\0' and dst < 500:
+                shell_expand_buf[dst] = cmd[wi4]
+                dst = dst + 1
+                wi4 = wi4 + 1
+
+    shell_expand_buf[dst] = '\0'
+
+    # Copy back
+    i2: int32 = 0
+    while shell_expand_buf[i2] != '\0' and i2 < 255:
+        cmd[i2] = shell_expand_buf[i2]
+        i2 = i2 + 1
+    cmd[i2] = '\0'
+
+def shell_is_assignment(cmd: Ptr[char]) -> bool:
+    """Check if command is a variable assignment (VAR=value).
+    Returns True if it's an assignment and handles it."""
+    # Must start with letter or underscore
+    if not ((cmd[0] >= 'a' and cmd[0] <= 'z') or
+            (cmd[0] >= 'A' and cmd[0] <= 'Z') or
+            cmd[0] == '_'):
+        return False
+
+    # Find the = sign
+    i: int32 = 0
+    while cmd[i] != '\0' and cmd[i] != '=' and cmd[i] != ' ':
+        if not shell_is_var_char(cmd[i]):
+            return False
+        i = i + 1
+
+    if cmd[i] != '=':
+        return False
+
+    # It's an assignment - extract name and value
+    j: int32 = 0
+    while j < i and j < 63:
+        shell_var_name[j] = cmd[j]
+        j = j + 1
+    shell_var_name[j] = '\0'
+
+    # Get value (after =)
+    value: Ptr[char] = &cmd[i + 1]
+
+    # Set the variable
+    if env_set(&shell_var_name[0], value):
+        shell_newline()
+    else:
+        shell_newline()
+        shell_puts("Error: too many variables")
+        shell_newline()
+
+    return True
+
 def shell_exec():
     global shell_cmd_pos, shell_cursor_pos
 
@@ -3344,6 +3669,19 @@ def shell_exec():
 
     # Expand aliases before execution
     shell_expand_alias(cmd)
+
+    # Expand variables ($VAR, ${VAR})
+    shell_expand_vars(cmd)
+
+    # Expand globs (*.py, file?.txt)
+    shell_expand_globs(cmd)
+
+    # Check for variable assignment (VAR=value)
+    if shell_is_assignment(cmd):
+        shell_prompt()
+        shell_cmd_pos = 0
+        shell_cursor_pos = 0
+        return
 
     # Check for background execution (&)
     is_bg: bool = shell_find_bg(cmd)
