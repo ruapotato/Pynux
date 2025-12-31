@@ -567,15 +567,21 @@ def devfs_init():
         ramfs_create("/etc/drivers", True)
 
     # Register default demo devices for emulator testing
+    # GPIO pins
     devfs_register(DEV_GPIO, 0, 0, "pin0")
     devfs_register(DEV_GPIO, 1, 1, "pin1")
     devfs_register(DEV_GPIO, 2, 2, "pin2")
     devfs_register(DEV_GPIO, 3, 3, "pin3")
+    # Sensors
     devfs_register(DEV_TEMP, 0, 4, "temp0")
     devfs_register(DEV_ACCEL, 0, 5, "accel0")
     devfs_register(DEV_LIGHT, 0, 6, "light0")
+    devfs_register(DEV_HUMID, 0, 7, "humid0")
+    devfs_register(DEV_PRESS, 0, 8, "press0")
+    # Motors
     devfs_register(DEV_SERVO, 0, 9, "servo0")
-    devfs_register(DEV_DC, 0, 10, "dc0")
+    devfs_register(DEV_STEPPER, 0, 10, "stepper0")
+    devfs_register(DEV_DC, 0, 11, "dc0")
 
     # Scan and load additional drivers from config
     devfs_scan_drivers()
