@@ -1,93 +1,60 @@
 # Pynux
 
-**GNU for microcontrollers. Python syntax. Native speed.**
+**A tiny OS for microcontrollers. Python syntax. Native speed.**
 
-Pynux is a Python-syntax systems language that compiles to native ARM. Run `cat`, `ls`, `grep`, and `sh` on a $4 Raspberry Pi Pico.
+Pynux is a Python-syntax systems language that compiles to native ARM Thumb-2. Write familiar Python code, get bare-metal performance on Cortex-M microcontrollers.
 
-## What is this?
+## Features
 
-- **Python syntax** you already know
-- **Compiles to native ARM** Thumb-2 (Cortex-M)
-- **Graphical desktop** - Multi-window DE over VTNext protocol
-- **Job control** - Background tasks with `jobs`, `fg`, `bg`
-- **User programs** - `programs/main.py` runs at boot like CircuitPython
+- **Python syntax** you already know (with static types)
+- **Compiles to native ARM** - no interpreter, no VM
+- **Full OS** - processes, IPC, filesystem, device drivers
+- **266 passing tests** across 8 test suites
+- **Graphical desktop** via VTNext protocol
+- **QEMU simulation** - develop without hardware
 
 ## Quick Start
 
 ```bash
+# Install dependencies
+sudo apt install gcc-arm-none-eabi qemu-system-arm python3
+
 # Build
 ./build.sh
 
-# Run in QEMU with VTNext graphical desktop
+# Run tests
+./boot_vm.sh --shell   # Watch 266 tests pass
+
+# Run graphical mode (requires pygame)
+pip install pygame
 ./boot_vm.sh
-
-# Run in text mode
-./boot_vm.sh --shell
 ```
 
-## Desktop Environment
-
-Pynux includes a graphical desktop environment with:
-
-- **Menu** (ESC) - Launch apps, close windows
-- **Terminal** - Full shell with file operations
-- **Editor** - Text editor with Ctrl+S save
-- **File Manager** - Navigate and open files
-
-### Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| ESC | Toggle menu |
-| TAB | Switch windows |
-| j/k | Navigate (menu/files) |
-| Enter | Select/execute |
-| Ctrl+S | Save (editor) |
-| Ctrl+C | Cancel (terminal) |
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Menu                                                    │
-├─────────────────────────────────────────────────────────┤
-│ ┌─ Terminal 1 ────────────────────────────────────────┐ │
-│ │ [1] main.py &                                       │ │
-│ │ main.py: Uptime monitor started                     │ │
-│ │                                                     │ │
-│ │ pynux:/> ls                                         │ │
-│ │ dev/  etc/  home/  tmp/                             │ │
-│ │ pynux:/> _                                          │ │
-│ └─────────────────────────────────────────────────────┘ │
-│ ┌─ Files: / ─────────┐ ┌─ Editor ────────────────────┐ │
-│ │ ..                  │ │                             │ │
-│ │ dev/                │ │ (empty)                     │ │
-│ │ etc/                │ │                             │ │
-│ │ home/               │ └─────────────────────────────┘ │
-│ └─────────────────────┘                                 │
-├─────────────────────────────────────────────────────────┤
-│ Heap: 2080/16384 | Win: 3 | F1:Menu F2:Switch          │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    User Programs                             │
+│              (programs/main.py, sensors, motors)             │
+├─────────────────────────────────────────────────────────────┤
+│     Shell      │    Libraries    │   Debug Tools            │
+│  (commands,    │  (io, string,   │  (trace, profiler,       │
+│   job control) │   math, etc.)   │   memtrack, GDB stub)    │
+├─────────────────────────────────────────────────────────────┤
+│  Process Mgmt  │   Filesystem    │   Device Drivers         │
+│  (IPC, pipes,  │   (RAMFS,       │   (GPIO, PWM, ADC,       │
+│   msg queues)  │    devfs)       │    I2C, SPI, sensors)    │
+├─────────────────────────────────────────────────────────────┤
+│                    Kernel / HAL                              │
+│              (timer, memory, interrupts)                     │
+├─────────────────────────────────────────────────────────────┤
+│                  ARM Cortex-M3 Hardware                      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Shell Commands
+## Writing Programs
 
-### File Operations
-`ls` `cat` `cp` `mv` `rm` `mkdir` `touch` `write` `head` `tail` `wc` `stat` `pwd` `cd`
-
-### System
-`uname` `hostname` `whoami` `uptime` `free` `date` `printenv` `arch` `tty` `groups`
-
-### Job Control
-`jobs` `fg` `bg`
-
-### Utilities
-`echo` `seq` `factor` `true` `false` `yes` `clear` `help` `version`
-
-### Hardware
-`sensors` `servo` `stepper` `motor` `drivers` `sensormon` `motorctl`
-
-## User Programs
-
-Create `programs/main.py` to run code at boot:
+Create `programs/main.py` - it runs automatically at boot:
 
 ```python
 # programs/main.py
@@ -97,9 +64,11 @@ from kernel.timer import timer_get_ticks
 last_print_time: int32 = 0
 
 def user_main():
-    console_puts("Hello from main.py!\n")
+    """Called once at startup."""
+    console_puts("Hello from Pynux!\n")
 
 def user_tick():
+    """Called repeatedly - cooperative multitasking."""
     global last_print_time
     ticks: int32 = timer_get_ticks()
     if ticks - last_print_time >= 5000:
@@ -109,210 +78,230 @@ def user_tick():
         console_puts("s\n")
 ```
 
-- `user_main()` - Called once at startup
-- `user_tick()` - Called repeatedly (cooperative multitasking)
-- Shows as `[1] main.py &` in job list
+### Reading Sensors
 
-## Device Filesystem (devfs)
+```python
+from lib.sensors import temp_read, accel_read, light_read
 
-Pynux exposes hardware as virtual files under `/dev/`, following the Unix philosophy. Read sensors and control actuators using standard file operations.
+def user_main():
+    # Read temperature (returns millidegrees C)
+    temp: int32 = temp_read(0)
+    console_puts("Temp: ")
+    console_print_int(temp / 1000)
+    console_puts(" C\n")
 
-### Reading Devices
-
-```bash
-# Read temperature sensor
-cat /dev/sensors/temp0
-> 23.45
-
-# Read GPIO pin state
-cat /dev/gpio/pin3
-> 1
-
-# Read accelerometer
-cat /dev/sensors/accel0
-> X=0 Y=0 Z=980
+    # Read accelerometer
+    x: int32 = 0
+    y: int32 = 0
+    z: int32 = 0
+    accel_read(0, &x, &y, &z)
 ```
 
-### Writing Devices
+### Controlling Motors
+
+```python
+from lib.motors import servo_write, dc_set_speed
+
+def user_main():
+    servo_write(0, 90)       # Servo to 90 degrees
+    dc_set_speed(0, 50)      # DC motor at 50%
+```
+
+## Shell Commands
+
+### File Operations
+```bash
+ls  cat  cp  mv  rm  mkdir  touch  pwd  cd  head  tail  wc  stat
+```
+
+### System Info
+```bash
+uname  uptime  free  date  hostname  arch
+```
+
+### Hardware
+```bash
+sensors          # Read all sensors
+servo 0 90       # Set servo angle
+motor 0 50       # Set motor speed
+drivers list     # Show loaded drivers
+```
+
+### Job Control
+```bash
+command &        # Run in background
+jobs             # List background jobs
+fg %1            # Bring to foreground
+```
+
+## Device Filesystem
+
+Hardware appears as files under `/dev/`:
 
 ```bash
-# Set GPIO pin high
-echo 1 > /dev/gpio/pin3
+# Read temperature
+cat /dev/sensors/temp0
+> 23.45
 
 # Set servo angle
 echo 90 > /dev/motors/servo0
 
-# Set DC motor speed
-echo 50 > /dev/motors/dc0
+# Read GPIO pin
+cat /dev/gpio/pin0
+> 1
 ```
 
-### Driver Configuration
+### Available Devices
 
-Create driver config files in `/etc/drivers/` (one device per file):
-
-```ini
-# /etc/drivers/temp0.conf
-type=temp
-id=0
-pin=4
-name=temp0
-```
-
-```ini
-# /etc/drivers/servo0.conf
-type=servo
-id=0
-pin=9
-name=servo0
-```
-
-```ini
-# /etc/drivers/motor0.conf
-type=dc
-id=0
-pin=10
-name=motor0
-```
-
-**Note:** By default, 12 demo devices are registered at boot:
-- `/dev/gpio/pin0` through `/dev/gpio/pin3` - GPIO pins
-- `/dev/sensors/temp0` - Temperature (simulated with noise)
-- `/dev/sensors/accel0` - 3-axis accelerometer
-- `/dev/sensors/light0` - Ambient light sensor
-- `/dev/sensors/humid0` - Humidity sensor
-- `/dev/sensors/press0` - Barometric pressure
-- `/dev/motors/servo0` - Servo motor (0-180°)
-- `/dev/motors/stepper0` - Stepper motor
-- `/dev/motors/dc0` - DC motor (-100% to 100%)
-
-### Supported Device Types
-
-| Type | Path | Read | Write |
-|------|------|------|-------|
-| GPIO | /dev/gpio/pinN | 0/1 | 0/1/high/low |
-| Temperature | /dev/sensors/tempN | XX.XX (C) | - |
-| Accelerometer | /dev/sensors/accelN | X=n Y=n Z=n | - |
-| Light | /dev/sensors/lightN | 0-65535 | - |
-| Humidity | /dev/sensors/humidN | XX.X (%) | - |
-| Pressure | /dev/sensors/pressN | XXXXX (Pa) | - |
-| Servo | /dev/motors/servoN | angle | 0-180 |
-| Stepper | /dev/motors/stepperN | position | steps |
-| DC Motor | /dev/motors/dcN | speed% | -100 to 100 |
-
-### Shell Commands
-
-```bash
-# List loaded drivers
-drivers list
-
-# Reload drivers from /etc/drivers/
-drivers reload
-```
+| Path | Read | Write |
+|------|------|-------|
+| `/dev/gpio/pinN` | 0/1 | 0/1 |
+| `/dev/sensors/tempN` | degrees C | - |
+| `/dev/sensors/accelN` | X Y Z | - |
+| `/dev/sensors/lightN` | 0-65535 | - |
+| `/dev/motors/servoN` | angle | 0-180 |
+| `/dev/motors/stepperN` | position | steps |
+| `/dev/motors/dcN` | speed% | -100 to 100 |
 
 ## Libraries
 
-Pynux includes 30+ libraries for embedded development:
-
 ### Core
-| Library | Description |
-|---------|-------------|
-| `lib/io.py` | UART, console I/O |
-| `lib/memory.py` | Heap allocator |
+| Library | Purpose |
+|---------|---------|
+| `lib/io.py` | Console I/O, UART |
+| `lib/memory.py` | Heap allocation |
 | `lib/string.py` | String operations |
-| `lib/math.py` | Math functions, trig, sqrt |
+| `lib/math.py` | Math, trig, sqrt |
+
+### Hardware
+| Library | Purpose |
+|---------|---------|
+| `lib/peripherals.py` | GPIO, SPI, I2C, PWM, ADC |
+| `lib/sensors.py` | Temperature, accelerometer, light |
+| `lib/motors.py` | Servo, stepper, DC motors |
+| `lib/i2c.py` | Advanced I2C with simulation |
+| `lib/spi.py` | Advanced SPI with simulation |
+
+### Debug & Profiling
+| Library | Purpose |
+|---------|---------|
+| `lib/trace.py` | Event tracing with timestamps |
+| `lib/profiler.py` | Function timing |
+| `lib/memtrack.py` | Memory leak detection |
 
 ### Data Structures
-| Library | Description |
-|---------|-------------|
+| Library | Purpose |
+|---------|---------|
 | `lib/list.py` | Dynamic arrays |
 | `lib/dict.py` | Hash maps |
 | `lib/structures.py` | Stack, queue, ring buffer |
-| `lib/algo.py` | Sorting, searching |
-
-### Hardware
-| Library | Description |
-|---------|-------------|
-| `lib/sensors.py` | Temp, accel, light, humid, pressure |
-| `lib/motors.py` | Servo, stepper, DC motors |
-| `lib/display.py` | HD44780 LCD, SSD1306 OLED, 7-segment |
-| `lib/peripherals.py` | GPIO, SPI, I2C, ADC, PWM |
-
-### Communication
-| Library | Description |
-|---------|-------------|
-| `lib/onewire.py` | 1-Wire protocol (DS18B20) |
-| `lib/canbus.py` | CAN bus messaging |
-| `lib/json.py` | JSON parser |
-| `lib/encoding.py` | Base64, hex encoding |
 
 ### Control Systems
-| Library | Description |
-|---------|-------------|
+| Library | Purpose |
+|---------|---------|
 | `lib/pid.py` | PID controller |
-| `lib/filters.py` | Low-pass, Kalman, moving average |
-| `lib/fsm.py` | Finite state machine |
+| `lib/filters.py` | Low-pass, Kalman filters |
+| `lib/fsm.py` | Finite state machines |
 
-### System
-| Library | Description |
-|---------|-------------|
-| `lib/rtc.py` | Real-time clock |
-| `lib/watchdog.py` | Watchdog timer |
-| `lib/eeprom.py` | EEPROM storage |
-| `lib/logging.py` | Log levels, output |
-| `lib/events.py` | Event queue |
+### Networking (Advanced)
+| Library | Purpose |
+|---------|---------|
+| `lib/net/` | TCP/IP stack for raw Ethernet |
+
+> **Note:** Most microcontroller projects use WiFi chips (ESP8266/ESP32) or hardware TCP/IP chips (Wiznet W5500) that handle networking internally. The `lib/net/` stack is for advanced use cases with raw Ethernet MACs.
+
+## Testing
+
+Pynux has comprehensive tests:
+
+```bash
+./boot_vm.sh --shell
+# Runs automatically, shows:
+# Test Suites: 8 passed
+# Individual Tests: 266 passed
+```
+
+Test suites cover:
+- IPC (pipes, message queues)
+- Memory management
+- Timer operations
+- RAM filesystem
+- Device filesystem
+- Event tracing
+- Profiler
+- Memory tracking
+
+## Project Structure
+
+```
+compiler/       # Python-to-ARM compiler (runs on host)
+runtime/        # ARM assembly startup
+kernel/         # Kernel, scheduler, filesystem
+lib/            # 30+ libraries
+programs/       # User programs (main.py runs at boot)
+tests/          # Test suites (266 tests)
+vtnext/         # Graphical terminal (pygame)
+```
 
 ## Target Hardware
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| QEMU mps2-an385 | Primary | Cortex-M3, development |
-| RP2040 (Pico) | Target | $4, huge community |
-| RP2350 (Pico 2) | Future | RISC-V option |
+| QEMU mps2-an385 | Working | Primary development |
+| RP2040 (Pico) | Planned | $4, great community |
+| STM32F4 | Planned | Common Cortex-M4 |
 
-## Project Structure
+## Memory Usage
 
-```
-compiler/       # Python 3.10+ compiler (runs on host)
-runtime/        # ARM assembly startup code
-kernel/         # Kernel, RAMFS, timer, devfs
-lib/            # 30+ libraries (sensors, motors, display, etc.)
-programs/       # User programs (main.py runs at boot)
-tests/          # Integration tests (expect scripts)
-vtnext/         # Graphical terminal renderer (pygame)
-```
+- **Code:** ~485KB
+- **Data:** ~175KB
+- **Heap:** 16KB available
+- **Stack:** 4KB per process
 
-## Building
+## Building from Source
+
+Requirements:
+- GCC ARM toolchain (`gcc-arm-none-eabi`)
+- QEMU ARM (`qemu-system-arm`)
+- Python 3.10+
+- pygame (optional, for graphical mode)
 
 ```bash
-# Requirements
-sudo apt install gcc-arm-none-eabi qemu-system-arm python3-pygame
+# Ubuntu/Debian
+sudo apt install gcc-arm-none-eabi qemu-system-arm python3
 
 # Build
 ./build.sh
 
-# Run (text mode)
-./boot_vm.sh --shell
-
-# Run (graphical mode)
-./boot_vm.sh
+# Run
+./boot_vm.sh --shell    # Text mode
+./boot_vm.sh            # Graphical mode
 ```
 
-## Memory
+## Language Features
 
-- 16KB heap (bump allocator)
-- ~230KB code
-- 512 bytes max file size
-- RAMFS for files
+Pynux uses Python syntax with static types:
 
-## Ideas for Future
+```python
+# Type annotations required
+count: int32 = 0
+name: Ptr[char] = "hello"
+data: Array[100, uint8]
 
-- **Network stack** - lwIP for TCP/IP on RP2040 W
-- **USB support** - Mass storage, HID
-- **Bluetooth** - BLE for RP2040 W
-- **Flash filesystem** - LittleFS for persistent storage
-- **Multitasking** - Cooperative scheduler with priorities
-- **Package manager** - Install libraries from network
-- **Remote debugging** - GDB stub over serial
+# Functions with types
+def add(a: int32, b: int32) -> int32:
+    return a + b
+
+# Pointers
+ptr: Ptr[int32] = &count
+value: int32 = ptr[0]
+
+# Arrays
+buffer: Array[256, uint8]
+buffer[0] = 42
+```
+
+See [LANGUAGE.md](LANGUAGE.md) for full syntax reference.
 
 ## License
 

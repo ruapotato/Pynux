@@ -106,11 +106,11 @@ if user_programs:
     print(f"  Found user programs: {', '.join(user_programs)}")
 
 # Add test files from tests/ folder
-# Exclude Python3-only test files and tests with missing dependencies
-excluded_tests = ["test_compiler.py", "test_integration.py", "test_all.py",
-                  "test_process.py", "test_sync.py",  # Missing symbols
-                  "test_boot.py", "test_gfx.py", "test_net.py",  # New modules with unimplemented APIs
-                  "test_scheduler.py", "test_shell.py"]  # API mismatches
+# Exclude Python3-only test files and tests needing work
+excluded_tests = ["test_compiler.py", "test_integration.py", "test_all.py",  # Python3 host tests
+                  "test_process.py", "test_sync.py",  # Need process/sync API updates
+                  "test_boot.py", "test_gfx.py",  # Need API alignment
+                  "test_scheduler.py", "test_shell.py"]  # Need API alignment
 test_files = []
 for test_path in sorted(glob.glob("tests/test_*.py")):
     name = os.path.basename(test_path)

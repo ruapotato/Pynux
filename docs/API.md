@@ -10,6 +10,9 @@ Complete API documentation for Pynux libraries.
 4. [Control Systems](#control-systems)
 5. [Communication](#communication)
 6. [System Services](#system-services)
+7. [Kernel Services](#kernel-services)
+8. [Debug & Profiling](#debug--profiling)
+9. [Advanced Hardware](#advanced-hardware)
 
 ---
 
@@ -18,29 +21,53 @@ Complete API documentation for Pynux libraries.
 ### lib/io.py - Input/Output
 
 ```python
-# UART operations
+# UART low-level (implemented in assembly)
 uart_init()                           # Initialize UART
 uart_putc(c: char)                    # Write character
 uart_getc() -> char                   # Read character (blocking)
 uart_available() -> bool              # Check if data available
 
-# Console output
-print_str(s: Ptr[char])               # Print string
-print_int(n: int32)                   # Print integer
+# Direct UART output
+print_str(s: Ptr[char])               # Print string to UART
+print_int(n: int32)                   # Print integer to UART
+print_hex(n: uint32)                  # Print hex to UART
 print_newline()                       # Print newline
+
+# Console abstraction (redirectable to DE terminal)
+console_putc(c: char)                 # Output character
+console_puts(s: Ptr[char])            # Output string
+console_print_int(n: int32)           # Output integer
+console_set_mode(mode: int32)         # 0=UART, 1=buffered for DE
+console_flush() -> Ptr[char]          # Get buffer and reset
+console_has_output() -> bool          # Check for buffered output
+
+# Line input
+read_char() -> char                   # Read single character
+read_line() -> Ptr[char]              # Read line with editing
 ```
 
 ### lib/memory.py - Memory Management
 
+Free-list allocator with coalescing support.
+
 ```python
-heap_init()                           # Initialize heap
-alloc(size: int32) -> Ptr[void]       # Allocate memory
-free(ptr: Ptr[void])                  # Free memory (no-op in bump allocator)
+# Allocation
+heap_init()                           # Initialize heap (auto-called)
+alloc(size: int32) -> Ptr[uint8]      # Allocate memory
+calloc(count: int32, size: int32) -> Ptr[uint8]  # Allocate zeroed
+realloc(ptr: Ptr[uint8], new_size: int32) -> Ptr[uint8]  # Resize
+free(ptr: Ptr[uint8])                 # Free memory (with coalescing)
+
+# Heap statistics
 heap_used() -> int32                  # Get used heap bytes
-heap_remaining() -> int32             # Get remaining heap bytes
-heap_total() -> int32                 # Get total heap size
-memset(ptr: Ptr[void], val: int32, n: int32)  # Set memory
-memcpy(dst: Ptr[void], src: Ptr[void], n: int32)  # Copy memory
+heap_remaining() -> int32             # Get free heap bytes
+heap_total() -> int32                 # Get total heap size (16KB)
+
+# Memory operations
+memset(dst: Ptr[uint8], val: uint8, size: int32)
+memcpy(dst: Ptr[uint8], src: Ptr[uint8], size: int32)
+memmove(dst: Ptr[uint8], src: Ptr[uint8], size: int32)  # Overlap-safe
+memcmp(a: Ptr[uint8], b: Ptr[uint8], size: int32) -> int32
 ```
 
 ### lib/string.py - String Operations
@@ -475,4 +502,196 @@ timer_init()
 timer_get_ticks() -> int32            # Milliseconds since boot
 timer_delay_ms(ms: int32)             # Blocking delay
 timer_tick()                          # Called by interrupt handler
+```
+
+---
+
+## Debug & Profiling
+
+### lib/trace.py - Execution Tracing
+
+Lightweight event tracing using a circular buffer. Useful for debugging timing issues, tracking IRQs, and profiling execution flow.
+
+```python
+# Event types (constants)
+TRACE_FUNC_ENTER = 0x01     # Function entry
+TRACE_FUNC_EXIT = 0x02      # Function exit
+TRACE_IRQ = 0x03            # IRQ entry
+TRACE_IRQ_EXIT = 0x04       # IRQ exit
+TRACE_ALLOC = 0x06          # Memory allocation
+TRACE_FREE = 0x07           # Memory free
+TRACE_ERROR = 0x0C          # Error event
+TRACE_USER = 0x10           # User-defined event
+
+# Initialization and control
+trace_init()                          # Initialize tracing
+trace_enable()                        # Start tracing
+trace_disable()                       # Stop tracing
+trace_is_enabled() -> bool            # Check if enabled
+trace_clear()                         # Clear buffer
+
+# Logging events
+trace_log(event: int32, data: uint32) # Log generic event
+trace_log_func_enter(func_addr: uint32)
+trace_log_func_exit(func_addr: uint32)
+trace_log_irq(irq_num: int32)
+trace_log_irq_exit(irq_num: int32)
+trace_log_alloc(ptr: uint32, size: int32)
+trace_log_free(ptr: uint32)
+trace_log_error(code: int32)
+trace_log_user(data: uint32)
+
+# Filtering
+trace_set_filter(mask: int32)         # Set event filter bitmask
+trace_get_filter() -> int32           # Get current filter
+
+# Analysis
+trace_get_count() -> int32            # Number of entries
+trace_get_overflow() -> int32         # Lost entries count
+trace_count_events(event_type: int32) -> int32
+trace_find_event(event_type: int32, start_from: int32) -> int32
+trace_get_last(event_out: Ptr[int32], data_out: Ptr[uint32]) -> bool
+
+# Output
+trace_dump()                          # Print all entries
+trace_dump_range(start_idx: int32, count: int32)
+```
+
+### lib/profiler.py - Function Timing
+
+Cycle-accurate timing profiler for measuring code performance.
+
+```python
+# Initialization and control
+profile_init()                        # Initialize profiler
+profile_enable()                      # Enable profiling
+profile_disable()                     # Disable (start/stop become no-ops)
+profile_is_enabled() -> bool
+profile_reset()                       # Clear all data
+
+# Timing sections
+profile_start(name: Ptr[char])        # Start timing named section
+profile_stop(name: Ptr[char])         # Stop timing named section
+
+# Query statistics (all times in cycles)
+profile_get_calls(name: Ptr[char]) -> int32   # Call count
+profile_get_total(name: Ptr[char]) -> int32   # Total cycles
+profile_get_avg(name: Ptr[char]) -> int32     # Average cycles per call
+profile_get_max(name: Ptr[char]) -> int32     # Max cycles
+
+# Output
+profile_report()                      # Print timing report
+profile_get_count() -> int32          # Number of profiled sections
+```
+
+**Example:**
+```python
+profile_init()
+profile_start("sensor_read")
+temp: int32 = temp_read()
+profile_stop("sensor_read")
+profile_report()  # Shows timing stats
+```
+
+### lib/memtrack.py - Memory Leak Detection
+
+Tracks allocations with tags for debugging memory usage and detecting leaks.
+
+```python
+# Initialization and control
+memtrack_init()                       # Initialize tracker
+memtrack_enable()                     # Enable tracking
+memtrack_disable()                    # Disable tracking
+memtrack_is_enabled() -> bool
+memtrack_reset()                      # Clear all data
+
+# Tracking allocations
+memtrack_alloc(ptr: Ptr[uint8], size: int32, tag: Ptr[char])
+memtrack_free(ptr: Ptr[uint8])
+
+# Query
+memtrack_get_total() -> int32         # Total bytes ever allocated
+memtrack_get_peak() -> int32          # Peak memory usage
+memtrack_get_current() -> int32       # Current allocated bytes
+memtrack_get_count() -> int32         # Active allocation count
+memtrack_get_size(ptr: Ptr[uint8]) -> int32   # Size of allocation
+memtrack_get_tag(ptr: Ptr[uint8]) -> Ptr[char]
+
+# Analysis
+memtrack_check_leaks() -> int32       # Returns leak count, prints report
+memtrack_report()                     # Print full report
+```
+
+**Example:**
+```python
+memtrack_init()
+ptr: Ptr[uint8] = alloc(256)
+memtrack_alloc(ptr, 256, "buffer")
+# ... use memory ...
+memtrack_check_leaks()  # Reports if not freed
+```
+
+### lib/breakpoint.py - Debug Breakpoints
+
+Software breakpoint support for debugging.
+
+```python
+breakpoint_init()
+breakpoint_trigger()                  # Trigger breakpoint (BKPT instruction)
+breakpoint_set(addr: uint32) -> bool  # Set breakpoint at address
+breakpoint_clear(addr: uint32) -> bool
+breakpoint_enable()
+breakpoint_disable()
+```
+
+---
+
+## Advanced Hardware
+
+### lib/i2c.py - Advanced I2C Bus
+
+Full I2C bus implementation with device scanning, multi-bus support, and simulation mode.
+
+```python
+# Bus initialization
+i2c_bus_init(bus: int32, speed: int32)    # Initialize bus (0=100kHz, 1=400kHz)
+i2c_bus_reset(bus: int32)                 # Reset bus
+
+# Device communication
+i2c_bus_write(bus: int32, addr: uint8, data: Ptr[uint8], len: int32) -> int32
+i2c_bus_read(bus: int32, addr: uint8, buf: Ptr[uint8], len: int32) -> int32
+i2c_bus_write_reg(bus: int32, addr: uint8, reg: uint8, val: uint8) -> int32
+i2c_bus_read_reg(bus: int32, addr: uint8, reg: uint8) -> int32
+
+# Bus scanning
+i2c_bus_scan(bus: int32)                  # Print detected devices
+i2c_bus_probe(bus: int32, addr: uint8) -> bool  # Check if device responds
+
+# Simulation
+i2c_sim_enable(bus: int32)                # Enable simulation mode
+i2c_sim_add_device(bus: int32, addr: uint8, device_type: int32)
+i2c_sim_set_reg(bus: int32, addr: uint8, reg: uint8, val: uint8)
+```
+
+### lib/spi.py - Advanced SPI Bus
+
+Full SPI implementation with multiple buses and chip select management.
+
+```python
+# Bus initialization
+spi_bus_init(bus: int32, speed: int32, mode: int32)
+spi_bus_reset(bus: int32)
+
+# Data transfer
+spi_bus_transfer(bus: int32, tx: Ptr[uint8], rx: Ptr[uint8], len: int32) -> int32
+spi_bus_write(bus: int32, data: Ptr[uint8], len: int32) -> int32
+spi_bus_read(bus: int32, buf: Ptr[uint8], len: int32) -> int32
+
+# Chip select
+spi_bus_select(bus: int32, cs: int32)     # Assert CS
+spi_bus_deselect(bus: int32, cs: int32)   # Deassert CS
+
+# Simulation
+spi_sim_enable(bus: int32)
+spi_sim_add_device(bus: int32, cs: int32, device_type: int32)
 ```
