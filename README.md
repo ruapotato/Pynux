@@ -247,9 +247,27 @@ vtnext/         # Graphical terminal (pygame)
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| QEMU mps2-an385 | Working | Primary development |
-| RP2040 (Pico) | Planned | $4, great community |
-| STM32F4 | Planned | Common Cortex-M4 |
+| QEMU mps2-an385 | **Working** | Primary development target |
+| RP2040 (Pico) | Experimental | BSP ready, needs hardware testing |
+| STM32F4 | Experimental | BSP ready, needs hardware testing |
+
+### Building for Hardware Targets
+
+```bash
+# Default: QEMU (recommended for development)
+./build.sh
+./build.sh --run                    # Build and run in QEMU
+
+# RP2040 (Raspberry Pi Pico) - EXPERIMENTAL
+./build.sh --target=rp2040          # Build for Pico
+./build.sh --target=rp2040 --flash  # Build and flash (hold BOOTSEL)
+
+# STM32F4 - EXPERIMENTAL
+./build.sh --target=stm32f4         # Build for STM32F4
+./build.sh --target=stm32f4 --flash # Build and flash via ST-Link
+```
+
+> **Note:** Hardware targets are experimental. The BSP (linker scripts, startup code, clock configuration) is complete, but has not been tested on real hardware yet. QEMU remains the recommended development environment.
 
 ## Memory Usage
 
