@@ -145,35 +145,36 @@ echo 50 > /dev/motors/dc0
 
 ### Driver Configuration
 
-Create driver config files in `/etc/drivers/` to auto-load hardware:
+Create driver config files in `/etc/drivers/` (one device per file):
 
 ```ini
-# /etc/drivers/sensors.conf
-[temp]
+# /etc/drivers/temp0.conf
+type=temp
 id=0
 pin=4
 name=temp0
-
-[light]
-id=0
-pin=5
-name=light0
 ```
 
 ```ini
-# /etc/drivers/motors.conf
-[servo]
+# /etc/drivers/servo0.conf
+type=servo
 id=0
 pin=9
 name=servo0
+```
 
-[dc]
+```ini
+# /etc/drivers/motor0.conf
+type=dc
 id=0
-pin1=10
-pin2=11
-pwm=12
+pin=10
 name=motor0
 ```
+
+**Note:** By default, demo devices are registered at boot:
+- `/dev/gpio/pin0` through `/dev/gpio/pin3`
+- `/dev/sensors/temp0`, `/dev/sensors/accel0`, `/dev/sensors/light0`
+- `/dev/motors/servo0`, `/dev/motors/dc0`
 
 ### Supported Device Types
 
