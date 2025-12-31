@@ -257,3 +257,155 @@ def rtrim(s: Ptr[char]):
     while length > 0 and isspace(s[length - 1]):
         length = length - 1
     s[length] = '\0'
+
+# Strip whitespace from both ends (modifies string, returns pointer)
+def strip(s: Ptr[char]) -> Ptr[char]:
+    rtrim(s)
+    return ltrim(s)
+
+# Replace first occurrence of old with new in string
+# dst must have enough space, returns dst
+def str_replace(dst: Ptr[char], src: Ptr[char], old: Ptr[char], new: Ptr[char]) -> Ptr[char]:
+    old_len: int32 = strlen(old)
+    new_len: int32 = strlen(new)
+    src_len: int32 = strlen(src)
+
+    # Find old in src
+    pos: Ptr[char] = strstr(src, old)
+    if cast[uint32](pos) == 0:
+        # Not found, just copy
+        strcpy(dst, src)
+        return dst
+
+    # Copy part before match
+    prefix_len: int32 = cast[int32](pos) - cast[int32](src)
+    i: int32 = 0
+    while i < prefix_len:
+        dst[i] = src[i]
+        i = i + 1
+
+    # Copy replacement
+    j: int32 = 0
+    while j < new_len:
+        dst[i] = new[j]
+        i = i + 1
+        j = j + 1
+
+    # Copy part after match
+    suffix_start: int32 = prefix_len + old_len
+    while suffix_start < src_len:
+        dst[i] = src[suffix_start]
+        i = i + 1
+        suffix_start = suffix_start + 1
+
+    dst[i] = '\0'
+    return dst
+
+# Replace all occurrences of old with new
+def str_replace_all(dst: Ptr[char], src: Ptr[char], old: Ptr[char], new: Ptr[char]) -> Ptr[char]:
+    old_len: int32 = strlen(old)
+    new_len: int32 = strlen(new)
+    src_len: int32 = strlen(src)
+
+    si: int32 = 0  # Source index
+    di: int32 = 0  # Dest index
+
+    while si < src_len:
+        # Check if old matches at current position
+        is_match: bool = True
+        k: int32 = 0
+        while k < old_len:
+            if src[si + k] != old[k]:
+                is_match = False
+                break
+            k = k + 1
+
+        if is_match:
+            # Copy replacement
+            j: int32 = 0
+            while j < new_len:
+                dst[di] = new[j]
+                di = di + 1
+                j = j + 1
+            si = si + old_len
+        else:
+            dst[di] = src[si]
+            di = di + 1
+            si = si + 1
+
+    dst[di] = '\0'
+    return dst
+
+# Split string by delimiter into array of pointers
+# Modifies src in place, returns count of parts
+# parts array must be pre-allocated with enough space
+def str_split(src: Ptr[char], delim: char, parts: Ptr[Ptr[char]], max_parts: int32) -> int32:
+    count: int32 = 0
+    start: int32 = 0
+    i: int32 = 0
+
+    while src[i] != '\0' and count < max_parts:
+        if src[i] == delim:
+            src[i] = '\0'
+            parts[count] = &src[start]
+            count = count + 1
+            start = i + 1
+        i = i + 1
+
+    # Add last part if any
+    if start <= i and count < max_parts:
+        parts[count] = &src[start]
+        count = count + 1
+
+    return count
+
+# Join array of strings with delimiter
+def str_join(dst: Ptr[char], parts: Ptr[Ptr[char]], count: int32, delim: Ptr[char]) -> Ptr[char]:
+    dst[0] = '\0'
+    delim_len: int32 = strlen(delim)
+
+    i: int32 = 0
+    di: int32 = 0
+
+    while i < count:
+        # Copy part
+        p: Ptr[char] = parts[i]
+        j: int32 = 0
+        while p[j] != '\0':
+            dst[di] = p[j]
+            di = di + 1
+            j = j + 1
+
+        # Add delimiter if not last
+        if i < count - 1:
+            j = 0
+            while j < delim_len:
+                dst[di] = delim[j]
+                di = di + 1
+                j = j + 1
+
+        i = i + 1
+
+    dst[di] = '\0'
+    return dst
+
+# Count occurrences of substring
+def str_count(s: Ptr[char], sub: Ptr[char]) -> int32:
+    count: int32 = 0
+    sub_len: int32 = strlen(sub)
+    if sub_len == 0:
+        return 0
+
+    pos: Ptr[char] = strstr(s, sub)
+    while cast[uint32](pos) != 0:
+        count = count + 1
+        pos = strstr(&pos[sub_len], sub)
+
+    return count
+
+# Find index of substring, returns -1 if not found
+def str_index(s: Ptr[char], sub: Ptr[char]) -> int32:
+    pos: Ptr[char] = strstr(s, sub)
+    if cast[uint32](pos) == 0:
+        return -1
+    return cast[int32](pos) - cast[int32](s)

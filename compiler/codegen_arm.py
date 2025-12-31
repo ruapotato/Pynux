@@ -360,8 +360,16 @@ class ARMCodeGen:
                     'join': '__pynux_str_join',
                     'isdigit': '__pynux_str_isdigit',
                     'isalpha': '__pynux_str_isalpha',
+                    'count': 'str_count',
+                    'index': 'str_index',
                 }
-                if method in string_methods:
+
+                # Handle list/array methods inline
+                if method in ('append', 'pop', 'insert', 'remove', 'clear'):
+                    self.gen_list_method(obj, method, args)
+                elif method in ('keys', 'values', 'items', 'get'):
+                    self.gen_dict_method(obj, method, args)
+                elif method in string_methods:
                     # Call runtime function with obj as first arg
                     all_args = [obj] + args
                     self.gen_call(Identifier(string_methods[method]), all_args)
@@ -1186,6 +1194,28 @@ class ARMCodeGen:
             self.emit("    rev16 r0, r0")
             return
 
+        # Python builtins for iteration and reduction
+        elif func_name == "sum":
+            # sum(iterable) -> total
+            # For arrays: sum elements, for range: use formula
+            self.gen_builtin_sum(args)
+            return
+
+        elif func_name == "any":
+            # any(iterable) -> True if any element is truthy
+            self.gen_builtin_any(args)
+            return
+
+        elif func_name == "all":
+            # all(iterable) -> True if all elements are truthy
+            self.gen_builtin_all(args)
+            return
+
+        elif func_name == "reversed":
+            # reversed(list) -> reversed list (in-place for now)
+            self.gen_builtin_reversed(args)
+            return
+
         # Check if this is an indirect call through a local variable (function pointer)
         is_indirect = func_name in self.ctx.locals
 
@@ -1473,6 +1503,314 @@ class ARMCodeGen:
         self.emit("    bl __pynux_read_line")
 
         self.emit("    pop {r0}")  # Return buffer address
+
+    def gen_builtin_sum(self, args: list[Expr]) -> None:
+        """Generate sum() built-in - sum elements of array."""
+        if len(args) < 1:
+            raise CodeGenError("sum() takes at least 1 argument")
+
+        arg = args[0]
+
+        # Check if it's an array we know the size of
+        if isinstance(arg, Identifier):
+            var_type = None
+            if arg.name in self.ctx.locals:
+                var_type = self.ctx.locals[arg.name].var_type
+            else:
+                var_type = self.global_var_types.get(arg.name)
+
+            if isinstance(var_type, ArrayType):
+                size = var_type.size
+                elem_size = self.get_type_size(var_type.element_type)
+
+                # Generate loop to sum elements
+                self.gen_expr(arg)  # Get array address in r0
+                self.emit("    mov r4, r0")  # r4 = array base
+                self.emit("    movs r5, #0")  # r5 = sum
+                self.emit(f"    movs r6, #{size}")  # r6 = count
+
+                loop_label = self.ctx.new_label("sum_loop")
+                done_label = self.ctx.new_label("sum_done")
+
+                self.emit(f"{loop_label}:")
+                self.emit("    cmp r6, #0")
+                self.emit(f"    beq {done_label}")
+
+                # Load element based on size
+                if elem_size == 1:
+                    self.emit("    ldrb r0, [r4]")
+                elif elem_size == 2:
+                    self.emit("    ldrh r0, [r4]")
+                else:
+                    self.emit("    ldr r0, [r4]")
+
+                self.emit("    add r5, r5, r0")
+                self.emit(f"    add r4, r4, #{elem_size}")
+                self.emit("    sub r6, r6, #1")
+                self.emit(f"    b {loop_label}")
+
+                self.emit(f"{done_label}:")
+                self.emit("    mov r0, r5")
+                return
+
+        raise CodeGenError("sum() requires an array with known size")
+
+    def gen_builtin_any(self, args: list[Expr]) -> None:
+        """Generate any() built-in - True if any element is truthy."""
+        if len(args) != 1:
+            raise CodeGenError("any() takes exactly 1 argument")
+
+        arg = args[0]
+
+        if isinstance(arg, Identifier):
+            var_type = None
+            if arg.name in self.ctx.locals:
+                var_type = self.ctx.locals[arg.name].var_type
+            else:
+                var_type = self.global_var_types.get(arg.name)
+
+            if isinstance(var_type, ArrayType):
+                size = var_type.size
+                elem_size = self.get_type_size(var_type.element_type)
+
+                self.gen_expr(arg)
+                self.emit("    mov r4, r0")  # r4 = array base
+                self.emit(f"    movs r6, #{size}")  # r6 = count
+
+                loop_label = self.ctx.new_label("any_loop")
+                found_label = self.ctx.new_label("any_found")
+                done_label = self.ctx.new_label("any_done")
+
+                self.emit(f"{loop_label}:")
+                self.emit("    cmp r6, #0")
+                self.emit(f"    beq {done_label}")
+
+                if elem_size == 1:
+                    self.emit("    ldrb r0, [r4]")
+                elif elem_size == 2:
+                    self.emit("    ldrh r0, [r4]")
+                else:
+                    self.emit("    ldr r0, [r4]")
+
+                self.emit("    cmp r0, #0")
+                self.emit(f"    bne {found_label}")
+                self.emit(f"    add r4, r4, #{elem_size}")
+                self.emit("    sub r6, r6, #1")
+                self.emit(f"    b {loop_label}")
+
+                self.emit(f"{found_label}:")
+                self.emit("    movs r0, #1")
+                self.emit(f"    b {done_label}_end")
+
+                self.emit(f"{done_label}:")
+                self.emit("    movs r0, #0")
+                self.emit(f"{done_label}_end:")
+                return
+
+        raise CodeGenError("any() requires an array with known size")
+
+    def gen_builtin_all(self, args: list[Expr]) -> None:
+        """Generate all() built-in - True if all elements are truthy."""
+        if len(args) != 1:
+            raise CodeGenError("all() takes exactly 1 argument")
+
+        arg = args[0]
+
+        if isinstance(arg, Identifier):
+            var_type = None
+            if arg.name in self.ctx.locals:
+                var_type = self.ctx.locals[arg.name].var_type
+            else:
+                var_type = self.global_var_types.get(arg.name)
+
+            if isinstance(var_type, ArrayType):
+                size = var_type.size
+                elem_size = self.get_type_size(var_type.element_type)
+
+                self.gen_expr(arg)
+                self.emit("    mov r4, r0")  # r4 = array base
+                self.emit(f"    movs r6, #{size}")  # r6 = count
+
+                loop_label = self.ctx.new_label("all_loop")
+                false_label = self.ctx.new_label("all_false")
+                done_label = self.ctx.new_label("all_done")
+
+                self.emit(f"{loop_label}:")
+                self.emit("    cmp r6, #0")
+                self.emit(f"    beq {done_label}")
+
+                if elem_size == 1:
+                    self.emit("    ldrb r0, [r4]")
+                elif elem_size == 2:
+                    self.emit("    ldrh r0, [r4]")
+                else:
+                    self.emit("    ldr r0, [r4]")
+
+                self.emit("    cmp r0, #0")
+                self.emit(f"    beq {false_label}")
+                self.emit(f"    add r4, r4, #{elem_size}")
+                self.emit("    sub r6, r6, #1")
+                self.emit(f"    b {loop_label}")
+
+                self.emit(f"{false_label}:")
+                self.emit("    movs r0, #0")
+                self.emit(f"    b {done_label}_end")
+
+                self.emit(f"{done_label}:")
+                self.emit("    movs r0, #1")
+                self.emit(f"{done_label}_end:")
+                return
+
+        raise CodeGenError("all() requires an array with known size")
+
+    def gen_builtin_reversed(self, args: list[Expr]) -> None:
+        """Generate reversed() - returns pointer to reversed array (in-place)."""
+        if len(args) != 1:
+            raise CodeGenError("reversed() takes exactly 1 argument")
+
+        arg = args[0]
+
+        if isinstance(arg, Identifier):
+            var_type = None
+            if arg.name in self.ctx.locals:
+                var_type = self.ctx.locals[arg.name].var_type
+            else:
+                var_type = self.global_var_types.get(arg.name)
+
+            if isinstance(var_type, ArrayType):
+                size = var_type.size
+                elem_size = self.get_type_size(var_type.element_type)
+
+                self.gen_expr(arg)
+                self.emit("    mov r4, r0")  # r4 = start pointer
+                self.emit(f"    add r5, r4, #{(size - 1) * elem_size}")  # r5 = end pointer
+
+                loop_label = self.ctx.new_label("rev_loop")
+                done_label = self.ctx.new_label("rev_done")
+
+                self.emit(f"{loop_label}:")
+                self.emit("    cmp r4, r5")
+                self.emit(f"    bge {done_label}")
+
+                # Swap elements at r4 and r5
+                if elem_size == 1:
+                    self.emit("    ldrb r0, [r4]")
+                    self.emit("    ldrb r1, [r5]")
+                    self.emit("    strb r1, [r4]")
+                    self.emit("    strb r0, [r5]")
+                elif elem_size == 2:
+                    self.emit("    ldrh r0, [r4]")
+                    self.emit("    ldrh r1, [r5]")
+                    self.emit("    strh r1, [r4]")
+                    self.emit("    strh r0, [r5]")
+                else:
+                    self.emit("    ldr r0, [r4]")
+                    self.emit("    ldr r1, [r5]")
+                    self.emit("    str r1, [r4]")
+                    self.emit("    str r0, [r5]")
+
+                self.emit(f"    add r4, r4, #{elem_size}")
+                self.emit(f"    sub r5, r5, #{elem_size}")
+                self.emit(f"    b {loop_label}")
+
+                self.emit(f"{done_label}:")
+                self.gen_expr(arg)  # Return original array pointer
+                return
+
+        raise CodeGenError("reversed() requires an array with known size")
+
+    def gen_list_method(self, obj: Expr, method: str, args: list[Expr]) -> None:
+        """Generate code for list/array methods like append, pop, etc."""
+        # For static arrays, these methods are limited
+        # We'll implement them for simple cases
+
+        var_type = None
+        if isinstance(obj, Identifier):
+            if obj.name in self.ctx.locals:
+                var_type = self.ctx.locals[obj.name].var_type
+            else:
+                var_type = self.global_var_types.get(obj.name)
+
+        if method == "clear":
+            # Zero out array
+            if isinstance(var_type, ArrayType):
+                size = var_type.size
+                elem_size = self.get_type_size(var_type.element_type)
+                total_bytes = size * elem_size
+
+                self.gen_expr(obj)  # Get array address
+                self.emit("    mov r4, r0")
+                self.emit("    movs r1, #0")  # Value to set
+                self.emit(f"    ldr r2, ={total_bytes}")  # Count
+                self.emit("    bl memset")
+                self.emit("    movs r0, #0")
+                return
+
+        elif method == "pop":
+            # For fixed arrays, we can't actually pop
+            # But we can return the last element (caller must track length)
+            if args and isinstance(var_type, ArrayType):
+                # pop(index) - get element at index
+                self.gen_expr(args[0])  # index in r0
+                elem_size = self.get_type_size(var_type.element_type)
+
+                if elem_size == 4:
+                    self.emit("    lsl r0, r0, #2")
+                elif elem_size == 2:
+                    self.emit("    lsl r0, r0, #1")
+                elif elem_size != 1:
+                    self.emit(f"    ldr r1, ={elem_size}")
+                    self.emit("    mul r0, r0, r1")
+
+                self.emit("    push {r0}")
+                self.gen_expr(obj)
+                self.emit("    pop {r1}")
+                self.emit("    add r0, r0, r1")
+
+                if elem_size == 1:
+                    self.emit("    ldrb r0, [r0]")
+                elif elem_size == 2:
+                    self.emit("    ldrh r0, [r0]")
+                else:
+                    self.emit("    ldr r0, [r0]")
+                return
+
+        # For other methods, emit a warning comment and return 0
+        self.emit(f"    @ Warning: list.{method}() not fully implemented for static arrays")
+        self.emit("    movs r0, #0")
+
+    def gen_dict_method(self, obj: Expr, method: str, args: list[Expr]) -> None:
+        """Generate code for dict methods like get, keys, values, items."""
+        var_type = None
+        if isinstance(obj, Identifier):
+            if obj.name in self.ctx.locals:
+                var_type = self.ctx.locals[obj.name].var_type
+            else:
+                var_type = self.global_var_types.get(obj.name)
+
+        if method == "get":
+            # dict.get(key, default=None)
+            if len(args) >= 1:
+                # For now, just do regular dict access
+                # A proper implementation would return default on missing key
+                self.gen_expr(args[0])  # key
+                self.emit("    push {r0}")
+                self.gen_expr(obj)
+                self.emit("    pop {r1}")
+                # Determine key type
+                if isinstance(var_type, DictType):
+                    if hasattr(var_type.key_type, 'name') and var_type.key_type.name == 'str':
+                        self.emit("    bl __pynux_dict_get_str")
+                    else:
+                        self.emit("    bl __pynux_dict_get_int")
+                else:
+                    self.emit("    bl __pynux_dict_get_int")
+                return
+
+        # For keys(), values(), items() - these need iterator support
+        # For now, emit stub
+        self.emit(f"    @ Warning: dict.{method}() requires iterator support")
+        self.emit("    movs r0, #0")
 
     def gen_member_access(self, obj: Expr, member: str) -> None:
         """Generate struct field access."""
