@@ -34,8 +34,9 @@ if [ ! -f "build/pynux.elf" ]; then
     BUILD_NEEDED=1
 else
     # Check if any source is newer than the elf
-    for src in kernel/*.py lib/*.py; do
-        if [ "$src" -nt "build/pynux.elf" ]; then
+    # Include compiler, build script, and all Python sources
+    for src in kernel/*.py lib/*.py lib/*/*.py lib/*/*/*.py programs/*.py compiler/*.py build.sh runtime/*.s; do
+        if [ -e "$src" ] && [ "$src" -nt "build/pynux.elf" ]; then
             BUILD_NEEDED=1
             break
         fi
