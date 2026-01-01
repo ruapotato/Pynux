@@ -3397,15 +3397,16 @@ class ARMCodeGen:
             var = self.ctx.alloc_local(param.name, 4, param.param_type)
 
         self.emit("")
+        self.emit(f"    .align 2")
         self.emit(f"    .global {func.name}")
+        self.emit(f"    .thumb_func")
+        self.emit(f"    .type {func.name}, %function")
         if is_interrupt:
-            self.emit(f"    .type {func.name}, %function")
             self.emit(f"    @ Interrupt handler - save all caller-saved registers")
             self.emit(f"{func.name}:")
             self.emit("    push {r0-r3, r7, r12, lr}")
             self.emit("    mov r7, sp")
         else:
-            self.emit(f"    .type {func.name}, %function")
             self.emit(f"{func.name}:")
             self.emit("    push {r7, lr}")
             self.emit("    mov r7, sp")
@@ -3560,6 +3561,19 @@ class ARMCodeGen:
         # Text section
         self.emit("    .section .text")
         self.emit("")
+
+        # Collect extern function declarations first
+        for decl in program.declarations:
+            if isinstance(decl, ExternDecl):
+                self.extern_funcs.add(decl.name)
+
+        # Emit extern function declarations
+        # Note: The actual .thumb_func is in the definition file (startup.s)
+        if self.extern_funcs:
+            self.emit("    @ External function declarations")
+            for func_name in sorted(self.extern_funcs):
+                self.emit(f"    .extern {func_name}")
+            self.emit("")
 
         # First pass: collect global variable info and class definitions
         global_vars: list[VarDecl] = []

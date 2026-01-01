@@ -419,11 +419,13 @@ unreset_done:
 @ ============================================================================
 
     .align 2
-    .thumb_func
-    .global rp2040_uart_init
     .global uart_init
-rp2040_uart_init:
+    .thumb_func
+    .type uart_init, %function
 uart_init:
+    @ Alias: rp2040_uart_init = uart_init
+    .set rp2040_uart_init, uart_init
+    .global rp2040_uart_init
     push {lr}
 
     @ Configure GPIO0 (TX) and GPIO1 (RX) for UART

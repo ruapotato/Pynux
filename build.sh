@@ -25,6 +25,7 @@ RUN_AFTER_BUILD=false
 FLASH_AFTER_BUILD=false
 TEST_MODE=false
 DEMO_MODE=false
+INCLUDE_EXPERIMENTAL_NETWORKING=false
 
 # ============================================================================
 # Parse Arguments
@@ -34,16 +35,19 @@ print_usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  --target=TARGET   Build target: qemu (default), rp2040, stm32f4"
+    echo "  --target=TARGET   Build target: qemu (default), rp2040, rp2040w, stm32f4"
     echo "  --run             Run in QEMU after build (qemu target only)"
     echo "  --test            Build in test mode (auto-run tests on boot)"
     echo "  --flash           Flash to device after build (hardware targets)"
     echo "  --clean           Clean build directory before building"
+    echo "  --include_experimental_native_networking"
+    echo "                    Include experimental software TCP/IP stack"
     echo "  --help            Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0                      # Build for QEMU"
     echo "  $0 --target=rp2040      # Build for Raspberry Pi Pico"
+    echo "  $0 --target=rp2040w     # Build for Raspberry Pi Pico W (WiFi)"
     echo "  $0 --target=stm32f4     # Build for STM32F4 boards"
     echo "  $0 --run                # Build and run in QEMU"
     echo "  $0 --test --run         # Build test kernel and run tests"
@@ -68,6 +72,9 @@ for arg in "$@"; do
             ;;
         --clean)
             rm -rf "$BUILD_DIR"
+            ;;
+        --include_experimental_native_networking)
+            INCLUDE_EXPERIMENTAL_NETWORKING=true
             ;;
         --help)
             print_usage
@@ -109,7 +116,21 @@ case $TARGET in
         LIBGCC=$(arm-none-eabi-gcc -mcpu=cortex-m0plus -mthumb -print-libgcc-file-name 2>/dev/null || echo "")
         LINK_LIBS="$LIBGCC"
         SKIP_TESTS=true  # Tests are designed for QEMU
+        HAS_WIFI=false
         echo "=== Pynux OS Build (RP2040 / Raspberry Pi Pico) ==="
+        ;;
+    rp2040w)
+        # RP2040 with CYW43439 WiFi chip (Pico W)
+        ASFLAGS="-mcpu=cortex-m0plus -mthumb"
+        LINKER_SCRIPT="bsp/rp2040/rp2040.ld"
+        STARTUP_FILE="bsp/rp2040/startup.s"
+        IO_FILE=""
+        SYSTEM_CLOCK=125000000
+        LIBGCC=$(arm-none-eabi-gcc -mcpu=cortex-m0plus -mthumb -print-libgcc-file-name 2>/dev/null || echo "")
+        LINK_LIBS="$LIBGCC"
+        SKIP_TESTS=true
+        HAS_WIFI=true
+        echo "=== Pynux OS Build (RP2040W / Raspberry Pi Pico W) ==="
         ;;
     stm32f4)
         # STM32F4 uses Cortex-M4 with FPU
@@ -125,7 +146,7 @@ case $TARGET in
         ;;
     *)
         echo "Unknown target: $TARGET"
-        echo "Valid targets: qemu, rp2040, stm32f4"
+        echo "Valid targets: qemu, rp2040, rp2040w, stm32f4"
         exit 1
         ;;
 esac
@@ -157,6 +178,12 @@ SYSTEM_CLOCK = $SYSTEM_CLOCK
 TEST_MODE = "$TEST_MODE" == "true"
 DEMO_MODE = "$DEMO_MODE" == "true"
 SKIP_TESTS = "$SKIP_TESTS" == "true"
+INCLUDE_EXPERIMENTAL_NETWORKING = "$INCLUDE_EXPERIMENTAL_NETWORKING" == "true"
+HAS_WIFI = "${HAS_WIFI:-false}" == "true"
+
+# STM32F4 has limited RAM (128KB) - exclude memory-hungry modules
+# RP2040 has 264KB so it can handle more
+MINIMAL_BUILD = (TARGET == "stm32f4")
 
 # Core system sources
 sources = [
@@ -176,10 +203,7 @@ sources = [
     ("lib/string.py", "string"),
     ("lib/io.py", "iolib"),
     ("lib/peripherals.py", "peripherals"),
-    ("lib/vtnext.py", "vtnext"),
-    ("lib/de.py", "de"),
     ("lib/shell.py", "shell"),
-    ("lib/widgets.py", "widgets"),
     ("lib/devtools.py", "devtools"),
     ("lib/math.py", "mathlib"),
     ("lib/sensors.py", "sensors"),
@@ -196,21 +220,49 @@ sources = [
     ("lib/profiler.py", "profiler"),
     ("lib/memtrack.py", "memtrack"),
     ("lib/breakpoint.py", "breakpoint"),
-    # Graphics library
-    ("lib/gfx/color.py", "gfx_color"),
-    ("lib/gfx/framebuffer.py", "gfx_framebuffer"),
-    ("lib/gfx/draw.py", "gfx_draw"),
-    # Network stack
-    ("lib/net/ethernet.py", "net_ethernet"),
-    ("lib/net/ip.py", "net_ip"),
-    ("lib/net/udp.py", "net_udp"),
-    ("lib/net/tcp.py", "net_tcp"),
-    ("lib/net/dhcp.py", "net_dhcp"),
 ]
+
+# Add UI/graphics modules only for targets with enough RAM
+if not MINIMAL_BUILD:
+    sources.extend([
+        ("lib/vtnext.py", "vtnext"),
+        ("lib/de.py", "de"),
+        ("lib/widgets.py", "widgets"),
+        # Graphics library
+        ("lib/gfx/color.py", "gfx_color"),
+        ("lib/gfx/framebuffer.py", "gfx_framebuffer"),
+        ("lib/gfx/draw.py", "gfx_draw"),
+    ])
+    print("  [FULL BUILD - Including UI and graphics]")
+else:
+    print("  [MINIMAL BUILD - Excluding UI and graphics for RAM-constrained target]")
+
+# Experimental native networking stack (opt-in only)
+if INCLUDE_EXPERIMENTAL_NETWORKING:
+    sources.extend([
+        ("lib/net/ethernet.py", "net_ethernet"),
+        ("lib/net/ip.py", "net_ip"),
+        ("lib/net/udp.py", "net_udp"),
+        ("lib/net/tcp.py", "net_tcp"),
+        ("lib/net/dhcp.py", "net_dhcp"),
+    ])
+    print("  [EXPERIMENTAL: Native TCP/IP networking stack included]")
+
+# Pico W WiFi support
+if HAS_WIFI:
+    if os.path.exists("lib/hal/rp2040_wifi.py"):
+        sources.append(("lib/hal/rp2040_wifi.py", "rp2040_wifi"))
+        print("  [WiFi: Pico W CYW43439 driver included]")
+    else:
+        print("  [WiFi: Driver not yet implemented]")
 
 # Add user programs from programs/ folder
 # Some programs are only for QEMU (they use test framework or QEMU-specific features)
 hw_excluded_progs = ["run_tests", "sensormon", "datalogger"] if SKIP_TESTS else []
+
+# For minimal builds, also exclude programs that require vtnext/graphics
+if MINIMAL_BUILD:
+    hw_excluded_progs.extend(["calc", "clock", "hexview", "imgview"])
 user_programs = []
 for prog_path in sorted(glob.glob("programs/*.py")):
     name = os.path.basename(prog_path).replace(".py", "")
@@ -292,6 +344,18 @@ with open("build/test_files.txt", "w") as f:
 # Save target info
 with open("build/target.txt", "w") as f:
     f.write(TARGET)
+
+# Save minimal build flag
+with open("build/minimal_build.txt", "w") as f:
+    f.write("true" if MINIMAL_BUILD else "false")
+
+# Save experimental networking flag
+with open("build/experimental_net.txt", "w") as f:
+    f.write("true" if INCLUDE_EXPERIMENTAL_NETWORKING else "false")
+
+# Save WiFi flag
+with open("build/has_wifi.txt", "w") as f:
+    f.write("true" if HAS_WIFI else "false")
 PYEND
 
 # ============================================================================
@@ -316,11 +380,22 @@ for name in kernel timer ramfs process devfs boot debug firmware gdb_stub sync; 
     echo "  build/${name}.s"
 done
 
-# Core libraries
-for name in memory string iolib peripherals vtnext de shell widgets devtools mathlib sensors motors; do
+# Read minimal build flag
+MINIMAL_BUILD=$(cat "$BUILD_DIR/minimal_build.txt" 2>/dev/null || echo "false")
+
+# Core libraries (always included)
+for name in memory string iolib peripherals shell devtools mathlib sensors motors; do
     $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
     echo "  build/${name}.s"
 done
+
+# UI libraries (only for full builds)
+if [ "$MINIMAL_BUILD" != "true" ]; then
+    for name in vtnext de widgets; do
+        $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
+        echo "  build/${name}.s"
+    done
+fi
 
 # Hardware libraries
 for name in i2c spi; do
@@ -340,17 +415,29 @@ for name in trace profiler memtrack breakpoint; do
     echo "  build/${name}.s"
 done
 
-# Graphics library
-for name in gfx_color gfx_framebuffer gfx_draw; do
-    $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
-    echo "  build/${name}.s"
-done
+# Graphics library (only for full builds)
+if [ "$MINIMAL_BUILD" != "true" ]; then
+    for name in gfx_color gfx_framebuffer gfx_draw; do
+        $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
+        echo "  build/${name}.s"
+    done
+fi
 
-# Network stack
-for name in net_ethernet net_ip net_udp net_tcp net_dhcp; do
-    $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
-    echo "  build/${name}.s"
-done
+# Experimental native networking stack (opt-in only)
+EXPERIMENTAL_NET=$(cat "$BUILD_DIR/experimental_net.txt" 2>/dev/null || echo "false")
+if [ "$EXPERIMENTAL_NET" == "true" ]; then
+    for name in net_ethernet net_ip net_udp net_tcp net_dhcp; do
+        $AS $ASFLAGS -o "$BUILD_DIR/${name}.o" "$BUILD_DIR/${name}.s"
+        echo "  build/${name}.s"
+    done
+fi
+
+# Pico W WiFi driver
+HAS_WIFI=$(cat "$BUILD_DIR/has_wifi.txt" 2>/dev/null || echo "false")
+if [ "$HAS_WIFI" == "true" ] && [ -f "$BUILD_DIR/rp2040_wifi.s" ]; then
+    $AS $ASFLAGS -o "$BUILD_DIR/rp2040_wifi.o" "$BUILD_DIR/rp2040_wifi.s"
+    echo "  build/rp2040_wifi.s"
+fi
 
 # User programs
 if [ -f "$BUILD_DIR/user_programs.txt" ]; then
@@ -395,10 +482,15 @@ OBJS="$OBJS $BUILD_DIR/kernel.o $BUILD_DIR/timer.o $BUILD_DIR/ramfs.o"
 OBJS="$OBJS $BUILD_DIR/process.o $BUILD_DIR/devfs.o $BUILD_DIR/boot.o"
 OBJS="$OBJS $BUILD_DIR/debug.o $BUILD_DIR/firmware.o $BUILD_DIR/gdb_stub.o $BUILD_DIR/sync.o"
 
-# Core libraries
+# Core libraries (always included)
 OBJS="$OBJS $BUILD_DIR/memory.o $BUILD_DIR/string.o $BUILD_DIR/iolib.o $BUILD_DIR/peripherals.o"
-OBJS="$OBJS $BUILD_DIR/vtnext.o $BUILD_DIR/de.o $BUILD_DIR/shell.o $BUILD_DIR/widgets.o $BUILD_DIR/devtools.o"
+OBJS="$OBJS $BUILD_DIR/shell.o $BUILD_DIR/devtools.o"
 OBJS="$OBJS $BUILD_DIR/mathlib.o $BUILD_DIR/sensors.o $BUILD_DIR/motors.o"
+
+# UI libraries (only for full builds)
+if [ "$MINIMAL_BUILD" != "true" ]; then
+    OBJS="$OBJS $BUILD_DIR/vtnext.o $BUILD_DIR/de.o $BUILD_DIR/widgets.o"
+fi
 
 # Hardware libraries
 OBJS="$OBJS $BUILD_DIR/i2c.o $BUILD_DIR/spi.o"
@@ -409,11 +501,20 @@ OBJS="$OBJS $BUILD_DIR/fsm.o $BUILD_DIR/pid.o $BUILD_DIR/filters.o"
 # Debug/profiling libraries
 OBJS="$OBJS $BUILD_DIR/trace.o $BUILD_DIR/profiler.o $BUILD_DIR/memtrack.o $BUILD_DIR/breakpoint.o"
 
-# Graphics library
-OBJS="$OBJS $BUILD_DIR/gfx_color.o $BUILD_DIR/gfx_framebuffer.o $BUILD_DIR/gfx_draw.o"
+# Graphics library (only for full builds)
+if [ "$MINIMAL_BUILD" != "true" ]; then
+    OBJS="$OBJS $BUILD_DIR/gfx_color.o $BUILD_DIR/gfx_framebuffer.o $BUILD_DIR/gfx_draw.o"
+fi
 
-# Network stack
-OBJS="$OBJS $BUILD_DIR/net_ethernet.o $BUILD_DIR/net_ip.o $BUILD_DIR/net_udp.o $BUILD_DIR/net_tcp.o $BUILD_DIR/net_dhcp.o"
+# Experimental native networking stack (opt-in only)
+if [ "$EXPERIMENTAL_NET" == "true" ]; then
+    OBJS="$OBJS $BUILD_DIR/net_ethernet.o $BUILD_DIR/net_ip.o $BUILD_DIR/net_udp.o $BUILD_DIR/net_tcp.o $BUILD_DIR/net_dhcp.o"
+fi
+
+# Pico W WiFi driver
+if [ "$HAS_WIFI" == "true" ] && [ -f "$BUILD_DIR/rp2040_wifi.o" ]; then
+    OBJS="$OBJS $BUILD_DIR/rp2040_wifi.o"
+fi
 
 # User programs
 if [ -f "$BUILD_DIR/user_programs.txt" ]; then

@@ -354,11 +354,13 @@ stm32f4_systick_init:
 @ ============================================================================
 
     .align 2
-    .thumb_func
-    .global stm32f4_uart_init
     .global uart_init
-stm32f4_uart_init:
+    .thumb_func
+    .type uart_init, %function
 uart_init:
+    @ Alias: stm32f4_uart_init = uart_init
+    .set stm32f4_uart_init, uart_init
+    .global stm32f4_uart_init
     push {lr}
 
     @ Enable GPIOA and USART1 clocks
@@ -786,6 +788,47 @@ sensormon_main:
     .global datalogger_main
     .thumb_func
 datalogger_main:
+    bx lr
+
+    .align 2
+    .global calc_main
+    .thumb_func
+calc_main:
+    bx lr
+
+    .align 2
+    .global clock_main
+    .thumb_func
+clock_main:
+    bx lr
+
+    .align 2
+    .global hexview_main
+    .thumb_func
+hexview_main:
+    bx lr
+
+    .align 2
+    .global imgview_main
+    .thumb_func
+imgview_main:
+    bx lr
+
+@ ============================================================================
+@ Stubs for vtnext/de (excluded on minimal builds)
+@ ============================================================================
+
+    .align 2
+    .global vtn_probe
+    .thumb_func
+vtn_probe:
+    movs r0, #0                 @ Return 0 (no display)
+    bx lr
+
+    .align 2
+    .global de_main
+    .thumb_func
+de_main:
     bx lr
 
     .end
