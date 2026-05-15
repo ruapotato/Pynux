@@ -10,19 +10,22 @@ tracks share the same compiler and language:
 
 1. **Bare-metal Pynux kernel** (M16+) — Pynux compiles its own bootable
    kernel image. QEMU `-kernel build/pynux-vmlinux.elf` boots through
-   multiboot1 into 64-bit long mode, runs `start_kernel()`, configures
-   traps + IRQs + per-CPU storage, brings up a three-layer allocator
-   (memblock → page_alloc → slab/kmalloc), schedules with preemption,
-   and drops into a userspace task at CPL 3 that talks back via
-   `SYSCALL`. Source tree mirrors Linux's layout
-   (`arch/x86/boot/`, `arch/x86/kernel/`, `arch/x86/mm/`, `arch/x86/lib/`,
-   `init/`, `mm/`, `kernel/`, `kernel/sched/`, `kernel/printk/`,
-   `drivers/tty/serial/`, `drivers/video/console/`) so reading the
-   equivalent Linux file → porting it to Pynux is the unit of work.
-   The Pynux language has gained a small set of kernel-aware
-   primitives along the way — `Percpu[T]` per-CPU storage,
-   `container_of(ptr, Type, field)`, `cast[Ptr[T]](x)`, and inline
-   `asm_volatile` — so the source stays close to how Linux's
+   multiboot1 into 64-bit long mode (4 GiB identity-mapped with 1 GiB
+   pages, U/S=1), runs `start_kernel()`, configures traps + Local APIC
+   + LAPIC timer + per-CPU storage, brings up the four-layer allocator
+   (memblock → page_alloc with buddy merge → slab/kmalloc → kzalloc),
+   schedules ring-0 and ring-3 tasks preemptively, drops into a
+   userspace task that reads `/motd` from a baked-in initramfs via
+   `SYS_OPEN`/`SYS_READ`/`SYS_CLOSE`, spawns a sibling via `SYS_CLONE`,
+   and exits cleanly when all tasks finish. Source tree mirrors Linux's
+   layout (`arch/x86/boot/`, `arch/x86/kernel/`, `arch/x86/mm/`,
+   `arch/x86/lib/`, `init/`, `mm/`, `kernel/`, `kernel/sched/`,
+   `kernel/printk/`, `drivers/tty/serial/`, `drivers/video/console/`,
+   `fs/`) so reading the equivalent Linux file → porting it to Pynux
+   is the unit of work. The Pynux language has gained a small set of
+   kernel-aware primitives along the way — `Percpu[T]` per-CPU
+   storage, `container_of(ptr, Type, field)`, `cast[Ptr[T]](x)`, and
+   inline `asm_volatile` — so the source stays close to how Linux's
    `include/linux/*.h` macros read.
 
 2. **.ko module infiltration** (M1..M15) — 40 Pynux-authored kernel
@@ -93,6 +96,11 @@ The end-game is a fully Pynux-authored kernel.
 | M16.16 | `container_of(ptr, Type, field)` compile-time builtin — collapses manual offset arithmetic at list walks | **Done** |
 | M16.17 | SYSCALL/SYSRET + first ring-3 userspace task — STAR/LSTAR/FMASK MSRs, GDT user CS/DS, SYS_PUTC + SYS_EXIT | **Done** |
 | M16.18 | VGA text framebuffer driver at 0xB8000 — 80×25 putc/puts/scroll (mirrors `drivers/video/console/vgacon.c`) | **Done** |
+| M16.19 | TSS + RSP0 — timer IRQs fire while at CPL 3; jiffies advances during user-mode spin (50M-pause loop survives) | **Done** |
+| M16.20 | clone() + multi-user-task lifecycle — parent spawns child, timer preemption interleaves them, exit() halts when last task gone | **Done** |
+| M16.21 | VFS + initramfs — baked-in /motd + /version, fd table, `SYS_OPEN`/`SYS_READ`/`SYS_CLOSE` from ring 3 | **Done** |
+| M16.22 | Local APIC + LAPIC timer — `IA32_APIC_BASE` enable, LVT timer periodic mode; 8259 + PIT retired | **Done** |
+| M16.23 | Buddy merge-on-free in alloc_pages — cascade verified all the way to order 10 (4 MiB) | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -220,16 +228,23 @@ arch/x86/
   kernel/setup_percpu.py + .S  Percpu[T] template memcpy + %gs base
   kernel/sched_asm.S    __switch_to_asm, kthread_bootstrap, enter_first_task
   kernel/syscall.py + .S STAR/LSTAR/FMASK MSRs, syscall_entry, do_syscall
+                        (SYS_PUTC/EXIT/GET_JIFFIES/CLONE/GETPID/
+                         OPEN/READ/CLOSE)
+  kernel/tss_asm.S      TSS + RSP0 — IRQs while in CPL 3
+  kernel/apic.py        Local APIC enable + LVT timer periodic mode
   lib/string_64.S       memset / memcpy / memmove via rep stos/movs
   mm/init.py            mem_init() arch-side bring-up
 mm/memblock.py          early bump allocator (~ mm/memblock.c)
-mm/page_alloc.py        order-N page allocator with per-order free lists
+mm/page_alloc.py        order-N page allocator + buddy merge-on-free
 mm/slab.py              SLUB-style slab caches + kmalloc / kzalloc / kfree
                         large kmalloc routes to alloc_pages
-kernel/sched/core.py    task_struct, kthread_create, preemptive schedule
+kernel/sched/core.py    task_struct, kthread_create, create_user_task,
+                        preemptive schedule, multi-task lifecycle
 kernel/printk/printk.py printk0/1/2 + pr_emerg/err/warn/info/debug
 kernel/panic.py         panic / BUG / WARN_ON
 kernel/list.py          list_head intrusive doubly-linked list
+fs/initramfs_data.S     baked-in file payloads (/motd, /version)
+fs/vfs.py               vfs_open / vfs_read / vfs_close + fd table
 drivers/tty/serial/early_8250.py  polled 16550A UART
 drivers/video/console/vga_text.py text-mode VGA console at 0xB8000
 init/main.py            start_kernel()
