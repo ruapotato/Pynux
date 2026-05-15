@@ -55,6 +55,8 @@
 from mm.page_alloc import alloc_page, free_page, PAGE_SIZE
 from kernel.printk.printk import printk0, printk1, printk2
 
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
 
 # --- KmemCache struct (64 bytes, all 8-byte fields) -----------------
 class KmemCache:
@@ -222,6 +224,19 @@ def kmalloc(size: uint64) -> uint64:
         printk1("kmalloc: request for %d bytes exceeds 2048\n", size)
         return 0
     return kmem_cache_alloc(&kmalloc_caches[idx])
+
+
+def kzalloc(size: uint64) -> uint64:
+    # kmalloc + memset(0, size). Linux's __GFP_ZERO maps onto this for
+    # callers that need a zero-initialised allocation (anything with a
+    # pointer field they'd otherwise have to clear by hand). The
+    # underlying memset goes through arch/x86/lib/string_64.S's
+    # rep-stosb path.
+    p: uint64 = kmalloc(size)
+    if p == 0:
+        return 0
+    memset(cast[Ptr[uint8]](p), 0, size)
+    return p
 
 
 def kfree(obj: uint64):

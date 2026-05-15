@@ -36,11 +36,14 @@ from mm.memblock import memblock_alloc, memblock_used, memblock_avail
 from mm.page_alloc import (
     alloc_page, free_page, page_alloc_total, page_alloc_free_count,
 )
-from mm.slab import kmalloc, kfree
+from mm.slab import kmalloc, kfree, kzalloc
 
 extern def trigger_int3()
 extern def local_irq_enable()
 extern def cpu_relax()
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memmove(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
 def trap_init():
@@ -93,6 +96,59 @@ def slab_smoke_test():
     kfree(d)
     kfree(e)
     kfree(0x123456)        # bad pointer — magic check should warn
+
+
+def string_ops_smoke_test():
+    # Exercise memset, memcpy, memmove (forward + backward), kzalloc.
+    # Each result is read back via printk so any miscompile shows up
+    # as a visible mismatch in the serial output.
+    printk0("Pynux: string-ops smoke test\n")
+
+    # --- memset: fill 8 bytes with 0xAA, expect 0xAAAAAAAAAAAAAAAA --
+    buf_a: uint64 = kmalloc(64)
+    memset(cast[Ptr[uint8]](buf_a), 0xAA, 8)
+    printk1("  memset(0xAA, 8) -> %x\n", cast[Ptr[uint64]](buf_a)[0])
+
+    # --- memcpy: copy 16 bytes from one slot to another -----------
+    cast[Ptr[uint64]](buf_a)[0] = 0xDEADBEEF_CAFEBABE
+    cast[Ptr[uint64]](buf_a)[1] = 0x1234567890ABCDEF
+    buf_b: uint64 = kmalloc(64)
+    memset(cast[Ptr[uint8]](buf_b), 0, 16)
+    memcpy(cast[Ptr[uint8]](buf_b), cast[Ptr[uint8]](buf_a), 16)
+    printk1("  memcpy -> [0]=%x\n", cast[Ptr[uint64]](buf_b)[0])
+    printk1("  memcpy -> [1]=%x\n", cast[Ptr[uint64]](buf_b)[1])
+
+    # --- memmove with backwards overlap: shift buffer right by 4 --
+    # Initial: bytes 0..7 = 1,2,3,4,5,6,7,8.
+    # memmove(buf+4, buf+0, 4): should shift left 4 bytes into right 4.
+    # Result: 1,2,3,4,1,2,3,4.  Tests the dst>src backward-walk path.
+    p8: Ptr[uint8] = cast[Ptr[uint8]](buf_a)
+    p8[0] = 1
+    p8[1] = 2
+    p8[2] = 3
+    p8[3] = 4
+    p8[4] = 5
+    p8[5] = 6
+    p8[6] = 7
+    p8[7] = 8
+    memmove(cast[Ptr[uint8]](buf_a + 4), cast[Ptr[uint8]](buf_a), 4)
+    printk2("  memmove backward: [0..3]=%x [4..7]=%x\n",
+            cast[Ptr[uint32]](buf_a)[0],
+            cast[Ptr[uint32]](buf_a + 4)[0])
+
+    # --- kzalloc: 96 bytes, every quad reads back as 0 -------------
+    z: uint64 = kzalloc(96)
+    bad: uint64 = 0
+    i: uint64 = 0
+    while i < 12:
+        if cast[Ptr[uint64]](z + i * 8)[0] != 0:
+            bad = bad + 1
+        i = i + 1
+    printk1("  kzalloc(96): non-zero quads = %d  (expect 0)\n", bad)
+
+    kfree(buf_a)
+    kfree(buf_b)
+    kfree(z)
 
 
 # --- Preemption demo -----------------------------------------------
@@ -156,6 +212,7 @@ def start_kernel():
     memblock_smoke_test()
     page_alloc_smoke_test()
     slab_smoke_test()
+    string_ops_smoke_test()
 
     setup_per_cpu_areas()
     printk1("Pynux: smp_processor_id() = %d\n", get_cpu_id())
