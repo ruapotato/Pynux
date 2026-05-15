@@ -212,28 +212,80 @@ _empty_str: Array[1, uint8]
 ENAMETOOLONG: int32 = -36
 
 
+def _normalize_inplace(buf: Ptr[uint8]):
+    # Compact "." and ".." components in-place on an absolute path.
+    # buf must start with '/' and be NUL-terminated. After the pass:
+    #
+    #   "/foo/./bar"      -> "/foo/bar"
+    #   "/foo/bar/.."     -> "/foo"
+    #   "/.."             -> "/"
+    #   "/a//b"           -> "/a/b"
+    #
+    # In-place is safe because write_pos always moves at most as fast
+    # as read_pos; we only ever copy from a higher buffer index to a
+    # lower one (or to itself).
+    read_pos:  uint64 = 1                  # skip leading '/'
+    write_pos: uint64 = 1
+    while buf[read_pos] != 0:
+        comp_start: uint64 = read_pos
+        while buf[read_pos] != 0 and buf[read_pos] != 47:
+            read_pos = read_pos + 1
+        comp_len: uint64 = read_pos - comp_start
+        if buf[read_pos] == 47:
+            read_pos = read_pos + 1
+        if comp_len == 0:
+            # Empty (consecutive '/' or trailing '/'). Skip.
+            continue
+        if comp_len == 1 and buf[comp_start] == 46:
+            # "." — skip.
+            continue
+        if comp_len == 2 and buf[comp_start] == 46 \
+                and buf[comp_start + 1] == 46:
+            # ".." — pop the previous component if any. Walk
+            # write_pos back past the previous "/" and the entry
+            # before it.
+            if write_pos > 1:
+                write_pos = write_pos - 1          # drop trailing '/'
+                while write_pos > 1 and buf[write_pos - 1] != 47:
+                    write_pos = write_pos - 1
+            continue
+        # Keep component: copy comp_start..comp_start+comp_len to
+        # write_pos, then add separator.
+        i: uint64 = 0
+        while i < comp_len:
+            buf[write_pos + i] = buf[comp_start + i]
+            i = i + 1
+        write_pos = write_pos + comp_len
+        buf[write_pos] = 47
+        write_pos = write_pos + 1
+    # Strip the trailing '/' we appended (unless we're sitting on
+    # the root '/').
+    if write_pos > 1 and buf[write_pos - 1] == 47:
+        write_pos = write_pos - 1
+    buf[write_pos] = 0
+
+
 def resolve_path(input: Ptr[char], output: Ptr[uint8],
                  count: uint64) -> int32:
-    # Produce an absolute path in `output` from `input` (which may be
-    # absolute or relative). Returns 0 on success, -ENAMETOOLONG if
-    # the result wouldn't fit. No "." / ".." normalisation yet —
-    # callers using "..foo" get an error from the FS layer when the
-    # literal component doesn't match anything.
+    # Produce an absolute, normalised path in `output` from `input`
+    # (which may be absolute or relative, with or without "." /
+    # ".."). Returns 0 on success, -ENAMETOOLONG if the absolute
+    # form (before normalisation) wouldn't fit.
     if count == 0:
         return ENAMETOOLONG
     if input[0] == 47:                         # '/'
-        # Absolute — straight copy.
         i: uint64 = 0
         while i + 1 < count:
             c: uint8 = cast[uint8](input[i] & 0xFF)
             output[i] = c
             if c == 0:
+                _normalize_inplace(output)
                 return 0
             i = i + 1
         output[i] = 0
         return ENAMETOOLONG
     # Relative — prepend cwd. Append '/' between cwd and input
-    # unless cwd is already "/" (the root case).
+    # unless cwd already ends in one.
     cwd: Ptr[uint8] = get_cwd_buf(current_idx_get())
     j: uint64 = 0
     while j + 1 < count and cwd[j] != 0:
@@ -246,12 +298,12 @@ def resolve_path(input: Ptr[char], output: Ptr[uint8],
             return ENAMETOOLONG
         output[j] = 47
         j = j + 1
-    # Append input.
     i: uint64 = 0
     while j + 1 < count:
         c: uint8 = cast[uint8](input[i] & 0xFF)
         output[j] = c
         if c == 0:
+            _normalize_inplace(output)
             return 0
         i = i + 1
         j = j + 1
