@@ -10,12 +10,20 @@ tracks share the same compiler and language:
 
 1. **Bare-metal Pynux kernel** (M16+) — Pynux compiles its own bootable
    kernel image. QEMU `-kernel build/pynux-vmlinux.elf` boots through
-   multiboot1 into 64-bit long mode, runs a Pynux `start_kernel()`,
-   handles traps and timer interrupts, and schedules cooperative
-   kernel threads. Source tree mirrors Linux's layout
-   (`arch/x86/boot/`, `arch/x86/kernel/`, `init/`, `mm/`, `drivers/`,
-   `kernel/sched/`, `kernel/printk/`) so reading the equivalent Linux
-   file → porting it to Pynux is the unit of work.
+   multiboot1 into 64-bit long mode, runs `start_kernel()`, configures
+   traps + IRQs + per-CPU storage, brings up a three-layer allocator
+   (memblock → page_alloc → slab/kmalloc), schedules with preemption,
+   and drops into a userspace task at CPL 3 that talks back via
+   `SYSCALL`. Source tree mirrors Linux's layout
+   (`arch/x86/boot/`, `arch/x86/kernel/`, `arch/x86/mm/`, `arch/x86/lib/`,
+   `init/`, `mm/`, `kernel/`, `kernel/sched/`, `kernel/printk/`,
+   `drivers/tty/serial/`, `drivers/video/console/`) so reading the
+   equivalent Linux file → porting it to Pynux is the unit of work.
+   The Pynux language has gained a small set of kernel-aware
+   primitives along the way — `Percpu[T]` per-CPU storage,
+   `container_of(ptr, Type, field)`, `cast[Ptr[T]](x)`, and inline
+   `asm_volatile` — so the source stays close to how Linux's
+   `include/linux/*.h` macros read.
 
 2. **.ko module infiltration** (M1..M15) — 40 Pynux-authored kernel
    modules that load into a stock Linux kernel via the regular kbuild
@@ -74,6 +82,17 @@ The end-game is a fully Pynux-authored kernel.
 | M16.5 | 8259 PIC + PIT timer @ 100 Hz + `jiffies` — first real hardware IRQ (mirrors `arch/x86/kernel/i8259.c` + `time.c`) | **Done** |
 | M16.6 | Cooperative scheduler — `__switch_to_asm`, `kthread_create`, two kernel threads ping-pong "ABAB…" (mirrors `kernel/sched/core.c`) | **Done** |
 | M16.7 | `printk` with `%d`/`%x`/`%s`/`%p`/`%c` — `printk0`/`printk1`/`printk2` variants (mirrors `kernel/printk/printk.c`) | **Done** |
+| M16.8 | kmalloc + slab + page_alloc — SLUB-style intra-object freelists, 7 kmalloc caches 32..2048 (mirrors `mm/slub.c`) | **Done** |
+| M16.9 | Timer-driven preemption — `schedule()` called from timer ISR, `kthread_bootstrap` trampoline mirrors `common_irq` tail | **Done** |
+| M16.10 | memset / memcpy / memmove + kzalloc — `rep stosb`/`rep movsb` (mirrors `arch/x86/lib/{memset,memcpy}_64.S`) | **Done** |
+| M16.11 | panic / BUG / WARN_ON + pr_emerg/err/warn/info/debug log levels (mirrors `kernel/panic.c` + `KERN_*`) | **Done** |
+| M16.12 | list_head intrusive doubly-linked list — `INIT_LIST_HEAD`, `list_add`, `list_del`, list poison (mirrors `include/linux/list.h`) | **Done** |
+| M16.13 | Multiboot mmap parsing — `arch/x86/kernel/e820.py` walks firmware memory map, drives `memblock_set_region` | **Done** |
+| M16.14 | `Percpu[T]` first-class language feature — codegen emits literal `%gs:offset`, master template in `.data..percpu` | **Done** |
+| M16.15 | alloc_pages(order) + kmalloc > 2 KiB — per-order free lists, page-backed large allocations | **Done** |
+| M16.16 | `container_of(ptr, Type, field)` compile-time builtin — collapses manual offset arithmetic at list walks | **Done** |
+| M16.17 | SYSCALL/SYSRET + first ring-3 userspace task — STAR/LSTAR/FMASK MSRs, GDT user CS/DS, SYS_PUTC + SYS_EXIT | **Done** |
+| M16.18 | VGA text framebuffer driver at 0xB8000 — 80×25 putc/puts/scroll (mirrors `drivers/video/console/vgacon.c`) | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -185,23 +204,34 @@ compiler/        Pynux compiler (CPython-hosted)
 
 # Bare-metal Pynux kernel (M16+) — layout mirrors Linux source tree
 arch/x86/
-  boot/header.S         multiboot1 header + 32→64 long-mode transition
+  boot/header.S         multiboot1 + 32->64 transition; identity-map
+                        first 1 GiB with U/S=1; GDT (kernel + user CS/DS)
   kernel/head_64.S      64-bit entry: BSS-zero, call start_kernel
   kernel/vmlinux.lds    linker script (elf32-i386 wrapper, 64-bit code)
+  kernel/boot_info_asm.S mb_magic / mb_info accessors
   kernel/idt_asm.S      per-vector trap stubs + common_trap
   kernel/idt.py         gate descriptor packing, idt_init
   kernel/traps.py       do_trap dispatch + hex printing
   kernel/irq_asm.S      per-IRQ stubs + common_irq (iretq path)
   kernel/irq.py         do_irq vector dispatch
   kernel/i8259.py       8259 PIC remap + mask/unmask + EOI
-  kernel/time.py        PIT @ 100 Hz, jiffies, timer_interrupt
-  kernel/setup_percpu.py  + .S  per-CPU area + %gs base
-  kernel/sched_asm.S    __switch_to_asm (context switch primitive)
-  mm/init.py            mem_init() arch-side
-mm/memblock.py          bump allocator (~ mm/memblock.c)
-kernel/sched/core.py    task_struct, kthread_create, schedule
-kernel/printk/printk.py printk0/1/2 with %d/%x/%s/%p/%c
-drivers/tty/serial/early_8250.py  polled 16550A UART + early_print_hex64
+  kernel/time.py        PIT @ 100 Hz, jiffies, timer_interrupt -> schedule
+  kernel/e820.py        multiboot mmap walk -> memblock_set_region
+  kernel/setup_percpu.py + .S  Percpu[T] template memcpy + %gs base
+  kernel/sched_asm.S    __switch_to_asm, kthread_bootstrap, enter_first_task
+  kernel/syscall.py + .S STAR/LSTAR/FMASK MSRs, syscall_entry, do_syscall
+  lib/string_64.S       memset / memcpy / memmove via rep stos/movs
+  mm/init.py            mem_init() arch-side bring-up
+mm/memblock.py          early bump allocator (~ mm/memblock.c)
+mm/page_alloc.py        order-N page allocator with per-order free lists
+mm/slab.py              SLUB-style slab caches + kmalloc / kzalloc / kfree
+                        large kmalloc routes to alloc_pages
+kernel/sched/core.py    task_struct, kthread_create, preemptive schedule
+kernel/printk/printk.py printk0/1/2 + pr_emerg/err/warn/info/debug
+kernel/panic.py         panic / BUG / WARN_ON
+kernel/list.py          list_head intrusive doubly-linked list
+drivers/tty/serial/early_8250.py  polled 16550A UART
+drivers/video/console/vga_text.py text-mode VGA console at 0xB8000
 init/main.py            start_kernel()
 
 kernel-modules/  Pynux source for each module milestone
