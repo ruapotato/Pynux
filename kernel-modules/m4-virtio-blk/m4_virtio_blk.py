@@ -218,6 +218,16 @@ def pynux_probe(vdev: Ptr[uint8]) -> int32:
 
 
 def pynux_remove(vdev: Ptr[uint8]):
+    # virtio_dev_remove WARNs if config->get_status is non-zero after
+    # remove returns. Call reset() and del_vqs() to clear state.
+    config_ptr: Ptr[uint8] = 0
+    memcpy(&config_ptr, vdev + VDEV_CONFIG_OFF, 8)
+    reset_fn: Ptr[uint8] = 0
+    memcpy(&reset_fn, config_ptr + 40, 8)   # VCO_RESET_OFF
+    reset_fn(vdev)
+    del_vqs_fn: Ptr[uint8] = 0
+    memcpy(&del_vqs_fn, config_ptr + 56, 8) # VCO_DEL_VQS_OFF
+    del_vqs_fn(vdev)
     _printk("[M4-VIRTIO] remove called\n", 0)
 
 

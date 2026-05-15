@@ -87,6 +87,14 @@ if ls /m4_virtio_blk.ko >/dev/null 2>&1; then
         echo "$name" > /sys/bus/virtio/drivers/virtio_blk/unbind
     done
 fi
+if ls /m4_virtio_net.ko >/dev/null 2>&1; then
+    for d in /sys/bus/virtio/drivers/virtio_net/virtio*; do
+        [ -e "$d" ] || continue
+        name=$(basename "$d")
+        echo "[PYNUX] unbinding $name from kernel virtio_net"
+        echo "$name" > /sys/bus/virtio/drivers/virtio_net/unbind
+    done
+fi
 for ko in /*.ko; do
     echo "[PYNUX] insmod $ko"
     insmod "$ko"

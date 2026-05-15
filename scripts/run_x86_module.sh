@@ -73,6 +73,10 @@ if [ -f "$DISKIMG" ]; then
     DISK_ARGS="-drive file=$DISKIMG,if=none,id=pynuxblk,format=raw \
                -device virtio-blk-pci,drive=pynuxblk"
 fi
+# Always wire a virtio-net device with SLIRP user-mode networking so the
+# M4.3b Pynux virtio-net driver has a device to probe. Other modules
+# pay a few-line boot tax but no functional cost.
+NET_ARGS="-netdev user,id=pynuxnet -device virtio-net-pci,netdev=pynuxnet"
 OUTPUT="$(timeout "$TIMEOUT" qemu-system-x86_64 \
     -kernel "$BZIMAGE" \
     -initrd "$INITRAMFS" \
@@ -80,6 +84,7 @@ OUTPUT="$(timeout "$TIMEOUT" qemu-system-x86_64 \
     -nographic -monitor none \
     -serial stdio -serial null \
     $DISK_ARGS \
+    $NET_ARGS \
     -no-reboot -m 256M \
     < /dev/null 2>&1 | tee /dev/stderr)" || true
 echo "---------------------------------------------------------------"
