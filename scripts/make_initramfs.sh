@@ -128,7 +128,7 @@ if ls /m11_debugfs.ko >/dev/null 2>&1; then
     fi
 fi
 
-if ls /m5_netfilter.ko >/dev/null 2>&1; then
+if ls /m5_netfilter.ko >/dev/null 2>&1 || ls /m12_nfdump.ko >/dev/null 2>&1; then
     echo "[PYNUX] --- exercise netfilter hook ---"
     ifconfig eth0 10.0.2.15 up 2>&1 | head -2
     ping -c 2 -W 1 10.0.2.2 2>&1 | grep -E "transmitted|received" | head -1
@@ -159,6 +159,20 @@ if grep -qE '^[ 0-9]*241 pynurand$' /proc/devices 2>/dev/null; then
         echo "[PYNUX] random FAILED (got $bytes bytes)"
     fi
     rm -f /dev/pynurand
+fi
+
+if grep -qE '^[ 0-9]*243 pynuxnull$' /proc/devices 2>/dev/null; then
+    echo "[PYNUX] --- exercise /dev/pynuxnull ---"
+    mknod /dev/pynuxnull c 243 0
+    # busybox echo without -n adds \n, so "hello\n" = 6 bytes
+    printf '%s' "hello" > /dev/pynuxnull
+    eof_bytes=$(dd if=/dev/pynuxnull bs=64 count=1 2>/dev/null | wc -c)
+    if [ "$eof_bytes" = "0" ]; then
+        echo "[PYNUX] null ok"
+    else
+        echo "[PYNUX] null FAILED ($eof_bytes bytes from read)"
+    fi
+    rm -f /dev/pynuxnull
 fi
 
 if grep -qE '^[ 0-9]*242 pynuxzero$' /proc/devices 2>/dev/null; then

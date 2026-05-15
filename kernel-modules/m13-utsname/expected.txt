@@ -1,0 +1,9 @@
+# M13.1: kernel release = "6.12.48" → bytes 54 46 49 50 46 52 56.
+[UTS] release[0]=54
+[UTS] release[1]=46
+[UTS] release[2]=49
+[UTS] release[3]=50
+[UTS] release[4]=46
+[UTS] release[5]=52
+[UTS] release[6]=56
+[UTS] unregistered

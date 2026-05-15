@@ -1,0 +1,7 @@
+# M12.1: ping 10.0.2.2 → ICMP replies from 10.0.2.2 (0x0202000a)
+# to 10.0.2.15 (0x0f02000a) hit our hook with parsed addresses.
+[NFL] register rc = 0
+[NFL] pkt src = 0x202000a
+[NFL] pkt dst = 0xf02000a
+[NFL] total packets = 2
+[NFL] unregistered

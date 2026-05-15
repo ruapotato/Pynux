@@ -1,0 +1,5 @@
+# M12.2: /dev/pynuxnull swallows writes and EOFs on read.
+[NULL] register rc = 0
+[PYNUX] null ok
+[NULL] bytes consumed = 5
+[NULL] unregistered

@@ -1,0 +1,70 @@
+# Pynux M12.1: netfilter packet inspector.
+#
+# Extends M5.3: the Pynux NF_INET_PRE_ROUTING hook not only counts
+# packets but also peeks into the sk_buff to extract IPv4 src/dst from
+# the header (skb->data[12..20]) and prints them in hex. With SLIRP
+# the ping reply has src=10.0.2.2 (0x0202000A) and dst=10.0.2.15
+# (0x0F02000A) when read as little-endian int32.
+
+extern def nf_register_net_hook(net: Ptr[uint8], ops: Ptr[uint8]) -> int32
+extern def nf_unregister_net_hook(net: Ptr[uint8], ops: Ptr[uint8])
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def init_net() -> int32
+extern def _printk(fmt: str, val: int32) -> int32
+
+
+class NfHookOps:
+    hook:      Ptr[uint8]
+    dev:       Ptr[uint8]
+    priv:      Ptr[uint8]
+    pf:        int32
+    hooknum:   uint32
+    priority:  int32
+    pad_end:   int32
+
+
+NFPROTO_IPV4_VAL:        int32  = 2
+NF_INET_PRE_ROUTING_VAL: uint32 = 0
+NF_ACCEPT_VAL:           uint32 = 1
+
+# sk_buff fields (probed for 6.12.48)
+SKB_DATA_OFF: int32 = 200
+IP_HDR_SRC_OFF: int32 = 12
+IP_HDR_DST_OFF: int32 = 16
+
+# Cap logging — netfilter PRE_ROUTING fires for every IPv4 packet.
+MAX_LOG: int32 = 2
+
+pynux_nf_ops:   NfHookOps
+pynux_nf_count: int32
+
+
+def pynux_nf_hook(priv: Ptr[uint8], skb: Ptr[uint8],
+                  state: Ptr[uint8]) -> uint32:
+    pynux_nf_count = pynux_nf_count + 1
+    if pynux_nf_count <= MAX_LOG:
+        data_ptr: Ptr[uint8] = 0
+        memcpy(&data_ptr, skb + SKB_DATA_OFF, 8)
+        src: int32 = 0
+        dst: int32 = 0
+        memcpy(&src, data_ptr + IP_HDR_SRC_OFF, 4)
+        memcpy(&dst, data_ptr + IP_HDR_DST_OFF, 4)
+        _printk("[NFL] pkt src = 0x%x\n", src)
+        _printk("[NFL] pkt dst = 0x%x\n", dst)
+    return NF_ACCEPT_VAL
+
+
+def init_module() -> int32:
+    pynux_nf_ops.hook = pynux_nf_hook
+    pynux_nf_ops.pf = NFPROTO_IPV4_VAL
+    pynux_nf_ops.hooknum = NF_INET_PRE_ROUTING_VAL
+    pynux_nf_ops.priority = 0
+    rc: int32 = nf_register_net_hook(init_net, &pynux_nf_ops)
+    _printk("[NFL] register rc = %d\n", rc)
+    return rc
+
+
+def cleanup_module():
+    nf_unregister_net_hook(init_net, &pynux_nf_ops)
+    _printk("[NFL] total packets = %d\n", pynux_nf_count)
+    _printk("[NFL] unregistered\n", 0)
