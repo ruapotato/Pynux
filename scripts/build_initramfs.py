@@ -21,6 +21,7 @@ fs/initramfs_blob.S (which is committed; assembly happens at build
 time without re-running this script).
 """
 
+import os
 from pathlib import Path
 
 FILES = [
@@ -30,9 +31,9 @@ FILES = [
     ("/hello.txt",  b"Hello from a third file. cpio supports many.\n"),
 ]
 
-# Path to the userland init binary built by scripts/build_user.sh.
-# If it exists, embed as /init so the kernel can ELF-load + exec it.
-INIT_ELF_PATH = "build/user/init.elf"
+# See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
+# override which on-disk file becomes /init in the cpio archive, e.g.
+# to swap in a Pynux-compiled user binary without touching user/init.S.
 
 
 def cpio_entry(name: str, data: bytes) -> bytes:
@@ -70,18 +71,58 @@ def build_archive() -> bytes:
     blob = b""
     here = Path(__file__).resolve().parent.parent
 
+    # If INIT_ELF=<path> is set, embed that file as /init (overriding
+    # whatever ELF in build/user/ would otherwise have grabbed the
+    # /init slot). Lets us point /init at e.g. a Pynux-compiled
+    # user/hello.elf for one run without touching user/init.S or the
+    # glob below. We track which on-disk path is acting as /init so
+    # the directory glob doesn't re-embed it under its native name.
+    init_override = os.environ.get("INIT_ELF")
+    init_override_real: Path | None = None
+    if init_override:
+        p = Path(init_override)
+        if not p.is_absolute():
+            p = here / p
+        if not p.exists():
+            raise SystemExit(f"INIT_ELF={init_override}: file not found")
+        data = p.read_bytes()
+        blob += cpio_entry("/init", data)
+        init_override_real = p.resolve()
+        print(f"  embedded /init ({len(data)} bytes from "
+              f"{p.relative_to(here) if p.is_relative_to(here) else p}) "
+              f"[INIT_ELF override]")
+
     # Userland ELFs: anything in build/user/ becomes a cpio entry
     # named "/" + binary name (without .elf). /init must exist for
     # the kernel boot path to work; others (e.g. /hello) are extras
-    # for SYS_EXECVE demos.
+    # for SYS_EXECVE demos. Skipped if (a) INIT_ELF already covered
+    # /init (we drop build/user/init.elf to avoid a duplicate entry)
+    # or (b) the path matches the override exactly (already embedded).
     user_dir = here / "build" / "user"
     if user_dir.is_dir():
         for elf in sorted(user_dir.glob("*.elf")):
+            if init_override_real is not None:
+                if elf.resolve() == init_override_real:
+                    continue          # already embedded above as /init
+                if elf.name == "init.elf":
+                    continue          # /init slot is taken by override
             data = elf.read_bytes()
             name = "/" + elf.stem
             blob += cpio_entry(name, data)
             print(f"  embedded {name} ({len(data)} bytes from "
                   f"build/user/{elf.name})")
+
+    # Kernel modules: anything in build/mod/ gets embedded as /<stem>
+    # so module_load() can fetch by path. Convention is to start the
+    # binary names with "kmod_" so the cpio entries read /kmod_X.
+    mod_dir = here / "build" / "mod"
+    if mod_dir.is_dir():
+        for elf in sorted(mod_dir.glob("*.elf")):
+            data = elf.read_bytes()
+            name = "/" + elf.stem
+            blob += cpio_entry(name, data)
+            print(f"  embedded {name} ({len(data)} bytes from "
+                  f"build/mod/{elf.name})")
 
     for name, data in FILES:
         blob += cpio_entry(name, data)

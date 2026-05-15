@@ -54,6 +54,7 @@ from fs.vfs import (
     initramfs_data_ptr, initramfs_data_size,
 )
 from fs.elf import elf_load_blob
+from arch.x86.kernel.module import module_api_init, module_load
 from drivers.pci.pci import pci_scan
 from drivers.net.netfilter import (
     netfilter_init, register_netfilter_hook, nf_run_hooks,
@@ -519,6 +520,12 @@ def start_kernel():
 
     # Initialise the VFS fd table BEFORE any user task issues SYS_OPEN.
     vfs_init()
+
+    # M16.32: bring the module loader API table online and demo-load
+    # the hello module so we know the insmod-equivalent path works
+    # before any userspace runs.
+    module_api_init()
+    module_load("/kmod_hello")
 
     # --- M16.30: load /init from cpio via the ELF loader ----------
     # exec() into a real userspace binary instead of the baked-in

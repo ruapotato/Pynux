@@ -1,0 +1,74 @@
+# arch/x86/kernel/module.py
+#
+# Mirrors kernel/module/main.c at the smallest meaningful scale:
+# Linux's loadable module ABI plus an insmod-equivalent. A "Pynux
+# module" is a position-independent ELF with a single exported entry
+# `init_module(api: Ptr[ModuleApi]) -> int32`. The kernel reads the
+# binary from the initramfs, ELF-loads it (same code path that loads
+# /init userland binaries), and calls the entry at CPL=0 with a
+# struct of kernel function pointers in %rdi.
+#
+# Why a function-pointer table instead of name-based symbol
+# resolution? Real Linux modules carry an ELF symbol table and the
+# kernel walks its own exported-symbol list (EXPORT_SYMBOL) to
+# resolve relocations. That requires a proper module-loading
+# pipeline (relocation types, symtab parsing, KSYM_FN walks). For
+# M16.32 we sidestep all of that — the module knows ahead of time
+# that the kernel hands it an API table and indexes into it via
+# fixed offsets. A future M16.x will grow into real symbol-based
+# resolution against EXPORT_SYMBOL equivalents.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from fs.vfs import initramfs_data_ptr, initramfs_data_size
+from fs.elf import elf_load_blob
+from mm.slab import kmalloc, kfree
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+class ModuleApi:
+    printk_str: uint64        # offset 0  : void (*)(const char *)
+    kmalloc:    uint64        # offset 8  : void *(*)(uint64)
+    kfree:      uint64        # offset 16 : void (*)(void *)
+
+
+module_api: ModuleApi
+
+
+def _mod_printk_str(s: Ptr[char]):
+    # The ModuleApi entry; just routes through printk1's %s spec.
+    printk1("%s", cast[uint64](s))
+
+
+def module_api_init():
+    # Build the function-pointer table modules will consume. Wired up
+    # once at boot; modules loaded later see the same table.
+    module_api.printk_str = cast[uint64](&_mod_printk_str)
+    module_api.kmalloc    = cast[uint64](&kmalloc)
+    module_api.kfree      = cast[uint64](&kfree)
+
+
+def module_load(path: Ptr[char]) -> int32:
+    # insmod equivalent. Returns init_module's return value (0 on
+    # success) or a negative errno on lookup/load failure.
+    blob: uint64 = initramfs_data_ptr(path)
+    if blob == 0:
+        printk1("modload: '%s' not in initramfs\n", cast[uint64](path))
+        return -2                             # -ENOENT
+    sz: uint64 = initramfs_data_size(path)
+
+    entry: uint64 = elf_load_blob(cast[Ptr[uint8]](blob), sz)
+    if entry == 0:
+        printk1("modload: ELF load of '%s' failed\n", cast[uint64](path))
+        return -8                             # -ENOEXEC
+
+    printk2("modload: '%s' loaded; entry=%p, calling init_module...\n",
+            cast[uint64](path), entry)
+
+    # Call init_module(&module_api). The codegen treats a local of
+    # pointer type as an indirect call target — same idiom as the
+    # netfilter hook chain in M16.29.
+    init_fn: Ptr[uint8] = cast[Ptr[uint8]](entry)
+    rc: int32 = init_fn(&module_api)
+    printk1("modload: init_module returned %d\n", cast[uint64](rc))
+    return rc
