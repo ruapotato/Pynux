@@ -15,11 +15,16 @@ cd "$PROJ_ROOT"
 
 mkdir -p build/user
 
-as --32 -o build/user/init.o user/init.S
-ld -m elf_i386 -nostdlib -static \
-   -T user/init.lds \
-   -o build/user/init.elf \
-   build/user/init.o
+build_one() {
+    local name="$1"
+    as --32 -o "build/user/${name}.o" "user/${name}.S"
+    ld -m elf_i386 -nostdlib -static \
+       -T user/init.lds \
+       -o "build/user/${name}.elf" \
+       "build/user/${name}.o"
+    echo "[build_user] wrote $(pwd)/build/user/${name}.elf"
+    file "build/user/${name}.elf"
+}
 
-echo "[build_user] wrote $(pwd)/build/user/init.elf"
-file build/user/init.elf
+build_one init
+build_one hello

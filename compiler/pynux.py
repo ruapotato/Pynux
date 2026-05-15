@@ -31,6 +31,13 @@ TARGETS = {
     # license stamp that's only meaningful for loadable modules.
     "x86_64-bare-metal": {"codegen": "x86", "kbuild": False,
                           "bare_metal": True},
+    # CPL-3 user-mode ELF the Pynux kernel's fs/elf.py loader can run.
+    # Same codegen as bare-metal (RIP-relative addressing, no .modinfo),
+    # different link: we add user/runtime.S (the _start + syscall
+    # wrappers) and use user/init.lds (single PT_LOAD, OUTPUT_FORMAT
+    # elf32-i386 so the kernel's loader can parse it).
+    "x86_64-pynux-user": {"codegen": "x86", "kbuild": False,
+                          "bare_metal": True},
 }
 DEFAULT_TARGET = "arm-cortex-m3"
 
@@ -278,6 +285,77 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
     return True
 
 
+def assemble_and_link_x86_user(asm_file: Path, output: Path,
+                                project_root: Path) -> bool:
+    """Assemble + link a Pynux source into a CPL-3 user-mode ELF.
+
+    Same shape as assemble_and_link_x86_bare but a much smaller link:
+    the user binary is purely the compiler-emitted .S (with the
+    .code64 prepend trick) plus user/runtime.S (the _start entry and
+    syscall wrappers). The linker script is user/init.lds, which
+    emits an elf32-i386 wrapper with a single PT_LOAD at virtual base
+    0 — this is what fs/elf.py knows how to load.
+
+    No kernel objects are linked in: a user binary lives in its own
+    address space and reaches the kernel only via the `syscall`
+    instruction.
+    """
+    as_cmd = "as"
+    ld_cmd = "ld"
+
+    try:
+        subprocess.run([as_cmd, "--version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("Error: GNU as not found (install binutils)", file=sys.stderr)
+        return False
+
+    runtime_s = project_root / "user/runtime.S"
+    lds       = project_root / "user/init.lds"
+    for required in (runtime_s, lds):
+        if not required.exists():
+            print(f"Error: missing {required}", file=sys.stderr)
+            return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        runtime_o = tmpdir / "runtime.o"
+        main_o    = tmpdir / "main.o"
+
+        # Same .code64 prepend trick the bare-metal kernel uses: the
+        # Pynux codegen is target-mode-agnostic, but we want 64-bit
+        # instructions inside an elf32-i386 wrapper. `as --32` plus a
+        # leading `.code64` directive produces exactly that.
+        pynux_s = tmpdir / "pynux_main.S"
+        pynux_s.write_text(".code64\n" + asm_file.read_text())
+
+        for src, obj in [(runtime_s, runtime_o), (pynux_s, main_o)]:
+            result = subprocess.run(
+                [as_cmd, "--32", "-o", str(obj), str(src)],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                print(f"Error assembling {src}:\n{result.stderr}",
+                      file=sys.stderr)
+                return False
+
+        # runtime.o first so _start (and the syscall stubs the user
+        # code calls into) sits at the very start of .text. The
+        # linker script doesn't strictly require this — _start is the
+        # ENTRY — but listing it first keeps the layout predictable
+        # when eyeballing `objdump -d`.
+        link_cmd = [
+            ld_cmd, "-m", "elf_i386", "-nostdlib", "-static",
+            "-T", str(lds), "-o", str(output),
+            str(runtime_o), str(main_o),
+        ]
+        result = subprocess.run(link_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Error linking:\n{result.stderr}", file=sys.stderr)
+            return False
+
+    return True
+
+
 def assemble_and_link(asm_file: Path, output: Path, runtime_dir: Path) -> bool:
     """Assemble and link to create ELF binary."""
     # Check for toolchain
@@ -408,6 +486,8 @@ def cmd_compile(args: argparse.Namespace) -> int:
     try:
         if args.target == "x86_64-bare-metal":
             ok = assemble_and_link_x86_bare(asm_path, output, find_pynux_root())
+        elif args.target == "x86_64-pynux-user":
+            ok = assemble_and_link_x86_user(asm_path, output, find_pynux_root())
         else:
             ok = assemble_and_link(asm_path, output, find_runtime())
         if not ok:

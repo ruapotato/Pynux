@@ -68,17 +68,21 @@ def cpio_trailer() -> bytes:
 
 def build_archive() -> bytes:
     blob = b""
-    # If the userland /init binary has been built, include it first.
     here = Path(__file__).resolve().parent.parent
-    init_path = here / INIT_ELF_PATH
-    if init_path.exists():
-        init_bytes = init_path.read_bytes()
-        blob += cpio_entry("/init", init_bytes)
-        print(f"  embedded /init ({len(init_bytes)} bytes from "
-              f"{INIT_ELF_PATH})")
-    else:
-        print(f"  (no /init: {INIT_ELF_PATH} not built — run "
-              f"scripts/build_user.sh first)")
+
+    # Userland ELFs: anything in build/user/ becomes a cpio entry
+    # named "/" + binary name (without .elf). /init must exist for
+    # the kernel boot path to work; others (e.g. /hello) are extras
+    # for SYS_EXECVE demos.
+    user_dir = here / "build" / "user"
+    if user_dir.is_dir():
+        for elf in sorted(user_dir.glob("*.elf")):
+            data = elf.read_bytes()
+            name = "/" + elf.stem
+            blob += cpio_entry(name, data)
+            print(f"  embedded {name} ({len(data)} bytes from "
+                  f"build/user/{elf.name})")
+
     for name, data in FILES:
         blob += cpio_entry(name, data)
     blob += cpio_trailer()

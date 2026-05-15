@@ -123,6 +123,32 @@ set_efer_sce:
     wrmsr
     ret
 
+/* ---------- do_execve_finish(new_rip, new_rsp) -------------------- *
+ * Tail-call from the SYS_EXECVE handler when it has loaded a new ELF
+ * and wants to "become" that program. We never return through the
+ * normal syscall path — instead we set up the registers SYSRETQ
+ * reads (%rcx = new RIP, %r11 = new RFLAGS with IF=1) and load the
+ * new user RSP directly, then SYSRETQ ourselves out to CPL=3.
+ *
+ * Why this isn't an ordinary return: the standard syscall path
+ * restores the user RIP/RSP/RFLAGS that were captured at entry. To
+ * exec(), we have to replace those WITHOUT going through the
+ * kernel-stack popping that syscall_entry does at its tail (because
+ * the kernel-stack frame still has the syscall-time saved %rcx /
+ * %r11, and the user_rsp_save slot still has the syscall-time user
+ * stack). Directly sysretq-ing with new state skips all that.
+ *
+ * SysV: %rdi = new user RIP, %rsi = new user RSP. No return.
+ */
+
+    .align 16
+    .globl do_execve_finish
+do_execve_finish:
+    movq    %rdi, %rcx                 /* SYSRETQ pulls RIP from %rcx */
+    movq    $0x202, %r11               /* RFLAGS (IF=1, reserved bit) */
+    movq    %rsi, %rsp                 /* user stack                  */
+    sysretq
+
 /* ---------- enter_user_mode(entry, stack) ------------------------ *
  * Build an iretq frame on the kernel stack with CPL=3 selectors and
  * iretq into ring 3. The iret frame on x86_64 is always 5 quads in

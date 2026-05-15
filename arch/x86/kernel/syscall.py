@@ -30,7 +30,14 @@ from kernel.sched.core import (
     create_user_task, task_exit_current,
     current_task_pid,
 )
-from fs.vfs import vfs_open, vfs_read, vfs_write, vfs_close, vfs_lseek
+from fs.vfs import (
+    vfs_open, vfs_read, vfs_write, vfs_close, vfs_lseek,
+    initramfs_data_ptr, initramfs_data_size,
+)
+from fs.elf import elf_load_blob
+from mm.page_alloc import alloc_page
+
+extern def do_execve_finish(new_rip: uint64, new_rsp: uint64)
 
 extern def write_msr(index: uint32, value: uint64)
 extern def read_msr(index: uint32) -> uint64
@@ -55,6 +62,7 @@ SYS_READ:        uint64 = 6                    # a0=fd, a1=buf, a2=count
 SYS_CLOSE:       uint64 = 7
 SYS_WRITE:       uint64 = 8                    # a0=fd, a1=buf, a2=count
 SYS_LSEEK:       uint64 = 9                    # a0=fd, a1=offset, a2=whence
+SYS_EXECVE:      uint64 = 10                   # a0 = path; never returns
 
 # Single-CPU stash slots used by the syscall entry stub to flip
 # between user RSP and kernel RSP. Regular globals (not Percpu[T])
@@ -144,5 +152,30 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         n: int64 = vfs_lseek(cast[int32](a0),
                              cast[int64](a1), cast[int32](a2))
         return cast[uint64](n)
+    if nr == SYS_EXECVE:
+        # Look up `path` in the initramfs, ELF-load, and SYSRETQ
+        # directly to the new entry. The current task's task_struct
+        # and per-task fd table are preserved (no fork+exec races at
+        # this scale; we behave more like a Linux exec() that replaces
+        # the user image but keeps the kernel-side context).
+        path: Ptr[char] = cast[Ptr[char]](a0)
+        blob: uint64 = initramfs_data_ptr(path)
+        if blob == 0:
+            printk1("execve: '%s' not in initramfs\n", a0)
+            return cast[uint64](-2)            # -ENOENT
+        sz: uint64 = initramfs_data_size(path)
+        entry: uint64 = elf_load_blob(cast[Ptr[uint8]](blob), sz)
+        if entry == 0:
+            printk1("execve: ELF load of '%s' failed\n", a0)
+            return cast[uint64](-8)            # -ENOEXEC
+        # Fresh user stack for the new program. The previous user
+        # stack page is leaked for now (no per-task ustack tracking
+        # in this code path); proper teardown comes with mm_struct.
+        new_ustack: uint64 = alloc_page() + 4096
+        printk2("execve: jumping to %p with stack %p\n",
+                entry, new_ustack)
+        do_execve_finish(entry, new_ustack)
+        # Not reached.
+        return 0
     printk2("Pynux: unknown syscall nr=%d a0=%x\n", nr, a0)
     return cast[uint64](-1)

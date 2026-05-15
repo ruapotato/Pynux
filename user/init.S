@@ -68,7 +68,14 @@ _start:
     movq    $8, %rax
     syscall
 
-    /* exit(0) */
+    /* execve("/hello") — replaces this task's user image with the
+     * /hello binary. SYS_EXECVE never returns on success, so the
+     * SYS_EXIT below only runs if the exec fails. */
+    leaq    init_path_hello(%rip), %rdi
+    movq    $10, %rax               /* SYS_EXECVE */
+    syscall
+
+    /* exec failed (or fell through) — exit cleanly. */
     movq    $1, %rax                /* SYS_EXIT */
     syscall
 
@@ -87,8 +94,11 @@ init_banner_end:
 init_fname_version:
     .asciz "/version"
 
+init_path_hello:
+    .asciz "/hello"
+
 init_ok:
-    .ascii "[/init] exit(0)\n"
+    .ascii "[/init] ok, exec'ing /hello\n"
 init_ok_end:
 
     .balign 8
