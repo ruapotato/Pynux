@@ -1,0 +1,4 @@
+# M8.3: dummy ethernet net_device registers and shows up in ip link.
+[NET] register_netdev rc = 0
+[NET] ndo_open called
+[NET] unregistered

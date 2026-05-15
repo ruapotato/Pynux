@@ -125,6 +125,14 @@ if ls /m5_netfilter.ko >/dev/null 2>&1; then
     echo "[PYNUX] --- end netfilter ---"
 fi
 
+if ls /m8_netdev.ko >/dev/null 2>&1; then
+    echo "[PYNUX] --- m8 netdev ---"
+    # Pynux device gets the next free ethN slot after eth0=virtio-net.
+    ifconfig eth1 192.168.99.1 netmask 255.255.255.0 up 2>&1 | head -2
+    ifconfig eth1 2>&1 | head -3
+    echo "[PYNUX] --- end netdev ---"
+fi
+
 if [ -d /sys/pynux ]; then
     echo "[PYNUX] --- /sys/pynux/info ---"
     cat /sys/pynux/info

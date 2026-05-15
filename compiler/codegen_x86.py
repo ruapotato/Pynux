@@ -647,9 +647,20 @@ class X86CodeGen:
             # Function reference: load the symbol's address (RIP-relative).
             self.emit(f"    leaq {name}(%rip), %rax")
         elif name in self.global_var_types:
-            # Global scalar: load address, then dereference.
-            self.emit(f"    leaq {name}(%rip), %rax")
-            self.emit(f"    movq (%rax), %rax")
+            t = self.global_var_types[name]
+            is_aggregate = (
+                isinstance(t, ArrayType)
+                or (t is not None and hasattr(t, "name")
+                    and t.name in self.structs)
+            )
+            if is_aggregate:
+                # Array or struct global: decay to address; callers index,
+                # member-access, or take addr of it.
+                self.emit(f"    leaq {name}(%rip), %rax")
+            else:
+                # Scalar global: load address, then dereference.
+                self.emit(f"    leaq {name}(%rip), %rax")
+                self.emit(f"    movq (%rax), %rax")
         else:
             raise CodeGenError(f"x86: unknown identifier '{name}'")
 
