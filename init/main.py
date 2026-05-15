@@ -54,7 +54,7 @@ extern def tss_init(rsp0: uint64)
 from mm.memblock import memblock_alloc, memblock_used, memblock_avail
 from mm.page_alloc import (
     alloc_page, free_page, alloc_pages, free_pages,
-    page_alloc_total, page_alloc_free_count,
+    page_alloc_total, page_alloc_free_count, count_free_at_order,
 )
 from mm.slab import kmalloc, kfree, kzalloc
 
@@ -90,7 +90,24 @@ def page_alloc_smoke_test():
     p3: uint64 = alloc_page()
     printk1("  alloc_page #3 = %p  (fresh)\n", p3)
     free_page(p2)
+    # After freeing p2, order-0 has 1 entry (p2). order-1 entry count
+    # depends on prior splits but should not change between this and
+    # the next print.
+    printk2("  after free(p2): order0=%d order1=%d\n",
+            count_free_at_order(0), count_free_at_order(1))
     free_page(p3)
+    # p3 is p2's buddy (consecutive 4 KiB pages from the same 8 KiB
+    # split). M16.23 buddy merging should pop p2 off order-0 and
+    # produce one extra order-1 entry. Cascading: the new order-1
+    # entry's buddy is also free (left over from the original split),
+    # so we merge again to order-2, and so on. The net effect of
+    # freeing both halves of the previously-split run is that the
+    # entire 4 MiB top-level block can recombine — proving the
+    # buddy chain works end-to-end.
+    printk2("  after free(p3): order0=%d order1=%d\n",
+            count_free_at_order(0), count_free_at_order(1))
+    printk2("  cascaded: order2=%d  order10=%d  (1 if fully merged)\n",
+            count_free_at_order(2), count_free_at_order(10))
     printk2("  page_alloc: total=%d free=%d\n",
             page_alloc_total(), page_alloc_free_count())
 

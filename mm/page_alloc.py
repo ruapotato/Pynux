@@ -47,16 +47,19 @@ nr_pages_free:    uint64 = 0
 def alloc_pages(order: int32) -> uint64:
     # Returns a page-aligned base address of 2^order contiguous 4 KiB
     # pages, or 0 on OOM. Caller "owns" the entire run until they
-    # call free_pages(addr, order).
+    # call free_pages(addr, order). nr_pages_free is bumped along
+    # every code path that adds/removes from order-0's free list so
+    # the counter stays consistent across split / merge / direct free.
     if order < 0:
         return 0
     if order > MAX_ORDER:
         return 0
 
     # Path 1: this order's free list has a ready run.
-    head: uint64 = free_pages_order[order]
+    o: uint64 = cast[uint64](order)
+    head: uint64 = free_pages_order[o]
     if head != 0:
-        free_pages_order[order] = cast[Ptr[uint64]](head)[0]
+        free_pages_order[o] = cast[Ptr[uint64]](head)[0]
         if order == 0:
             nr_pages_free = nr_pages_free - 1
         return head
@@ -66,38 +69,97 @@ def alloc_pages(order: int32) -> uint64:
     if order < MAX_ORDER:
         higher: uint64 = alloc_pages(order + 1)
         if higher != 0:
-            half: uint64 = PAGE_SIZE << cast[uint64](order)
+            half: uint64 = PAGE_SIZE << o
             buddy: uint64 = higher + half
-            cast[Ptr[uint64]](buddy)[0] = free_pages_order[order]
-            free_pages_order[order] = buddy
+            cast[Ptr[uint64]](buddy)[0] = free_pages_order[o]
+            free_pages_order[o] = buddy
+            if order == 0:
+                nr_pages_free = nr_pages_free + 1
             return higher
 
     # Path 3: fresh allocation from memblock. Size and alignment must
     # both be the full run width so the address is correctly aligned
     # for the order-0 split that may follow.
-    size: uint64 = PAGE_SIZE << cast[uint64](order)
+    size: uint64 = PAGE_SIZE << o
     page: uint64 = memblock_alloc(size, size)
     if page == 0:
         return 0
-    pages_in_run: uint64 = cast[uint64](1) << cast[uint64](order)
+    pages_in_run: uint64 = cast[uint64](1) << o
     nr_pages_total = nr_pages_total + pages_in_run
     return page
 
 
+def _try_remove_buddy(target: uint64, order: int32) -> int32:
+    # Scan the order-N free list for `target` (which is meant to be
+    # this freeing block's buddy). If found, unlink and return 1.
+    # O(list length) — fine while lists stay short; replace with a
+    # struct-page-style buddy bit when fragmentation pressure grows.
+    o: uint64 = cast[uint64](order)
+    head: uint64 = free_pages_order[o]
+    if head == 0:
+        return 0
+    if head == target:
+        free_pages_order[o] = cast[Ptr[uint64]](head)[0]
+        return 1
+    prev: uint64 = head
+    cur:  uint64 = cast[Ptr[uint64]](head)[0]
+    while cur != 0:
+        if cur == target:
+            cast[Ptr[uint64]](prev)[0] = cast[Ptr[uint64]](cur)[0]
+            return 1
+        prev = cur
+        cur  = cast[Ptr[uint64]](cur)[0]
+    return 0
+
+
 def free_pages(addr: uint64, order: int32):
-    # Return a previously-allocated run to its order's free list. No
-    # buddy merging yet — a free order-0 page sitting next to its
-    # buddy won't recombine into an order-1 run until we add the
-    # memmap-style metadata Linux uses. Tolerable for M16.15 use sites
-    # (kmalloc large-blocks are rare and short-lived).
+    # Return a run to the allocator. If its buddy at the same order
+    # is already free, MERGE them into a single order-(N+1) block and
+    # recurse; this is the canonical buddy algorithm (mirrors
+    # __free_one_page in mm/page_alloc.c). Stops at MAX_ORDER.
     if addr == 0:
         return
     if order < 0 or order > MAX_ORDER:
         return
-    cast[Ptr[uint64]](addr)[0] = free_pages_order[order]
-    free_pages_order[order] = addr
-    if order == 0:
+
+    cur_addr:  uint64 = addr
+    cur_order: int32  = order
+    while cur_order < MAX_ORDER:
+        run_size: uint64 = PAGE_SIZE << cast[uint64](cur_order)
+        buddy:    uint64 = cur_addr ^ run_size
+        if _try_remove_buddy(buddy, cur_order) == 0:
+            break
+        # Merged. Canonical "parent" block is the lower of the two,
+        # which is `addr & ~(run_size << 1)` aligned. cur_addr ^ run_size
+        # gives buddy; AND with ~run_size canonicalises.
+        if buddy < cur_addr:
+            cur_addr = buddy
+        # If order == 0 we just consumed a free order-0 entry too,
+        # adjust the free-count accordingly.
+        if cur_order == 0:
+            nr_pages_free = nr_pages_free - 1
+        cur_order = cur_order + 1
+
+    # Push the (possibly merged) block onto its order's free list.
+    o: uint64 = cast[uint64](cur_order)
+    cast[Ptr[uint64]](cur_addr)[0] = free_pages_order[o]
+    free_pages_order[o] = cur_addr
+    if cur_order == 0:
         nr_pages_free = nr_pages_free + 1
+
+
+def count_free_at_order(order: int32) -> uint64:
+    # Walk one order's free list and count entries. Used by the
+    # M16.23 smoke test to demonstrate buddy merging. Not on a hot
+    # path so the O(N) walk is fine.
+    if order < 0 or order > MAX_ORDER:
+        return 0
+    n: uint64 = 0
+    p: uint64 = free_pages_order[cast[uint64](order)]
+    while p != 0:
+        n = n + 1
+        p = cast[Ptr[uint64]](p)[0]
+    return n
 
 
 # --- order-0 convenience aliases (backwards-compat with M16.8) -----
