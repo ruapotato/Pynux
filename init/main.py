@@ -41,6 +41,9 @@ from kernel.sched.core import (
     sched_init, kthread_create, start_first_task, get_current_pid,
 )
 from arch.x86.kernel.syscall import syscall_init
+from drivers.video.console.vga_text import (
+    vga_init, vga_putc, vga_puts, vga_read_cell_char,
+)
 
 extern def enter_user_mode(entry: uint64, stack: uint64)
 extern def user_demo_entry()
@@ -248,6 +251,54 @@ def list_smoke_test():
     demo_n2.value = 20
     demo_n3.value = 30
 
+    list_add(&demo_n1.link, &demo_head)
+    list_add(&demo_n2.link, &demo_head)
+    list_add(&demo_n3.link, &demo_head)
+
+    printk1("  list_empty after 3 adds = %d  (expect 0)\n",
+            cast[uint64](list_empty(&demo_head)))
+
+    total: uint64 = _list_walk_and_sum(&demo_head)
+    printk1("  walked sum = %d  (expect 60)\n", total)
+
+    list_del(&demo_n2.link)
+    total = _list_walk_and_sum(&demo_head)
+    printk1("  after list_del(n2): sum = %d  (expect 40)\n", total)
+
+    list_add_tail(&demo_n2.link, &demo_head)
+    total = _list_walk_and_sum(&demo_head)
+    printk1("  after list_add_tail(n2): sum = %d  (expect 60)\n", total)
+
+
+def vga_smoke_test():
+    # Write a short string to the framebuffer at row 0, then read back
+    # the cells via serial. This works in -nographic where no display
+    # exists — VGA memory at 0xB8000 still receives writes, and the
+    # readback confirms the path end-to-end.
+    printk0("Pynux: VGA framebuffer smoke test\n")
+    vga_init()
+    vga_puts("Pynux VGA framebuffer @ 0xB8000\n")
+    vga_puts("If you are seeing this in a graphical QEMU window,\n")
+    vga_puts("the text-mode console works.\n")
+
+    # Read first 9 cells of row 0 back over serial. We wrote "Pynux VGA"
+    # as the first 9 characters above, so the readback should match.
+    printk0("  readback first row 0: '")
+    j: uint64 = 0
+    while j < 9:
+        printk1("%c", cast[uint64](vga_read_cell_char(0, j)))
+        j = j + 1
+    printk0("'\n")
+    printk0("Pynux: list_head smoke test\n")
+
+    INIT_LIST_HEAD(&demo_head)
+    printk1("  list_empty after init = %d  (expect 1)\n",
+            cast[uint64](list_empty(&demo_head)))
+
+    demo_n1.value = 10
+    demo_n2.value = 20
+    demo_n3.value = 30
+
     # Add at head: post-add order is 1 -> 2 -> 3 ... wait no,
     # list_add inserts AT THE FRONT, so calling order 1,2,3 yields
     # head -> 3 -> 2 -> 1 -> back to head.
@@ -366,6 +417,7 @@ def start_kernel():
     string_ops_smoke_test()
     diag_smoke_test()
     list_smoke_test()
+    vga_smoke_test()
 
     setup_per_cpu_areas()
     printk1("Pynux: smp_processor_id() = %d\n", get_cpu_id())

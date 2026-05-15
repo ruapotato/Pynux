@@ -1,0 +1,114 @@
+# drivers/video/console/vga_text.py
+#
+# Mirrors drivers/video/console/vgacon.c in Linux at the smallest
+# meaningful scale: writes to the legacy 80×25 colour text-mode VGA
+# buffer at physical 0xB8000. Each cell is two bytes — an ASCII
+# character followed by an attribute byte (low nibble = foreground,
+# high nibble = background, both BIOS colour codes).
+#
+# QEMU's default PC machine exposes the VGA card whether `-display` is
+# enabled or not, so writes always reach memory; you just won't see
+# them on screen under `-nographic`. The smoke test in init/main.py
+# verifies the writes hit the buffer by reading them back through the
+# serial console — that way the bare-metal CI run can prove the path
+# works without a graphical display.
+#
+# Layout reminders:
+#   address(row, col) = 0xB8000 + (row * 80 + col) * 2
+#   attribute 0x0F    = bright white on black
+#   attribute 0x07    = light grey on black (BIOS default)
+#
+# Things deliberately deferred:
+#   - hardware cursor positioning via CRTC ports 0x3D4/0x3D5
+#   - colour API beyond a single global attribute
+#   - mode-set / 80×50 / non-text modes
+#   - a `struct console` registration like vgacon does on Linux —
+#     we don't have the printk-console subsystem yet.
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+VGA_BUFFER:   uint64 = 0xB8000
+VGA_COLS:     uint64 = 80
+VGA_ROWS:     uint64 = 25
+DEFAULT_ATTR: int32  = 0x0F          # bright white on black
+
+vga_row: uint64 = 0
+vga_col: uint64 = 0
+
+
+def _write_cell(row: uint64, col: uint64, ch: int32, attr: int32):
+    addr: uint64 = VGA_BUFFER + (row * VGA_COLS + col) * 2
+    cast[Ptr[uint8]](addr)[0]     = cast[uint8](ch & 0xFF)
+    cast[Ptr[uint8]](addr + 1)[0] = cast[uint8](attr & 0xFF)
+
+
+def _vga_scroll():
+    # Shift rows 1..VGA_ROWS-1 up by one. memcpy works here because
+    # the source/destination don't overlap by more than one row in
+    # the unsafe direction (we copy forward, dst < src).
+    src:   uint64 = VGA_BUFFER + VGA_COLS * 2
+    dst:   uint64 = VGA_BUFFER
+    nbytes: uint64 = (VGA_ROWS - 1) * VGA_COLS * 2
+    memcpy(cast[Ptr[uint8]](dst), cast[Ptr[uint8]](src), nbytes)
+
+    # Blank the new bottom row.
+    blank_row: uint64 = VGA_ROWS - 1
+    i: uint64 = 0
+    while i < VGA_COLS:
+        _write_cell(blank_row, i, 0x20, DEFAULT_ATTR)        # space
+        i = i + 1
+
+
+def vga_init():
+    # Mirrors Linux's vgacon_init() role: clear screen, reset cursor
+    # position. We don't program the hardware cursor — there's no
+    # current consumer.
+    r: uint64 = 0
+    while r < VGA_ROWS:
+        c: uint64 = 0
+        while c < VGA_COLS:
+            _write_cell(r, c, 0x20, DEFAULT_ATTR)
+            c = c + 1
+        r = r + 1
+    vga_row = 0
+    vga_col = 0
+
+
+def vga_putc(ch: int32):
+    if ch == 10:                                            # '\n'
+        vga_col = 0
+        vga_row = vga_row + 1
+        if vga_row >= VGA_ROWS:
+            _vga_scroll()
+            vga_row = VGA_ROWS - 1
+        return
+    if ch == 13:                                            # '\r'
+        vga_col = 0
+        return
+    if ch == 8 and vga_col > 0:                             # '\b'
+        vga_col = vga_col - 1
+        _write_cell(vga_row, vga_col, 0x20, DEFAULT_ATTR)
+        return
+
+    _write_cell(vga_row, vga_col, ch, DEFAULT_ATTR)
+    vga_col = vga_col + 1
+    if vga_col >= VGA_COLS:
+        vga_col = 0
+        vga_row = vga_row + 1
+        if vga_row >= VGA_ROWS:
+            _vga_scroll()
+            vga_row = VGA_ROWS - 1
+
+
+def vga_puts(s: Ptr[char]):
+    i: int32 = 0
+    while s[i] != 0:
+        vga_putc(s[i])
+        i = i + 1
+
+
+def vga_read_cell_char(row: uint64, col: uint64) -> int32:
+    # Diagnostic readback so test code can verify a write actually
+    # landed in the framebuffer, even when there's no display.
+    addr: uint64 = VGA_BUFFER + (row * VGA_COLS + col) * 2
+    return cast[int32](cast[Ptr[uint8]](addr)[0])
