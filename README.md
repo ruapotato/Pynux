@@ -9,24 +9,30 @@ machine code via a hand-written, zero-dependency compiler. Two parallel
 tracks share the same compiler and language:
 
 1. **Bare-metal Pynux kernel** (M16+) — Pynux compiles its own bootable
-   kernel image. QEMU `-kernel build/pynux-vmlinux.elf` boots through
-   multiboot1 into 64-bit long mode (4 GiB identity-mapped with 1 GiB
-   pages, U/S=1), runs `start_kernel()`, configures traps + Local APIC
-   + LAPIC timer + per-CPU storage, brings up the four-layer allocator
-   (memblock → page_alloc with buddy merge → slab/kmalloc → kzalloc),
-   schedules ring-0 and ring-3 tasks preemptively, drops into a
-   userspace task that reads `/motd` from a baked-in initramfs via
-   `SYS_OPEN`/`SYS_READ`/`SYS_CLOSE`, spawns a sibling via `SYS_CLONE`,
-   and exits cleanly when all tasks finish. Source tree mirrors Linux's
-   layout (`arch/x86/boot/`, `arch/x86/kernel/`, `arch/x86/mm/`,
-   `arch/x86/lib/`, `init/`, `mm/`, `kernel/`, `kernel/sched/`,
-   `kernel/printk/`, `drivers/tty/serial/`, `drivers/video/console/`,
-   `fs/`) so reading the equivalent Linux file → porting it to Pynux
-   is the unit of work. The Pynux language has gained a small set of
+   kernel image. QEMU `-kernel build/pynux-vmlinux.elf -smp 2` boots
+   through multiboot1 into 64-bit long mode (4 GiB identity-mapped
+   with 1 GiB pages, U/S=1), runs `start_kernel()`, configures traps
+   + Local APIC (PIT-calibrated to exactly 100 Hz) + per-CPU storage
+   + TSS for ring-3 → ring-0 transitions, brings up the four-layer
+   allocator (memblock → page_alloc with buddy merge → slab/kmalloc
+   → kzalloc), enumerates the PCI bus, wakes the second CPU via
+   INIT-SIPI-SIPI through a real-mode trampoline, schedules ring-0
+   and ring-3 tasks preemptively (each user task on its own PML4 +
+   per-task fd table), parses a baked-in cpio "newc" initramfs into
+   a file table, drops into a userspace task that reads `/motd` via
+   `SYS_OPEN`/`SYS_READ`/`SYS_WRITE`/`SYS_LSEEK`/`SYS_CLOSE`, spawns
+   a sibling via `SYS_CLONE`, and exits cleanly when all tasks
+   finish. Source tree mirrors Linux's layout
+   (`arch/x86/boot/`, `arch/x86/kernel/`, `arch/x86/mm/`,
+   `arch/x86/lib/`, `arch/x86/realmode/`, `init/`, `mm/`, `kernel/`,
+   `kernel/sched/`, `kernel/printk/`, `drivers/tty/serial/`,
+   `drivers/video/console/`, `drivers/pci/`, `drivers/net/`, `fs/`)
+   so reading the equivalent Linux file → porting it to Pynux is the
+   unit of work. The Pynux language has gained a small set of
    kernel-aware primitives along the way — `Percpu[T]` per-CPU
    storage, `container_of(ptr, Type, field)`, `cast[Ptr[T]](x)`, and
-   inline `asm_volatile` — so the source stays close to how Linux's
-   `include/linux/*.h` macros read.
+   inline `asm_volatile` / `outb`/`inb`/`outl`/`inl` — so the source
+   stays close to how Linux's `include/linux/*.h` macros read.
 
 2. **.ko module infiltration** (M1..M15) — 40 Pynux-authored kernel
    modules that load into a stock Linux kernel via the regular kbuild
@@ -101,6 +107,12 @@ The end-game is a fully Pynux-authored kernel.
 | M16.21 | VFS + initramfs — baked-in /motd + /version, fd table, `SYS_OPEN`/`SYS_READ`/`SYS_CLOSE` from ring 3 | **Done** |
 | M16.22 | Local APIC + LAPIC timer — `IA32_APIC_BASE` enable, LVT timer periodic mode; 8259 + PIT retired | **Done** |
 | M16.23 | Buddy merge-on-free in alloc_pages — cascade verified all the way to order 10 (4 MiB) | **Done** |
+| M16.24 | AP bootstrap — INIT-SIPI-SIPI; trampoline at 0x8000 real→32-bit→long mode; AP bumps `cpus_online` | **Done** |
+| M16.25 | LAPIC timer PIT-anchored calibration — exact HZ=100 instead of hand-picked count | **Done** |
+| M16.26 | Per-task fd tables + `SYS_WRITE` + `SYS_LSEEK` — stdout/stderr pre-opened; lseek repositions | **Done** |
+| M16.27 | Real cpio "newc" initramfs — `scripts/build_initramfs.py` generates the blob; `fs/cpio.py` parses at boot | **Done** |
+| M16.28 | Per-task page tables — each user task owns its own PML4 (clone of BSP's); CR3 switched on context switch | **Done** |
+| M16.29 | PCI bus scan + netfilter chain — enumerates QEMU's i440FX/PIIX3/stdvga/E1000; indirect-call hook dispatch | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -231,7 +243,12 @@ arch/x86/
                         (SYS_PUTC/EXIT/GET_JIFFIES/CLONE/GETPID/
                          OPEN/READ/CLOSE)
   kernel/tss_asm.S      TSS + RSP0 — IRQs while in CPL 3
-  kernel/apic.py        Local APIC enable + LVT timer periodic mode
+  kernel/apic.py        Local APIC enable + LVT timer + PIT calibration
+                        + INIT/SIPI IPI helpers
+  kernel/smp.py + smp_asm.S   AP bring-up via INIT-SIPI-SIPI;
+                              ap_main_pynux; CR3 / load_cr3 helpers
+  realmode/trampoline.S real-mode→long-mode AP trampoline (placed
+                        at physical 0x8000 by linker VMA trick)
   lib/string_64.S       memset / memcpy / memmove via rep stos/movs
   mm/init.py            mem_init() arch-side bring-up
 mm/memblock.py          early bump allocator (~ mm/memblock.c)
@@ -243,10 +260,16 @@ kernel/sched/core.py    task_struct, kthread_create, create_user_task,
 kernel/printk/printk.py printk0/1/2 + pr_emerg/err/warn/info/debug
 kernel/panic.py         panic / BUG / WARN_ON
 kernel/list.py          list_head intrusive doubly-linked list
-fs/initramfs_data.S     baked-in file payloads (/motd, /version)
-fs/vfs.py               vfs_open / vfs_read / vfs_close + fd table
+fs/cpio.py              parser for embedded newc cpio archive
+fs/initramfs_blob.S     generated cpio bytes (scripts/build_initramfs.py)
+fs/vfs.py               vfs_open / read / write / close / lseek
+                        + per-task fd table (lives in task_struct)
 drivers/tty/serial/early_8250.py  polled 16550A UART
 drivers/video/console/vga_text.py text-mode VGA console at 0xB8000
+drivers/pci/pci.py      PCI config space access (port 0xCF8/0xCFC)
+                        + bus scan
+drivers/net/netfilter.py netfilter hook chain + indirect dispatch
+scripts/build_initramfs.py  regenerates fs/initramfs_blob.S
 init/main.py            start_kernel()
 
 kernel-modules/  Pynux source for each module milestone
