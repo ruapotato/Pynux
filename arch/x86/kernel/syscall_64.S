@@ -169,64 +169,62 @@ enter_user_mode:
     .align 16
     .globl user_demo_entry
 user_demo_entry:
-    /* Parent task. Print "P[n]" repeatedly, with a brief pause loop
-     * between prints, until having printed ~20 chars; clone a child
-     * in the middle. Both parent and child are scheduled by the
-     * timer, so the output should interleave 'P' and 'C' chars,
-     * proving multiple user tasks coexist. */
+    /* M16.21 user demo: open /motd, slurp its bytes via SYS_READ in
+     * a small loop, write each byte out with SYS_PUTC, then close
+     * and exit. Exercises the full SYS_OPEN / SYS_READ / SYS_CLOSE
+     * path through fs/vfs.py and the initramfs blob in
+     * fs/initramfs_data.S. */
 
-    /* "Parent: " banner */
-    movb    $'P', %dil; movq $0, %rax; syscall
-    movb    $':', %dil; movq $0, %rax; syscall
-    movb    $' ', %dil; movq $0, %rax; syscall
+    /* fd = open("/motd") */
+    leaq    fname_motd(%rip), %rdi
+    movq    $5, %rax                   /* SYS_OPEN */
+    syscall
+    movq    %rax, %r13                 /* save fd in callee-saved reg */
 
-    /* Clone the child task. a0 = entry. */
-    leaq    user_child_entry(%rip), %rdi
-    movq    $3, %rax                    /* SYS_CLONE */
+    /* Loop: while (n = read(fd, buf, 64)) > 0: putc each */
+.Lread_loop:
+    movq    %r13, %rdi                 /* fd                         */
+    leaq    user_read_buf(%rip), %rsi  /* buf                        */
+    movq    $64, %rdx                  /* count                      */
+    movq    $6, %rax                   /* SYS_READ                   */
+    syscall
+    testq   %rax, %rax
+    jle     .Lread_done                /* EOF (0) or error (<0)      */
+
+    movq    %rax, %r14                 /* %r14 = bytes read          */
+    leaq    user_read_buf(%rip), %r15  /* cursor                     */
+.Lprint_loop:
+    movb    (%r15), %dil
+    movzbq  %dil, %rdi
+    movq    $0, %rax                   /* SYS_PUTC                   */
+    syscall
+    incq    %r15
+    decq    %r14
+    jnz     .Lprint_loop
+    jmp     .Lread_loop
+
+.Lread_done:
+    /* close(fd) */
+    movq    %r13, %rdi
+    movq    $7, %rax                   /* SYS_CLOSE                  */
     syscall
 
-    /* Parent loop: print 'P' 10 times with pauses between. */
-    movq    $10, %r12
-.Lpar_loop:
-    movb    $'P', %dil; movq $0, %rax; syscall
-    movq    $1500000, %rcx
-.Lpar_pause:
-    pause
-    decq    %rcx
-    jnz     .Lpar_pause
-    decq    %r12
-    jnz     .Lpar_loop
-
-    /* Done. SYS_EXIT — the kernel will schedule the child or halt
-     * if the child already finished. */
-    movb    $'\n', %dil; movq $0, %rax; syscall
+    /* exit */
     movq    $1, %rax
     syscall
 
 .user_demo_hang:
     jmp     .user_demo_hang
 
+/* ---------- user-mode .data / .rodata ----------------------------
+ * fname_motd is a string literal we point SYS_OPEN at. user_read_buf
+ * is the 64-byte chunk SYS_READ fills.  Both pages are U=1 because
+ * the entire identity-mapped region is.                              */
+    .section .rodata
+fname_motd:
+    .asciz "/motd"
 
-/* ---------- user_child_entry: second ring-3 task ---------------- *
- * Print 'C' a few times then exit. clone() doesn't return here —
- * the child starts fresh at this label with all caller-saved regs
- * zeroed. */
-    .align 16
-    .globl user_child_entry
-user_child_entry:
-    movq    $10, %r12
-.Lchild_loop:
-    movb    $'C', %dil; movq $0, %rax; syscall
-    movq    $1500000, %rcx
-.Lchild_pause:
-    pause
-    decq    %rcx
-    jnz     .Lchild_pause
-    decq    %r12
-    jnz     .Lchild_loop
-
-    movb    $'\n', %dil; movq $0, %rax; syscall
-    movq    $1, %rax
-    syscall
-.user_child_hang:
-    jmp     .user_child_hang
+    .section .data
+    .align 8
+user_read_buf:
+    .skip 64

@@ -225,7 +225,8 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
     # of .head.text). Anything else in arch/x86/{boot,kernel} that ends in
     # .S is picked up automatically — drop a new file in and rebuild.
     extra_s = sorted(
-        p for p in (project_root / "arch/x86").rglob("*.S")
+        p for path_root in ("arch/x86", "fs")
+        for p in (project_root / path_root).rglob("*.S")
         if p != boot_s and p != head_s
     )
 

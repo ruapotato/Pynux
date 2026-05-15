@@ -30,6 +30,7 @@ from kernel.sched.core import (
     create_user_task, task_exit_current,
     current_task_pid,
 )
+from fs.vfs import vfs_open, vfs_read, vfs_close
 
 extern def write_msr(index: uint32, value: uint64)
 extern def read_msr(index: uint32) -> uint64
@@ -49,6 +50,9 @@ SYS_EXIT:        uint64 = 1
 SYS_GET_JIFFIES: uint64 = 2
 SYS_CLONE:       uint64 = 3                    # a0 = entry, returns new pid
 SYS_GETPID:      uint64 = 4
+SYS_OPEN:        uint64 = 5                    # a0 = name ptr, returns fd
+SYS_READ:        uint64 = 6                    # a0=fd, a1=buf, a2=count
+SYS_CLOSE:       uint64 = 7
 
 # Single-CPU stash slots used by the syscall entry stub to flip
 # between user RSP and kernel RSP. Regular globals (not Percpu[T])
@@ -120,5 +124,15 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         return cast[uint64](slot) + 1
     if nr == SYS_GETPID:
         return current_task_pid()
+    if nr == SYS_OPEN:
+        rc: int32 = vfs_open(cast[Ptr[char]](a0))
+        return cast[uint64](rc)
+    if nr == SYS_READ:
+        n: int64 = vfs_read(cast[int32](a0),
+                            cast[Ptr[uint8]](a1), a2)
+        return cast[uint64](n)
+    if nr == SYS_CLOSE:
+        rc: int32 = vfs_close(cast[int32](a0))
+        return cast[uint64](rc)
     printk2("Pynux: unknown syscall nr=%d a0=%x\n", nr, a0)
     return cast[uint64](-1)

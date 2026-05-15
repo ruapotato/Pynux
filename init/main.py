@@ -45,6 +45,7 @@ from arch.x86.kernel.syscall import syscall_init
 from drivers.video.console.vga_text import (
     vga_init, vga_putc, vga_puts, vga_read_cell_char,
 )
+from fs.vfs import vfs_init
 
 extern def enter_user_mode(entry: uint64, stack: uint64)
 extern def user_demo_entry()
@@ -426,6 +427,9 @@ def start_kernel():
 
     i8259_init()
     time_init()
+
+    # Initialise the VFS fd table BEFORE any user task issues SYS_OPEN.
+    vfs_init()
 
     # --- M16.20: register the first user task in the runqueue ----
     # The parent runs at user_demo_entry; mid-run it calls SYS_CLONE
