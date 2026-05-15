@@ -18,6 +18,7 @@
 #   wall-clock and scheduler ticks.
 
 from arch.x86.kernel.i8259 import i8259_send_eoi, i8259_unmask_irq
+from kernel.sched.core import schedule
 
 PIT_CHANNEL0_DATA: int32 = 0x40
 PIT_CMD:           int32 = 0x43
@@ -49,9 +50,14 @@ def time_init():
 
 
 def timer_interrupt():
-    # Called from do_irq() when vector 32 (IRQ 0) fires.
+    # Called from do_irq() when vector 32 (IRQ 0) fires. Bumps the
+    # tick counter, acks the PIC, then surrenders the CPU to the
+    # scheduler. ACK before schedule() so the next interrupt is
+    # already armed by the time we return to the new task — Linux
+    # has the same ordering in the legacy 8259 timer handler.
     jiffies = jiffies + 1
     i8259_send_eoi(0)
+    schedule()
 
 
 def get_jiffies() -> uint64:

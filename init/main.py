@@ -2,22 +2,23 @@
 #
 # Pynux start_kernel() — mirrors init/main.c in Linux. Called from
 # arch/x86/kernel/head_64.S:start_kernel_asm_entry after BSS is zeroed.
-# Future M16.x work expands this function the way Linux does in
-# init/main.c — setup_arch(), trap_init(), mm_init(), sched_init(), and
-# eventually rest_init() / kernel_init(). Function names and ordering
-# track Linux so the diff against init/main.c stays readable.
 #
-# As of M16.7:
-#   - setup_early_printk()       drivers/tty/serial/early_8250.py
-#   - printk0/1/2                kernel/printk/printk.py (%d %x %s %p %c)
-#   - trap_init()                arch/x86/kernel/idt.py
-#   - mem_init()                 arch/x86/mm/init.py (memblock)
-#   - setup_per_cpu_areas()      arch/x86/kernel/setup_percpu.py
-#   - i8259_init() + time_init() PIC + PIT @ 100 Hz
-#   - sched_init() + kthread_create()  cooperative scheduler
+# As of M16.9 the bring-up sequence mirrors Linux's init/main.c quite
+# closely, in this call order:
 #
-# Output now uses printk* everywhere so message formatting tracks how
-# Linux phrases its early-boot log lines.
+#   setup_early_printk()       (drivers/tty/serial/early_8250.py)
+#   trap_init()                (arch/x86/kernel/idt.py)
+#   mem_init()                 (arch/x86/mm/init.py: memblock + pages + slab)
+#   setup_per_cpu_areas()      (arch/x86/kernel/setup_percpu.py)
+#   i8259_init() + time_init() (PIC + PIT @ 100 Hz)
+#   sched_init() + kthread_create(...)
+#   local_irq_enable() (sti)
+#   start_first_task()         — never returns
+#
+# After start_first_task() the system is purely preemptive: the only
+# path that calls schedule() is the timer ISR. The two demo workers
+# busy-loop without any cooperative yield; the timer alone shuffles
+# control between them.
 
 from drivers.tty.serial.early_8250 import setup_early_printk
 from kernel.printk.printk import printk0, printk1, printk2
@@ -28,51 +29,18 @@ from arch.x86.mm.init import mem_init
 from arch.x86.kernel.setup_percpu import setup_per_cpu_areas, get_cpu_id
 from arch.x86.kernel.i8259 import i8259_init
 from arch.x86.kernel.time import time_init, get_jiffies
-from kernel.sched.core import sched_init, kthread_create, yield_cpu
+from kernel.sched.core import (
+    sched_init, kthread_create, start_first_task, get_current_pid,
+)
 from mm.memblock import memblock_alloc, memblock_used, memblock_avail
-from mm.page_alloc import alloc_page, free_page, page_alloc_total, page_alloc_free_count
+from mm.page_alloc import (
+    alloc_page, free_page, page_alloc_total, page_alloc_free_count,
+)
 from mm.slab import kmalloc, kfree
 
 extern def trigger_int3()
 extern def local_irq_enable()
 extern def cpu_relax()
-
-print_count: uint64 = 0
-MAX_PRINTS:  uint64 = 30
-
-
-def busy_wait_one_tick():
-    start: uint64 = get_jiffies()
-    while get_jiffies() == start:
-        cpu_relax()
-
-
-def halt_forever():
-    asm_volatile("cli")
-    while True:
-        asm_volatile("hlt")
-
-
-def task_a_entry():
-    while True:
-        printk0("A")
-        print_count = print_count + 1
-        if print_count >= MAX_PRINTS:
-            printk0("\nPynux: M16.x demo done, halting\n")
-            halt_forever()
-        busy_wait_one_tick()
-        yield_cpu()
-
-
-def task_b_entry():
-    while True:
-        printk0("B")
-        print_count = print_count + 1
-        if print_count >= MAX_PRINTS:
-            printk0("\nPynux: M16.x demo done, halting\n")
-            halt_forever()
-        busy_wait_one_tick()
-        yield_cpu()
 
 
 def trap_init():
@@ -90,9 +58,6 @@ def memblock_smoke_test():
 
 
 def page_alloc_smoke_test():
-    # Three pages: 1st pulled fresh from memblock, freed, then a 2nd
-    # alloc returns the same page (cache hit on free list). 3rd is a
-    # new fresh page. Confirms both fresh-pull and freelist paths.
     printk0("Pynux: page_alloc smoke test\n")
     p1: uint64 = alloc_page()
     printk1("  alloc_page #1 = %p\n", p1)
@@ -108,48 +73,75 @@ def page_alloc_smoke_test():
 
 
 def slab_smoke_test():
-    # Exercise multiple kmalloc sizes, prove kfree reuses storage by
-    # checking that a re-allocation of the same size returns a known
-    # earlier address (most-recently-freed → head of free list).
     printk0("Pynux: slab smoke test\n")
-    a: uint64 = kmalloc(48)        # → kmalloc-64
-    b: uint64 = kmalloc(48)        # adjacent in the same slab
-    c: uint64 = kmalloc(200)       # → kmalloc-256
-    d: uint64 = kmalloc(1500)      # → kmalloc-2048
+    a: uint64 = kmalloc(48)
+    b: uint64 = kmalloc(48)
+    c: uint64 = kmalloc(200)
+    d: uint64 = kmalloc(1500)
     printk1("  kmalloc(  48) = %p\n", a)
     printk1("  kmalloc(  48) = %p\n", b)
     printk1("  kmalloc( 200) = %p\n", c)
     printk1("  kmalloc(1500) = %p\n", d)
-
-    # Free b, then ask for another 48 — should get b back (LIFO).
     kfree(b)
     e: uint64 = kmalloc(48)
     printk1("  kmalloc(  48) after kfree(b) = %p  (expect == b)\n", e)
-
-    # Write and read each chunk to sanity-check the memory is usable.
     cast[Ptr[uint64]](a)[0] = 0xCAFEBABE_DEADBEEF
     val: uint64 = cast[Ptr[uint64]](a)[0]
     printk1("  *a after write = %x\n", val)
-
     kfree(a)
     kfree(c)
     kfree(d)
     kfree(e)
-    # Double-free / wild-pointer guard.
-    kfree(0x123456)                # bogus pointer; should warn loudly
+    kfree(0x123456)        # bad pointer — magic check should warn
 
 
-def timer_smoke_test():
-    printk0("Pynux: waiting for timer ticks...\n")
-    last: uint64 = 0
+# --- Preemption demo -----------------------------------------------
+#
+# Both tasks run a tight busy-loop with no cooperative yield. Without
+# preemption, only task A would ever get the CPU. With the M16.9
+# preemption path, the PIT timer interrupts the running task every
+# ~10 ms and schedule() rotates to the other. The expected output
+# is interleaved 'A' and 'B' characters, with a roughly even mix —
+# proof that the timer ISR is genuinely taking the CPU away from
+# unwilling code.
+#
+# We cap total prints from each task at MAX_PRINTS so the smoke test
+# halts cleanly instead of running forever.
+
+print_count_a: uint64 = 0
+print_count_b: uint64 = 0
+MAX_PRINTS:    uint64 = 40
+inner_iters:   uint64 = 200000   # busy-spin between prints
+
+
+def halt_forever():
+    asm_volatile("cli")
     while True:
-        cur: uint64 = get_jiffies()
-        if cur != last:
-            printk1("  jiffies = %d\n", cur)
-            last = cur
-            if cur >= 5:
-                return
-        cpu_relax()
+        asm_volatile("hlt")
+
+
+def task_a_entry():
+    while True:
+        printk0("A")
+        print_count_a = print_count_a + 1
+        if print_count_a + print_count_b >= MAX_PRINTS:
+            printk0("\nPynux: preemption demo done, halting\n")
+            halt_forever()
+        i: uint64 = 0
+        while i < inner_iters:
+            i = i + 1
+
+
+def task_b_entry():
+    while True:
+        printk0("B")
+        print_count_b = print_count_b + 1
+        if print_count_a + print_count_b >= MAX_PRINTS:
+            printk0("\nPynux: preemption demo done, halting\n")
+            halt_forever()
+        i: uint64 = 0
+        while i < inner_iters:
+            i = i + 1
 
 
 def start_kernel():
@@ -170,15 +162,20 @@ def start_kernel():
 
     i8259_init()
     time_init()
-    printk0("Pynux: PIT @ 100 Hz armed, enabling IRQs\n")
-    local_irq_enable()
-
-    timer_smoke_test()
 
     sched_init()
-    kthread_create(1, cast[uint64](&task_a_entry), 0x5f5f615f6b736174)
-    kthread_create(2, cast[uint64](&task_b_entry), 0x5f5f625f6b736174)
-    printk0("Pynux: two kthreads created, entering scheduler\n")
+    kthread_create(0, cast[uint64](&task_a_entry), 0x5f5f615f6b736174)
+    kthread_create(1, cast[uint64](&task_b_entry), 0x5f5f625f6b736174)
 
-    while True:
-        yield_cpu()
+    printk0("Pynux: entering task 0 (IRQs enabled atomically via iretq)\n")
+    # Do NOT call local_irq_enable() here. If we did, the very next
+    # timer tick would fire while still in start_kernel's boot context;
+    # schedule() would then save the boot RSP into task slot 0 (where
+    # we previously stashed task A's pre-built bootstrap stack),
+    # corrupting it. The iret frame inside each kthread's pre-built
+    # stack has RFLAGS = 0x202 (IF=1), so IRQs come on atomically with
+    # the iretq that lands in the task's entry function.
+    start_first_task()
+    # NOT REACHED.
+    printk0("Pynux: ERROR — returned from start_first_task\n")
+    halt_forever()
