@@ -19,7 +19,7 @@
 #   ints; no real errno space yet)
 #   close on an already-closed fd returns -EBADF (-9)
 
-from drivers.tty.serial.early_8250 import early_putc
+from drivers.tty.serial.early_8250 import early_putc, early_getc_polled
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.sched.core import (
     TaskStruct, current_task,
@@ -137,7 +137,26 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     if file_idx == FD_CLOSED_MARK:
         return cast[int64](EBADF)
     if file_idx == FD_STDIN_MARK:
-        return 0                            # always EOF for now
+        # Read up to `count` bytes from the UART. early_getc_polled
+        # blocks; we stop early on '\n' or '\r' so line-oriented
+        # readers (a shell, /echo) don't have to issue per-byte
+        # syscalls. Linux's tty cooked-mode does the same translation.
+        n: uint64 = 0
+        while n < count:
+            c: int32 = early_getc_polled()
+            buf[n] = cast[uint8](c & 0xFF)
+            n = n + 1
+            if c == 10 or c == 13:
+                # Echo a newline so the user sees the line break
+                # when typing into QEMU stdio. This also makes piped
+                # input look natural in the output capture.
+                if c == 13:
+                    # Convert CR to LF on the way out — bash/qemu
+                    # send CR when stdin is a pipe sometimes.
+                    buf[n - 1] = 10
+                early_putc(10)
+                return cast[int64](n)
+        return cast[int64](n)
     if file_idx == FD_STDOUT_MARK or file_idx == FD_STDERR_MARK:
         return cast[int64](EBADF)           # can't read these
 

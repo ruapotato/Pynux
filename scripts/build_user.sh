@@ -28,3 +28,4 @@ build_one() {
 
 build_one init
 build_one hello
+build_one echo

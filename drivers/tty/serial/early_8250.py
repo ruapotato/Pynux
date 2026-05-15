@@ -69,6 +69,27 @@ def early_puts(s: Ptr[char]):
         i = i + 1
 
 
+# Receive path. LSR bit 0 is "Data Ready" (DR) — 1 once a full byte
+# has arrived in the receive buffer. The byte itself is read from the
+# RX register (same port as TX = UART_PORT + UART_THR_OFFSET).
+UART_LSR_DR: int32 = 0x01
+
+
+def early_uart_rx_ready() -> int32:
+    # Non-blocking poll: returns 1 if a byte is waiting, 0 otherwise.
+    if (inb(UART_PORT + UART_LSR_OFFSET) & UART_LSR_DR) != 0:
+        return 1
+    return 0
+
+
+def early_getc_polled() -> int32:
+    # Blocking byte read. Spins on the LSR Data Ready bit. Used by
+    # vfs_read when the caller is doing sys_read(fd=0, ...) on stdin.
+    while (inb(UART_PORT + UART_LSR_OFFSET) & UART_LSR_DR) == 0:
+        pass
+    return inb(UART_PORT + UART_THR_OFFSET)
+
+
 def early_hex_digit(nibble: uint64) -> int32:
     if nibble < 10:
         return cast[int32](nibble) + 48        # '0'
