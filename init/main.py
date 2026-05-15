@@ -35,8 +35,9 @@ from arch.x86.kernel.traps import do_trap          # exported for common_trap
 from arch.x86.kernel.irq import do_irq             # exported for common_irq
 from arch.x86.mm.init import mem_init
 from arch.x86.kernel.setup_percpu import setup_per_cpu_areas, get_cpu_id
-from arch.x86.kernel.i8259 import i8259_init
+from arch.x86.kernel.i8259 import i8259_init, i8259_disable
 from arch.x86.kernel.time import time_init, get_jiffies, get_local_timer_ticks
+from arch.x86.kernel.apic import apic_init, lapic_setup_timer
 from kernel.sched.core import (
     sched_init, kthread_create, create_user_task,
     start_first_task, current_task_pid,
@@ -425,8 +426,17 @@ def start_kernel():
     setup_per_cpu_areas()
     printk1("Pynux: smp_processor_id() = %d\n", get_cpu_id())
 
+    # Initialize the 8259 (sets vector remap + masks everything),
+    # then disable it; bring the LAPIC up; configure the LAPIC timer
+    # in periodic mode. The IDT timer vector (32) is unchanged — only
+    # the source switches from PIT to LAPIC. time_init() still wires
+    # the PIT for legacy callers but with the 8259 masked nothing
+    # delivered from there reaches the CPU.
     i8259_init()
     time_init()
+    i8259_disable()
+    apic_init()
+    lapic_setup_timer()
 
     # Initialise the VFS fd table BEFORE any user task issues SYS_OPEN.
     vfs_init()

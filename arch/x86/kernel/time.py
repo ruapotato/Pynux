@@ -18,6 +18,7 @@
 #   wall-clock and scheduler ticks.
 
 from arch.x86.kernel.i8259 import i8259_send_eoi, i8259_unmask_irq
+from arch.x86.kernel.apic import lapic_send_eoi
 from kernel.sched.core import schedule
 
 PIT_CHANNEL0_DATA: int32 = 0x40
@@ -54,17 +55,15 @@ def time_init():
 
 
 def timer_interrupt():
-    # Called from do_irq() when vector 32 (IRQ 0) fires. Bumps the
-    # tick counter, acks the PIC, then surrenders the CPU to the
-    # scheduler. ACK before schedule() so the next interrupt is
-    # already armed by the time we return to the new task — Linux
-    # has the same ordering in the legacy 8259 timer handler.
+    # Called from do_irq() when vector 32 fires.  Since M16.22 the
+    # interrupt source is the Local APIC timer (periodic, configured
+    # in arch/x86/kernel/apic.py); pre-M16.22 it was the PIT through
+    # the 8259. The dispatch vector is identical so do_irq routes
+    # the same way; the only change is which controller we EOI.
     jiffies = jiffies + 1
-    # Also bump the per-CPU counter. The codegen lowers both the read
-    # and the write through `%gs:local_timer_ticks` — proof the
-    # Percpu[T] path works in IRQ context.
+    # Per-CPU counter (M16.14 Percpu[T] demo path, lowered to %gs:8).
     local_timer_ticks = local_timer_ticks + 1
-    i8259_send_eoi(0)
+    lapic_send_eoi()
     schedule()
 
 

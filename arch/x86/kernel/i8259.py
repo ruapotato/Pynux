@@ -96,3 +96,14 @@ def i8259_send_eoi(irq: int32):
     if irq >= 8:
         outb(PIC_EOI, PIC_SLAVE_CMD)
     outb(PIC_EOI, PIC_MASTER_CMD)
+
+
+def i8259_disable():
+    # Mask every line on both PICs. APIC takes over from here. Linux
+    # calls this `disable_pic()` in arch/x86/kernel/apic/apic.c after
+    # bringing the local APIC up — once SVR's SW-enable is set, the
+    # LAPIC delivers timer / IPI vectors on its own and the 8259 is
+    # just dead weight (and a potential source of spurious IRQs if
+    # left armed).
+    outb(0xFF, PIC_MASTER_DATA)
+    outb(0xFF, PIC_SLAVE_DATA)

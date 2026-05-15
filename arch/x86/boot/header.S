@@ -58,32 +58,28 @@ _start:
     orl     $0x7, %eax              /* US | RW | P */
     movl    %eax, (%edi)
 
-    movl    $pdpt, %edi
-    movl    $pd, %eax
-    orl     $0x7, %eax              /* US | RW | P */
-    movl    %eax, (%edi)
-
-    /* Fill PD with 512 entries, each a 2 MiB page.
+    /* Fill PDPT with 4 entries, each a 1 GiB page mapping (PS=1).
+     * That gets us a 4 GiB identity map in just four entries — enough
+     * to reach the LAPIC MMIO window at 0xFEE00000 and any HPET/IOAPIC
+     * MMIO that lives just below 4 GiB. The PD table allocated below
+     * is now unused at runtime; we keep its storage so the linker
+     * doesn't shrink .pgtables and offsets stay stable.
+     *
      *   bit 0: P  - present
      *   bit 1: RW - writable
      *   bit 2: US - user/supervisor (1 = user accessible)
-     *   bit 7: PS - page size (1 for 2 MiB / 1 GiB pages)
-     * We set US=1 so user-mode (ring 3) code can read/write/execute the
-     * identity-mapped region too. M16.17 introduces a userspace
-     * task that issues SYSCALL; without U=1 the very first user-mode
-     * instruction fetch faults. This is intentionally simple — proper
-     * kernel/user page separation comes when we add per-task page
-     * tables. */
-    movl    $pd, %edi
-    movl    $0, %ecx                /* loop counter */
+     *   bit 7: PS - 1 GiB page (terminal entry at PDPT level)
+     */
+    movl    $pdpt, %edi
+    movl    $0, %ecx
     movl    $0x87, %eax             /* PS | US | RW | P; phys base = 0 */
 1:
     movl    %eax, (%edi)
-    movl    $0,   4(%edi)           /* high 32 bits of PTE */
-    addl    $0x200000, %eax         /* next 2 MiB */
+    movl    $0, 4(%edi)
+    addl    $0x40000000, %eax       /* next 1 GiB */
     addl    $8, %edi
     incl    %ecx
-    cmpl    $512, %ecx
+    cmpl    $4, %ecx
     jne     1b
 
     /* ----- Enable PAE, load CR3, set EFER.LME, then CR0.PG ---------- */
