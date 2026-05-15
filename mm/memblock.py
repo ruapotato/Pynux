@@ -31,14 +31,33 @@ MEMBLOCK_TOP:  uint64 = 0x0F000000
 
 
 def memblock_init():
-    # Linux's memblock_init reads e820 / DT to discover usable RAM;
-    # we have a single hard-coded contiguous range and no need for
-    # a region list yet. When we wire in multiboot info parsing
-    # (next: see mb_info stored by header.S) this becomes a loop
-    # over the multiboot memory-map tags.
+    # Default-fallback range, used if no e820 / multiboot parsing
+    # supplies a better one. arch/x86/kernel/e820.py:e820_init() may
+    # call memblock_set_region() AFTER this to widen / narrow to the
+    # firmware-reported usable RAM. Calling memblock_init() before
+    # e820_init() is intentional — it gives us a known-safe range so
+    # any allocations that happen during e820 parsing itself succeed.
     memblock_region_start = MEMBLOCK_BASE
     memblock_region_end   = MEMBLOCK_TOP
     memblock_total_alloc  = 0
+
+
+def memblock_set_region(base: uint64, end: uint64):
+    # Replace the active region wholesale. Intended for use by
+    # arch/x86/kernel/e820.py after walking the firmware memory map.
+    # Resets the allocation counter — callers must do this BEFORE
+    # any memblock_alloc() in the new region, or accounting drifts.
+    memblock_region_start = base
+    memblock_region_end   = end
+    memblock_total_alloc  = 0
+
+
+def memblock_region_base() -> uint64:
+    return memblock_region_start
+
+
+def memblock_region_top() -> uint64:
+    return memblock_region_end
 
 
 def memblock_alloc(size: uint64, align: uint64) -> uint64:
