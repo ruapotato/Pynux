@@ -38,6 +38,8 @@ kernel built up subsystem by subsystem.
 | M9.1 | task introspection — read `current` via `%gs:pcpu_hot` inline asm; print pid + comm of the insmod-ing process | **Done** |
 | M9.2 | intrusive doubly-linked list — INIT_LIST_HEAD + list_add + walk all implemented in pure Pynux | **Done** |
 | M9.3 | kernel UDP socket — sock_create_kern + kernel_bind to port 9999 + sock_release | **Done** |
+| M10.1 | `/dev/pynuxzero` — clone of /dev/zero (reads return NUL bytes via _copy_to_user) | **Done** |
+| M10.2 | delayed_work — queue_delayed_work_on + delayed_work_timer_fn, fires after 10 ms | **Done** |
 
 The microcontroller OS the project originally shipped (ARM Cortex-M,
 QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
@@ -152,6 +154,8 @@ kernel-modules/  Pynux source for each module milestone
   m9-task/       M9.1 read `current` via per-CPU segment register
   m9-list/       M9.2 list_head intrusive list (pure Pynux)
   m9-socket/     M9.3 in-kernel UDP socket bound to port 9999
+  m10-zero/      M10.1 /dev/pynuxzero (clone of /dev/zero)
+  m10-dwork/     M10.2 delayed_work via timer-backed workqueue
 
 scripts/         x86 dev-loop infrastructure
   build_x86_kernel.sh    Fetch + build mitigations-off Linux for QEMU

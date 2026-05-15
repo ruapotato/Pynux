@@ -1,0 +1,5 @@
+# M10.1: /dev/pynuxzero reads return zero bytes; the dd produces a
+# stream of \0 which busybox cmp can verify is all zeros.
+[ZERO] register rc = 0
+[PYNUX] zero ok
+[ZERO] unregistered

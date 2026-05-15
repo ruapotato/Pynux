@@ -151,6 +151,18 @@ if grep -qE '^[ 0-9]*241 pynurand$' /proc/devices 2>/dev/null; then
     rm -f /dev/pynurand
 fi
 
+if grep -qE '^[ 0-9]*242 pynuxzero$' /proc/devices 2>/dev/null; then
+    echo "[PYNUX] --- exercise /dev/pynuxzero ---"
+    mknod /dev/pynuxzero c 242 0
+    nonzero=$(dd if=/dev/pynuxzero bs=1024 count=1 2>/dev/null | tr -d '\0' | wc -c)
+    if [ "$nonzero" = "0" ]; then
+        echo "[PYNUX] zero ok"
+    else
+        echo "[PYNUX] zero FAILED ($nonzero non-zero bytes)"
+    fi
+    rm -f /dev/pynuxzero
+fi
+
 if grep -qE '^[ 0-9]*240 pynux$' /proc/devices 2>/dev/null; then
     echo "[PYNUX] --- exercise /dev/pynux ---"
     mknod /dev/pynux c 240 0

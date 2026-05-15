@@ -1,0 +1,5 @@
+# M10.2: timer-backed delayed work fires after 10 ms; count == 1.
+[DWORK] queued for 10 ms
+[DWORK] fired
+[DWORK] count = 1
+[DWORK] unregistered
