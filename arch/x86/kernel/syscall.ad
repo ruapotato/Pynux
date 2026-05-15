@@ -27,16 +27,17 @@ from drivers.tty.serial.early_8250 import early_putc
 from kernel.printk.printk import printk0, printk1, printk2
 from arch.x86.kernel.time import get_jiffies
 from kernel.sched.core import (
+    TaskStruct, current_task,
     create_user_task, create_user_task_argv, task_exit_current,
     current_task_pid, task_lookup_by_pid, task_state, task_exit_code,
     task_pid_at, yield_to_others, STATE_EXITED,
-    set_child_stdout_tmpfs,
+    dup_fd_to_child,
 )
 from fs.vfs import (
-    vfs_open, vfs_open_write, vfs_read, vfs_write, vfs_close, vfs_lseek,
+    vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_write,
+    vfs_close, vfs_lseek,
     initramfs_data_ptr, initramfs_data_size,
 )
-from fs.tmpfs import tmpfs_open_for_write
 from fs.elf import elf_load_blob
 from mm.page_alloc import alloc_page
 
@@ -68,9 +69,10 @@ SYS_CLOSE:       uint64 = 7
 SYS_WRITE:       uint64 = 8                    # a0=fd, a1=buf, a2=count
 SYS_LSEEK:       uint64 = 9                    # a0=fd, a1=offset, a2=whence
 SYS_EXECVE:      uint64 = 10                   # a0=path, a1=argv; never returns on success
-SYS_SPAWN:       uint64 = 11                   # a0=path, a1=argv, a2=stdout_path; returns child pid
+SYS_SPAWN:       uint64 = 11                   # a0=path, a1=argv, a2=stdin_fd, a3=stdout_fd; returns child pid
 SYS_WAITPID:     uint64 = 12                   # a0=pid; returns child exit_code
 SYS_OPEN_WRITE:  uint64 = 13                   # a0=path; creates/truncates, returns fd
+SYS_PIPE:        uint64 = 14                   # a0=Ptr[int32 fds[2]]; returns 0 on success
 
 # M16.35: the previous user_rsp_save / kernel_rsp globals were
 # retired in favour of a per-task syscall stack. syscall_entry now
@@ -287,11 +289,12 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         return 0
     if nr == SYS_SPAWN:
         # Like SYS_EXECVE but creates a NEW user task and returns its
-        # pid to the caller. The shell (user/hamsh) uses this to run
-        # external commands without dying itself. M16.37: a2 holds an
-        # optional stdout-redirect path (used by hamsh's `>`); if
-        # non-zero, the child's fd[1] is wired to that tmpfs entry
-        # before the task ever runs.
+        # pid to the caller. M16.38: a2 / a3 carry optional stdin /
+        # stdout fds from the parent that should be dup'd into the
+        # child's fd 0 / fd 1 before the task ever runs. -1 (read as
+        # int32) means "inherit the default (serial)". The parent
+        # owns its end of any pipe — closing it after spawn doesn't
+        # affect the child, because dup_fd_to_child bumped refcounts.
         path: Ptr[char] = cast[Ptr[char]](a0)
         blob: uint64 = initramfs_data_ptr(path)
         if blob == 0:
@@ -314,17 +317,20 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         )
         if slot < 0:
             return cast[uint64](-1)
-        if a2 != 0:
-            # Stdout redirect: open/truncate the tmpfs target in the
-            # parent's context (path-driven; tmpfs has no per-task
-            # state), then plant the slot on the child's fd[1]. We
-            # quietly drop the redirect on tmpfs-open failure — the
-            # child still runs, output just goes to serial. ENOSPC
-            # / bad path errors print earlier via tmpfs's own log.
-            ts: int32 = tmpfs_open_for_write(cast[Ptr[char]](a2))
-            if ts >= 0:
-                set_child_stdout_tmpfs(slot, ts)
+        parent: Ptr[TaskStruct] = current_task()
+        sin:  int32 = cast[int32](a2)
+        sout: int32 = cast[int32](a3)
+        if sin >= 0 and sin < 8:
+            dup_fd_to_child(slot, 0, parent, cast[uint64](sin))
+        if sout >= 0 and sout < 8:
+            dup_fd_to_child(slot, 1, parent, cast[uint64](sout))
         return task_pid_at(slot)
+    if nr == SYS_PIPE:
+        # Hand a pair of (rfd, wfd) back to the calling task. The
+        # fds are stored at *(int32*)a0[0..1] — the caller passes
+        # a Ptr[int32] to a two-element buffer.
+        rc: int32 = vfs_pipe(cast[Ptr[int32]](a0))
+        return cast[uint64](rc)
     if nr == SYS_WAITPID:
         # Block until the named child enters STATE_EXITED, then return
         # its exit_code. With no signals or sleep/wake yet, we busy-

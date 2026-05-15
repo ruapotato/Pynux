@@ -24,7 +24,8 @@ from kernel.printk.printk import printk0, printk1, printk2
 from kernel.sched.core import (
     TaskStruct, current_task,
     FD_CLOSED_MARK, FD_STDIN_MARK, FD_STDOUT_MARK, FD_STDERR_MARK,
-    FD_BUFFER_MARK, FD_TMPFS_MARK,
+    FD_BUFFER_MARK, FD_TMPFS_MARK, FD_PIPE_MARK_R, FD_PIPE_MARK_W,
+    close_fd_in_task, yield_to_others,
 )
 from fs.cpio import (
     cpio_init,
@@ -36,15 +37,20 @@ from fs.tmpfs import (
     is_tmpfs_path, tmpfs_lookup, tmpfs_open_for_write,
     tmpfs_size, tmpfs_data, tmpfs_write,
 )
+from fs.pipe import (
+    pipe_alloc, pipe_read, pipe_write,
+    pipe_readers, pipe_writers,
+)
 from mm.slab import kmalloc, kfree
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
-NR_FDS: uint32 = 4
+NR_FDS: uint32 = 8
 
 # Errno constants (small negative; matches Linux's signs).
 ENOENT: int32 = -2
 EBADF:  int32 = -9
+EPIPE:  int32 = -32
 ENOSPC: int32 = -28
 EINVAL: int32 = -22
 EMFILE: int32 = -24
@@ -159,6 +165,44 @@ def vfs_open_write(name: Ptr[char]) -> int32:
     return fd
 
 
+def vfs_pipe(out_fds: Ptr[int32]) -> int32:
+    # Allocate a kernel pipe and place its read fd in out_fds[0] and
+    # write fd in out_fds[1] in the calling task. Returns 0 on
+    # success; -EMFILE if the caller doesn't have two free fd slots,
+    # -ENOSPC if the global pipe table is full. We allocate fds in
+    # the parent task only — children inherit by dup'ing.
+    task: Ptr[TaskStruct] = current_task()
+    rfd: int32 = _alloc_fd(task)
+    if rfd < 0:
+        return EMFILE
+    # Provisionally mark rfd used so _alloc_fd skips it when we ask
+    # for the second fd, but we haven't routed it anywhere yet.
+    task[0].fd_idx[cast[uint64](rfd)] = FD_PIPE_MARK_R
+    wfd: int32 = _alloc_fd(task)
+    if wfd < 0:
+        # Roll back the half-taken read fd before we error out.
+        task[0].fd_idx[cast[uint64](rfd)] = FD_CLOSED_MARK
+        return EMFILE
+
+    slot: int32 = pipe_alloc()
+    if slot < 0:
+        task[0].fd_idx[cast[uint64](rfd)] = FD_CLOSED_MARK
+        return ENOSPC
+
+    rfdu: uint64 = cast[uint64](rfd)
+    wfdu: uint64 = cast[uint64](wfd)
+    task[0].fd_idx[rfdu] = FD_PIPE_MARK_R
+    task[0].fd_pos[rfdu] = 0
+    task[0].fd_buf[rfdu] = cast[uint64](slot)
+    task[0].fd_idx[wfdu] = FD_PIPE_MARK_W
+    task[0].fd_pos[wfdu] = 0
+    task[0].fd_buf[wfdu] = cast[uint64](slot)
+
+    out_fds[0] = rfd
+    out_fds[1] = wfd
+    return 0
+
+
 def _open_tmpfs_read(name: Ptr[char]) -> int32:
     slot: int32 = tmpfs_lookup(name)
     if slot < 0:
@@ -246,6 +290,21 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         memcpy(buf, cast[Ptr[uint8]](cast[uint64](src) + pos), take)
         task[0].fd_pos[fdu] = pos + take
         return cast[int64](take)
+    if file_idx == FD_PIPE_MARK_R:
+        # Blocking read: yield until pipe_read returns >0 OR every
+        # writer has closed (EOF). We don't sleep on a wait queue
+        # yet — yield_to_others() just rotates the runqueue, and the
+        # timer ISR / sibling syscalls eventually push data into us.
+        slot: int32 = cast[int32](task[0].fd_buf[fdu])
+        while True:
+            n: int64 = pipe_read(slot, buf, count)
+            if n > 0:
+                return n
+            if pipe_writers(slot) == 0:
+                return 0                       # all writers gone -> EOF
+            yield_to_others()
+    if file_idx == FD_PIPE_MARK_W:
+        return cast[int64](EBADF)              # can't read a write end
     if file_idx == FD_STDIN_MARK:
         # Read up to `count` bytes from the UART. early_getc_polled
         # blocks; we stop early on '\n' or '\r' so line-oriented
@@ -306,6 +365,28 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         n: uint64 = tmpfs_write(slot, buf, pos, count)
         task[0].fd_pos[fdu] = pos + n
         return cast[int64](n)
+    if file_idx == FD_PIPE_MARK_W:
+        # Blocking write: drain as much as the ring will accept,
+        # yielding when full until a reader makes room. EPIPE if
+        # every reader has closed (matches Linux's write-after-close
+        # error; no SIGPIPE yet — userland sees the errno).
+        slot: int32 = cast[int32](task[0].fd_buf[fdu])
+        total: uint64 = 0
+        while total < count:
+            if pipe_readers(slot) == 0:
+                if total > 0:
+                    return cast[int64](total)
+                return cast[int64](EPIPE)
+            chunk: int64 = pipe_write(slot,
+                cast[Ptr[uint8]](cast[uint64](buf) + total),
+                count - total)
+            if chunk > 0:
+                total = total + cast[uint64](chunk)
+            else:
+                yield_to_others()
+        return cast[int64](total)
+    if file_idx == FD_PIPE_MARK_R:
+        return cast[int64](EBADF)              # can't write a read end
     if file_idx == FD_STDOUT_MARK or file_idx == FD_STDERR_MARK:
         # Route every byte to the early UART. No buffering, no
         # newline translation. Matches Linux's writeable terminal
@@ -330,18 +411,11 @@ def vfs_close(fd: int32) -> int32:
     fdu: uint64 = cast[uint64](fd)
     if task[0].fd_idx[fdu] == FD_CLOSED_MARK:
         return EBADF
-    # Tear down a procfs snapshot's backing buffer if any. tmpfs fds
-    # reuse fd_buf to hold the slot index (NOT a pointer); the entry
-    # outlives the fd, so we MUST NOT kfree there. cpio / stdio fds
-    # leave fd_buf at 0. Standard streams are normally closable; we
-    # permit it but don't shut the serial port down.
-    if task[0].fd_idx[fdu] == FD_BUFFER_MARK \
-            and task[0].fd_buf[fdu] != 0:
-        kfree(task[0].fd_buf[fdu])
-    task[0].fd_buf[fdu]    = 0
-    task[0].fd_buflen[fdu] = 0
-    task[0].fd_idx[fdu] = FD_CLOSED_MARK
-    task[0].fd_pos[fdu] = 0
+    # Delegate the release pattern to kernel/sched/core.py's
+    # close_fd_in_task — same helper task_exit_current uses, so
+    # explicit-close and implicit-on-exit have identical cleanup
+    # (kfree procfs buffer, decrement pipe refcounts, etc).
+    close_fd_in_task(task, fdu)
     return 0
 
 
@@ -355,7 +429,8 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
     if file_idx == FD_CLOSED_MARK:
         return cast[int64](EBADF)
     if file_idx == FD_STDIN_MARK or file_idx == FD_STDOUT_MARK \
-            or file_idx == FD_STDERR_MARK or file_idx == FD_BUFFER_MARK:
+            or file_idx == FD_STDERR_MARK or file_idx == FD_BUFFER_MARK \
+            or file_idx == FD_PIPE_MARK_R or file_idx == FD_PIPE_MARK_W:
         # Linux returns ESPIPE for seek on a pipe / tty; we don't
         # distinguish that errno yet, just say EINVAL. procfs files
         # are seekable in Linux but our snapshot semantics make seek

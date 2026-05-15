@@ -28,8 +28,11 @@
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
-                     stdout_path: Ptr[char]) -> int32
+                     stdin_fd: int32, stdout_fd: int32) -> int32
 extern def sys_waitpid(pid: int32) -> int64
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_pipe(fds: Ptr[int32]) -> int32
 extern def sys_exit(code: uint64)
 
 
@@ -107,21 +110,31 @@ def tokenize(line: Ptr[uint8], n: uint64,
     return argc
 
 
-def split_redirect(argv: Ptr[uint64], argc: uint64) -> uint64:
-    # Walk argv looking for a ">" token. If found, return its index
-    # (so caller can read argv[idx+1] as the redirect target and
-    # treat argc=idx as the trimmed length). Returns argc if no ">".
-    # Only the LAST ">" wins if there are multiple (matches bash for
-    # the simple case we care about); we just iterate forward and
-    # update on each hit.
+def find_token(argv: Ptr[uint64], argc: uint64, tok: uint8) -> uint64:
+    # Walk argv looking for the single-char token `tok` (used for
+    # ">" and "|"). Returns its index, or argc if not found. For ">"
+    # the LAST occurrence wins (bash-compat for the simple cases we
+    # care about); for "|" we only support a single occurrence so
+    # the first hit is fine.
     found: uint64 = argc
     i: uint64 = 0
     while i < argc:
         s: Ptr[uint8] = cast[Ptr[uint8]](argv[i])
-        if s[0] == 62 and s[1] == 0:                # ">"
+        if s[0] == tok and s[1] == 0:
             found = i
         i = i + 1
     return found
+
+
+def find_first_token(argv: Ptr[uint64], argc: uint64,
+                     tok: uint8) -> uint64:
+    i: uint64 = 0
+    while i < argc:
+        s: Ptr[uint8] = cast[Ptr[uint8]](argv[i])
+        if s[0] == tok and s[1] == 0:
+            return i
+        i = i + 1
+    return argc
 
 
 def print_prompt():
@@ -132,9 +145,21 @@ def builtin_help():
     write_str(1, "hamsh builtins: exit, help\n")
     write_str(1, "external commands are read from the cpio initramfs;\n")
     write_str(1, "  e.g. type '/hello' to run /hello.\n")
-    write_str(1, "redirect stdout with '>' onto any /tmp/ path, e.g.:\n")
+    write_str(1, "redirect stdout with '>' onto any /tmp/ path, pipe\n")
+    write_str(1, "two commands with '|':\n")
     write_str(1, "  /echo hi > /tmp/x\n")
     write_str(1, "  /cat /tmp/x\n")
+    write_str(1, "  /echo two words | /cat\n")
+
+
+def spawn_cmd(argv: Ptr[uint64], stdin_fd: int32, stdout_fd: int32) -> int32:
+    cmd: Ptr[uint8] = cast[Ptr[uint8]](argv[0])
+    pid: int32 = sys_spawn(cast[Ptr[char]](cmd), argv, stdin_fd, stdout_fd)
+    if pid < 0:
+        write_str(2, "hamsh: not found: ")
+        write_str(2, cmd)
+        write_str(2, "\n")
+    return pid
 
 
 def main() -> int32:
@@ -157,45 +182,102 @@ def main() -> int32:
         if argc == 0:
             continue
 
-        # Handle '> /tmp/file' redirect: if ">" appears in argv we
-        # trim it (plus the following path) out of the command's argv
-        # and hand the path to the kernel as SYS_SPAWN's a2. The
-        # last ">" wins, matching bash for the simple cases we care
-        # about. Missing target → error, missing target /tmp/ prefix
-        # → kernel returns EROFS and the child runs with normal
-        # serial stdout.
-        redirect_idx: uint64 = split_redirect(&argv_buf[0], argc)
-        stdout_path: Ptr[char] = cast[Ptr[char]](0)
+        # 1. Parse '> /tmp/file' redirect (last ">" wins, bash-style).
+        #    Trim it + its target out of argv so the spawned command
+        #    doesn't see them. We OPEN the target up-front so a bad
+        #    redirect is reported before any spawn happens.
+        redirect_idx: uint64 = find_token(&argv_buf[0], argc, 62)  # '>'
+        out_fd: int32 = -1
         if redirect_idx < argc:
             if redirect_idx + 1 >= argc:
-                write_str(2, "hamsh: syntax error: '>' needs a target\n")
+                write_str(2, "hamsh: syntax: '>' needs a target\n")
                 continue
-            stdout_path = cast[Ptr[char]](argv_buf[redirect_idx + 1])
-            argv_buf[redirect_idx] = 0       # truncate argv before exec
+            target: Ptr[char] = cast[Ptr[char]](argv_buf[redirect_idx + 1])
+            out_fd = sys_open_write(target)
+            if out_fd < 0:
+                write_str(2, "hamsh: open failed: ")
+                write_str(2, cast[Ptr[uint8]](target))
+                write_str(2, "\n")
+                continue
+            argv_buf[redirect_idx] = 0
             argc = redirect_idx
 
         if argc == 0:
-            write_str(2, "hamsh: syntax error: no command before '>'\n")
+            write_str(2, "hamsh: syntax: no command before '>'\n")
+            if out_fd >= 0:
+                sys_close(out_fd)
+            continue
+
+        # 2. Parse '|' for a single-stage pipeline. Multiple pipes
+        #    will land when we want them; for now first-occurrence
+        #    only.
+        pipe_idx: uint64 = find_first_token(&argv_buf[0], argc, 124)  # '|'
+
+        if pipe_idx < argc:
+            if pipe_idx == 0:
+                write_str(2, "hamsh: syntax: nothing before '|'\n")
+                if out_fd >= 0:
+                    sys_close(out_fd)
+                continue
+            if pipe_idx + 1 >= argc:
+                write_str(2, "hamsh: syntax: nothing after '|'\n")
+                if out_fd >= 0:
+                    sys_close(out_fd)
+                continue
+
+            # Open a kernel pipe and route the two halves through it.
+            fds: Array[2, int32]
+            if sys_pipe(&fds[0]) < 0:
+                write_str(2, "hamsh: pipe failed\n")
+                if out_fd >= 0:
+                    sys_close(out_fd)
+                continue
+            rfd: int32 = fds[0]
+            wfd: int32 = fds[1]
+
+            # Cut the argv into two NUL-terminated halves.
+            argv_buf[pipe_idx] = 0
+            left:  Ptr[uint64] = &argv_buf[0]
+            right: Ptr[uint64] = &argv_buf[pipe_idx + 1]
+
+            cmd_l: Ptr[uint8] = cast[Ptr[uint8]](left[0])
+            if streq(cmd_l, "exit") != 0 or streq(cmd_l, "help") != 0:
+                write_str(2, "hamsh: builtins can't pipe\n")
+                sys_close(rfd)
+                sys_close(wfd)
+                if out_fd >= 0:
+                    sys_close(out_fd)
+                continue
+
+            pid1: int32 = spawn_cmd(left,  -1, wfd)
+            pid2: int32 = spawn_cmd(right, rfd, out_fd)
+            # Close OUR copies; refcounts in the kernel let the
+            # children keep the pipe alive until each side closes.
+            sys_close(rfd)
+            sys_close(wfd)
+            if out_fd >= 0:
+                sys_close(out_fd)
+            if pid1 >= 0:
+                sys_waitpid(pid1)
+            if pid2 >= 0:
+                sys_waitpid(pid2)
             continue
 
         cmd: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[0])
-
         if streq(cmd, "exit") != 0:
+            if out_fd >= 0:
+                sys_close(out_fd)
             write_str(1, "[hamsh] bye.\n")
             return 0
         if streq(cmd, "help") != 0:
             builtin_help()
+            if out_fd >= 0:
+                sys_close(out_fd)
             continue
 
-        # External command. sys_spawn returns -ENOENT (-2) if the
-        # path isn't in the cpio archive; we surface that as a
-        # generic "command not found" without spelunking the errno.
-        pid: int32 = sys_spawn(cast[Ptr[char]](cmd),
-                               &argv_buf[0], stdout_path)
-        if pid < 0:
-            write_str(2, "hamsh: not found: ")
-            write_str(2, cmd)
-            write_str(2, "\n")
-            continue
-        sys_waitpid(pid)
+        pid: int32 = spawn_cmd(&argv_buf[0], -1, out_fd)
+        if out_fd >= 0:
+            sys_close(out_fd)
+        if pid >= 0:
+            sys_waitpid(pid)
     return 0

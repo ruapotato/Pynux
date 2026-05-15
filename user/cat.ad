@@ -43,10 +43,25 @@ def cat_one(path: Ptr[char]) -> int32:
     return 0
 
 
+def drain_stdin():
+    # Stream fd 0 until EOF. When fd 0 is a pipe (the `|` case in
+    # hamsh) reads block via the kernel's yield loop and return 0
+    # only once every writer has closed.
+    buf: Array[128, uint8]
+    while True:
+        n: int64 = sys_read(0, &buf[0], CHUNK)
+        if n <= 0:
+            break
+        sys_write(1, &buf[0], cast[uint64](n))
+
+
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
     if argc < 2:
-        write_str(2, "cat: missing operand\n")
-        return 1
+        # No file args → stream stdin to stdout (Linux behavior;
+        # what makes `... | /cat` work as the right-hand side of a
+        # shell pipeline).
+        drain_stdin()
+        return 0
     i: int32 = 1
     while i < argc:
         cat_one(cast[Ptr[char]](argv[cast[uint64](i)]))

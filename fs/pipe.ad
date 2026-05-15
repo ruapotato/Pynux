@@ -1,0 +1,184 @@
+# fs/pipe.py
+#
+# Anonymous pipes — kernel side. A pipe is a fixed-capacity ring
+# buffer with separate refcounts for its read and write ends.
+# Closing an end decrements the matching count; when both hit zero
+# the slot is reclaimed.
+#
+# Semantics (mirroring Linux's pipe semantics at minimum scope):
+#
+#   read end:
+#     - byte(s) available → return them (partial reads are fine)
+#     - empty, writers > 0  → "would block" (vfs caller yields)
+#     - empty, writers == 0 → EOF (return 0)
+#
+#   write end:
+#     - free space available → enqueue (partial writes are fine)
+#     - full, readers > 0   → "would block" (vfs caller yields)
+#     - full, readers == 0  → EPIPE
+#
+# No SIGPIPE yet — userspace gets back -EPIPE explicitly and decides
+# what to do. Real Linux raises a signal; we'll get there when the
+# signal subsystem lands.
+
+from mm.slab import kmalloc, kfree
+from kernel.printk.printk import printk0, printk1
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+PIPE_MAX: uint64 = 8
+PIPE_CAP: uint64 = 1024
+
+
+class Pipe:
+    buf:     uint64               # kmalloc'd ring or 0 (free slot)
+    head:    uint64               # next-read offset (mod cap)
+    tail:    uint64               # next-write offset (mod cap)
+    count:   uint64               # bytes currently buffered
+    cap:     uint64               # ring capacity (== PIPE_CAP)
+    readers: uint64               # open read-end count
+    writers: uint64               # open write-end count
+    used:    uint64               # 1 = in use, 0 = free
+
+
+pipe_table: Array[8, Pipe]
+
+
+def _find_free_slot() -> int32:
+    i: uint64 = 0
+    while i < PIPE_MAX:
+        if pipe_table[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def pipe_alloc() -> int32:
+    # Returns a slot with readers = writers = 1 (caller owns one of
+    # each, just as a brand-new pipe() returns one rfd + one wfd to
+    # the caller). -1 on out-of-slots / OOM.
+    slot: int32 = _find_free_slot()
+    if slot < 0:
+        printk0("pipe: out of slots\n")
+        return -1
+    su: uint64 = cast[uint64](slot)
+
+    if pipe_table[su].buf == 0:
+        b: uint64 = kmalloc(PIPE_CAP)
+        if b == 0:
+            return -1
+        pipe_table[su].buf = b
+    pipe_table[su].cap     = PIPE_CAP
+    pipe_table[su].head    = 0
+    pipe_table[su].tail    = 0
+    pipe_table[su].count   = 0
+    pipe_table[su].readers = 1
+    pipe_table[su].writers = 1
+    pipe_table[su].used    = 1
+    return slot
+
+
+def pipe_inc_reader(slot: int32):
+    pipe_table[cast[uint64](slot)].readers = \
+        pipe_table[cast[uint64](slot)].readers + 1
+
+
+def pipe_inc_writer(slot: int32):
+    pipe_table[cast[uint64](slot)].writers = \
+        pipe_table[cast[uint64](slot)].writers + 1
+
+
+def _maybe_free(slot: int32):
+    su: uint64 = cast[uint64](slot)
+    if pipe_table[su].readers == 0 and pipe_table[su].writers == 0:
+        # Both ends gone — return the ring to the slab and free the
+        # slot. We zero used so a future pipe_alloc reclaims it; the
+        # buf pointer is intentionally left set so we can lazy-reuse
+        # the allocation, but we'll re-init head/tail/count on the
+        # next alloc.
+        if pipe_table[su].buf != 0:
+            kfree(pipe_table[su].buf)
+            pipe_table[su].buf = 0
+        pipe_table[su].used = 0
+
+
+def pipe_close_reader(slot: int32):
+    su: uint64 = cast[uint64](slot)
+    if pipe_table[su].readers > 0:
+        pipe_table[su].readers = pipe_table[su].readers - 1
+    _maybe_free(slot)
+
+
+def pipe_close_writer(slot: int32):
+    su: uint64 = cast[uint64](slot)
+    if pipe_table[su].writers > 0:
+        pipe_table[su].writers = pipe_table[su].writers - 1
+    _maybe_free(slot)
+
+
+def pipe_readers(slot: int32) -> uint64:
+    return pipe_table[cast[uint64](slot)].readers
+
+
+def pipe_writers(slot: int32) -> uint64:
+    return pipe_table[cast[uint64](slot)].writers
+
+
+def pipe_read(slot: int32, dst: Ptr[uint8], count: uint64) -> int64:
+    # Returns bytes copied; 0 means "nothing right now — caller has
+    # to check writers to distinguish EOF from would-block". Reads
+    # are non-blocking at this layer; vfs_read wraps the yield loop.
+    su:  uint64 = cast[uint64](slot)
+    have: uint64 = pipe_table[su].count
+    if have == 0:
+        return 0
+    take: uint64 = count
+    if take > have:
+        take = have
+
+    cap:  uint64 = pipe_table[su].cap
+    head: uint64 = pipe_table[su].head
+    buf:  uint64 = pipe_table[su].buf
+
+    # Two-segment copy: from head to end-of-ring, then wraparound.
+    first: uint64 = cap - head
+    if first > take:
+        first = take
+    memcpy(dst, cast[Ptr[uint8]](buf + head), first)
+    if take > first:
+        memcpy(cast[Ptr[uint8]](cast[uint64](dst) + first),
+               cast[Ptr[uint8]](buf), take - first)
+
+    pipe_table[su].head  = (head + take) % cap
+    pipe_table[su].count = have - take
+    return cast[int64](take)
+
+
+def pipe_write(slot: int32, src: Ptr[uint8], count: uint64) -> int64:
+    # Returns bytes copied. 0 here means "ring is full right now" —
+    # caller checks readers to distinguish from EPIPE.
+    su:  uint64 = cast[uint64](slot)
+    have: uint64 = pipe_table[su].count
+    cap:  uint64 = pipe_table[su].cap
+    if have >= cap:
+        return 0
+    free_space: uint64 = cap - have
+    take: uint64 = count
+    if take > free_space:
+        take = free_space
+
+    tail: uint64 = pipe_table[su].tail
+    buf:  uint64 = pipe_table[su].buf
+
+    first: uint64 = cap - tail
+    if first > take:
+        first = take
+    memcpy(cast[Ptr[uint8]](buf + tail), src, first)
+    if take > first:
+        memcpy(cast[Ptr[uint8]](buf),
+               cast[Ptr[uint8]](cast[uint64](src) + first), take - first)
+
+    pipe_table[su].tail  = (tail + take) % cap
+    pipe_table[su].count = have + take
+    return cast[int64](take)

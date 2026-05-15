@@ -23,7 +23,12 @@
 
 from mm.memblock import memblock_alloc
 from mm.page_alloc import alloc_page
-from kernel.printk.printk import printk0, printk1
+from mm.slab import kfree
+from kernel.printk.printk import printk0, printk1, printk2
+from fs.pipe import (
+    pipe_close_reader, pipe_close_writer,
+    pipe_inc_reader, pipe_inc_writer,
+)
 
 extern def __switch_to_asm(prev: Ptr[uint8], next: Ptr[uint8])
 extern def enter_first_task(task: Ptr[uint8])
@@ -44,16 +49,17 @@ class TaskStruct:
     state:        uint64       # offset 40: STATE_*
     is_user:      uint64       # offset 48: 1 if CPL=3 task
     name0:        uint64       # offset 56: 8-char ASCII tag (debug)
-    # Per-task file descriptor table — 4 slots. Each fd has a file
-    # index (or special marker for stdin/stdout/stderr/proc) and a
-    # 64-bit read/write position. fd_buf / fd_buflen hold the kmalloc-
-    # backed body of dynamic (procfs-style) files; cpio + stdio fds
-    # leave them at 0. We keep the four side-by-side rather than
-    # packed so callers don't have to pun bit-fields out.
-    fd_idx:       Array[4, uint32]    # offset 64..80
-    fd_pos:       Array[4, uint64]    # offset 80..112
-    fd_buf:       Array[4, uint64]    # offset 112..144
-    fd_buflen:    Array[4, uint64]    # offset 144..176
+    # Per-task file descriptor table — 8 slots (bumped from 4 in
+    # M16.38 so a shell holding stdio + a pipe pair + a `>` target
+    # doesn't immediately EMFILE). Each fd has a file index (or
+    # special marker for stdin/stdout/stderr/proc/tmpfs/pipe) and a
+    # 64-bit read/write position. fd_buf / fd_buflen hold the
+    # kmalloc-backed body of dynamic (procfs) files or the slot
+    # index for tmpfs / pipe fds; cpio + stdio fds leave them at 0.
+    fd_idx:       Array[8, uint32]    # offset 64..96
+    fd_pos:       Array[8, uint64]    # offset 96..160
+    fd_buf:       Array[8, uint64]    # offset 160..224
+    fd_buflen:    Array[8, uint64]    # offset 224..288
     # Task-specific PML4 physical address. For M16.28 every task
     # gets its own top-level page table page, freshly cloned from
     # BSP's so the lower-level mappings (PDPT/PD) are shared — same
@@ -361,10 +367,12 @@ def schedule():
 
 
 def task_exit_current(code: int64):
-    # Mark the current task EXITED, record exit code, and yield.
-    # Stacks intentionally NOT freed (no reclaim path yet — that's a
-    # slab + RCU follow-up). The exit_code is consumed by a parent
-    # in SYS_WAITPID; with no parent the value is simply unread.
+    # Mark the current task EXITED, record exit code, drop its open
+    # fds, and yield. Stacks intentionally NOT freed (no reclaim
+    # path yet — that's a slab + RCU follow-up). The exit_code is
+    # consumed by a parent in SYS_WAITPID; with no parent the value
+    # is simply unread.
+    task_close_all_fds(current_idx)
     task_table[current_idx].exit_code = code
     task_table[current_idx].state = STATE_EXITED
     printk2("task: pid %d exited (code=%d)\n",
@@ -410,6 +418,12 @@ FD_BUFFER_MARK: uint32 = 0xFFFFFFFB
 # FD_BUFFER_MARK, fd_buf is NOT a pointer here and is never kfreed
 # at close — the tmpfs entry outlives the fd.
 FD_TMPFS_MARK:  uint32 = 0xFFFFFFFA
+# FD_PIPE_MARK_R / FD_PIPE_MARK_W reference a kernel-side anonymous
+# pipe by slot index (again stored in fd_buf). The pipe table holds
+# its own reader/writer refcounts; copying one of these fds into a
+# child task bumps the matching refcount, closing it decrements.
+FD_PIPE_MARK_R: uint32 = 0xFFFFFFF9
+FD_PIPE_MARK_W: uint32 = 0xFFFFFFF8
 
 
 def current_task_pid() -> uint64:
@@ -464,16 +478,68 @@ def task_table_size() -> uint64:
     return NTASKS
 
 
-def set_child_stdout_tmpfs(child_slot: int32, tmpfs_slot: int32):
-    # Wire the child task's fd[1] to a tmpfs entry instead of the
-    # default FD_STDOUT_MARK (serial). Used by SYS_SPAWN's `>` path
-    # — the kernel opens the redirect target in tmpfs and plants the
-    # resulting slot index here so the child writes land in the file.
+NR_FDS: uint64 = 8
+
+
+def close_fd_in_task(task: Ptr[TaskStruct], fdu: uint64):
+    # Single source of truth for tearing down an open fd. Used by
+    # vfs_close (after fd-range / EBADF validation) and by
+    # task_close_all_fds (the auto-cleanup on task exit). Calls the
+    # right resource release based on the fd_idx marker:
+    #
+    #   FD_BUFFER_MARK    kfree the kmalloc'd procfs snapshot
+    #   FD_PIPE_MARK_R    decrement the pipe's reader count
+    #   FD_PIPE_MARK_W    decrement the pipe's writer count
+    #   FD_TMPFS_MARK     no-op (entries are global and persistent)
+    #   stdio markers     no-op (serial port is shared)
+    #
+    # After release, the slot is rewritten to FD_CLOSED_MARK + zeros
+    # so a subsequent open can claim it.
+    fi: uint32 = task[0].fd_idx[fdu]
+    if fi == FD_BUFFER_MARK:
+        if task[0].fd_buf[fdu] != 0:
+            kfree(task[0].fd_buf[fdu])
+    elif fi == FD_PIPE_MARK_R:
+        pipe_close_reader(cast[int32](task[0].fd_buf[fdu]))
+    elif fi == FD_PIPE_MARK_W:
+        pipe_close_writer(cast[int32](task[0].fd_buf[fdu]))
+    task[0].fd_idx[fdu]    = FD_CLOSED_MARK
+    task[0].fd_buf[fdu]    = 0
+    task[0].fd_buflen[fdu] = 0
+    task[0].fd_pos[fdu]    = 0
+
+
+def task_close_all_fds(slot: uint64):
+    # Called from task_exit_current — walk the dying task's fd table
+    # and apply the same release logic vfs_close uses, so pipe
+    # refcounts unwind cleanly when a child exits without an
+    # explicit close, and so procfs snapshots aren't leaked.
+    i: uint64 = 0
+    while i < NR_FDS:
+        if task_table[slot].fd_idx[i] != FD_CLOSED_MARK:
+            close_fd_in_task(&task_table[slot], i)
+        i = i + 1
+
+
+def dup_fd_to_child(child_slot: int32, child_fdu: uint64,
+                    parent: Ptr[TaskStruct], parent_fdu: uint64) -> int32:
+    # Copy parent's fd entry into child's slot at fd index child_fdu.
+    # Bumps pipe refcounts so a parent close after spawn doesn't yank
+    # the channel out from under the child. Caller has validated
+    # parent_fdu is in range and not FD_CLOSED_MARK.
+    fi: uint32 = parent[0].fd_idx[parent_fdu]
+    if fi == FD_CLOSED_MARK:
+        return -1
     cu: uint64 = cast[uint64](child_slot)
-    task_table[cu].fd_idx[1]    = FD_TMPFS_MARK
-    task_table[cu].fd_pos[1]    = 0
-    task_table[cu].fd_buf[1]    = cast[uint64](tmpfs_slot)
-    task_table[cu].fd_buflen[1] = 0
+    task_table[cu].fd_idx[child_fdu]    = fi
+    task_table[cu].fd_pos[child_fdu]    = parent[0].fd_pos[parent_fdu]
+    task_table[cu].fd_buf[child_fdu]    = parent[0].fd_buf[parent_fdu]
+    task_table[cu].fd_buflen[child_fdu] = parent[0].fd_buflen[parent_fdu]
+    if fi == FD_PIPE_MARK_R:
+        pipe_inc_reader(cast[int32](parent[0].fd_buf[parent_fdu]))
+    elif fi == FD_PIPE_MARK_W:
+        pipe_inc_writer(cast[int32](parent[0].fd_buf[parent_fdu]))
+    return 0
 
 
 def yield_to_others():
@@ -490,9 +556,12 @@ def _init_fd_table(slot: uint64):
     task_table[slot].fd_idx[0] = FD_STDIN_MARK
     task_table[slot].fd_idx[1] = FD_STDOUT_MARK
     task_table[slot].fd_idx[2] = FD_STDERR_MARK
-    task_table[slot].fd_idx[3] = FD_CLOSED_MARK
-    i: uint64 = 0
-    while i < 4:
+    i: uint64 = 3
+    while i < NR_FDS:
+        task_table[slot].fd_idx[i] = FD_CLOSED_MARK
+        i = i + 1
+    i = 0
+    while i < NR_FDS:
         task_table[slot].fd_pos[i]    = 0
         task_table[slot].fd_buf[i]    = 0
         task_table[slot].fd_buflen[i] = 0

@@ -168,10 +168,15 @@ sys_execve:
     .size sys_execve, .-sys_execve
 
 
-    /* --- sys_spawn(path, argv) -> int32 (child pid or -errno) ------- */
+    /* --- sys_spawn(path, argv, stdin_fd, stdout_fd) -> int32 --------
+     * 4-arg syscall. SysV places arg 4 in %rcx, but the syscall
+     * ABI reserves %rcx for the user RIP and uses %r10 for arg 4.
+     * Shuffle %rcx -> %r10 before `syscall`. The next syscall whose
+     * caller has >=4 args needs the same dance. */
     .globl sys_spawn
     .type sys_spawn, @function
 sys_spawn:
+    movq    %rcx, %r10              /* arg 4: stdout_fd */
     movq    $11, %rax               /* SYS_SPAWN */
     syscall
     ret
@@ -186,3 +191,14 @@ sys_waitpid:
     syscall
     ret
     .size sys_waitpid, .-sys_waitpid
+
+
+    /* --- sys_pipe(int fds[2]) -> int32 -------------------------------
+     * Returns 0 on success; fds[0] = read end, fds[1] = write end. */
+    .globl sys_pipe
+    .type sys_pipe, @function
+sys_pipe:
+    movq    $14, %rax               /* SYS_PIPE */
+    syscall
+    ret
+    .size sys_pipe, .-sys_pipe
