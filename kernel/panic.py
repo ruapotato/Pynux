@@ -1,0 +1,66 @@
+# kernel/panic.py
+#
+# Mirrors the smallest meaningful slice of kernel/panic.c in Linux:
+# panic(), BUG(), and WARN_ON(). All three terminate or interrupt the
+# normal printk flow with a recognizable banner so an operator can spot
+# them in serial logs.
+#
+# Pynux's lack of varargs and lack of `__FILE__`/`__LINE__` macros means
+# call sites supply a single descriptive string. The convention is the
+# same as Linux when reading panic.c without the macros:
+#
+#     panic("oom");                       -- Linux
+#     panic("OOM in early_init")          -- Pynux equivalent
+#
+#     BUG();                              -- Linux (macro grabs file/line)
+#     BUG("free of unowned page")         -- Pynux supplies it explicitly
+#
+#     WARN_ON(x > MAX);                   -- Linux
+#     WARN_ON(x > MAX, "x exceeded MAX")  -- Pynux equivalent
+#
+# We deliberately don't try to fake a backtrace yet. Once we have a
+# frame-walker that can read %rbp chains, BUG() will grow a `dump_stack()`
+# call (and WARN_ON the same).
+
+from kernel.printk.printk import printk1
+
+extern def local_irq_disable()
+
+
+def _hang_forever():
+    # Interrupts off so a stray IRQ can't drag execution out of the
+    # halt loop and obscure the panic banner. HLT yields the CPU until
+    # the next interrupt — which can't happen with IF=0 — making this
+    # a true sleep, not a busy spin.
+    local_irq_disable()
+    while True:
+        asm_volatile("hlt")
+
+
+def panic(msg: Ptr[char]):
+    # Unrecoverable. Linux's panic() also tries to invoke registered
+    # panic notifiers, possibly reboots, and dumps a stack trace; we
+    # have none of that infrastructure yet, so the body is just the
+    # banner + halt. Notifiers / stack dumps land when their underlying
+    # subsystems exist.
+    printk1("\n--- Kernel panic: %s ---\n", cast[uint64](msg))
+    printk1("Halting CPU. msg @ %p\n", cast[uint64](msg))
+    _hang_forever()
+
+
+def BUG(msg: Ptr[char]):
+    # Used at assertion sites the kernel can't recover from but that
+    # aren't quite "the system is fundamentally broken" the way panic()
+    # implies. In practice on Linux they end up doing the same thing.
+    printk1("\n*** BUG: %s ***\n", cast[uint64](msg))
+    _hang_forever()
+
+
+def WARN_ON(cond: uint64, msg: Ptr[char]) -> uint64:
+    # Returns the condition value so callers can chain inside an `if`,
+    # mirroring Linux's `if (WARN_ON(x))` idiom. Treats any non-zero
+    # cond as fired. Caller continues executing — WARN is for
+    # "shouldn't happen but the kernel can keep going".
+    if cond != 0:
+        printk1("WARN: %s\n", cast[uint64](msg))
+    return cond

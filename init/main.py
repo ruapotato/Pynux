@@ -21,7 +21,11 @@
 # control between them.
 
 from drivers.tty.serial.early_8250 import setup_early_printk
-from kernel.printk.printk import printk0, printk1, printk2
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+    pr_info, pr_warn, pr_err, pr_emerg,
+)
+from kernel.panic import WARN_ON
 from arch.x86.kernel.idt import idt_init
 from arch.x86.kernel.traps import do_trap          # exported for common_trap
 from arch.x86.kernel.irq import do_irq             # exported for common_irq
@@ -151,6 +155,26 @@ def string_ops_smoke_test():
     kfree(z)
 
 
+def diag_smoke_test():
+    # Exercise the log-level wrappers and WARN_ON. panic() and BUG()
+    # are not invoked here because they halt the box; we just confirm
+    # the diagnostic banners render correctly.
+    printk0("Pynux: diag smoke test\n")
+    pr_emerg("EMERG-level message\n")
+    pr_alert_test: int32 = 0          # placeholder, no pr_alert here
+    pr_err("test error message\n")
+    pr_warn("test warning message\n")
+    pr_info("test info message\n")
+
+    # WARN_ON with a false condition: must NOT print.
+    rc1: uint64 = WARN_ON(0, "(silent) WARN_ON(0) should not appear")
+    printk1("  WARN_ON(0) returned %d\n", rc1)
+
+    # WARN_ON with a true condition: must print but continue.
+    rc2: uint64 = WARN_ON(1, "(loud) WARN_ON(1) fires intentionally")
+    printk1("  WARN_ON(1) returned %d\n", rc2)
+
+
 # --- Preemption demo -----------------------------------------------
 #
 # Both tasks run a tight busy-loop with no cooperative yield. Without
@@ -213,6 +237,7 @@ def start_kernel():
     page_alloc_smoke_test()
     slab_smoke_test()
     string_ops_smoke_test()
+    diag_smoke_test()
 
     setup_per_cpu_areas()
     printk1("Pynux: smp_processor_id() = %d\n", get_cpu_id())

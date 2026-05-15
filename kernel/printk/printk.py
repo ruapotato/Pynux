@@ -154,3 +154,52 @@ def printk2(fmt: Ptr[char], a: uint64, b: uint64):
         else:
             early_putc(c)
         i = i + 1
+
+
+# --- KERN_* log-level wrappers --------------------------------------
+#
+# Mirrors include/linux/printk.h's pr_emerg / pr_alert / pr_crit /
+# pr_err / pr_warn / pr_notice / pr_info / pr_debug. Linux encodes the
+# level as a tiny prefix '<N>' inside the format string and dispatches
+# in vprintk_emit; for now we just prefix human-readable bracket
+# tags. When syslog-style log levels matter (e.g. printk_console_level
+# filtering), we'll switch to the in-band '<N>' encoding.
+
+def pr_emerg(msg: Ptr[char]):
+    early_puts("[EMERG]  ")
+    early_puts(msg)
+
+
+def pr_alert(msg: Ptr[char]):
+    early_puts("[ALERT]  ")
+    early_puts(msg)
+
+
+def pr_crit(msg: Ptr[char]):
+    early_puts("[CRIT]   ")
+    early_puts(msg)
+
+
+def pr_err(msg: Ptr[char]):
+    early_puts("[ERR]    ")
+    early_puts(msg)
+
+
+def pr_warn(msg: Ptr[char]):
+    early_puts("[WARN]   ")
+    early_puts(msg)
+
+
+def pr_notice(msg: Ptr[char]):
+    early_puts("[NOTICE] ")
+    early_puts(msg)
+
+
+def pr_info(msg: Ptr[char]):
+    early_puts("[INFO]   ")
+    early_puts(msg)
+
+
+def pr_debug(msg: Ptr[char]):
+    early_puts("[DEBUG]  ")
+    early_puts(msg)
