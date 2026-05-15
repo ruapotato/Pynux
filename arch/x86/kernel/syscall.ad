@@ -38,6 +38,7 @@ from kernel.sched.core import (
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_write,
     vfs_close, vfs_lseek, vfs_dup, vfs_dup2, vfs_listdir,
+    resolve_path,
     initramfs_data_ptr, initramfs_data_size,
 )
 from fs.elf import elf_load_blob
@@ -250,10 +251,18 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
     if nr == SYS_GETPID:
         return current_task_pid()
     if nr == SYS_OPEN:
-        rc: int32 = vfs_open(cast[Ptr[char]](a0))
+        abs_path: Array[256, uint8]
+        rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+        if rc != 0:
+            return cast[uint64](rc)
+        rc = vfs_open(cast[Ptr[char]](&abs_path[0]))
         return cast[uint64](rc)
     if nr == SYS_OPEN_WRITE:
-        rc: int32 = vfs_open_write(cast[Ptr[char]](a0))
+        abs_path: Array[256, uint8]
+        rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+        if rc != 0:
+            return cast[uint64](rc)
+        rc = vfs_open_write(cast[Ptr[char]](&abs_path[0]))
         return cast[uint64](rc)
     if nr == SYS_READ:
         n: int64 = vfs_read(cast[int32](a0),
@@ -359,11 +368,21 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
     if nr == SYS_DUP2:
         return cast[uint64](vfs_dup2(cast[int32](a0), cast[int32](a1)))
     if nr == SYS_LISTDIR:
-        return cast[uint64](vfs_listdir(cast[Ptr[char]](a0),
+        abs_path: Array[256, uint8]
+        rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+        if rc != 0:
+            return cast[uint64](rc)
+        return cast[uint64](vfs_listdir(cast[Ptr[char]](&abs_path[0]),
                                         cast[Ptr[uint8]](a1), a2))
     if nr == SYS_CHDIR:
-        rc: int32 = set_task_cwd(current_idx_get(),
-                                 cast[Ptr[uint8]](a0))
+        # Resolve to absolute first so the stored cwd is always
+        # absolute. That keeps subsequent SYS_GETCWD coherent and
+        # makes future "cd .." straightforward to implement.
+        abs_path: Array[256, uint8]
+        rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+        if rc != 0:
+            return cast[uint64](rc)
+        rc = set_task_cwd(current_idx_get(), &abs_path[0])
         if rc < 0:
             return cast[uint64](-7)            # -E2BIG
         return 0

@@ -29,6 +29,7 @@ from kernel.sched.core import (
     FD_BUFFER_MARK, FD_TMPFS_MARK, FD_PIPE_MARK_R, FD_PIPE_MARK_W,
     FD_FAT_MARK,
     close_fd_in_task, copy_fd_entry, yield_to_others,
+    get_cwd_buf, current_idx_get,
 )
 from fs.cpio import (
     cpio_init,
@@ -206,6 +207,56 @@ def vfs_listdir(name: Ptr[char], buf: Ptr[uint8],
 
 
 _empty_str: Array[1, uint8]
+
+
+ENAMETOOLONG: int32 = -36
+
+
+def resolve_path(input: Ptr[char], output: Ptr[uint8],
+                 count: uint64) -> int32:
+    # Produce an absolute path in `output` from `input` (which may be
+    # absolute or relative). Returns 0 on success, -ENAMETOOLONG if
+    # the result wouldn't fit. No "." / ".." normalisation yet —
+    # callers using "..foo" get an error from the FS layer when the
+    # literal component doesn't match anything.
+    if count == 0:
+        return ENAMETOOLONG
+    if input[0] == 47:                         # '/'
+        # Absolute — straight copy.
+        i: uint64 = 0
+        while i + 1 < count:
+            c: uint8 = cast[uint8](input[i] & 0xFF)
+            output[i] = c
+            if c == 0:
+                return 0
+            i = i + 1
+        output[i] = 0
+        return ENAMETOOLONG
+    # Relative — prepend cwd. Append '/' between cwd and input
+    # unless cwd is already "/" (the root case).
+    cwd: Ptr[uint8] = get_cwd_buf(current_idx_get())
+    j: uint64 = 0
+    while j + 1 < count and cwd[j] != 0:
+        output[j] = cwd[j]
+        j = j + 1
+    if j == 0:
+        return ENAMETOOLONG                    # cwd was empty
+    if output[j - 1] != 47:
+        if j + 1 >= count:
+            return ENAMETOOLONG
+        output[j] = 47
+        j = j + 1
+    # Append input.
+    i: uint64 = 0
+    while j + 1 < count:
+        c: uint8 = cast[uint8](input[i] & 0xFF)
+        output[j] = c
+        if c == 0:
+            return 0
+        i = i + 1
+        j = j + 1
+    output[j] = 0
+    return ENAMETOOLONG
 
 
 def vfs_pipe(out_fds: Ptr[int32]) -> int32:
