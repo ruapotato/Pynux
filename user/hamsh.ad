@@ -27,7 +27,8 @@
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
-extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64]) -> int32
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdout_path: Ptr[char]) -> int32
 extern def sys_waitpid(pid: int32) -> int64
 extern def sys_exit(code: uint64)
 
@@ -106,6 +107,23 @@ def tokenize(line: Ptr[uint8], n: uint64,
     return argc
 
 
+def split_redirect(argv: Ptr[uint64], argc: uint64) -> uint64:
+    # Walk argv looking for a ">" token. If found, return its index
+    # (so caller can read argv[idx+1] as the redirect target and
+    # treat argc=idx as the trimmed length). Returns argc if no ">".
+    # Only the LAST ">" wins if there are multiple (matches bash for
+    # the simple case we care about); we just iterate forward and
+    # update on each hit.
+    found: uint64 = argc
+    i: uint64 = 0
+    while i < argc:
+        s: Ptr[uint8] = cast[Ptr[uint8]](argv[i])
+        if s[0] == 62 and s[1] == 0:                # ">"
+            found = i
+        i = i + 1
+    return found
+
+
 def print_prompt():
     write_str(1, "hamsh$ ")
 
@@ -114,6 +132,9 @@ def builtin_help():
     write_str(1, "hamsh builtins: exit, help\n")
     write_str(1, "external commands are read from the cpio initramfs;\n")
     write_str(1, "  e.g. type '/hello' to run /hello.\n")
+    write_str(1, "redirect stdout with '>' onto any /tmp/ path, e.g.:\n")
+    write_str(1, "  /echo hi > /tmp/x\n")
+    write_str(1, "  /cat /tmp/x\n")
 
 
 def main() -> int32:
@@ -136,6 +157,27 @@ def main() -> int32:
         if argc == 0:
             continue
 
+        # Handle '> /tmp/file' redirect: if ">" appears in argv we
+        # trim it (plus the following path) out of the command's argv
+        # and hand the path to the kernel as SYS_SPAWN's a2. The
+        # last ">" wins, matching bash for the simple cases we care
+        # about. Missing target → error, missing target /tmp/ prefix
+        # → kernel returns EROFS and the child runs with normal
+        # serial stdout.
+        redirect_idx: uint64 = split_redirect(&argv_buf[0], argc)
+        stdout_path: Ptr[char] = cast[Ptr[char]](0)
+        if redirect_idx < argc:
+            if redirect_idx + 1 >= argc:
+                write_str(2, "hamsh: syntax error: '>' needs a target\n")
+                continue
+            stdout_path = cast[Ptr[char]](argv_buf[redirect_idx + 1])
+            argv_buf[redirect_idx] = 0       # truncate argv before exec
+            argc = redirect_idx
+
+        if argc == 0:
+            write_str(2, "hamsh: syntax error: no command before '>'\n")
+            continue
+
         cmd: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[0])
 
         if streq(cmd, "exit") != 0:
@@ -148,7 +190,8 @@ def main() -> int32:
         # External command. sys_spawn returns -ENOENT (-2) if the
         # path isn't in the cpio archive; we surface that as a
         # generic "command not found" without spelunking the errno.
-        pid: int32 = sys_spawn(cast[Ptr[char]](cmd), &argv_buf[0])
+        pid: int32 = sys_spawn(cast[Ptr[char]](cmd),
+                               &argv_buf[0], stdout_path)
         if pid < 0:
             write_str(2, "hamsh: not found: ")
             write_str(2, cmd)

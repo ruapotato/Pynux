@@ -28,7 +28,7 @@ build_one() {
 
 build_one init
 build_one hello
-build_one echo
+build_one stdin_demo                   # used by scripts/test_stdin.sh
 
 # Hamnix-compiled userland binaries.
 build_adder_user() {
@@ -43,3 +43,5 @@ build_adder_user() {
 
 build_adder_user hamsh                # M16.35: interactive shell
 build_adder_user ps                   # M16.36: dumps /proc snapshots
+build_adder_user echo                 # M16.37: writes argv to stdout
+build_adder_user cat                  # M16.37: streams files to stdout

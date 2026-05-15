@@ -84,6 +84,18 @@ sys_open:
     .size sys_open, .-sys_open
 
 
+    /* --- sys_open_write(path) -> int32 -------------------------------
+     * Open-or-create for write. Truncates an existing file. Tmpfs
+     * paths (/tmp/*) are the only writable target as of M16.37. */
+    .globl sys_open_write
+    .type sys_open_write, @function
+sys_open_write:
+    movq    $13, %rax               /* SYS_OPEN_WRITE */
+    syscall
+    ret
+    .size sys_open_write, .-sys_open_write
+
+
     /* --- sys_close(fd) -> int32 -------------------------------------- */
     .globl sys_close
     .type sys_close, @function

@@ -13,7 +13,7 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 ELF=build/hamnix-vmlinux.elf
-ECHO_ELF=build/user/echo.elf
+ECHO_ELF=build/user/stdin_demo.elf
 # Keep input short — the 16550 RX FIFO is only 16 bytes and is
 # accumulating piped input while the kernel boots (~100 ms), so a
 # longer string loses chars off the front. A real shell uses

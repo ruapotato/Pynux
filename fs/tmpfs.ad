@@ -1,0 +1,167 @@
+# fs/tmpfs.py
+#
+# Minimal in-memory writable filesystem — Hamnix's tmpfs. Backs any
+# path under /tmp/ with a fixed-capacity kmalloc'd buffer. Entries
+# persist across opens, so:
+#
+#     /echo hello > /tmp/x
+#     /cat /tmp/x          → "hello\n"
+#
+# works the way the user expects. No directories, no permissions, no
+# inode/dentry split; one flat name table indexed by absolute path.
+# Real fs/ramfs.c shape comes later when EXT4/FAT force a proper
+# superblock/inode/dentry layout (see [[project-install-roadmap]]).
+#
+# Capacity is per-file (TMPFS_FILE_CAP) and global (TMPFS_MAX_FILES).
+# Writes past TMPFS_FILE_CAP are short-write'd; out-of-slots opens
+# return -ENOSPC. Mirrors how Linux's tmpfs degrades when the in-
+# memory backing fills up.
+
+from mm.slab import kmalloc
+from kernel.printk.printk import printk0, printk1
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+TMPFS_MAX_FILES: uint64 = 8
+TMPFS_FILE_CAP:  uint64 = 4096        # per-file fixed cap
+TMPFS_NAME_LEN:  uint64 = 32          # NUL-terminated path, incl prefix
+
+
+class TmpfsEntry:
+    used:     uint64                  # 0 = free slot
+    size:     uint64                  # current bytes
+    data:     uint64                  # kmalloc'd backing or 0
+    name:     Array[32, uint8]        # NUL-terminated path
+
+
+tmpfs_table: Array[8, TmpfsEntry]
+
+
+def _name_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _name_copy(dst: Ptr[uint8], src: Ptr[uint8], max: uint64) -> int32:
+    # Copy NUL-terminated src into dst, cap at max-1. Returns 1 on
+    # success, 0 if src was too long (caller treats as -ENAMETOOLONG).
+    i: uint64 = 0
+    while i + 1 < max:
+        c: uint8 = src[i]
+        dst[i] = c
+        if c == 0:
+            return 1
+        i = i + 1
+    if src[i] == 0:
+        dst[i] = 0
+        return 1
+    return 0
+
+
+def is_tmpfs_path(name: Ptr[char]) -> int32:
+    # True if `name` starts with "/tmp/". Same shape as procfs.is_proc_path —
+    # cheap prefix walk, no strncmp dependency.
+    prefix: Ptr[uint8] = "/tmp/"
+    i: int32 = 0
+    while True:
+        p: int32 = prefix[i]
+        if p == 0:
+            return 1
+        n: int32 = name[i]
+        if n != p:
+            return 0
+        i = i + 1
+
+
+def tmpfs_lookup(name: Ptr[char]) -> int32:
+    n: uint64 = TMPFS_MAX_FILES
+    i: uint64 = 0
+    while i < n:
+        if tmpfs_table[i].used != 0:
+            if _name_eq(&tmpfs_table[i].name[0],
+                        cast[Ptr[uint8]](name)) != 0:
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _find_free_slot() -> int32:
+    i: uint64 = 0
+    while i < TMPFS_MAX_FILES:
+        if tmpfs_table[i].used == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def tmpfs_open_for_write(name: Ptr[char]) -> int32:
+    # Lookup or create. If the file exists, truncate (size = 0).
+    # Returns the slot index, or -1 on out-of-slots / bad name.
+    existing: int32 = tmpfs_lookup(name)
+    if existing >= 0:
+        tmpfs_table[cast[uint64](existing)].size = 0
+        return existing
+
+    slot: int32 = _find_free_slot()
+    if slot < 0:
+        printk0("tmpfs: out of file slots\n")
+        return -1
+    su: uint64 = cast[uint64](slot)
+
+    if _name_copy(&tmpfs_table[su].name[0],
+                  cast[Ptr[uint8]](name), TMPFS_NAME_LEN) == 0:
+        printk0("tmpfs: name too long\n")
+        return -1
+
+    # Lazily allocate the backing buffer on first create.
+    if tmpfs_table[su].data == 0:
+        buf: uint64 = kmalloc(TMPFS_FILE_CAP)
+        if buf == 0:
+            return -1
+        tmpfs_table[su].data = buf
+
+    tmpfs_table[su].used = 1
+    tmpfs_table[su].size = 0
+    return slot
+
+
+def tmpfs_size(slot: int32) -> uint64:
+    return tmpfs_table[cast[uint64](slot)].size
+
+
+def tmpfs_capacity() -> uint64:
+    return TMPFS_FILE_CAP
+
+
+def tmpfs_data(slot: int32) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](tmpfs_table[cast[uint64](slot)].data)
+
+
+def tmpfs_write(slot: int32, src: Ptr[uint8], pos: uint64,
+                count: uint64) -> uint64:
+    # Write up to `count` bytes from `src` to entry `slot` starting at
+    # offset `pos`. Caps at TMPFS_FILE_CAP — short-writes if the
+    # caller would overflow. Returns bytes actually written; the
+    # caller advances fd_pos accordingly and updates `size`.
+    su: uint64 = cast[uint64](slot)
+    cap: uint64 = TMPFS_FILE_CAP
+    if pos >= cap:
+        return 0
+    remaining: uint64 = cap - pos
+    take: uint64 = count
+    if take > remaining:
+        take = remaining
+    memcpy(cast[Ptr[uint8]](tmpfs_table[su].data + pos), src, take)
+    new_end: uint64 = pos + take
+    if new_end > tmpfs_table[su].size:
+        tmpfs_table[su].size = new_end
+    return take

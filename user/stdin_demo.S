@@ -1,15 +1,18 @@
 /*
- * user/echo.S - user-mode "read a line, echo it" demo.
+ * user/stdin_demo.S - user-mode "read a line, echo it" demo.
  *
- * Foundation for an interactive shell. Reads up to 32 bytes from
- * stdin (fd 0 — routes to UART RX via the kernel's vfs_read FD_STDIN
- * branch), then writes them back to stdout (fd 1). One round-trip per
- * run, then exits.
+ * Originally user/echo.S; renamed in M16.37 when user/echo.ad
+ * (the real coreutils-shaped echo) shipped. Kept around as the
+ * focused stdin-readback fixture that scripts/test_stdin.sh drives.
+ *
+ * Reads up to 32 bytes from stdin (fd 0 — routes to UART RX via
+ * the kernel's vfs_read FD_STDIN branch), then writes them back to
+ * stdout (fd 1). One round-trip per run, then exits.
  *
  * Run interactively:
- *   bash scripts/run_x86_bare.sh  with INIT_ELF=build/user/echo.elf
+ *   INIT_ELF=build/user/stdin_demo.elf bash scripts/run_x86_bare.sh
  * Or piped:
- *   echo "hello" | INIT_ELF=build/user/echo.elf bash scripts/run_x86_bare.sh
+ *   echo "hello" | INIT_ELF=build/user/stdin_demo.elf bash scripts/run_x86_bare.sh
  */
 
     .code64

@@ -1,0 +1,39 @@
+# user/echo.ad
+#
+# Hamnix `echo`: writes argv[1..] to stdout joined by spaces with a
+# trailing newline. Mirrors `echo` from coreutils at the smallest
+# meaningful scope (no -n / -e flags). Replaces the earlier
+# user/echo.S, which was a fixed-line read-from-stdin demo from
+# before the shell existed.
+#
+# main() picks up argc/argv via the SysV first-two-args path the
+# runtime stages for every user task (user/runtime.S _start forwards
+# rdi/rsi from kernel iret-frame into the call to main).
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(s: Ptr[uint8]):
+    sys_write(1, s, strlen_u8(s))
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # argv[0] is the program path itself; print argv[1..argc-1]. Even
+    # if argc == 1 (just the program name) we still emit the trailing
+    # newline so `echo > /tmp/x` truncates the file deterministically.
+    i: int32 = 1
+    while i < argc:
+        if i > 1:
+            sys_write(1, " ", 1)
+        s: Ptr[uint8] = cast[Ptr[uint8]](argv[cast[uint64](i)])
+        write_str(s)
+        i = i + 1
+    sys_write(1, "\n", 1)
+    return 0

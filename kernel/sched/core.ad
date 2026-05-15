@@ -146,14 +146,27 @@ def _build_initial_kstack(kstack_top: uint64, iret_cs: uint64,
 
 
 # Offsets of the rdi / rsi slots within the 9-caller-saved block
-# kthread_bootstrap pops just before iretq. Numbers come from the
-# stack layout assembled in _build_initial_kstack (high address to
-# low: iret-ss/rsp/rflags/cs/rip + 8B error code + 8B vector + the
-# 9 caller-saved r11/r10/r9/r8/rdi/rsi/rdx/rcx/rax). The 5-quad iret
-# frame plus 2-quad vec/ec puts r11 at top-32-56; rdi lands four
-# slots below r11.
-_KSTACK_RDI_OFFSET_FROM_TOP: uint64 = 96         # iret(40) + vec/ec(16) + 4*8
-_KSTACK_RSI_OFFSET_FROM_TOP: uint64 = 104
+# kthread_bootstrap pops just before iretq. kthread_bootstrap pops
+# from %rsp upward in this order: r11, r10, r9, r8, rdi, rsi, rdx,
+# rcx, rax. Since the stack grows down, the LOWEST address of the
+# block is r11 (popped first) and the HIGHEST is rax (popped last):
+#
+#   kstack_top - 64   rax    (1st push in _build_initial_kstack)
+#   kstack_top - 72   rcx
+#   kstack_top - 80   rdx
+#   kstack_top - 88   rsi
+#   kstack_top - 96   rdi
+#   kstack_top - 104  r8
+#   kstack_top - 112  r9
+#   kstack_top - 120  r10
+#   kstack_top - 128  r11    (last push; pop-order #1)
+#
+# The 56-byte gap above the block is the 5-quad iret frame (40) plus
+# 8-byte error code + 8-byte vector. Earlier revisions of these
+# offsets had rsi at -104 (which is r8) — that landed argv in %r8
+# while rsi stayed zero, so user main() saw argv == 0.
+_KSTACK_RDI_OFFSET_FROM_TOP: uint64 = 96
+_KSTACK_RSI_OFFSET_FROM_TOP: uint64 = 88
 
 
 def _plant_user_args(kstack_top: uint64, argc: uint64, argv: uint64):
@@ -392,6 +405,11 @@ FD_STDERR_MARK: uint32 = 0xFFFFFFFD
 # private buffer so subsequent reads see a consistent snapshot, even
 # if the underlying state (jiffies, task table) moves under us.
 FD_BUFFER_MARK: uint32 = 0xFFFFFFFB
+# FD_TMPFS_MARK fds reference a persistent in-memory tmpfs entry by
+# slot index, stored in fd_buf (re-purposed as the slot id). Unlike
+# FD_BUFFER_MARK, fd_buf is NOT a pointer here and is never kfreed
+# at close — the tmpfs entry outlives the fd.
+FD_TMPFS_MARK:  uint32 = 0xFFFFFFFA
 
 
 def current_task_pid() -> uint64:
@@ -444,6 +462,18 @@ def task_name0_at(slot: int32) -> uint64:
 
 def task_table_size() -> uint64:
     return NTASKS
+
+
+def set_child_stdout_tmpfs(child_slot: int32, tmpfs_slot: int32):
+    # Wire the child task's fd[1] to a tmpfs entry instead of the
+    # default FD_STDOUT_MARK (serial). Used by SYS_SPAWN's `>` path
+    # — the kernel opens the redirect target in tmpfs and plants the
+    # resulting slot index here so the child writes land in the file.
+    cu: uint64 = cast[uint64](child_slot)
+    task_table[cu].fd_idx[1]    = FD_TMPFS_MARK
+    task_table[cu].fd_pos[1]    = 0
+    task_table[cu].fd_buf[1]    = cast[uint64](tmpfs_slot)
+    task_table[cu].fd_buflen[1] = 0
 
 
 def yield_to_others():
