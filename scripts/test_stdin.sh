@@ -12,7 +12,7 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-ELF=build/pynux-vmlinux.elf
+ELF=build/hamnix-vmlinux.elf
 ECHO_ELF=build/user/echo.elf
 # Keep input short — the 16550 RX FIFO is only 16 bytes and is
 # accumulating piped input while the kernel boots (~100 ms), so a
@@ -30,9 +30,9 @@ echo "[test_stdin] Swap /init = build/user/echo.elf"
 INIT_ELF="$ECHO_ELF" python3 scripts/build_initramfs.py
 
 echo "[test_stdin] Rebuild kernel image"
-python3 -m compiler.pynux compile \
+python3 -m compiler.adder compile \
     --target=x86_64-bare-metal \
-    init/main.py \
+    init/main.ad \
     -o "$ELF"
 
 echo "[test_stdin] Boot QEMU with piped input"

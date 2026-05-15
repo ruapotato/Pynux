@@ -4,7 +4,7 @@
  * Mirrors arch/x86/entry/entry_64.S's irq entry path. Sixteen stubs
  * (one per legacy 8259 IRQ line, vectors 0x20..0x2F after the PIC
  * remap done in i8259.py) all funnel into common_irq, which saves
- * the SysV caller-clobbered set, hands the vector number to Pynux's
+ * the SysV caller-clobbered set, hands the vector number to Hamnix's
  * do_irq(), restores registers, and `iretq`s back to the interrupted
  * code.
  *
@@ -31,7 +31,7 @@ irq_stub_\n:
     .endm
 
     /* Legacy IRQs 0..15 → vectors 32..47. We expose stub indices
-     * 32..47 to match the vector numbering one-to-one, so a Pynux
+     * 32..47 to match the vector numbering one-to-one, so a Hamnix
      * caller doesn't have to add/subtract PIC_BASE_VECTOR. */
     IRQ_STUB 32
     IRQ_STUB 33
@@ -121,7 +121,7 @@ get_irq_stub:
     ret
 
 /* ---------- sti / cli wrappers ----------------------------------- *
- * Pynux can express these via asm_volatile("sti") / asm_volatile("cli")
+ * Hamnix can express these via asm_volatile("sti") / asm_volatile("cli")
  * directly, but giving them function names keeps the call sites
  * readable and makes them grep-able when porting.
  */

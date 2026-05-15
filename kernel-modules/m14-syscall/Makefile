@@ -1,5 +1,5 @@
-PYNUX     ?= python3 -m compiler.pynux
-KDIR      ?= $(HOME)/pynux-kernel/linux
+PYNUX     ?= python3 -m compiler.adder
+KDIR      ?= $(HOME)/hamnix-kernel/linux
 PWD       := $(shell pwd)
 PROJ_ROOT := $(abspath $(PWD)/../..)
 
@@ -8,10 +8,10 @@ obj-m := m14_syscall.o
 all: m14_syscall.S
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-m14_syscall.S: m14_syscall.py
+m14_syscall.S: m14_syscall.ad
 	cd $(PROJ_ROOT) && $(PYNUX) compile \
 	    --target=x86_64-linux-kernel-module \
-	    kernel-modules/m14-syscall/m14_syscall.py \
+	    kernel-modules/m14-syscall/m14_syscall.ad \
 	    -o kernel-modules/m14-syscall/m14_syscall.S
 
 clean:

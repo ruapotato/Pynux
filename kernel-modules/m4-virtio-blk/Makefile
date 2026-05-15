@@ -1,5 +1,5 @@
-PYNUX     ?= python3 -m compiler.pynux
-KDIR      ?= $(HOME)/pynux-kernel/linux
+PYNUX     ?= python3 -m compiler.adder
+KDIR      ?= $(HOME)/hamnix-kernel/linux
 PWD       := $(shell pwd)
 PROJ_ROOT := $(abspath $(PWD)/../..)
 
@@ -8,10 +8,10 @@ obj-m := m4_virtio_blk.o
 all: m4_virtio_blk.S
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-m4_virtio_blk.S: m4_virtio_blk.py
+m4_virtio_blk.S: m4_virtio_blk.ad
 	cd $(PROJ_ROOT) && $(PYNUX) compile \
 	    --target=x86_64-linux-kernel-module \
-	    kernel-modules/m4-virtio-blk/m4_virtio_blk.py \
+	    kernel-modules/m4-virtio-blk/m4_virtio_blk.ad \
 	    -o kernel-modules/m4-virtio-blk/m4_virtio_blk.S
 
 clean:

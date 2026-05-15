@@ -1,5 +1,5 @@
 /*
- * arch/x86/boot/header.S - Pynux multiboot1 entry + 32->64 long-mode transition.
+ * arch/x86/boot/header.S - Hamnix multiboot1 entry + 32->64 long-mode transition.
  *
  * Mirrors the role of Linux's arch/x86/boot/header.S (boot protocol header)
  * and arch/x86/boot/compressed/head_64.S (long-mode setup), collapsed into
@@ -16,7 +16,7 @@
  *   3. The far-jump target is `long_mode_start`, which tail-calls into
  *      arch/x86/kernel/head_64.S's start_kernel_asm_entry.
  *
- * Everything here is hand-written GNU `as` AT&T syntax; the Pynux compiler
+ * Everything here is hand-written GNU `as` AT&T syntax; the Hamnix compiler
  * itself never emits 32-bit code.
  */
 
@@ -52,7 +52,7 @@ _start:
      *   PML4[0]  -> PDPT
      *   PDPT[0]  -> PD   (covers first 1 GiB via 2 MiB pages)
      *   PD[i]    -> 2 MiB page at i << 21, for i in 0..511
-     * Total identity-mapped: 1 GiB. Pynux is well under that for M16.x.   */
+     * Total identity-mapped: 1 GiB. Hamnix is well under that for M16.x.   */
     movl    $pml4, %edi
     movl    $pdpt, %eax
     orl     $0x7, %eax              /* US | RW | P */
@@ -129,7 +129,7 @@ long_mode_start:
     movl    $boot_stack_top, %esp
 
     /* Tail-call into the 64-bit head stub, which performs BSS zeroing
-     * and finally invokes the Pynux start_kernel(). */
+     * and finally invokes the Hamnix start_kernel(). */
     jmp     start_kernel_asm_entry
 
 /* ---------- 64-bit GDT used to enter long mode -------------------- *

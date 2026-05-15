@@ -1,0 +1,576 @@
+# init/main.py
+#
+# Hamnix start_kernel() — mirrors init/main.c in Linux. Called from
+# arch/x86/kernel/head_64.S:start_kernel_asm_entry after BSS is zeroed.
+#
+# As of M16.9 the bring-up sequence mirrors Linux's init/main.c quite
+# closely, in this call order:
+#
+#   setup_early_printk()       (drivers/tty/serial/early_8250.py)
+#   trap_init()                (arch/x86/kernel/idt.py)
+#   mem_init()                 (arch/x86/mm/init.py: memblock + pages + slab)
+#   setup_per_cpu_areas()      (arch/x86/kernel/setup_percpu.py)
+#   i8259_init() + time_init() (PIC + PIT @ 100 Hz)
+#   sched_init() + kthread_create(...)
+#   local_irq_enable() (sti)
+#   start_first_task()         — never returns
+#
+# After start_first_task() the system is purely preemptive: the only
+# path that calls schedule() is the timer ISR. The two demo workers
+# busy-loop without any cooperative yield; the timer alone shuffles
+# control between them.
+
+from drivers.tty.serial.early_8250 import setup_early_printk
+from kernel.printk.printk import (
+    printk0, printk1, printk2,
+    pr_info, pr_warn, pr_err, pr_emerg,
+)
+from kernel.panic import WARN_ON
+from kernel.list import (
+    ListHead, INIT_LIST_HEAD, list_add, list_add_tail,
+    list_del, list_empty,
+)
+from arch.x86.kernel.idt import idt_init
+from arch.x86.kernel.traps import do_trap          # exported for common_trap
+from arch.x86.kernel.irq import do_irq             # exported for common_irq
+from arch.x86.mm.init import mem_init
+from arch.x86.kernel.setup_percpu import setup_per_cpu_areas, get_cpu_id
+from arch.x86.kernel.i8259 import i8259_init, i8259_disable
+from arch.x86.kernel.time import time_init, get_jiffies, get_local_timer_ticks
+from arch.x86.kernel.apic import (
+    apic_init, lapic_setup_timer, lapic_calibrate_and_setup_timer,
+)
+from arch.x86.kernel.smp import smp_boot_secondary, get_cpus_online
+from kernel.sched.core import (
+    sched_init, kthread_create, create_user_task,
+    start_first_task, current_task_pid, task_pml4,
+)
+from arch.x86.kernel.syscall import syscall_init
+from drivers.video.console.vga_text import (
+    vga_init, vga_putc, vga_puts, vga_read_cell_char,
+)
+from fs.vfs import (
+    vfs_init, vfs_open, vfs_read, vfs_close,
+    initramfs_data_ptr, initramfs_data_size,
+)
+from fs.elf import elf_load_blob
+from arch.x86.kernel.module import module_api_init, module_load
+from drivers.pci.pci import pci_scan
+from drivers.net.netfilter import (
+    netfilter_init, register_netfilter_hook, nf_run_hooks,
+    NF_HOOK_ACCEPT,
+)
+
+extern def enter_user_mode(entry: uint64, stack: uint64)
+extern def user_demo_entry()
+extern def tss_init(rsp0: uint64)
+from mm.memblock import memblock_alloc, memblock_used, memblock_avail
+from mm.page_alloc import (
+    alloc_page, free_page, alloc_pages, free_pages,
+    page_alloc_total, page_alloc_free_count, count_free_at_order,
+)
+from mm.slab import kmalloc, kfree, kzalloc
+
+extern def trigger_int3()
+extern def local_irq_enable()
+extern def cpu_relax()
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memmove(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+def trap_init():
+    idt_init()
+
+
+# --- Netfilter smoke-test hook -------------------------------------
+#
+# Counts every packet it sees. Returns ACCEPT so the chain walk
+# continues (no-op since this is the only hook for now). Hook
+# signature matches the convention in drivers/net/netfilter.py:
+#   (data: Ptr[uint8], length: uint64) -> int32
+
+nf_packets_seen: uint64 = 0
+
+
+def packet_count_hook(data: Ptr[uint8], length: uint64) -> int32:
+    nf_packets_seen = nf_packets_seen + 1
+    printk2("netfilter: hook saw packet len=%d (total=%d)\n",
+            length, nf_packets_seen)
+    return NF_HOOK_ACCEPT
+
+
+def net_smoke_test():
+    # Scan PCI bus then run the netfilter chain on a synthetic
+    # 64-byte "packet". The real-driver path comes later; the goal
+    # here is to prove the infrastructure (PCI config-space access,
+    # netfilter hook chain + indirect call) works end-to-end.
+    pci_scan()
+    netfilter_init()
+    rc: int32 = register_netfilter_hook(cast[uint64](&packet_count_hook))
+    if rc != 0:
+        printk0("netfilter: registration failed\n")
+        return
+
+    # Inject a synthetic packet so the hook actually runs. The 64
+    # bytes come from a memblock allocation; we don't care about
+    # contents — the hook only reads `length`.
+    pkt: uint64 = memblock_alloc(64, 8)
+    memset(cast[Ptr[uint8]](pkt), 0xAB, 64)
+    verdict: int32 = nf_run_hooks(cast[Ptr[uint8]](pkt), 64)
+    printk1("netfilter: chain verdict = %d\n",
+            cast[uint64](verdict))
+
+
+def memblock_smoke_test():
+    printk0("Hamnix: memblock smoke test\n")
+    a: uint64 = memblock_alloc(128, 16)
+    b: uint64 = memblock_alloc(256, 64)
+    c: uint64 = memblock_alloc(64, 8)
+    printk1("  alloc(128,16) = %p\n", a)
+    printk1("  alloc(256,64) = %p\n", b)
+    printk1("  alloc( 64, 8) = %p\n", c)
+
+
+def page_alloc_smoke_test():
+    printk0("Hamnix: page_alloc smoke test\n")
+    p1: uint64 = alloc_page()
+    printk1("  alloc_page #1 = %p\n", p1)
+    free_page(p1)
+    p2: uint64 = alloc_page()
+    printk1("  alloc_page #2 = %p  (expect == #1)\n", p2)
+    p3: uint64 = alloc_page()
+    printk1("  alloc_page #3 = %p  (fresh)\n", p3)
+    free_page(p2)
+    # After freeing p2, order-0 has 1 entry (p2). order-1 entry count
+    # depends on prior splits but should not change between this and
+    # the next print.
+    printk2("  after free(p2): order0=%d order1=%d\n",
+            count_free_at_order(0), count_free_at_order(1))
+    free_page(p3)
+    # p3 is p2's buddy (consecutive 4 KiB pages from the same 8 KiB
+    # split). M16.23 buddy merging should pop p2 off order-0 and
+    # produce one extra order-1 entry. Cascading: the new order-1
+    # entry's buddy is also free (left over from the original split),
+    # so we merge again to order-2, and so on. The net effect of
+    # freeing both halves of the previously-split run is that the
+    # entire 4 MiB top-level block can recombine — proving the
+    # buddy chain works end-to-end.
+    printk2("  after free(p3): order0=%d order1=%d\n",
+            count_free_at_order(0), count_free_at_order(1))
+    printk2("  cascaded: order2=%d  order10=%d  (1 if fully merged)\n",
+            count_free_at_order(2), count_free_at_order(10))
+    printk2("  page_alloc: total=%d free=%d\n",
+            page_alloc_total(), page_alloc_free_count())
+
+
+def slab_smoke_test():
+    printk0("Hamnix: slab smoke test\n")
+    a: uint64 = kmalloc(48)
+    b: uint64 = kmalloc(48)
+    c: uint64 = kmalloc(200)
+    d: uint64 = kmalloc(1500)
+    printk1("  kmalloc(  48) = %p\n", a)
+    printk1("  kmalloc(  48) = %p\n", b)
+    printk1("  kmalloc( 200) = %p\n", c)
+    printk1("  kmalloc(1500) = %p\n", d)
+    kfree(b)
+    e: uint64 = kmalloc(48)
+    printk1("  kmalloc(  48) after kfree(b) = %p  (expect == b)\n", e)
+    cast[Ptr[uint64]](a)[0] = 0xCAFEBABE_DEADBEEF
+    val: uint64 = cast[Ptr[uint64]](a)[0]
+    printk1("  *a after write = %x\n", val)
+    kfree(a)
+    kfree(c)
+    kfree(d)
+    kfree(e)
+    kfree(0x123456)        # bad pointer — magic check should warn
+
+    # --- large kmalloc path: alloc_pages-backed -------------------
+    # Pick sizes that span multiple order classes:
+    #   8000  ->  order 1 (2 pages = 8 KiB after header)
+    #   20000 ->  order 3 (8 pages = 32 KiB)
+    #   100000 -> order 5 (32 pages = 128 KiB)
+    large1: uint64 = kmalloc(8000)
+    large2: uint64 = kmalloc(20000)
+    large3: uint64 = kmalloc(100000)
+    printk1("  kmalloc(  8000) = %p  (order 1)\n", large1)
+    printk1("  kmalloc( 20000) = %p  (order 3)\n", large2)
+    printk1("  kmalloc(100000) = %p  (order 5)\n", large3)
+
+    # Write/read the last byte of the largest block to prove the
+    # full range is mapped + usable (no segfault here means the
+    # entire 128 KiB is alive).
+    cast[Ptr[uint8]](large3 + 99999)[0] = 0x5A
+    val8: uint8 = cast[Ptr[uint8]](large3 + 99999)[0]
+    printk1("  large3[99999] roundtrip = 0x%x  (expect 0x5a)\n",
+            cast[uint64](val8))
+
+    kfree(large1)
+    kfree(large2)
+    kfree(large3)
+
+    # Re-allocate at the same order — should return one of the
+    # freed runs (LIFO order from the per-order free list).
+    reuse: uint64 = kmalloc(20000)
+    printk1("  kmalloc(20000) after free = %p  (expect == prev)\n", reuse)
+    kfree(reuse)
+
+
+def string_ops_smoke_test():
+    # Exercise memset, memcpy, memmove (forward + backward), kzalloc.
+    # Each result is read back via printk so any miscompile shows up
+    # as a visible mismatch in the serial output.
+    printk0("Hamnix: string-ops smoke test\n")
+
+    # --- memset: fill 8 bytes with 0xAA, expect 0xAAAAAAAAAAAAAAAA --
+    buf_a: uint64 = kmalloc(64)
+    memset(cast[Ptr[uint8]](buf_a), 0xAA, 8)
+    printk1("  memset(0xAA, 8) -> %x\n", cast[Ptr[uint64]](buf_a)[0])
+
+    # --- memcpy: copy 16 bytes from one slot to another -----------
+    cast[Ptr[uint64]](buf_a)[0] = 0xDEADBEEF_CAFEBABE
+    cast[Ptr[uint64]](buf_a)[1] = 0x1234567890ABCDEF
+    buf_b: uint64 = kmalloc(64)
+    memset(cast[Ptr[uint8]](buf_b), 0, 16)
+    memcpy(cast[Ptr[uint8]](buf_b), cast[Ptr[uint8]](buf_a), 16)
+    printk1("  memcpy -> [0]=%x\n", cast[Ptr[uint64]](buf_b)[0])
+    printk1("  memcpy -> [1]=%x\n", cast[Ptr[uint64]](buf_b)[1])
+
+    # --- memmove with backwards overlap: shift buffer right by 4 --
+    # Initial: bytes 0..7 = 1,2,3,4,5,6,7,8.
+    # memmove(buf+4, buf+0, 4): should shift left 4 bytes into right 4.
+    # Result: 1,2,3,4,1,2,3,4.  Tests the dst>src backward-walk path.
+    p8: Ptr[uint8] = cast[Ptr[uint8]](buf_a)
+    p8[0] = 1
+    p8[1] = 2
+    p8[2] = 3
+    p8[3] = 4
+    p8[4] = 5
+    p8[5] = 6
+    p8[6] = 7
+    p8[7] = 8
+    memmove(cast[Ptr[uint8]](buf_a + 4), cast[Ptr[uint8]](buf_a), 4)
+    printk2("  memmove backward: [0..3]=%x [4..7]=%x\n",
+            cast[Ptr[uint32]](buf_a)[0],
+            cast[Ptr[uint32]](buf_a + 4)[0])
+
+    # --- kzalloc: 96 bytes, every quad reads back as 0 -------------
+    z: uint64 = kzalloc(96)
+    bad: uint64 = 0
+    i: uint64 = 0
+    while i < 12:
+        if cast[Ptr[uint64]](z + i * 8)[0] != 0:
+            bad = bad + 1
+        i = i + 1
+    printk1("  kzalloc(96): non-zero quads = %d  (expect 0)\n", bad)
+
+    kfree(buf_a)
+    kfree(buf_b)
+    kfree(z)
+
+
+# --- list_head smoke test ------------------------------------------
+#
+# Container struct: a tiny payload + an embedded ListHead. Mirrors
+# how Linux's task_struct / kmem_cache / file etc. embed a
+# `struct list_head` for chaining. Both globals and the offset
+# constant below are referenced from the smoke test below.
+
+class ListNode:
+    value:    uint64           # offset  0
+    pad:      uint64           # offset  8 (keeps link 16-byte aligned)
+    link:     ListHead         # offset 16, size 16
+
+
+# Byte offset of `link` within ListNode. Hamnix has no container_of
+# macro, so the container-walk code has to subtract this constant
+# explicitly from a ListHead pointer to recover the surrounding
+# ListNode.
+LIST_NODE_LINK_OFFSET: uint64 = 16
+
+
+demo_head: ListHead
+demo_n1:   ListNode
+demo_n2:   ListNode
+demo_n3:   ListNode
+
+
+def _list_walk_and_sum(head: Ptr[ListHead]) -> uint64:
+    # Walk forward from head, summing each node's payload `value`.
+    # Stops when we loop back to head — the canonical circular-list
+    # termination condition. Uses container_of to recover the
+    # enclosing ListNode from its embedded ListHead pointer; mirrors
+    # Linux's `list_for_each_entry` macro at the body level.
+    head_addr: uint64 = cast[uint64](head)
+    pos:       uint64 = head[0].next_ptr
+    total:     uint64 = 0
+    while pos != head_addr:
+        link: Ptr[ListHead] = cast[Ptr[ListHead]](pos)
+        node: Ptr[ListNode] = container_of(link, ListNode, link)
+        total = total + node[0].value
+        pos = link[0].next_ptr
+    return total
+
+
+def list_smoke_test():
+    printk0("Hamnix: list_head smoke test\n")
+
+    INIT_LIST_HEAD(&demo_head)
+    printk1("  list_empty after init = %d  (expect 1)\n",
+            cast[uint64](list_empty(&demo_head)))
+
+    demo_n1.value = 10
+    demo_n2.value = 20
+    demo_n3.value = 30
+
+    list_add(&demo_n1.link, &demo_head)
+    list_add(&demo_n2.link, &demo_head)
+    list_add(&demo_n3.link, &demo_head)
+
+    printk1("  list_empty after 3 adds = %d  (expect 0)\n",
+            cast[uint64](list_empty(&demo_head)))
+
+    total: uint64 = _list_walk_and_sum(&demo_head)
+    printk1("  walked sum = %d  (expect 60)\n", total)
+
+    list_del(&demo_n2.link)
+    total = _list_walk_and_sum(&demo_head)
+    printk1("  after list_del(n2): sum = %d  (expect 40)\n", total)
+
+    list_add_tail(&demo_n2.link, &demo_head)
+    total = _list_walk_and_sum(&demo_head)
+    printk1("  after list_add_tail(n2): sum = %d  (expect 60)\n", total)
+
+
+def vga_smoke_test():
+    # Write a short string to the framebuffer at row 0, then read back
+    # the cells via serial. This works in -nographic where no display
+    # exists — VGA memory at 0xB8000 still receives writes, and the
+    # readback confirms the path end-to-end.
+    printk0("Hamnix: VGA framebuffer smoke test\n")
+    vga_init()
+    vga_puts("Hamnix VGA framebuffer @ 0xB8000\n")
+    vga_puts("If you are seeing this in a graphical QEMU window,\n")
+    vga_puts("the text-mode console works.\n")
+
+    # Read first 9 cells of row 0 back over serial. We wrote "Hamnix VGA"
+    # as the first 9 characters above, so the readback should match.
+    printk0("  readback first row 0: '")
+    j: uint64 = 0
+    while j < 9:
+        printk1("%c", cast[uint64](vga_read_cell_char(0, j)))
+        j = j + 1
+    printk0("'\n")
+    printk0("Hamnix: list_head smoke test\n")
+
+    INIT_LIST_HEAD(&demo_head)
+    printk1("  list_empty after init = %d  (expect 1)\n",
+            cast[uint64](list_empty(&demo_head)))
+
+    demo_n1.value = 10
+    demo_n2.value = 20
+    demo_n3.value = 30
+
+    # Add at head: post-add order is 1 -> 2 -> 3 ... wait no,
+    # list_add inserts AT THE FRONT, so calling order 1,2,3 yields
+    # head -> 3 -> 2 -> 1 -> back to head.
+    list_add(&demo_n1.link, &demo_head)
+    list_add(&demo_n2.link, &demo_head)
+    list_add(&demo_n3.link, &demo_head)
+
+    printk1("  list_empty after 3 adds = %d  (expect 0)\n",
+            cast[uint64](list_empty(&demo_head)))
+
+    # Walk sum: 30 + 20 + 10 = 60. Independent of insertion order,
+    # which is also a soft validity check on prev pointers.
+    total: uint64 = _list_walk_and_sum(&demo_head)
+    printk1("  walked sum = %d  (expect 60)\n", total)
+
+    # Remove the middle node (n2), walk again. Expected: 30 + 10 = 40.
+    list_del(&demo_n2.link)
+    total = _list_walk_and_sum(&demo_head)
+    printk1("  after list_del(n2): sum = %d  (expect 40)\n", total)
+
+    # list_add_tail puts a node at the BACK; after the del above the
+    # list is head -> 3 -> 1 -> head, so a tail-add of n2 makes it
+    # head -> 3 -> 1 -> 2 -> head. Sum becomes 30+10+20 = 60 again.
+    list_add_tail(&demo_n2.link, &demo_head)
+    total = _list_walk_and_sum(&demo_head)
+    printk1("  after list_add_tail(n2): sum = %d  (expect 60)\n", total)
+
+
+def diag_smoke_test():
+    # Exercise the log-level wrappers and WARN_ON. panic() and BUG()
+    # are not invoked here because they halt the box; we just confirm
+    # the diagnostic banners render correctly.
+    printk0("Hamnix: diag smoke test\n")
+    pr_emerg("EMERG-level message\n")
+    pr_alert_test: int32 = 0          # placeholder, no pr_alert here
+    pr_err("test error message\n")
+    pr_warn("test warning message\n")
+    pr_info("test info message\n")
+
+    # WARN_ON with a false condition: must NOT print.
+    rc1: uint64 = WARN_ON(0, "(silent) WARN_ON(0) should not appear")
+    printk1("  WARN_ON(0) returned %d\n", rc1)
+
+    # WARN_ON with a true condition: must print but continue.
+    rc2: uint64 = WARN_ON(1, "(loud) WARN_ON(1) fires intentionally")
+    printk1("  WARN_ON(1) returned %d\n", rc2)
+
+
+# --- Preemption demo -----------------------------------------------
+#
+# Both tasks run a tight busy-loop with no cooperative yield. Without
+# preemption, only task A would ever get the CPU. With the M16.9
+# preemption path, the PIT timer interrupts the running task every
+# ~10 ms and schedule() rotates to the other. The expected output
+# is interleaved 'A' and 'B' characters, with a roughly even mix —
+# proof that the timer ISR is genuinely taking the CPU away from
+# unwilling code.
+#
+# We cap total prints from each task at MAX_PRINTS so the smoke test
+# halts cleanly instead of running forever.
+
+print_count_a: uint64 = 0
+print_count_b: uint64 = 0
+MAX_PRINTS:    uint64 = 40
+inner_iters:   uint64 = 200000   # busy-spin between prints
+
+
+def halt_forever():
+    asm_volatile("cli")
+    while True:
+        asm_volatile("hlt")
+
+
+def task_a_entry():
+    while True:
+        printk0("A")
+        print_count_a = print_count_a + 1
+        if print_count_a + print_count_b >= MAX_PRINTS:
+            printk0("\n")
+            printk2("Hamnix: jiffies=%d  local_timer_ticks=%d (per-CPU)\n",
+                    get_jiffies(), get_local_timer_ticks())
+            printk0("Hamnix: preemption demo done, halting\n")
+            halt_forever()
+        i: uint64 = 0
+        while i < inner_iters:
+            i = i + 1
+
+
+def task_b_entry():
+    while True:
+        printk0("B")
+        print_count_b = print_count_b + 1
+        if print_count_a + print_count_b >= MAX_PRINTS:
+            printk0("\n")
+            printk2("Hamnix: jiffies=%d  local_timer_ticks=%d (per-CPU)\n",
+                    get_jiffies(), get_local_timer_ticks())
+            printk0("Hamnix: preemption demo done, halting\n")
+            halt_forever()
+        i: uint64 = 0
+        while i < inner_iters:
+            i = i + 1
+
+
+def start_kernel():
+    setup_early_printk()
+    printk0("Hamnix kernel booting...\n")
+    printk0("Hamnix: hello from start_kernel\n")
+
+    trap_init()
+    printk0("Hamnix: trap_init done\n")
+
+    mem_init()
+    memblock_smoke_test()
+    page_alloc_smoke_test()
+    slab_smoke_test()
+    string_ops_smoke_test()
+    diag_smoke_test()
+    list_smoke_test()
+    vga_smoke_test()
+    net_smoke_test()
+
+    setup_per_cpu_areas()
+    printk1("Hamnix: smp_processor_id() = %d\n", get_cpu_id())
+
+    # Initialize the 8259 (sets vector remap + masks everything),
+    # then disable it; bring the LAPIC up; configure the LAPIC timer
+    # in periodic mode. The IDT timer vector (32) is unchanged — only
+    # the source switches from PIT to LAPIC. time_init() still wires
+    # the PIT for legacy callers but with the 8259 masked nothing
+    # delivered from there reaches the CPU.
+    i8259_init()
+    time_init()
+    i8259_disable()
+    apic_init()
+    # Calibrate the LAPIC timer against PIT channel 2 (10 ms one-shot),
+    # then program periodic mode at the measured rate. Replaces the
+    # M16.22 hand-picked initial count.
+    lapic_calibrate_and_setup_timer()
+
+    # M16.24: bring up the secondary CPU via INIT-SIPI-SIPI. Requires
+    # QEMU launched with `-smp 2`. If launched with -smp 1 the SIPI
+    # delivers nowhere and the AP never bumps cpus_online, which is
+    # caught and reported (timeout, not a hang).
+    smp_boot_secondary()
+    printk1("Hamnix: cpus_online = %d\n", get_cpus_online())
+
+    # Initialise the VFS fd table BEFORE any user task issues SYS_OPEN.
+    vfs_init()
+
+    # M16.32: bring the module loader API table online and demo-load
+    # the hello module so we know the insmod-equivalent path works
+    # before any userspace runs.
+    module_api_init()
+    module_load("/kmod_hello")
+
+    # --- M16.30: load /init from cpio via the ELF loader ----------
+    # exec() into a real userspace binary instead of the baked-in
+    # user_demo_entry. The ELF lives in the cpio archive (embedded
+    # at build time by scripts/build_initramfs.py); fs/elf.py walks
+    # its PT_LOAD segments and returns the live entry address.
+    init_blob: uint64 = initramfs_data_ptr("/init")
+    init_size: uint64 = initramfs_data_size("/init")
+    if init_blob == 0:
+        printk0("Hamnix: /init not in initramfs; falling back to baked entry\n")
+        init_entry: uint64 = cast[uint64](&user_demo_entry)
+    else:
+        printk2("Hamnix: ELF-loading /init (%d bytes from %p)\n",
+                init_size, init_blob)
+        init_entry: uint64 = elf_load_blob(
+            cast[Ptr[uint8]](init_blob), init_size)
+        if init_entry == 0:
+            printk0("Hamnix: /init load failed; falling back\n")
+            init_entry = cast[uint64](&user_demo_entry)
+        else:
+            printk1("Hamnix: /init entry @ %p\n", init_entry)
+
+    sched_init()
+    parent_slot: int32 = create_user_task(
+        init_entry, 0x5f5f696e69745f5f)         # "__init__"
+    printk1("Hamnix: parent user task @ slot %d\n",
+            cast[uint64](parent_slot))
+    printk1("Hamnix: parent task PML4 = %p (per-task)\n",
+            task_pml4(parent_slot))
+
+    # Allocate a single syscall-time kernel stack used by
+    # syscall_entry's user_rsp_save / kernel_rsp slots. Each task has
+    # its own ring-0 stack already (task->kstack_top); TSS.RSP0 is
+    # updated by schedule() on every context switch so a CPL-3 IRQ
+    # lands on the CURRENT task's kstack. Wiring the syscall path
+    # through the per-task kstack too is a TODO that lands when we
+    # have proper preemption-during-syscall.
+    syscall_kstack: uint64 = alloc_page() + 4096
+    syscall_init(syscall_kstack)
+    # tss_init's RSP0 arg is just a seed — start_first_task will
+    # overwrite TSS.RSP0 with slot 0's kstack_top before iretq'ing.
+    tss_init(syscall_kstack)
+
+    printk0("Hamnix: entering parent via start_first_task...\n")
+    start_first_task()
+    # NOT REACHED — schedule() halts the box when all tasks exit.
+    printk0("Hamnix: ERROR — returned from start_first_task\n")
+    halt_forever()

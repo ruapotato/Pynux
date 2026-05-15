@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch and build the custom x86_64 Linux kernel for the Pynux M1 dev loop.
+# Fetch and build the custom x86_64 Linux kernel for the Hamnix M1 dev loop.
 #
 # Produces a bzImage with mitigations off (see x86_kernel_config.sh) that
 # scripts/run_x86_module.sh boots under QEMU. This is a one-time setup step
@@ -7,14 +7,14 @@
 #
 # Env overrides:
 #   KERNEL_VERSION  kernel.org stable version      (default: 6.12.48)
-#   PYNUX_KERNEL_DIR  where to put the source tree  (default: ~/pynux-kernel)
+#   PYNUX_KERNEL_DIR  where to put the source tree  (default: ~/hamnix-kernel)
 #
 # Build dependencies (Debian): build-essential flex bison libelf-dev
 # libssl-dev bc. Install them first if `make` complains.
 set -euo pipefail
 
 KERNEL_VERSION="${KERNEL_VERSION:-6.12.48}"
-PYNUX_KERNEL_DIR="${PYNUX_KERNEL_DIR:-$HOME/pynux-kernel}"
+PYNUX_KERNEL_DIR="${PYNUX_KERNEL_DIR:-$HOME/hamnix-kernel}"
 KSRC="$PYNUX_KERNEL_DIR/linux"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

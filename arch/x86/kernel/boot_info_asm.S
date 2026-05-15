@@ -9,9 +9,9 @@
  *      .globl mb_info
  *      mb_info:  .long 0
  *
- * Pynux currently has no "extern variable" syntax, so we read those
+ * Hamnix currently has no "extern variable" syntax, so we read those
  * symbols out via tiny accessor functions instead. Both slots store
- * 32-bit values that we zero-extend into a uint64 for the Pynux
+ * 32-bit values that we zero-extend into a uint64 for the Hamnix
  * caller. The multiboot info struct lives below 4 GiB (multiboot1
  * spec) so the upper bits are genuinely zero.
  */

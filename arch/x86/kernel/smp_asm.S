@@ -4,7 +4,7 @@
  * The AP boot trampoline (arch/x86/realmode/trampoline.S) far-jumps
  * into `ap_main_64` after reaching long mode on the AP. This file
  * houses that landing function and a couple of small accessors the
- * Pynux SMP layer needs but can't express directly:
+ * Hamnix SMP layer needs but can't express directly:
  *
  *   get_bsp_cr3()                     read CR3 on the BSP so we can
  *                                     plant it in the trampoline's
@@ -21,7 +21,7 @@
  *
  *   ap_main_64                        the 64-bit entry the AP jumps
  *                                     into once it's in long mode.
- *                                     Calls Pynux ap_main_pynux().
+ *                                     Calls Hamnix ap_main_hamnix().
  */
 
     .code64
@@ -105,13 +105,13 @@ ap_stack_top_addr:
  * The AP already has a valid kernel stack (set from ap_stack_top by
  * the trampoline) and is sharing the BSP's page tables via CR3.
  *
- * From here we just call into Pynux. The C-style ABI shuffle is
+ * From here we just call into Hamnix. The C-style ABI shuffle is
  * straightforward: no args, no return.  */
     .align 16
     .globl ap_main_64
 ap_main_64:
-    call    ap_main_pynux
-    /* Defensive: if ap_main_pynux ever returns, halt the AP. */
+    call    ap_main_hamnix
+    /* Defensive: if ap_main_hamnix ever returns, halt the AP. */
 1:  cli
     hlt
     jmp 1b

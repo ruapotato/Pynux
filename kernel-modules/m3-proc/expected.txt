@@ -1,5 +1,5 @@
-# M3.1: /proc/pynux/state must exist and its contents come from the
-# Pynux-implemented seq_file show callback.
+# M3.1: /proc/hamnix/state must exist and its contents come from the
+# Hamnix-implemented seq_file show callback.
 [M3-PROC] registered
-hello from pynux procfs
+hello from hamnix procfs
 [M3-PROC] unregistered

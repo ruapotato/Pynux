@@ -4,7 +4,7 @@
  * Mirrors arch/x86/realmode/rm/trampoline_64.S in Linux. SIPI dropped
  * the AP at CS=0x0800:IP=0x0000 (physical 0x8000) in 16-bit real mode.
  * From here we need to transition all the way to 64-bit long mode and
- * jump into the Pynux-side `ap_main_64` landing function.
+ * jump into the Hamnix-side `ap_main_64` landing function.
  *
  * The trampoline is linked with VMA=0x8000 but LMA inside the loaded
  * kernel image (see vmlinux.lds). The BSP memcpys the bytes to 0x8000
@@ -141,7 +141,7 @@ ap_gdt_descriptor_lm:
  * These quads are read in 32-bit / 64-bit code paths above. BSP
  * writes them just before sending INIT-SIPI-SIPI; the linker
  * places them at known offsets within the trampoline so the BSP
- * (Pynux side) can compute their physical address as
+ * (Hamnix side) can compute their physical address as
  *      0x8000 + (label - ap_trampoline_start).
  */
     .balign 8

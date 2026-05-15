@@ -1,4 +1,4 @@
-# M4.2: a Pynux virtio_driver registered for VIRTIO_ID_BLOCK gets a
+# M4.2: a Hamnix virtio_driver registered for VIRTIO_ID_BLOCK gets a
 # probe callback, sets up a virtqueue via vdev->config->find_vqs, does
 # a DMA-coherent allocation, submits a read of sector 0, and gets the
 # response. The disk image's sector 0 starts with "PYNU" (0x50 0x59

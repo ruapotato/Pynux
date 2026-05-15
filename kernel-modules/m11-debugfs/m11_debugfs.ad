@@ -1,0 +1,35 @@
+# Hamnix M11.2: debugfs entry.
+#
+# debugfs_create_dir("hamnix", NULL) + debugfs_create_u32("counter",
+# 0644, dir, &counter) exposes a Hamnix-owned u32 under
+# /sys/kernel/debug/hamnix/counter. Userspace cats it (reads the
+# value), echoes to it (writes the value). All done by the debugfs
+# core; Hamnix just owns the storage.
+
+extern def debugfs_create_dir(name: Ptr[char], parent: Ptr[uint8]) -> Ptr[uint8]
+extern def debugfs_create_u32(name: Ptr[char], mode: int32,
+                              parent: Ptr[uint8], value: Ptr[uint8]) -> Ptr[uint8]
+extern def debugfs_remove(entry: Ptr[uint8])
+extern def _printk(fmt: str, val: int32) -> int32
+
+
+hamnix_dfs_dir:   Ptr[uint8]
+hamnix_dfs_value: int32
+
+
+def init_module() -> int32:
+    hamnix_dfs_dir = debugfs_create_dir("hamnix", 0)
+    if hamnix_dfs_dir == 0:
+        _printk("[DFS] debugfs_create_dir FAILED\n", 0)
+        return -12
+    hamnix_dfs_value = 0x42
+    debugfs_create_u32("counter", 420, hamnix_dfs_dir, &hamnix_dfs_value)
+    _printk("[DFS] /sys/kernel/debug/hamnix/counter created\n", 0)
+    return 0
+
+
+def cleanup_module():
+    if hamnix_dfs_dir != 0:
+        debugfs_remove(hamnix_dfs_dir)
+    _printk("[DFS] final value = %d\n", hamnix_dfs_value)
+    _printk("[DFS] unregistered\n", 0)

@@ -4,7 +4,7 @@
  * Mirrors arch/x86/entry/entry_64.S's per-vector entry stubs in Linux.
  * 32 trap stubs (one per CPU exception vector) all funnel into
  * common_trap, which saves the caller-saved register set, hands the
- * vector number to the Pynux `do_trap()`, and halts.
+ * vector number to the Hamnix `do_trap()`, and halts.
  *
  * Asymmetry between vectors:
  *   - The CPU pushes an error code only for certain vectors (8, 10,
@@ -18,7 +18,7 @@
  * Symbol export: `trap_stub_table` is a 32-quad array of trap stub
  * addresses, consumed by `idt_init()` in arch/x86/kernel/idt.py to
  * populate IDT gate offsets. Keeping the dispatch table in asm avoids
- * a chain of leaq's in Pynux and gives us a single place to add
+ * a chain of leaq's in Hamnix and gives us a single place to add
  * vectors later.
  */
 
@@ -83,8 +83,8 @@ trap_stub_\n:
  * On entry the stack contains, from high to low addresses:
  *   ss, rsp, rflags, cs, rip, error_code, vector
  * %rsp points at `vector`. We save the SysV caller-saved set, load
- * the vector into %rdi (1st arg), and call into Pynux. We never
- * return — Pynux's do_trap halts.
+ * the vector into %rdi (1st arg), and call into Hamnix. We never
+ * return — Hamnix's do_trap halts.
  */
     .align 16
     .globl common_trap
@@ -167,8 +167,8 @@ trap_stub_table:
     .long trap_stub_31; .long 0
 
 /* ---------- idt_load: build descriptor on stack, lidt ------------ *
- * Pynux's asm_volatile() is zero-operand, so byte-packing the 10-byte
- * lidt operand from Pynux would be awkward. We take just the base
+ * Hamnix's asm_volatile() is zero-operand, so byte-packing the 10-byte
+ * lidt operand from Hamnix would be awkward. We take just the base
  * address in %rdi (SysV first arg) and build the full descriptor in
  * a stack-allocated 16-byte slot here, then `lidt` from it. Limit is
  * a fixed constant: 256 gates × 16 bytes − 1 = 4095.
@@ -190,7 +190,7 @@ idt_load:
     ret
 
 /* get_trap_stub: return trap_stub_table[vector] for vector in %rdi.
- * Used by Pynux's idt_init() to populate gate offsets without needing
+ * Used by Hamnix's idt_init() to populate gate offsets without needing
  * to express asm-symbol-address arithmetic at the language level. */
     .align 16
     .globl get_trap_stub
@@ -199,8 +199,8 @@ get_trap_stub:
     movq (%rax, %rdi, 8), %rax
     ret
 
-/* trigger_int3: provoke vector 3 from Pynux. Single byte 0xCC.
- * A Pynux-side smoke test calls this after idt_init() to confirm
+/* trigger_int3: provoke vector 3 from Hamnix. Single byte 0xCC.
+ * A Hamnix-side smoke test calls this after idt_init() to confirm
  * the handler chain works end-to-end. */
     .align 16
     .globl trigger_int3

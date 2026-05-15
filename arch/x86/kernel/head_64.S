@@ -1,15 +1,15 @@
 /*
- * arch/x86/kernel/head_64.S - Pynux 64-bit kernel entry.
+ * arch/x86/kernel/head_64.S - Hamnix 64-bit kernel entry.
  *
  * Mirrors Linux's arch/x86/kernel/head_64.S: it is the first 64-bit code
  * that runs as "the kernel proper" after the bootloader / decompressor
- * hands off. For Pynux the handoff comes from arch/x86/boot/header.S's
+ * hands off. For Hamnix the handoff comes from arch/x86/boot/header.S's
  * long_mode_start, which jumps here once long mode is live, segments are
  * reloaded, and the boot stack is anchored.
  *
  * Responsibilities (minimal for M16.1):
- *   1. Zero the kernel BSS (the Pynux compiler places globals there).
- *   2. Call the Pynux-emitted start_kernel().
+ *   1. Zero the kernel BSS (the Hamnix compiler places globals there).
+ *   2. Call the Hamnix-emitted start_kernel().
  *   3. If start_kernel ever returns, halt the CPU.
  */
 
@@ -29,7 +29,7 @@ start_kernel_asm_entry:
     cld
     rep stosq
 
-    /* Hand off to the Pynux kernel. SysV AMD64: no args, no return value. */
+    /* Hand off to the Hamnix kernel. SysV AMD64: no args, no return value. */
     call    start_kernel
 
     /* If start_kernel returns (it shouldn't yet), halt forever. */

@@ -7,11 +7,11 @@
  *   1. saves the user's RIP (came in via %rcx) and RFLAGS (via %r11),
  *   2. switches RSP from user_rsp to kernel_rsp,
  *   3. shuffles the syscall-ABI registers into SysV positions and
- *      calls a Pynux `do_syscall(nr, a0, a1, a2)`,
+ *      calls a Hamnix `do_syscall(nr, a0, a1, a2)`,
  *   4. restores everything and sysretq's back to user.
  *
- * Plus a few helpers Pynux needs that touch privileged MSRs / segment
- * selectors / iretq, neither expressible in pure Pynux today:
+ * Plus a few helpers Hamnix needs that touch privileged MSRs / segment
+ * selectors / iretq, neither expressible in pure Hamnix today:
  *
  *   write_msr / read_msr   - generic MSR access
  *   set_efer_sce            - flip IA32_EFER.SCE so SYSCALL works at all
@@ -53,7 +53,7 @@ syscall_entry:
     pushq   %r12                      /* park user %r12 on user stack */
 
     /* Park user RSP, load kernel RSP. user_rsp_save / kernel_rsp are
-     * regular .data globals defined by Pynux side; leaq RIP-relative
+     * regular .data globals defined by Hamnix side; leaq RIP-relative
      * because absolute references generate BFD_RELOC_X86_64_32S in
      * elf32-i386.   */
     leaq    user_rsp_save(%rip), %r12
@@ -178,7 +178,7 @@ enter_user_mode:
 
 /* ---------- user_demo_entry: ring-3 test payload ----------------- *
  * A tiny user program that issues a series of SYS_PUTC (nr=0) calls
- * to print "Pynux user: HELLO\n" character-by-character, then a
+ * to print "Hamnix user: HELLO\n" character-by-character, then a
  * SYS_EXIT (nr=1) which never returns. Demonstrates:
  *
  *   - User code actually executing at CPL 3 (the iretq landed).
@@ -233,7 +233,7 @@ user_demo_entry:
 
 .Lread_done:
     /* lseek(fd, 9, SEEK_SET) + read 12 + write to stdout. Byte 9
-     * of /motd is "Pynux from a" — proves the seek repositions. */
+     * of /motd is "Hamnix from a" — proves the seek repositions. */
     movq    %r13, %rdi
     movq    $9, %rsi
     movq    $0, %rdx                   /* SEEK_SET                   */

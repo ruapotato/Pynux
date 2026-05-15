@@ -1,5 +1,5 @@
 """
-Pynux Parser - Recursive descent parser for Python-style syntax.
+Adder Parser - Recursive descent parser for Python-style syntax.
 
 Builds AST from tokens. Uses Python 3.10+ match statements.
 """
@@ -21,7 +21,7 @@ class ParseError(Exception):
 
 
 class Parser:
-    """Recursive descent parser for Pynux."""
+    """Recursive descent parser for Adder."""
 
     def __init__(self, tokens: list[Token], filename: str = "<string>"):
         self.tokens = tokens

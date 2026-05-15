@@ -1,5 +1,5 @@
 /*
- * mod/module.lds - linker script for Pynux kernel modules.
+ * mod/module.lds - linker script for Hamnix kernel modules.
  *
  * Same elf32-i386 wrapper as the kernel image and user binaries.
  * Modules are position-independent (RIP-relative throughout); link

@@ -1,0 +1,56 @@
+# Hamnix M7.1: Kprobes — Hamnix instruments a kernel function.
+#
+# Registers a kprobe at __x64_sys_openat. The Hamnix pre_handler runs
+# before every openat() syscall in the kernel, increments a counter,
+# and returns 0 (continue). The /init script triggers some opens
+# implicitly (cat, ls); cleanup prints the count.
+#
+# This proves Hamnix can intercept arbitrary kernel functions — every
+# call to the chosen function passes through Hamnix code before the
+# original handler runs.
+
+extern def register_kprobe(p: Ptr[uint8]) -> int32
+extern def unregister_kprobe(p: Ptr[uint8])
+extern def memset(dst: Ptr[uint8], v: int32, n: uint64) -> Ptr[uint8]
+extern def _printk(fmt: str, val: int32) -> int32
+
+
+# struct kprobe (128 bytes; key offsets probed)
+#   addr          @ 40  — resolved by kernel from symbol_name
+#   symbol_name   @ 48
+#   pre_handler   @ 64
+#   post_handler  @ 72
+class Kprobe:
+    pad_pre_addr:    Array[40, uint8]
+    addr:            Ptr[uint8]            # 40 (kernel fills in)
+    symbol_name:     Ptr[char]             # 48
+    pad_after_sym:   Array[8, uint8]       # 56..64
+    pre_handler:     Ptr[uint8]            # 64
+    post_handler:    Ptr[uint8]            # 72
+    pad_end:         Array[48, uint8]      # 80..128
+
+
+hamnix_kp:       Kprobe
+hamnix_kp_count: int32
+
+
+def hamnix_pre_handler(p: Ptr[uint8], regs: Ptr[uint8]) -> int32:
+    hamnix_kp_count = hamnix_kp_count + 1
+    # Don't printk per-call — openat is way too hot. Counter only.
+    return 0
+
+
+def init_module() -> int32:
+    memset(&hamnix_kp, 0, 128)
+    hamnix_kp.symbol_name = "__x64_sys_openat"
+    hamnix_kp.pre_handler = hamnix_pre_handler
+
+    rc: int32 = register_kprobe(&hamnix_kp)
+    _printk("[KPROBE] register rc = %d\n", rc)
+    return rc
+
+
+def cleanup_module():
+    unregister_kprobe(&hamnix_kp)
+    _printk("[KPROBE] openat calls intercepted = %d\n", hamnix_kp_count)
+    _printk("[KPROBE] unregistered\n", 0)

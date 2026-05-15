@@ -15,7 +15,7 @@
  *   memmove(dst, src, n)  ->  dst, handling overlap (backwards copy
  *                              if dst > src)
  *
- * For Pynux extern decls, use any of:
+ * For Hamnix extern decls, use any of:
  *   extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
  *   extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
  *   extern def memmove(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]

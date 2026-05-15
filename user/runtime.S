@@ -1,11 +1,11 @@
 /*
- * user/runtime.S - Pynux userspace runtime.
+ * user/runtime.S - Hamnix userspace runtime.
  *
  * Provides the _start entry point and a small set of syscall wrappers
- * that Pynux user programs can call as ordinary `extern def` symbols.
+ * that Hamnix user programs can call as ordinary `extern def` symbols.
  *
  * Calling convention mismatch (and why these wrappers exist):
- *   Pynux generated code uses System V AMD64 (rdi, rsi, rdx, rcx, r8, r9
+ *   Hamnix generated code uses System V AMD64 (rdi, rsi, rdx, rcx, r8, r9
  *   for the first six integer/pointer args, return in rax).
  *   Our kernel's syscall entry expects:
  *     %rax = syscall number

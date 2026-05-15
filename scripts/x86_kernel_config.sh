@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Apply the Pynux M1 kernel configuration to a kernel source tree.
+# Apply the Hamnix M1 kernel configuration to a kernel source tree.
 #
 # Starts from `make defconfig` and disables the x86 mitigations that the
-# Pynux x86_64 backend does not yet emit code for, while enabling the
+# Hamnix x86_64 backend does not yet emit code for, while enabling the
 # serial console + module loading that the QEMU dev loop needs.
 #
 # Usage: x86_kernel_config.sh <kernel-source-dir>

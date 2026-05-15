@@ -1,5 +1,5 @@
 /*
- * arch/x86/kernel/vmlinux.lds - Pynux bare-metal x86_64 kernel linker script.
+ * arch/x86/kernel/vmlinux.lds - Hamnix bare-metal x86_64 kernel linker script.
  *
  * Mirrors arch/x86/kernel/vmlinux.lds.S (Linux). The kernel is loaded at
  * the standard multiboot 1 MiB physical address; for M16.1 we identity-map
@@ -35,7 +35,7 @@ SECTIONS
         *(.head.text)
     }
 
-    /* Main kernel text: head_64.S + every Pynux-emitted .text section. */
+    /* Main kernel text: head_64.S + every Hamnix-emitted .text section. */
     .text : ALIGN(16) {
         *(.text)
         *(.text.*)
@@ -71,7 +71,7 @@ SECTIONS
      * LMA is the current load cursor — the bytes ride along in the
      * kernel image at whatever address that resolves to; the BSP
      * memcpys them from LMA to VMA before sending SIPI. Mirrors the
-     * same VMA/LMA-split trick Pynux already uses for .data..percpu. */
+     * same VMA/LMA-split trick Hamnix already uses for .data..percpu. */
     __ap_trampoline_load = .;
     .ap_trampoline 0x8000 : AT(__ap_trampoline_load) {
         __ap_trampoline_start = .;

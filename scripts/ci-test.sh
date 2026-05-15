@@ -1,5 +1,5 @@
 #!/bin/bash
-# Pynux CI Test Runner
+# Hamnix CI Test Runner
 #
 # Builds and runs tests in QEMU, returns exit codes for CI integration.
 #
@@ -59,7 +59,7 @@ for arg in "$@"; do
 done
 
 echo -e "${CYAN}======================================${NC}"
-echo -e "${CYAN}  Pynux CI Test Runner${NC}"
+echo -e "${CYAN}  Hamnix CI Test Runner${NC}"
 echo -e "${CYAN}======================================${NC}"
 echo ""
 
@@ -93,7 +93,7 @@ QEMU_OUTPUT=$(timeout $TIMEOUT qemu-system-arm \
     -M mps2-an385 \
     -cpu cortex-m3 \
     -nographic \
-    -kernel build/pynux.elf 2>&1) || true
+    -kernel build/hamnix.elf 2>&1) || true
 
 if [ "$VERBOSE" = true ]; then
     echo "$QEMU_OUTPUT"

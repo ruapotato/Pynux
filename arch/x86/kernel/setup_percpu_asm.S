@@ -2,7 +2,7 @@
  * arch/x86/kernel/setup_percpu_asm.S - low-level per-CPU helpers.
  *
  * Mirrors the inline-asm bits scattered through arch/x86/kernel/setup_percpu.c
- * and arch/x86/include/asm/percpu.h. Pynux's asm_volatile is zero-operand,
+ * and arch/x86/include/asm/percpu.h. Hamnix's asm_volatile is zero-operand,
  * so anything that needs register-bound operands lives here as plain
  * SysV-AMD64 function calls.
  *
@@ -45,10 +45,10 @@ read_cpu_id_percpu:
 
 /* ---------- Per-CPU template accessors --------------------------
  * The codegen emits `__per_cpu_template_start` / `__per_cpu_template_end`
- * around the Pynux-side .data..percpu block. setup_per_cpu_areas()
+ * around the Hamnix-side .data..percpu block. setup_per_cpu_areas()
  * reads these to memcpy() the master template into each CPU's area.
  *
- * Pynux has no extern-variable syntax, and absolute references
+ * Hamnix has no extern-variable syntax, and absolute references
  * (`movl sym, %eax`) blow up under elf32-i386 (BFD_RELOC_X86_64_32S).
  * Workaround: stash the values as plain `.long sym` words in .rodata
  * where the relocation resolves to a literal 32-bit address at link

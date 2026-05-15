@@ -1,1 +1,1 @@
-"""Pynux compiler - Python syntax to native ARM."""
+"""Adder compiler - Python syntax to native ARM."""

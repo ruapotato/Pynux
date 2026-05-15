@@ -1,4 +1,4 @@
-# M4.3b: Pynux virtio_driver matches VIRTIO_ID_NET; probe reads MAC
+# M4.3b: Hamnix virtio_driver matches VIRTIO_ID_NET; probe reads MAC
 # from config space (QEMU SLIRP default 52:54:00:12:34:56) and sets up
 # both virtqueues.
 [VNET] register rc = 0

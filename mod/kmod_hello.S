@@ -1,7 +1,7 @@
 /*
  * mod/kmod_hello.S - sample loadable kernel module.
  *
- * Demonstrates Pynux's M16.32 module loader. The kernel ELF-loads
+ * Demonstrates Hamnix's M16.32 module loader. The kernel ELF-loads
  * this binary into kernel-mode memory and calls `init_module` at
  * CPL=0 with a Ptr[ModuleApi] in %rdi.
  *

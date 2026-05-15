@@ -1,32 +1,32 @@
-# Contributing to Pynux
+# Contributing to Hamnix
 
-Thank you for your interest in contributing to Pynux! This guide explains how to set up your development environment, understand the codebase, and submit contributions.
+Thank you for your interest in contributing to Hamnix! This guide explains how to set up your development environment, understand the codebase, and submit contributions.
 
 ## Project Overview
 
-Pynux is a Python-like systems programming language that compiles to ARM Cortex-M3 assembly. It targets embedded systems and provides direct hardware control with Python-style syntax.
+Hamnix is a Python-like systems programming language that compiles to ARM Cortex-M3 assembly. It targets embedded systems and provides direct hardware control with Python-style syntax.
 
 ## Project Structure
 
 ```
-pynux/
+hamnix/
 ├── compiler/           # Compiler implementation (Python)
 │   ├── lexer.py       # Tokenizer
 │   ├── parser.py      # Recursive descent parser
 │   ├── ast_nodes.py   # AST node definitions
 │   ├── type_checker.py# Type analysis
 │   └── codegen_arm.py # ARM assembly generator
-├── kernel/            # OS kernel (Pynux source)
+├── kernel/            # OS kernel (Hamnix source)
 │   ├── process.py     # Process management, signals, IPC
 │   ├── devfs.py       # Device filesystem
 │   ├── ramfs.py       # RAM filesystem
 │   └── timer.py       # Timer subsystem
-├── lib/               # Standard library (Pynux source)
+├── lib/               # Standard library (Hamnix source)
 │   ├── io.py          # Basic I/O
 │   ├── memory.py      # Memory management
 │   ├── string.py      # String operations
 │   └── ...            # Other libraries
-├── apps/              # Applications (Pynux source)
+├── apps/              # Applications (Hamnix source)
 ├── tests/             # Test suite
 ├── docs/              # Documentation
 └── build.sh           # Build script
@@ -43,8 +43,8 @@ pynux/
 ### Getting Started
 
 ```bash
-git clone https://github.com/your-org/pynux.git
-cd pynux
+git clone https://github.com/your-org/hamnix.git
+cd hamnix
 
 # Run the build to verify setup
 ./build.sh
@@ -55,7 +55,7 @@ python3 tests/test_compiler.py
 
 ## Language Syntax
 
-Pynux uses Python-like syntax with explicit type annotations:
+Hamnix uses Python-like syntax with explicit type annotations:
 
 ### Types
 
@@ -279,7 +279,7 @@ python3 tests/test_compiler.py
 
 ### Writing Tests
 
-For Pynux code tests (run on target):
+For Hamnix code tests (run on target):
 
 ```python
 def test_feature():
@@ -381,4 +381,4 @@ devfs_write(DEV_GPIO, 0, "1")
 
 ## License
 
-By contributing to Pynux, you agree that your contributions will be licensed under the same license as the project.
+By contributing to Hamnix, you agree that your contributions will be licensed under the same license as the project.

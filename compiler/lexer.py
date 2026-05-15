@@ -1,5 +1,5 @@
 """
-Pynux Lexer - Tokenizes Python-syntax source code.
+Adder Lexer - Tokenizes Python-syntax source code.
 
 Clean Python 3.10+ implementation using enums and dataclasses.
 """
@@ -46,7 +46,7 @@ class TokenType(Enum):
     NONLOCAL = auto()
     DEL = auto()
 
-    # Pynux-specific
+    # Adder-specific
     EXTERN = auto()
     ASM = auto()
     DEFER = auto()
@@ -208,7 +208,7 @@ KEYWORDS: dict[str, TokenType] = {
     "False": TokenType.FALSE,
     "None": TokenType.NONE,
 
-    # Pynux-specific
+    # Adder-specific
     "extern": TokenType.EXTERN,
     "asm": TokenType.ASM,
     "defer": TokenType.DEFER,
@@ -290,7 +290,7 @@ class LexerError(Exception):
 
 
 class Lexer:
-    """Tokenizes Pynux source code."""
+    """Tokenizes Adder source code."""
 
     def __init__(self, source: str, filename: str = "<string>"):
         self.source = source

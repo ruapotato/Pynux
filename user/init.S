@@ -1,7 +1,7 @@
 /*
  * user/init.S - first real userspace binary, loaded from cpio at boot.
  *
- * Hand-written so we don't need a Pynux→user-mode compiler target
+ * Hand-written so we don't need a Hamnix→user-mode compiler target
  * yet. The whole thing is position-independent (all data access via
  * RIP-relative leaq) so the kernel can place the loaded segment at
  * any physical address and just jump in.

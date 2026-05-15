@@ -36,7 +36,7 @@
  *     bits 32..63 reserved
  *
  * tss_init(rsp0) is a single asm helper that performs all three
- * runtime steps (set RSP0, build descriptor, ltr) so Pynux callers
+ * runtime steps (set RSP0, build descriptor, ltr) so Hamnix callers
  * don't have to express the bit-packing themselves.
  */
 

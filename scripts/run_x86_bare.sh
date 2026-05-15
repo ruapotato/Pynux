@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# scripts/run_x86_bare.sh - Boot the Pynux bare-metal kernel under QEMU.
+# scripts/run_x86_bare.sh - Boot the Hamnix bare-metal kernel under QEMU.
 #
-# Builds build/pynux-vmlinux.elf from init/main.py if needed, then runs it
+# Builds build/hamnix-vmlinux.elf from init/main.ad if needed, then runs it
 # via `qemu-system-x86_64 -kernel`. Serial output (the banner) goes to
 # stdout. Times out after a short window since the kernel halts after
 # printing — that's the success signal.
@@ -12,7 +12,7 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 mkdir -p build
-ELF=build/pynux-vmlinux.elf
+ELF=build/hamnix-vmlinux.elf
 
 # Build the userland binaries and kernel modules before regenerating
 # the cpio archive — the archive embeds whatever sits in build/user/
@@ -28,10 +28,10 @@ bash scripts/build_modules.sh
 echo "[run_x86_bare] Regenerating fs/initramfs_blob.S from cpio"
 python3 scripts/build_initramfs.py
 
-echo "[run_x86_bare] Compiling init/main.py -> $ELF"
-python3 -m compiler.pynux compile \
+echo "[run_x86_bare] Compiling init/main.ad -> $ELF"
+python3 -m compiler.adder compile \
     --target=x86_64-bare-metal \
-    init/main.py \
+    init/main.ad \
     -o "$ELF"
 
 echo "[run_x86_bare] file $ELF"

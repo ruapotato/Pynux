@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/build_modules.sh - assemble + link Pynux kernel modules.
+# scripts/build_modules.sh - assemble + link Hamnix kernel modules.
 #
 # Each mod/*.S becomes build/mod/<name>.elf; scripts/build_initramfs.py
 # embeds them as /<name> entries (with the kmod_ prefix preserved) so

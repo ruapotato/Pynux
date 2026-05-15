@@ -1,0 +1,165 @@
+# Hamnix M4.3b: a virtio-net driver. Per the research-agent's Option A,
+# this validates the registration + config-space-read + virtqueue-setup
+# path. Mirrors the same skeleton as m4_virtio_blk: matching id_table,
+# probe callback, indirect call through vdev->config vtable.
+#
+# Exercises:
+#   * virtio_driver registration against VIRTIO_ID_NET (=1).
+#   * config-space read via vdev->config->get (offset 0 of
+#     virtio_config_ops) — reads the 6-byte MAC.
+#   * find_vqs with TWO virtqueues (the RX/"input" and TX/"output" pair).
+#
+# After load, the Hamnix probe prints the device's MAC address
+# (QEMU SLIRP default: 52:54:00:12:34:56) and confirms both virtqueues
+# came up.
+
+# -------- externs ---------------------------------------------------------
+extern def __register_virtio_driver(drv: Ptr[uint8], owner: Ptr[uint8]) -> int32
+extern def unregister_virtio_driver(drv: Ptr[uint8])
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], v: int32, n: uint64) -> Ptr[uint8]
+extern def __this_module() -> int32
+extern def _printk(fmt: str, val: int32) -> int32
+
+
+# -------- struct layouts (probed) ----------------------------------------
+class DeviceDriver:
+    name: Ptr[char]
+    pad_after_name: Array[8, uint8]
+    owner: Ptr[uint8]
+    pad_end: Array[120, uint8]
+
+class VirtioDriver:
+    driver: DeviceDriver
+    id_table: Ptr[uint8]
+    feature_table: Ptr[uint8]
+    pad1: Array[32, uint8]
+    probe: Ptr[uint8]
+    pad2: Array[8, uint8]
+    remove: Ptr[uint8]
+    pad_end: Array[24, uint8]
+
+class VirtioDeviceId:
+    device: int32
+    vendor: int32
+
+
+# -------- offsets in kernel structs --------------------------------------
+VDEV_CONFIG_OFF:    int32 = 744    # struct virtio_config_ops *
+VCO_GET_OFF:        int32 = 0      # void (*get)(vdev, offset, buf, len)
+VCO_RESET_OFF:      int32 = 40     # void reset(vdev)
+VCO_FIND_VQS_OFF:   int32 = 48     # find_vqs
+VCO_DEL_VQS_OFF:    int32 = 56     # void del_vqs(vdev)
+
+# struct virtio_net_config (24 bytes; mac@0 of 6 bytes, status@6 u16)
+VNET_CONFIG_MAC_OFF: int32 = 0
+
+
+# -------- constants ------------------------------------------------------
+VIRTIO_ID_NET_VAL: int32 = 1
+VIRTIO_ID_ANY:     int32 = -1
+
+
+# -------- globals --------------------------------------------------------
+hamnix_ids: VirtioDeviceId
+hamnix_drv: VirtioDriver
+
+# vq names: "input\0output\0" (13 bytes); each is the name argument
+# vqs_info[i] expects.
+hamnix_vq_names:  Array[16, uint8]
+hamnix_vqs_info:  Array[64, uint8]    # 2 x struct virtqueue_info (32 bytes)
+hamnix_vqs:       Array[16, uint8]    # 2 x struct virtqueue *
+
+
+def hamnix_probe(vdev: Ptr[uint8]) -> int32:
+    _printk("[VNET] probe enter\n", 0)
+
+    # Read MAC via vdev->config->get(vdev, offset, buf, len).
+    config_ptr: Ptr[uint8] = 0
+    memcpy(&config_ptr, vdev + VDEV_CONFIG_OFF, 8)
+    get_fn: Ptr[uint8] = 0
+    memcpy(&get_fn, config_ptr + VCO_GET_OFF, 8)
+
+    # vp_get (modern virtio-pci) only handles 1/2/4/8-byte reads — BUG()s
+    # on anything else. Read the 6-byte MAC one byte at a time, mirroring
+    # virtio_cread_bytes().
+    mac: Array[6, uint8]
+    memset(&mac, 0, 6)
+    i: int32 = 0
+    while i < 6:
+        get_fn(vdev, i, &mac + i, 1)
+        i = i + 1
+
+    # Print each MAC byte. _printk takes (fmt, int), so emit 6 lines.
+    b0: int32 = 0
+    memcpy(&b0, &mac, 1)
+    b1: int32 = 0
+    memcpy(&b1, &mac + 1, 1)
+    b2: int32 = 0
+    memcpy(&b2, &mac + 2, 1)
+    b3: int32 = 0
+    memcpy(&b3, &mac + 3, 1)
+    b4: int32 = 0
+    memcpy(&b4, &mac + 4, 1)
+    b5: int32 = 0
+    memcpy(&b5, &mac + 5, 1)
+    _printk("[VNET] mac[0] = 0x%x\n", b0)
+    _printk("[VNET] mac[1] = 0x%x\n", b1)
+    _printk("[VNET] mac[2] = 0x%x\n", b2)
+    _printk("[VNET] mac[3] = 0x%x\n", b3)
+    _printk("[VNET] mac[4] = 0x%x\n", b4)
+    _printk("[VNET] mac[5] = 0x%x\n", b5)
+
+    # Set up the (rx, tx) virtqueue pair. names = "input", "output".
+    memcpy(&hamnix_vq_names, "input\0output\0", 13)
+    memset(&hamnix_vqs_info, 0, 64)
+    rx_name_addr: Ptr[uint8] = &hamnix_vq_names
+    tx_name_addr: Ptr[uint8] = &hamnix_vq_names + 6
+    memcpy(&hamnix_vqs_info, &rx_name_addr, 8)
+    memcpy(&hamnix_vqs_info + 32, &tx_name_addr, 8)
+
+    find_vqs_fn: Ptr[uint8] = 0
+    memcpy(&find_vqs_fn, config_ptr + VCO_FIND_VQS_OFF, 8)
+
+    rc: int32 = find_vqs_fn(vdev, 2, &hamnix_vqs, &hamnix_vqs_info, 0)
+    _printk("[VNET] find_vqs rc = %d\n", rc)
+    if rc != 0:
+        return rc
+
+    _printk("[VNET] probe complete\n", 0)
+    return 0
+
+
+def hamnix_remove(vdev: Ptr[uint8]):
+    # The virtio core WARNs if dev->config->get_status is non-zero after
+    # the driver's remove() returns ("Driver should have reset device").
+    # Call reset() + del_vqs() to clear that.
+    config_ptr: Ptr[uint8] = 0
+    memcpy(&config_ptr, vdev + VDEV_CONFIG_OFF, 8)
+    reset_fn: Ptr[uint8] = 0
+    memcpy(&reset_fn, config_ptr + VCO_RESET_OFF, 8)
+    reset_fn(vdev)
+    del_vqs_fn: Ptr[uint8] = 0
+    memcpy(&del_vqs_fn, config_ptr + VCO_DEL_VQS_OFF, 8)
+    del_vqs_fn(vdev)
+    _printk("[VNET] remove called\n", 0)
+
+
+def init_module() -> int32:
+    hamnix_ids.device = VIRTIO_ID_NET_VAL
+    hamnix_ids.vendor = VIRTIO_ID_ANY
+
+    hamnix_drv.driver.name = "hamnix-virtio-net"
+    hamnix_drv.driver.owner = __this_module
+    hamnix_drv.id_table = &hamnix_ids
+    hamnix_drv.probe = hamnix_probe
+    hamnix_drv.remove = hamnix_remove
+
+    rc: int32 = __register_virtio_driver(&hamnix_drv, __this_module)
+    _printk("[VNET] register rc = %d\n", rc)
+    return 0
+
+
+def cleanup_module():
+    unregister_virtio_driver(&hamnix_drv)
+    _printk("[VNET] unregistered\n", 0)

@@ -1,5 +1,5 @@
 """
-Pynux AST Node Definitions
+Adder AST Node Definitions
 
 All node types for the Abstract Syntax Tree.
 Uses dataclasses for clean, immutable node definitions.

@@ -1,5 +1,5 @@
 """
-Pynux x86_64 backend — Linux kernel module target.
+Adder x86_64 backend — Linux kernel module target.
 
 A hand-written x86_64 encoder, deliberately chosen over LLVM to keep zero
 external dependencies and stay consistent with the hand-written ARM Thumb-2
@@ -58,7 +58,7 @@ ARG_REGS = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"]
 # Names recognized by the x86 backend as inline intrinsics rather than
 # normal function calls.
 #   outb/inb: the kernel's are `static __always_inline` with no exported
-#     symbols, so Pynux must emit the bare `out`/`in` instructions.
+#     symbols, so Adder must emit the bare `out`/`in` instructions.
 #   asm_volatile(s): general inline asm — emit the string literal verbatim
 #     as a `.text` instruction. Zero-operand for now (the brief's required
 #     #3 extension); supports cli/sti/pause/mfence/etc.
@@ -81,7 +81,7 @@ class LocalVar:
 
 @dataclass
 class StructInfo:
-    """Field layout of a Pynux class used as a C-ABI-compatible struct."""
+    """Field layout of a Adder class used as a C-ABI-compatible struct."""
     name: str
     fields: list[tuple[str, Type, int]]  # (field name, type, byte offset)
     total_size: int                       # 8-byte-aligned total
@@ -302,7 +302,7 @@ class X86CodeGen:
     # -- program ------------------------------------------------------------
 
     def gen_program(self, program: Program) -> str:
-        self.emit("# Pynux generated x86_64 assembly")
+        self.emit("# Adder generated x86_64 assembly")
         self.emit("# Target: x86_64-linux-kernel-module (System V AMD64)")
         self.emit()
 
@@ -892,12 +892,12 @@ class X86CodeGen:
                 # x86 shift count must be in %cl.
                 self.emit("    shlq %cl, %rax")
             case BinOp.SHR:
-                # Logical shift right (Pynux ints are non-negative for M2).
+                # Logical shift right (Adder ints are non-negative for M2).
                 self.emit("    shrq %cl, %rax")
             case BinOp.DIV | BinOp.IDIV:
                 # divq divides %rdx:%rax by the operand and leaves the
                 # quotient in %rax, remainder in %rdx. We zero %rdx for
-                # an unsigned 64/64 → 64 division — Pynux uint types
+                # an unsigned 64/64 → 64 division — Adder uint types
                 # all share the 64-bit encoding, and current call sites
                 # (PIT divisor math) are non-negative. When signed
                 # division is needed we'll branch on operand type.
@@ -1102,7 +1102,7 @@ class X86CodeGen:
 
         # Indirect call: if the name resolves to a local (or global scalar
         # of pointer type), call through the value rather than the symbol.
-        # This is how Pynux invokes function pointers stored in vtables
+        # This is how Adder invokes function pointers stored in vtables
         # (e.g. `find_vqs_fn(vdev, ...)` after loading from
         # `vdev->config->find_vqs`).
         indirect = (
@@ -1195,5 +1195,5 @@ class X86CodeGen:
 
 
 def generate(program: Program, bare_metal: bool = False) -> str:
-    """Generate x86_64 assembly from a Pynux AST."""
+    """Generate x86_64 assembly from a Adder AST."""
     return X86CodeGen(bare_metal=bare_metal).gen_program(program)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Pynux x86_64 kernel-module dev loop: build -> boot QEMU -> read serial.
+# Hamnix x86_64 kernel-module dev loop: build -> boot QEMU -> read serial.
 #
-# Builds a Pynux kernel module, packs it into the busybox initramfs, boots
+# Builds a Hamnix kernel module, packs it into the busybox initramfs, boots
 # the custom mitigations-off kernel under QEMU with -serial stdio, and
 # asserts the module's printk output appeared. This closes the
 # code -> build -> boot -> read -> iterate loop for the kernel-module target.
@@ -9,7 +9,7 @@
 # Usage: run_x86_module.sh [module-dir]      (default: kernel-modules/hello)
 #
 # Env overrides:
-#   PYNUX_KERNEL_DIR  kernel + busybox location  (default: ~/pynux-kernel)
+#   PYNUX_KERNEL_DIR  kernel + busybox location  (default: ~/hamnix-kernel)
 #   KDIR              kernel build tree          (default: $PYNUX_KERNEL_DIR/linux)
 #   TIMEOUT           QEMU timeout in seconds    (default: 60)
 #
@@ -21,7 +21,7 @@ set -euo pipefail
 
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODULE_DIR="${1:-kernel-modules/hello}"
-PYNUX_KERNEL_DIR="${PYNUX_KERNEL_DIR:-$HOME/pynux-kernel}"
+PYNUX_KERNEL_DIR="${PYNUX_KERNEL_DIR:-$HOME/hamnix-kernel}"
 KDIR="${KDIR:-$PYNUX_KERNEL_DIR/linux}"
 TIMEOUT="${TIMEOUT:-60}"
 
@@ -59,28 +59,28 @@ echo "[run] packing initramfs"
 echo "[run] booting QEMU (timeout ${TIMEOUT}s)"
 echo "---------------------------------------------------------------"
 # console=ttyS0 keeps the kernel printing during boot (before our module
-# loads). console=pynux is parsed as a pending match — register_console
+# loads). console=hamnix is parsed as a pending match — register_console
 # enables our console when its name matches.
 # Two -serial slots so the guest sees ttyS0 (stdio = console) AND
 # ttyS1 (null backend, but the 16550A hardware on 0x2f8/IRQ 3 is now
 # wired into QEMU — needed by M4.1's UART-RX IRQ test on COM2).
 # virtio-blk-pci attached so M4.2's driver has a device to probe; the
 # /init script handles unbinding the kernel's built-in virtio_blk so
-# our Pynux driver can claim it.
-DISKIMG="$PROJ_ROOT/build/pynuxblk.img"
+# our Hamnix driver can claim it.
+DISKIMG="$PROJ_ROOT/build/hamnixblk.img"
 DISK_ARGS=""
 if [ -f "$DISKIMG" ]; then
-    DISK_ARGS="-drive file=$DISKIMG,if=none,id=pynuxblk,format=raw \
-               -device virtio-blk-pci,drive=pynuxblk"
+    DISK_ARGS="-drive file=$DISKIMG,if=none,id=hamnixblk,format=raw \
+               -device virtio-blk-pci,drive=hamnixblk"
 fi
 # Always wire a virtio-net device with SLIRP user-mode networking so the
-# M4.3b Pynux virtio-net driver has a device to probe. Other modules
+# M4.3b Hamnix virtio-net driver has a device to probe. Other modules
 # pay a few-line boot tax but no functional cost.
-NET_ARGS="-netdev user,id=pynuxnet -device virtio-net-pci,netdev=pynuxnet"
+NET_ARGS="-netdev user,id=hamnixnet -device virtio-net-pci,netdev=hamnixnet"
 OUTPUT="$(timeout "$TIMEOUT" qemu-system-x86_64 \
     -kernel "$BZIMAGE" \
     -initrd "$INITRAMFS" \
-    -append "console=ttyS0 console=pynux panic=-1 nokaslr" \
+    -append "console=ttyS0 console=hamnix panic=-1 nokaslr" \
     -nographic -monitor none \
     -serial stdio -serial null \
     $DISK_ARGS \

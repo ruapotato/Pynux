@@ -1,5 +1,5 @@
-PYNUX     ?= python3 -m compiler.pynux
-KDIR      ?= $(HOME)/pynux-kernel/linux
+PYNUX     ?= python3 -m compiler.adder
+KDIR      ?= $(HOME)/hamnix-kernel/linux
 PWD       := $(shell pwd)
 PROJ_ROOT := $(abspath $(PWD)/../..)
 
@@ -8,10 +8,10 @@ obj-m := m11_debugfs.o
 all: m11_debugfs.S
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-m11_debugfs.S: m11_debugfs.py
+m11_debugfs.S: m11_debugfs.ad
 	cd $(PROJ_ROOT) && $(PYNUX) compile \
 	    --target=x86_64-linux-kernel-module \
-	    kernel-modules/m11-debugfs/m11_debugfs.py \
+	    kernel-modules/m11-debugfs/m11_debugfs.ad \
 	    -o kernel-modules/m11-debugfs/m11_debugfs.S
 
 clean:

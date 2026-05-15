@@ -1,6 +1,6 @@
-# Pynux Language Reference
+# Adder Language Reference
 
-Pynux is a Python-syntax systems programming language that compiles to ARM Thumb-2 assembly for Cortex-M3 microcontrollers.
+Adder is a Python-syntax systems programming language that compiles to ARM Thumb-2 assembly for Cortex-M3 microcontrollers.
 
 ## Table of Contents
 - [Types](#types)

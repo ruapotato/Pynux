@@ -1,5 +1,5 @@
-PYNUX     ?= python3 -m compiler.pynux
-KDIR      ?= $(HOME)/pynux-kernel/linux
+PYNUX     ?= python3 -m compiler.adder
+KDIR      ?= $(HOME)/hamnix-kernel/linux
 PWD       := $(shell pwd)
 PROJ_ROOT := $(abspath $(PWD)/../..)
 
@@ -8,10 +8,10 @@ obj-m := m10_zero.o
 all: m10_zero.S
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-m10_zero.S: m10_zero.py
+m10_zero.S: m10_zero.ad
 	cd $(PROJ_ROOT) && $(PYNUX) compile \
 	    --target=x86_64-linux-kernel-module \
-	    kernel-modules/m10-zero/m10_zero.py \
+	    kernel-modules/m10-zero/m10_zero.ad \
 	    -o kernel-modules/m10-zero/m10_zero.S
 
 clean:

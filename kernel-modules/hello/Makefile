@@ -1,6 +1,6 @@
-# kbuild wrapper for the Pynux hello-world kernel module (milestone M1).
+# kbuild wrapper for the Hamnix hello-world kernel module (milestone M1).
 #
-# The Pynux compiler emits hello.S; the Linux kernel build system (kbuild)
+# The Hamnix compiler emits hello.S; the Linux kernel build system (kbuild)
 # owns assembly + link + modpost, turning hello.S into a loadable hello.ko.
 # We do not invoke `as`/`ld` ourselves — this avoids host-vs-kernel
 # assembler-flag mismatch.
@@ -10,8 +10,8 @@
 # against the running distro kernel:
 #   make KDIR=/lib/modules/$(uname -r)/build
 
-PYNUX     ?= python3 -m compiler.pynux
-KDIR      ?= $(HOME)/pynux-kernel/linux
+PYNUX     ?= python3 -m compiler.adder
+KDIR      ?= $(HOME)/hamnix-kernel/linux
 PWD       := $(shell pwd)
 PROJ_ROOT := $(abspath $(PWD)/../..)
 
@@ -20,10 +20,10 @@ obj-m := hello.o
 all: hello.S
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-hello.S: hello.py
+hello.S: hello.ad
 	cd $(PROJ_ROOT) && $(PYNUX) compile \
 	    --target=x86_64-linux-kernel-module \
-	    kernel-modules/hello/hello.py \
+	    kernel-modules/hello/hello.ad \
 	    -o kernel-modules/hello/hello.S
 
 clean:

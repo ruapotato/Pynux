@@ -1,5 +1,5 @@
 """
-Pynux ARM Assembly Optimizer
+Adder ARM Assembly Optimizer
 
 Provides multiple optimization passes for generated ARM Thumb-2 assembly:
 1. Peephole Optimization - Local instruction pattern matching

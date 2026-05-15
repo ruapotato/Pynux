@@ -1,5 +1,5 @@
-PYNUX     ?= python3 -m compiler.pynux
-KDIR      ?= $(HOME)/pynux-kernel/linux
+PYNUX     ?= python3 -m compiler.adder
+KDIR      ?= $(HOME)/hamnix-kernel/linux
 PWD       := $(shell pwd)
 PROJ_ROOT := $(abspath $(PWD)/../..)
 
@@ -8,10 +8,10 @@ obj-m := m6_sync.o
 all: m6_sync.S
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-m6_sync.S: m6_sync.py
+m6_sync.S: m6_sync.ad
 	cd $(PROJ_ROOT) && $(PYNUX) compile \
 	    --target=x86_64-linux-kernel-module \
-	    kernel-modules/m6-sync/m6_sync.py \
+	    kernel-modules/m6-sync/m6_sync.ad \
 	    -o kernel-modules/m6-sync/m6_sync.S
 
 clean:

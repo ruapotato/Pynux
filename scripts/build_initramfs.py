@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 scripts/build_initramfs.py — generates a cpio "newc" archive for the
-bare-metal Pynux initramfs and emits it as a .S file of .byte
+bare-metal Hamnix initramfs and emits it as a .S file of .byte
 directives that the kernel image .incbin-includes.
 
 cpio newc layout (per cpio(5)):
@@ -25,15 +25,15 @@ import os
 from pathlib import Path
 
 FILES = [
-    ("/motd",       b"Welcome to Pynux from a real cpio initramfs!\n"
+    ("/motd",       b"Welcome to Hamnix from a real cpio initramfs!\n"
                     b"This file came out of a newc-formatted blob.\n"),
-    ("/version",    b"Pynux bare-metal kernel, M16.30 - ELF /init loader\n"),
+    ("/version",    b"Hamnix bare-metal kernel, M16.30 - ELF /init loader\n"),
     ("/hello.txt",  b"Hello from a third file. cpio supports many.\n"),
 ]
 
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
-# to swap in a Pynux-compiled user binary without touching user/init.S.
+# to swap in a Hamnix-compiled user binary without touching user/init.S.
 
 
 def cpio_entry(name: str, data: bytes) -> bytes:
@@ -73,7 +73,7 @@ def build_archive() -> bytes:
 
     # If INIT_ELF=<path> is set, embed that file as /init (overriding
     # whatever ELF in build/user/ would otherwise have grabbed the
-    # /init slot). Lets us point /init at e.g. a Pynux-compiled
+    # /init slot). Lets us point /init at e.g. a Hamnix-compiled
     # user/hello.elf for one run without touching user/init.S or the
     # glob below. We track which on-disk path is acting as /init so
     # the directory glob doesn't re-embed it under its native name.

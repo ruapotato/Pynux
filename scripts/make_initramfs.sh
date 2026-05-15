@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the minimal busybox initramfs for the Pynux M1 QEMU dev loop.
+# Build the minimal busybox initramfs for the Hamnix M1 QEMU dev loop.
 #
 # The initramfs auto-loads the kernel module, dumps dmesg, unloads it, and
 # powers off — so QEMU output is fully scriptable. The /init script prints
@@ -12,7 +12,7 @@
 #
 # Env overrides:
 #   BUSYBOX_VERSION   busybox release to build static  (default: 1.36.1)
-#   PYNUX_KERNEL_DIR  cache dir for the busybox build  (default: ~/pynux-kernel)
+#   PYNUX_KERNEL_DIR  cache dir for the busybox build  (default: ~/hamnix-kernel)
 set -euo pipefail
 
 if [ "$#" -lt 1 ]; then
@@ -21,7 +21,7 @@ if [ "$#" -lt 1 ]; then
 fi
 
 BUSYBOX_VERSION="${BUSYBOX_VERSION:-1.36.1}"
-PYNUX_KERNEL_DIR="${PYNUX_KERNEL_DIR:-$HOME/pynux-kernel}"
+PYNUX_KERNEL_DIR="${PYNUX_KERNEL_DIR:-$HOME/hamnix-kernel}"
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$PROJ_ROOT/build"
 BB_SRC="$PYNUX_KERNEL_DIR/busybox-${BUSYBOX_VERSION}"
@@ -77,7 +77,7 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 
 echo "[PYNUX] loading kernel module(s)"
-# If a Pynux virtio-blk module is about to load, unbind the kernel's
+# If a Hamnix virtio-blk module is about to load, unbind the kernel's
 # built-in virtio_blk first so our driver can claim the device.
 if ls /m4_virtio_blk.ko >/dev/null 2>&1; then
     for d in /sys/bus/virtio/drivers/virtio_blk/virtio*; do
@@ -108,10 +108,10 @@ echo "[PYNUX] --- /proc/consoles ---"
 cat /proc/consoles
 echo "[PYNUX] --- end consoles ---"
 
-if [ -e /proc/pynux/state ]; then
-    echo "[PYNUX] --- /proc/pynux/state ---"
-    cat /proc/pynux/state
-    echo "[PYNUX] --- end /proc/pynux/state ---"
+if [ -e /proc/hamnix/state ]; then
+    echo "[PYNUX] --- /proc/hamnix/state ---"
+    cat /proc/hamnix/state
+    echo "[PYNUX] --- end /proc/hamnix/state ---"
 fi
 
 echo "[PYNUX] --- /proc/partitions ---"
@@ -120,11 +120,11 @@ echo "[PYNUX] --- end /proc/partitions ---"
 
 if ls /m11_debugfs.ko >/dev/null 2>&1; then
     mount -t debugfs none /sys/kernel/debug 2>&1 | head -1
-    if [ -e /sys/kernel/debug/pynux/counter ]; then
-        initial=$(cat /sys/kernel/debug/pynux/counter)
+    if [ -e /sys/kernel/debug/hamnix/counter ]; then
+        initial=$(cat /sys/kernel/debug/hamnix/counter)
         echo "[PYNUX] dfs initial = $initial"
-        echo 123 > /sys/kernel/debug/pynux/counter
-        echo "[PYNUX] dfs after write = $(cat /sys/kernel/debug/pynux/counter)"
+        echo 123 > /sys/kernel/debug/hamnix/counter
+        echo "[PYNUX] dfs after write = $(cat /sys/kernel/debug/hamnix/counter)"
     fi
 fi
 
@@ -137,16 +137,16 @@ fi
 
 if ls /m8_netdev.ko >/dev/null 2>&1; then
     echo "[PYNUX] --- m8 netdev ---"
-    # Pynux device gets the next free ethN slot after eth0=virtio-net.
+    # Hamnix device gets the next free ethN slot after eth0=virtio-net.
     ifconfig eth1 192.168.99.1 netmask 255.255.255.0 up 2>&1 | head -2
     ifconfig eth1 2>&1 | head -3
     echo "[PYNUX] --- end netdev ---"
 fi
 
-if [ -d /sys/pynux ]; then
-    echo "[PYNUX] --- /sys/pynux/info ---"
-    cat /sys/pynux/info
-    echo "[PYNUX] --- end /sys/pynux/info ---"
+if [ -d /sys/hamnix ]; then
+    echo "[PYNUX] --- /sys/hamnix/info ---"
+    cat /sys/hamnix/info
+    echo "[PYNUX] --- end /sys/hamnix/info ---"
 fi
 
 if grep -qE '^[ 0-9]*241 pynurand$' /proc/devices 2>/dev/null; then
@@ -161,83 +161,83 @@ if grep -qE '^[ 0-9]*241 pynurand$' /proc/devices 2>/dev/null; then
     rm -f /dev/pynurand
 fi
 
-if grep -qE '^[ 0-9]*243 pynuxnull$' /proc/devices 2>/dev/null; then
-    echo "[PYNUX] --- exercise /dev/pynuxnull ---"
-    mknod /dev/pynuxnull c 243 0
+if grep -qE '^[ 0-9]*243 hamnixnull$' /proc/devices 2>/dev/null; then
+    echo "[PYNUX] --- exercise /dev/hamnixnull ---"
+    mknod /dev/hamnixnull c 243 0
     # busybox echo without -n adds \n, so "hello\n" = 6 bytes
-    printf '%s' "hello" > /dev/pynuxnull
-    eof_bytes=$(dd if=/dev/pynuxnull bs=64 count=1 2>/dev/null | wc -c)
+    printf '%s' "hello" > /dev/hamnixnull
+    eof_bytes=$(dd if=/dev/hamnixnull bs=64 count=1 2>/dev/null | wc -c)
     if [ "$eof_bytes" = "0" ]; then
         echo "[PYNUX] null ok"
     else
         echo "[PYNUX] null FAILED ($eof_bytes bytes from read)"
     fi
-    rm -f /dev/pynuxnull
+    rm -f /dev/hamnixnull
 fi
 
-if grep -qE '^[ 0-9]*242 pynuxzero$' /proc/devices 2>/dev/null; then
-    echo "[PYNUX] --- exercise /dev/pynuxzero ---"
-    mknod /dev/pynuxzero c 242 0
-    nonzero=$(dd if=/dev/pynuxzero bs=1024 count=1 2>/dev/null | tr -d '\0' | wc -c)
+if grep -qE '^[ 0-9]*242 hamnixzero$' /proc/devices 2>/dev/null; then
+    echo "[PYNUX] --- exercise /dev/hamnixzero ---"
+    mknod /dev/hamnixzero c 242 0
+    nonzero=$(dd if=/dev/hamnixzero bs=1024 count=1 2>/dev/null | tr -d '\0' | wc -c)
     if [ "$nonzero" = "0" ]; then
         echo "[PYNUX] zero ok"
     else
         echo "[PYNUX] zero FAILED ($nonzero non-zero bytes)"
     fi
-    rm -f /dev/pynuxzero
+    rm -f /dev/hamnixzero
 fi
 
-if grep -qE '^[ 0-9]*240 pynux$' /proc/devices 2>/dev/null; then
-    echo "[PYNUX] --- exercise /dev/pynux ---"
-    mknod /dev/pynux c 240 0
-    echo "[PYNUX] cat /dev/pynux:"
-    cat /dev/pynux
-    echo "[PYNUX] echo > /dev/pynux:"
-    echo "testdata" > /dev/pynux && echo "[PYNUX] write ok"
-    rm -f /dev/pynux
-    echo "[PYNUX] --- end /dev/pynux ---"
+if grep -qE '^[ 0-9]*240 hamnix$' /proc/devices 2>/dev/null; then
+    echo "[PYNUX] --- exercise /dev/hamnix ---"
+    mknod /dev/hamnix c 240 0
+    echo "[PYNUX] cat /dev/hamnix:"
+    cat /dev/hamnix
+    echo "[PYNUX] echo > /dev/hamnix:"
+    echo "testdata" > /dev/hamnix && echo "[PYNUX] write ok"
+    rm -f /dev/hamnix
+    echo "[PYNUX] --- end /dev/hamnix ---"
 fi
 
-if grep -q pynuxfs /proc/filesystems 2>/dev/null; then
-    echo "[PYNUX] --- exercise pynuxfs ---"
-    mkdir -p /mnt/pynuxfs
-    if mount -t pynuxfs none /mnt/pynuxfs; then
+if grep -q hamnixfs /proc/filesystems 2>/dev/null; then
+    echo "[PYNUX] --- exercise hamnixfs ---"
+    mkdir -p /mnt/hamnixfs
+    if mount -t hamnixfs none /mnt/hamnixfs; then
         echo "[PYNUX] mount ok"
 
         # File create + write + read.
-        if echo "hello from pynuxfs" > /mnt/pynuxfs/greeting; then
+        if echo "hello from hamnixfs" > /mnt/hamnixfs/greeting; then
             echo "[PYNUX] write ok"
         else
             echo "[PYNUX] write FAILED"
         fi
-        if [ -f /mnt/pynuxfs/greeting ]; then
+        if [ -f /mnt/hamnixfs/greeting ]; then
             echo "[PYNUX] file exists"
         fi
-        read_back=$(cat /mnt/pynuxfs/greeting 2>/dev/null)
-        if [ "$read_back" = "hello from pynuxfs" ]; then
+        read_back=$(cat /mnt/hamnixfs/greeting 2>/dev/null)
+        if [ "$read_back" = "hello from hamnixfs" ]; then
             echo "[PYNUX] read ok: $read_back"
         else
             echo "[PYNUX] read FAILED: got '$read_back'"
         fi
 
         # Directory create + remove.
-        if mkdir /mnt/pynuxfs/subdir; then
+        if mkdir /mnt/hamnixfs/subdir; then
             echo "[PYNUX] mkdir ok"
         else
             echo "[PYNUX] mkdir FAILED"
         fi
-        echo "[PYNUX] ls /mnt/pynuxfs:"
-        ls -la /mnt/pynuxfs
+        echo "[PYNUX] ls /mnt/hamnixfs:"
+        ls -la /mnt/hamnixfs
 
         # Cleanup.
-        rm /mnt/pynuxfs/greeting && echo "[PYNUX] rm ok"
-        rmdir /mnt/pynuxfs/subdir && echo "[PYNUX] rmdir ok"
+        rm /mnt/hamnixfs/greeting && echo "[PYNUX] rm ok"
+        rmdir /mnt/hamnixfs/subdir && echo "[PYNUX] rmdir ok"
 
-        umount /mnt/pynuxfs && echo "[PYNUX] umount ok"
+        umount /mnt/hamnixfs && echo "[PYNUX] umount ok"
     else
         echo "[PYNUX] mount FAILED"
     fi
-    echo "[PYNUX] --- end exercise pynuxfs ---"
+    echo "[PYNUX] --- end exercise hamnixfs ---"
 fi
 
 for ko in /*.ko; do

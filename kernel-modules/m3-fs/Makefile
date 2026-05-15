@@ -1,5 +1,5 @@
-PYNUX     ?= python3 -m compiler.pynux
-KDIR      ?= $(HOME)/pynux-kernel/linux
+PYNUX     ?= python3 -m compiler.adder
+KDIR      ?= $(HOME)/hamnix-kernel/linux
 PWD       := $(shell pwd)
 PROJ_ROOT := $(abspath $(PWD)/../..)
 
@@ -8,10 +8,10 @@ obj-m := m3_fs.o
 all: m3_fs.S
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-m3_fs.S: m3_fs.py
+m3_fs.S: m3_fs.ad
 	cd $(PROJ_ROOT) && $(PYNUX) compile \
 	    --target=x86_64-linux-kernel-module \
-	    kernel-modules/m3-fs/m3_fs.py \
+	    kernel-modules/m3-fs/m3_fs.ad \
 	    -o kernel-modules/m3-fs/m3_fs.S
 
 clean:

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Pynux GDB Debugging
+# Hamnix GDB Debugging
 #
 # Usage:
 #   ./scripts/debug.sh              # Debug in QEMU
@@ -39,8 +39,8 @@ for arg in "$@"; do
     esac
 done
 
-if [ ! -f "build/pynux.elf" ]; then
-    echo "Error: build/pynux.elf not found"
+if [ ! -f "build/hamnix.elf" ]; then
+    echo "Error: build/hamnix.elf not found"
     echo "Run: ./build.sh --target=$TARGET"
     exit 1
 fi
@@ -57,7 +57,7 @@ case $TARGET in
             -cpu cortex-m3 \
             -nographic \
             -S -gdb tcp::1234 \
-            -kernel build/pynux.elf &
+            -kernel build/hamnix.elf &
         QEMU_PID=$!
 
         sleep 1
@@ -66,7 +66,7 @@ case $TARGET in
         echo ""
 
         # Connect GDB
-        $GDB build/pynux.elf \
+        $GDB build/hamnix.elf \
             -ex "target remote :1234" \
             -ex "load" \
             -ex "break main" \
@@ -93,7 +93,7 @@ case $TARGET in
         echo ""
 
         # Connect GDB
-        $GDB build/pynux.elf \
+        $GDB build/hamnix.elf \
             -ex "target extended-remote :3333" \
             -ex "monitor reset halt" \
             -ex "load" \
@@ -121,7 +121,7 @@ case $TARGET in
         echo ""
 
         # Connect GDB
-        $GDB build/pynux.elf \
+        $GDB build/hamnix.elf \
             -ex "target extended-remote :3333" \
             -ex "monitor reset halt" \
             -ex "load" \
