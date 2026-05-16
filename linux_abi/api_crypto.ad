@@ -219,6 +219,94 @@ def _l_crypto_shash_digestsize(tfm: uint64) -> uint32:
     return cast[uint32](_digestsize_for_kind(kind))
 
 
+# --- L34: CRC helpers + bulk shash registration ----------------------
+#
+# Stock crypto modules (crc32c_generic, libcrc32c, crc32, ...) reach
+# for two distinct surfaces during init:
+#
+#   1. The CRC-family raw helpers — __crc32c_le, crc32_le, crc32_be.
+#      These are *plain library functions* in Linux (lib/crc32.c,
+#      crypto/crc32c.c), not real shash transforms. Modules call them
+#      directly to compute checksums; the test fixtures we care about
+#      only need them to not blow up and to return *some* deterministic
+#      value (the module's own self-test compares output against a
+#      known constant, but the L34 acceptance criterion is "no page
+#      fault during init" — a placeholder return is fine).
+#
+#   2. The shash registration surface — crypto_register_shash and the
+#      bulk crypto_register_shashes (plus matching unregister pairs).
+#      Real Linux walks the supplied struct shash_alg array, links each
+#      entry into a global registry, and calls a per-algorithm probe.
+#      At L34 we just need the calls to return 0 ("registered") so the
+#      caller's module_init proceeds. When a future milestone needs to
+#      actually *use* a module-registered shash, the bodies grow a
+#      registry — for now the placeholder unblocks init.
+#
+# All seven shims return placeholder values that match Linux's success
+# conventions but do no real work. Bodies stay trivially analyzable so
+# a later "real CRC32" or "real shash registry" milestone can swap them
+# in without disturbing the signature or the registration table.
+
+def _l___crc32c_le(crc: uint32, buf: uint64, length: uint64) -> uint32:
+    # u32 __crc32c_le(u32 crc, const u8 *buf, size_t len);
+    # Linux: Castagnoli polynomial CRC32, lib/libcrc32c.c. The real
+    # implementation walks `buf` byte-by-byte folding into `crc`. The
+    # L34 placeholder folds `len` into `crc` via XOR — gives an
+    # input-dependent, non-zero-ish result without dereferencing `buf`
+    # (which may be a userland-shaped pointer the loader handed us).
+    return crc ^ cast[uint32](length)
+
+
+def _l_crc32_le(crc: uint32, buf: uint64, length: uint64) -> uint32:
+    # u32 crc32_le(u32 crc, const u8 *buf, size_t len);
+    # Standard little-endian CRC32 (lib/crc32.c). Placeholder mixes a
+    # fixed magic with the len to differ from __crc32c_le's output —
+    # modules that compute both and compare will see distinct values.
+    return crc ^ cast[uint32](length) ^ cast[uint32](0x12345678)
+
+
+def _l_crc32_be(crc: uint32, buf: uint64, length: uint64) -> uint32:
+    # u32 crc32_be(u32 crc, const u8 *buf, size_t len);
+    # Big-endian variant. Different magic again so all three CRC shims
+    # return distinguishable placeholder values for the same input.
+    return crc ^ cast[uint32](length) ^ cast[uint32](0x87654321)
+
+
+def _l_crypto_register_shash(alg: uint64) -> int32:
+    # int crypto_register_shash(struct shash_alg *alg);
+    # Real Linux validates `alg`, links it into crypto_alg_list, and
+    # runs the per-algorithm self-test. L34 placeholder accepts any
+    # non-NULL pointer and returns success — module init proceeds.
+    if alg == 0:
+        return -22                                    # -EINVAL
+    return 0
+
+
+def _l_crypto_unregister_shash(alg: uint64):
+    # void crypto_unregister_shash(struct shash_alg *alg);
+    # No registry yet, so nothing to remove. Linux's void return type
+    # means callers don't inspect any status.
+    return
+
+
+def _l_crypto_register_shashes(algs: uint64, count: int32) -> int32:
+    # int crypto_register_shashes(struct shash_alg *algs, int count);
+    # Bulk variant — real Linux loops crypto_register_shash over the
+    # array and unwinds on failure. Placeholder accepts the call and
+    # returns success without touching the array contents.
+    if algs == 0:
+        return -22                                    # -EINVAL
+    if count <= 0:
+        return -22
+    return 0
+
+
+def _l_crypto_unregister_shashes(algs: uint64, count: int32):
+    # void crypto_unregister_shashes(struct shash_alg *algs, int count);
+    # Matches the bulk register; nothing to undo at L34.
+    return
+
+
 # --- registration ----------------------------------------------------
 
 def linux_abi_register_crypto():
@@ -233,3 +321,19 @@ def linux_abi_register_crypto():
                 cast[uint64](&_l_crypto_shash_tfm_digest))
     _add_export("crypto_shash_digestsize",
                 cast[uint64](&_l_crypto_shash_digestsize))
+    # L34: CRC helpers + shash (un)registration shims for stock distro
+    # crypto modules (crc32c_generic.ko was the trigger).
+    _add_export("__crc32c_le",
+                cast[uint64](&_l___crc32c_le))
+    _add_export("crc32_le",
+                cast[uint64](&_l_crc32_le))
+    _add_export("crc32_be",
+                cast[uint64](&_l_crc32_be))
+    _add_export("crypto_register_shash",
+                cast[uint64](&_l_crypto_register_shash))
+    _add_export("crypto_unregister_shash",
+                cast[uint64](&_l_crypto_unregister_shash))
+    _add_export("crypto_register_shashes",
+                cast[uint64](&_l_crypto_register_shashes))
+    _add_export("crypto_unregister_shashes",
+                cast[uint64](&_l_crypto_unregister_shashes))
