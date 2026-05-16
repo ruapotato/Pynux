@@ -60,6 +60,7 @@ from linux_abi.api_l50 import linux_abi_register_l50
 from linux_abi.api_l51 import linux_abi_register_l51
 from linux_abi.api_l52 import linux_abi_register_l52
 from linux_abi.api_l53 import linux_abi_register_l53
+from linux_abi.api_l54 import linux_abi_register_l54
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -420,6 +421,26 @@ def linux_abi_exports_init():
     # (gcm-specific runtime: null tfm singleton + async completion +
     # non-inline slab path).
     linux_abi_register_l53()
+    # L54: cast_common (zero-UND library) + seqiv + lz4 + zstd plus six
+    # netfilter xt_* matches/targets (xt_tcpudp, xt_state, xt_mark,
+    # xt_pkttype, xt_mac, xt_limit). 28 new rows: xt_register_match /
+    # xt_unregister_match (singular forms), xt_register_matches /
+    # xt_unregister_matches (array forms — xt_tcpudp), xt_register_targets
+    # / xt_unregister_targets (target arrays — xt_mark), nf_ct_netns_get
+    # / nf_ct_netns_put (conntrack netns refcount — xt_state checkentry),
+    # __dynamic_pr_debug + ___ratelimit (diagnostic shims), aead_geniv_alloc
+    # / aead_init_geniv / aead_exit_geniv (seqiv AEAD IV-generator
+    # runtime), kmemdup_noprof (slab dup-copy with real memcpy),
+    # crypto_register_scomp / crypto_unregister_scomp (compression
+    # alg registration — lz4 + zstd init path), vmalloc_noprof /
+    # vzalloc_noprof / vfree (vmalloc family — both compress modules'
+    # workspace allocs), LZ4_compress_default / LZ4_decompress_safe
+    # (LZ4 block-mode raw API), and zstd_cctx_workspace_bound /
+    # zstd_dctx_workspace_bound / zstd_get_params / zstd_init_cctx /
+    # zstd_init_dctx / zstd_compress_cctx / zstd_decompress_dctx /
+    # zstd_is_error (zstd workspace + context + compress/decompress
+    # runtime helpers).
+    linux_abi_register_l54()
 
 
 def linux_abi_lookup(name: Ptr[char]) -> uint64:

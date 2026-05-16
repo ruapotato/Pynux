@@ -1,0 +1,652 @@
+# linux_abi/api_l54.ad
+#
+# L54: shims for the ABI gap exposed by a mixed batch of nine stock
+# Debian 6.12 modules — netfilter match/target extensions, a crypto
+# AEAD IV-generator template, two compression-template modules, plus
+# one zero-UND library module that needs no exports at all:
+#
+#   cast_common.ko  — DATA-only export of CAST-5/6 S-boxes (L52 ships
+#                      its own copies; cast_common.ko itself is a
+#                      library-only kmod with no init function).
+#   seqiv.ko        — AEAD IV-sequencer template
+#   lz4.ko          — LZ4 compression alg + scomp
+#   zstd.ko         — Zstd compression alg + scomp
+#   xt_tcpudp.ko    — netfilter "tcp" / "udp" / "udplite" matches
+#   xt_state.ko     — netfilter conntrack-state match
+#   xt_mark.ko      — netfilter mark match + MARK target
+#   xt_pkttype.ko   — netfilter packet-type match
+#   xt_mac.ko       — netfilter MAC-address match
+#   xt_limit.ko     — netfilter rate-limit match
+#
+# Init-path disassembly (objdump -drC of each *.ko's .init.text):
+#
+#   cast_common.ko:
+#       No init_module — pure ksymtab exports. The loader logs
+#       "library-only module" and returns 0.
+#
+#   seqiv.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $&seqiv_tmpl, %rdi
+#           jmp  crypto_register_template      # L51: returns 0
+#
+#   lz4.ko / zstd.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $&<alg>, %rdi
+#           call crypto_register_alg            # L51
+#           test %eax, %eax
+#           jne  out
+#           mov  $&<scomp>, %rdi
+#           call crypto_register_scomp          # NEW in L54
+#           test %eax, %eax
+#           je   out
+#           mov  $&<alg>, %rdi
+#           call crypto_unregister_alg          # L51
+#       out:
+#           jmp  __x86_return_thunk
+#
+#   xt_tcpudp.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $0x8, %esi                    # 8 matches in array
+#           mov  $&tcpudp_mt_reg, %rdi
+#           jmp  xt_register_matches           # NEW in L54
+#
+#   xt_state.ko / xt_mac.ko / xt_pkttype.ko / xt_limit.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $&<match>, %rdi
+#           jmp  xt_register_match             # NEW in L54
+#
+#   xt_mark.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $0x3, %esi                    # 3 targets in array
+#           mov  $&mark_tg_reg, %rdi
+#           call xt_register_targets           # NEW in L54
+#           test %eax, %eax
+#           js   out
+#           mov  $&mark_mt_reg, %rdi
+#           call xt_register_match             # NEW in L54
+#           test %eax, %eax
+#           jns  ok
+#           mov  $0x3, %esi
+#           mov  $&mark_tg_reg, %rdi
+#           call xt_unregister_targets         # NEW in L54
+#       ok: xor %ebx, %ebx
+#       out: jmp __x86_return_thunk
+#
+# Cross-check against L1..L53 reduced the union of the nine non-library
+# modules' UND lists to twenty-eight distinct symbols not yet exported,
+# grouped below by milestone-internal theme.
+#
+# Following the L49..L53 convention: any runtime UND that isn't on the
+# init path still resolves through this file — the loader's relocation
+# pass binds the address even though the call site never fires during
+# module load. Future milestones grow these stubs into real
+# implementations without touching call sites.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# Group 1: netfilter xt_register_match / xt_unregister_match
+# =====================================================================
+#
+# Linux (include/linux/netfilter/x_tables.h):
+#   int  xt_register_match(struct xt_match *match);
+#   void xt_unregister_match(struct xt_match *match);
+#
+# Singular registration entry-points for a single struct xt_match.
+# Used by xt_state, xt_mac, xt_pkttype, xt_limit (and many more we
+# might ship later — xt_owner, xt_iprange, xt_ecn, ...). Their init
+# paths tail-jump to xt_register_match after stashing &match in %rdi.
+#
+# Stub strategy: validate the pointer, return 0. Real Linux walks the
+# global xt[] table (one entry per protocol family) and inserts the
+# match; the iptables/nft userspace ruleset machinery later looks it
+# up by name. Hamnix has neither at the moment — we don't ship an
+# iptables binary yet, so registration is a logical no-op.
+
+def _l_xt_register_match(mt: uint64) -> int32:
+    # int xt_register_match(struct xt_match *match);
+    # Real Linux: list_add_tail on xt[match->family].match.
+    # NOTE: parameter name `mt` (not `match`) — `match` is a reserved
+    # identifier in Adder (see feedback_compiler_quirks.md).
+    if mt == 0:
+        return -22                                       # -EINVAL
+    return 0
+
+
+def _l_xt_unregister_match(mt: uint64):
+    # void xt_unregister_match(struct xt_match *match);
+    # Real Linux: list_del on the per-family match list.
+    return
+
+
+# =====================================================================
+# Group 2: xt_register_matches / xt_unregister_matches (array form)
+# =====================================================================
+#
+# Linux:
+#   int  xt_register_matches(struct xt_match *match, unsigned int n);
+#   void xt_unregister_matches(struct xt_match *match, unsigned int n);
+#
+# Array variants — register `n` consecutive struct xt_match entries.
+# xt_tcpudp uses this for its 8-entry tcpudp_mt_reg array (tcp + udp +
+# udplite, IPv4 + IPv6, plus the inet variants).
+#
+# Stub strategy: validate inputs, return 0. Same logic as the singular
+# variants — no iptables consumer exists yet.
+
+def _l_xt_register_matches(mt: uint64, n: uint32) -> int32:
+    # int xt_register_matches(struct xt_match *match, unsigned int n);
+    if mt == 0:
+        return -22
+    if n == 0:
+        return -22
+    return 0
+
+
+def _l_xt_unregister_matches(mt: uint64, n: uint32):
+    # void xt_unregister_matches(struct xt_match *match, unsigned int n);
+    return
+
+
+# =====================================================================
+# Group 3: xt_register_targets / xt_unregister_targets (target form)
+# =====================================================================
+#
+# Linux:
+#   int  xt_register_targets(struct xt_target *target, unsigned int n);
+#   void xt_unregister_targets(struct xt_target *target, unsigned int n);
+#
+# Array form for targets (the rule-action side of netfilter; matches
+# are predicates, targets are actions like MARK / DROP / REJECT).
+# xt_mark.ko registers a 3-entry mark_tg_reg array (MARK IPv4, MARK
+# IPv6, MARK inet) before registering its mark match.
+#
+# Stub: same shape as the matches variants.
+
+def _l_xt_register_targets(target: uint64, n: uint32) -> int32:
+    # int xt_register_targets(struct xt_target *target, unsigned int n);
+    if target == 0:
+        return -22
+    if n == 0:
+        return -22
+    return 0
+
+
+def _l_xt_unregister_targets(target: uint64, n: uint32):
+    # void xt_unregister_targets(struct xt_target *target, unsigned int n);
+    return
+
+
+# =====================================================================
+# Group 4: netfilter conntrack + dynamic_pr_debug + ratelimit
+# =====================================================================
+#
+# Linux:
+#   int  nf_ct_netns_get(struct net *net, u8 nfproto);
+#   void nf_ct_netns_put(struct net *net, u8 nfproto);
+#   void __dynamic_pr_debug(struct _ddebug *descriptor, const char *fmt, ...);
+#   int  ___ratelimit(struct ratelimit_state *rs, const char *func);
+#
+# xt_state's checkentry path calls nf_ct_netns_get to ensure the
+# conntrack module is alive for the netns the rule is being added to,
+# and nf_ct_netns_put on rule removal. Neither fires during module
+# load — checkentry is invoked when userspace `iptables -A ... -m state
+# --state ESTABLISHED` runs.
+#
+# __dynamic_pr_debug is the variadic dynamic-debug emitter, called by
+# pr_debug() macros in xt_tcpudp's runtime. ___ratelimit is the
+# generic printk-ratelimit helper used by xt_state / xt_limit.
+#
+# Stub strategy:
+#   * nf_ct_netns_get returns 0 (success — the netns is "available").
+#   * nf_ct_netns_put no-op.
+#   * __dynamic_pr_debug ignores everything (Hamnix has no
+#     dynamic-debug subsystem). Variadic tail discarded as in
+#     _linux_printk_shim.
+#   * ___ratelimit returns 1 ("yes, please emit"). The caller may then
+#     printk0 — fine.
+
+def _l_nf_ct_netns_get(net: uint64, nfproto: uint32) -> int32:
+    # int nf_ct_netns_get(struct net *net, u8 nfproto);
+    # Real Linux: bumps the per-netns conntrack refcount, allocating
+    # the proto handler if needed. Stub: return 0.
+    return 0
+
+
+def _l_nf_ct_netns_put(net: uint64, nfproto: uint32):
+    # void nf_ct_netns_put(struct net *net, u8 nfproto);
+    return
+
+
+def _l___dynamic_pr_debug(descriptor: uint64, fmt: uint64) -> int32:
+    # void __dynamic_pr_debug(struct _ddebug *descriptor, const char *fmt, ...);
+    # Variadic emitter for pr_debug(). Linux's dynamic-debug machinery
+    # checks the descriptor's flags to decide whether to emit. Hamnix
+    # has no equivalent — drop everything. Variadic tail is in
+    # %rdx/%rcx/... (SysV); we ignore it the same way _linux_printk_shim
+    # does.
+    return 0
+
+
+def _l____ratelimit(rs: uint64, func: uint64) -> int32:
+    # int ___ratelimit(struct ratelimit_state *rs, const char *func);
+    # Linux: returns 1 if the caller should print, 0 if the burst window
+    # is closed. Stub: return 1 — Hamnix has no ratelimit suppression.
+    return 1
+
+
+# =====================================================================
+# Group 5: AEAD IV-generator (seqiv runtime)
+# =====================================================================
+#
+# Linux (include/crypto/internal/geniv.h):
+#   struct aead_instance *aead_geniv_alloc(struct crypto_template *tmpl,
+#                                            struct rtattr **tb);
+#   int  aead_init_geniv(struct crypto_aead *tfm);
+#   void aead_exit_geniv(struct crypto_aead *tfm);
+#
+# seqiv.ko's init tail-jumps to crypto_register_template (L51), so
+# none of these fire during module load. The geniv runtime is invoked
+# when a "seqiv(rfc4106(gcm(aes)))"-style transform is allocated —
+# aead_geniv_alloc builds the instance, aead_init_geniv runs per-tfm
+# setup, aead_exit_geniv tears it down on free.
+#
+# Stub strategy:
+#   * aead_geniv_alloc returns a kmalloc'd zeroed buffer big enough for
+#     a struct aead_instance (~512 bytes on x86_64). Caller's first
+#     check is "is the pointer ERR_PTR?" — anything in the low 4 GiB
+#     that isn't the ERR_PTR range is fine. Runtime in this batch
+#     never derefs it.
+#   * aead_init_geniv returns 0 (success).
+#   * aead_exit_geniv no-op.
+
+def _l_aead_geniv_alloc(tmpl: uint64, tb: uint64) -> uint64:
+    # struct aead_instance *aead_geniv_alloc(struct crypto_template *tmpl,
+    #                                         struct rtattr **tb);
+    # Real Linux: allocates a struct aead_instance, grabs the inner
+    # aead via a single spawn, fills the instance name to
+    # "seqiv(<inner>)", returns the instance for the caller to wire up
+    # encrypt/decrypt.
+    if tmpl == 0:
+        return 0
+    return kmalloc(512)
+
+
+def _l_aead_init_geniv(tfm: uint64) -> int32:
+    # int aead_init_geniv(struct crypto_aead *tfm);
+    # Real Linux: allocates a sync-skcipher for the IV-encryption inner
+    # transform and stashes it in the geniv tfm context. Stub: success.
+    if tfm == 0:
+        return -22
+    return 0
+
+
+def _l_aead_exit_geniv(tfm: uint64):
+    # void aead_exit_geniv(struct crypto_aead *tfm);
+    # Real Linux: drops the inner sync-skcipher refcount.
+    return
+
+
+# =====================================================================
+# Group 6: kmemdup_noprof (slab dup-copy helper)
+# =====================================================================
+#
+# Linux:
+#   void *kmemdup_noprof(const void *src, size_t len, gfp_t gfp);
+#
+# Allocates `len` bytes, copies `src` into the allocation, returns it.
+# seqiv runtime uses this to clone the per-request IV state when fan-
+# ning out to multiple skcipher_requests. Init never fires here.
+#
+# Unlike the no-op stubs above, this one needs a real copy: if a
+# caller's downstream path read the destination, it would observe
+# garbage. We have kmalloc + memcpy on hand, so do the right thing.
+
+def _l_kmemdup_noprof(src: uint64, n: uint64, gfp: uint64) -> uint64:
+    # void *kmemdup_noprof(const void *src, size_t len, gfp_t gfp);
+    if n == 0:
+        return 0
+    dst: uint64 = kmalloc(n)
+    if dst == 0:
+        return 0
+    if src != 0:
+        memcpy(cast[Ptr[uint8]](dst), cast[Ptr[uint8]](src), n)
+    return dst
+
+
+# =====================================================================
+# Group 7: compression-template registration (scomp)
+# =====================================================================
+#
+# Linux:
+#   int  crypto_register_scomp(struct scomp_alg *alg);
+#   void crypto_unregister_scomp(struct scomp_alg *alg);
+#
+# "scomp" = synchronous compression alg. Mirror of crypto_register_alg
+# (L51) but for the compression-template side of the crypto API. Used
+# by lz4 and zstd (and deflate, lzo, the rest of the comp family).
+# The init path on both lz4.ko and zstd.ko first registers the legacy
+# `struct crypto_alg` via crypto_register_alg (L51) and then registers
+# the modern scomp via crypto_register_scomp. The scomp registration
+# must return 0 for init to succeed.
+#
+# Stub: validate pointer, return 0. No userspace looks them up yet.
+
+def _l_crypto_register_scomp(alg: uint64) -> int32:
+    # int crypto_register_scomp(struct scomp_alg *alg);
+    if alg == 0:
+        return -22
+    return 0
+
+
+def _l_crypto_unregister_scomp(alg: uint64):
+    # void crypto_unregister_scomp(struct scomp_alg *alg);
+    return
+
+
+# =====================================================================
+# Group 8: vmalloc / vzalloc / vfree (slab-backed large allocator)
+# =====================================================================
+#
+# Linux:
+#   void *vmalloc_noprof(unsigned long size);
+#   void *vzalloc_noprof(unsigned long size);
+#   void  vfree(const void *addr);
+#
+# Real Linux's vmalloc allocates pages from the vmalloc area (a
+# virtually-contiguous region distinct from the linear map) and maps
+# them in. Used by lz4 and zstd for their compression workspaces
+# (~32 KiB for LZ4, several hundred KiB for zstd).
+#
+# Hamnix has no separate vmalloc area — the linear-map slab covers
+# everything we have. Forward to kmalloc / kfree. vzalloc_noprof
+# additionally zeroes — zero the buffer manually here since mm.slab
+# doesn't ship kzalloc yet (or does it via mm.slab.kzalloc? confirm).
+#
+# These are runtime allocations in lz4/zstd — only triggered by
+# crypto_alloc_acomp(), not module init. So even stubbing to NULL
+# (which Linux callers handle via -ENOMEM) would be enough; but real
+# allocations cost almost nothing and keep the code path honest.
+
+def _l_vmalloc_noprof(size: uint64) -> uint64:
+    # void *vmalloc_noprof(unsigned long size);
+    # Forward to kmalloc; the slab + buddy backing handles up to a few
+    # MiB. Init never lands here in this batch.
+    return kmalloc(size)
+
+
+def _l_vzalloc_noprof(size: uint64) -> uint64:
+    # void *vzalloc_noprof(unsigned long size);
+    # vmalloc + memset-zero. Init never lands here.
+    if size == 0:
+        return 0
+    p: uint64 = kmalloc(size)
+    if p == 0:
+        return 0
+    pb: Ptr[uint8] = cast[Ptr[uint8]](p)
+    i: uint64 = 0
+    do:
+        pb[i] = 0
+        i = i + 1
+    while i < size
+    return p
+
+
+def _l_vfree(addr: uint64):
+    # void vfree(const void *addr);
+    # Forward to kfree (it tolerates NULL).
+    if addr == 0:
+        return
+    kfree(addr)
+
+
+# =====================================================================
+# Group 9: LZ4 raw API (LZ4_compress_default / LZ4_decompress_safe)
+# =====================================================================
+#
+# Linux (include/linux/lz4.h):
+#   int LZ4_compress_default(const char *source, char *dest,
+#                              int isize, int maxOutputSize, void *wrkmem);
+#   int LZ4_decompress_safe(const char *source, char *dest,
+#                             int compressedSize, int maxDecompressedSize);
+#
+# These are the raw block-mode LZ4 entry points that lz4.ko's
+# scomp_alg .compress / .decompress hooks call into. The actual
+# compress/decompress math lives in lib/lz4/lz4_compress.c +
+# lz4_decompress.c — pulled in by lz4.ko itself, but the kernel
+# build typically EXPORT_SYMBOL_GPL's them from lib/lz4/lz4hc_compress.o
+# (a separate built-in object) so lz4.ko picks them up as exports.
+#
+# Init never lands here — lz4.ko's init only does
+# crypto_register_alg + crypto_register_scomp. Stub: return 0 (which
+# both APIs interpret as "no bytes produced" — a degenerate but safe
+# answer; real callers see "compression failed" / "decompression
+# yielded zero output" and bail out).
+
+def _l_LZ4_compress_default(source: uint64, dst: uint64, isize: int32,
+                              max_out: int32, wrkmem: uint64) -> int32:
+    # int LZ4_compress_default(const char *source, char *dest,
+    #                            int isize, int maxOutputSize, void *wrkmem);
+    # Real Linux: runs the LZ4 block-compression algorithm; returns
+    # the compressed size, or 0 on overrun. Stub: return 0.
+    return 0
+
+
+def _l_LZ4_decompress_safe(source: uint64, dst: uint64, csize: int32,
+                             max_out: int32) -> int32:
+    # int LZ4_decompress_safe(const char *source, char *dest,
+    #                          int compressedSize, int maxDecompressedSize);
+    # Real Linux: runs the LZ4 block-decompression algorithm; returns
+    # the decompressed size, or a negative value on malformed input.
+    # Stub: return 0 (degenerate "decoded nothing").
+    return 0
+
+
+# =====================================================================
+# Group 10: zstd runtime helpers (eight workspace/context APIs)
+# =====================================================================
+#
+# Linux (include/linux/zstd.h):
+#   size_t              zstd_cctx_workspace_bound(const zstd_parameters *params);
+#   size_t              zstd_dctx_workspace_bound(void);
+#   zstd_parameters     zstd_get_params(int level, unsigned long long src_size);
+#   zstd_cctx           *zstd_init_cctx(void *workspace, size_t workspace_size);
+#   zstd_dctx           *zstd_init_dctx(void *workspace, size_t workspace_size);
+#   size_t              zstd_compress_cctx(zstd_cctx *cctx, void *dst, size_t dst_capacity,
+#                                            const void *src, size_t src_size,
+#                                            const zstd_parameters *params);
+#   size_t              zstd_decompress_dctx(zstd_dctx *dctx, void *dst, size_t dst_capacity,
+#                                              const void *src, size_t src_size);
+#   unsigned int        zstd_is_error(size_t code);
+#
+# These are runtime — zstd.ko's init does
+# crypto_register_alg + crypto_register_scomp only. They fire when
+# userspace allocates a zstd transform via crypto_alloc_acomp("zstd").
+#
+# Stub strategy:
+#   * Workspace-size queries return a small fixed value (16 KiB).
+#     Callers vmalloc that much for the workspace; with our
+#     vmalloc_noprof forwarding to kmalloc, that's a 16 KiB slab
+#     allocation that the runtime never reads.
+#   * zstd_get_params: zstd_parameters is a struct returned by value
+#     (~48 bytes). We're not exercising the runtime, so the caller's
+#     reads against it would read whatever's on the return-slot
+#     stack — but since we never reach those reads, it doesn't matter.
+#     Our shim simply returns through standard prologue/epilogue with
+#     no struct-return setup. Init-path callers that capture the
+#     struct write zeroes from the return area. This is enough.
+#   * Init helpers return whatever workspace pointer was passed in
+#     (treated as the cctx/dctx handle by the caller).
+#   * Compress/decompress return 0 (degenerate empty output).
+#   * zstd_is_error returns 0 (success, not an error).
+
+def _l_zstd_cctx_workspace_bound(params: uint64) -> uint64:
+    # size_t zstd_cctx_workspace_bound(const zstd_parameters *params);
+    return cast[uint64](16384)
+
+
+def _l_zstd_dctx_workspace_bound() -> uint64:
+    # size_t zstd_dctx_workspace_bound(void);
+    return cast[uint64](16384)
+
+
+def _l_zstd_get_params(level: int32, src_size: uint64) -> int32:
+    # zstd_parameters zstd_get_params(int level, unsigned long long src_size);
+    # Linux returns a struct by value; the SysV ABI passes that via
+    # the caller-allocated return area when the struct is too large
+    # for register pair (>16 bytes). zstd_parameters is ~48 bytes so
+    # it's caller-allocated in %rdi (sret). Our shim ignores the sret
+    # slot — init-path callers don't actually invoke this (it's
+    # runtime), so the uninitialised return area never gets read.
+    # Return 0 as a placeholder int (the slot is ignored anyway).
+    return 0
+
+
+def _l_zstd_init_cctx(workspace: uint64, ws_size: uint64) -> uint64:
+    # zstd_cctx *zstd_init_cctx(void *workspace, size_t workspace_size);
+    # Real Linux: lays out a ZSTD_CCtx inside the workspace and
+    # returns a pointer to it. Stub: return the workspace pointer
+    # itself — caller's NULL-check passes.
+    return workspace
+
+
+def _l_zstd_init_dctx(workspace: uint64, ws_size: uint64) -> uint64:
+    # zstd_dctx *zstd_init_dctx(void *workspace, size_t workspace_size);
+    return workspace
+
+
+def _l_zstd_compress_cctx(cctx: uint64, dst: uint64, dst_cap: uint64,
+                            src: uint64, src_size: uint64,
+                            params: uint64) -> uint64:
+    # size_t zstd_compress_cctx(zstd_cctx *cctx, void *dst, size_t dst_capacity,
+    #                            const void *src, size_t src_size,
+    #                            const zstd_parameters *params);
+    # Returns 0 (degenerate — "no compressed bytes produced"). Init
+    # never lands here.
+    return 0
+
+
+def _l_zstd_decompress_dctx(dctx: uint64, dst: uint64, dst_cap: uint64,
+                              src: uint64, src_size: uint64) -> uint64:
+    # size_t zstd_decompress_dctx(zstd_dctx *dctx, void *dst, size_t dst_capacity,
+    #                              const void *src, size_t src_size);
+    return 0
+
+
+def _l_zstd_is_error(code: uint64) -> uint32:
+    # unsigned int zstd_is_error(size_t code);
+    # Linux: returns 1 if `code` is a zstd error sentinel (top 32 bits
+    # set in a specific pattern), 0 otherwise. Stub: treat all codes
+    # as successes — return 0.
+    return 0
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_l54():
+    # Called from linux_abi_exports_init() after L53's rows.
+    # Adds 28 exports for the L54 batch:
+    #   2 xt_register_match / unregister_match  (xt_state, xt_mac,
+    #                                              xt_pkttype, xt_limit,
+    #                                              xt_mark)
+    #   2 xt_register_matches / unregister_matches (xt_tcpudp)
+    #   2 xt_register_targets / unregister_targets (xt_mark)
+    #   4 netfilter conntrack + diag (nf_ct_netns_get/put,
+    #                                   __dynamic_pr_debug, ___ratelimit)
+    #   3 aead_geniv (alloc + init + exit) for seqiv
+    #   1 kmemdup_noprof
+    #   2 crypto_register_scomp / unregister_scomp (lz4, zstd)
+    #   3 vmalloc family (vmalloc_noprof, vzalloc_noprof, vfree)
+    #   2 LZ4 raw API
+    #   8 zstd runtime helpers
+    # cast_common.ko ships zero UND symbols; nothing to add for it.
+
+    # Group 1: xt single-match registration
+    _add_export("xt_register_match",
+                cast[uint64](&_l_xt_register_match))
+    _add_export("xt_unregister_match",
+                cast[uint64](&_l_xt_unregister_match))
+
+    # Group 2: xt array-match registration
+    _add_export("xt_register_matches",
+                cast[uint64](&_l_xt_register_matches))
+    _add_export("xt_unregister_matches",
+                cast[uint64](&_l_xt_unregister_matches))
+
+    # Group 3: xt array-target registration
+    _add_export("xt_register_targets",
+                cast[uint64](&_l_xt_register_targets))
+    _add_export("xt_unregister_targets",
+                cast[uint64](&_l_xt_unregister_targets))
+
+    # Group 4: nf conntrack + diag
+    _add_export("nf_ct_netns_get",
+                cast[uint64](&_l_nf_ct_netns_get))
+    _add_export("nf_ct_netns_put",
+                cast[uint64](&_l_nf_ct_netns_put))
+    _add_export("__dynamic_pr_debug",
+                cast[uint64](&_l___dynamic_pr_debug))
+    _add_export("___ratelimit",
+                cast[uint64](&_l____ratelimit))
+
+    # Group 5: AEAD IV-generator (seqiv runtime)
+    _add_export("aead_geniv_alloc",
+                cast[uint64](&_l_aead_geniv_alloc))
+    _add_export("aead_init_geniv",
+                cast[uint64](&_l_aead_init_geniv))
+    _add_export("aead_exit_geniv",
+                cast[uint64](&_l_aead_exit_geniv))
+
+    # Group 6: kmemdup_noprof
+    _add_export("kmemdup_noprof",
+                cast[uint64](&_l_kmemdup_noprof))
+
+    # Group 7: scomp registration (lz4, zstd)
+    _add_export("crypto_register_scomp",
+                cast[uint64](&_l_crypto_register_scomp))
+    _add_export("crypto_unregister_scomp",
+                cast[uint64](&_l_crypto_unregister_scomp))
+
+    # Group 8: vmalloc family
+    _add_export("vmalloc_noprof",
+                cast[uint64](&_l_vmalloc_noprof))
+    _add_export("vzalloc_noprof",
+                cast[uint64](&_l_vzalloc_noprof))
+    _add_export("vfree",
+                cast[uint64](&_l_vfree))
+
+    # Group 9: LZ4 raw API
+    _add_export("LZ4_compress_default",
+                cast[uint64](&_l_LZ4_compress_default))
+    _add_export("LZ4_decompress_safe",
+                cast[uint64](&_l_LZ4_decompress_safe))
+
+    # Group 10: zstd runtime
+    _add_export("zstd_cctx_workspace_bound",
+                cast[uint64](&_l_zstd_cctx_workspace_bound))
+    _add_export("zstd_dctx_workspace_bound",
+                cast[uint64](&_l_zstd_dctx_workspace_bound))
+    _add_export("zstd_get_params",
+                cast[uint64](&_l_zstd_get_params))
+    _add_export("zstd_init_cctx",
+                cast[uint64](&_l_zstd_init_cctx))
+    _add_export("zstd_init_dctx",
+                cast[uint64](&_l_zstd_init_dctx))
+    _add_export("zstd_compress_cctx",
+                cast[uint64](&_l_zstd_compress_cctx))
+    _add_export("zstd_decompress_dctx",
+                cast[uint64](&_l_zstd_decompress_dctx))
+    _add_export("zstd_is_error",
+                cast[uint64](&_l_zstd_is_error))
