@@ -30,7 +30,7 @@ from kernel.sched.core import (
     TaskStruct, current_task,
     create_user_task, create_user_task_argv, task_exit_current,
     current_task_pid, task_lookup_by_pid, task_state, task_exit_code,
-    task_pid_at, yield_to_others, STATE_EXITED,
+    task_pid_at, task_reap, yield_to_others, STATE_EXITED,
     dup_fd_to_child,
     signal_post, signal_check_and_handle,
     get_cwd_buf, set_task_cwd, current_idx_get,
@@ -404,10 +404,11 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         dst[i] = 0
         return i + 1
     if nr == SYS_WAITPID:
-        # Block until the named child enters STATE_EXITED, then return
-        # its exit_code. With no signals or sleep/wake yet, we busy-
-        # yield via schedule() — the timer ISR keeps round-robin alive
-        # and the child eventually runs to SYS_EXIT.
+        # Block until the named child enters STATE_EXITED, then
+        # return its exit_code AND reap the slot. Without the reap
+        # step, pipelines exhaust NTASKS within a handful of
+        # commands — slot stays as STATE_EXITED forever and
+        # create_user_task can't find a free slot.
         target: int32 = task_lookup_by_pid(a0)
         if target < 0:
             return cast[uint64](-10)           # -ECHILD
@@ -416,6 +417,8 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             target = task_lookup_by_pid(a0)
             if target < 0:
                 return cast[uint64](-10)
-        return cast[uint64](task_exit_code(target))
+        code: int64 = task_exit_code(target)
+        task_reap(target)
+        return cast[uint64](code)
     printk2("Hamnix: unknown syscall nr=%d a0=%x\n", nr, a0)
     return cast[uint64](-1)

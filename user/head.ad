@@ -1,0 +1,80 @@
+# user/head.ad
+#
+# Minimal Hamnix `head`. Reads stdin, writes the first N lines
+# (default 10) to stdout, then exits. The -N flag is parsed as
+# `-<digits>`; anything else is an error. Composes with pipes:
+#
+#   /cat /mnt/HELLO.TXT | /head -1
+
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def parse_int(s: Ptr[uint8]) -> int32:
+    n: int32 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int32](c - 48)
+        i = i + 1
+    return n
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    limit: int32 = 10
+    if argc >= 2:
+        arg: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        if arg[0] == 45:                       # '-'
+            v: int32 = parse_int(cast[Ptr[uint8]](
+                cast[uint64](arg) + 1))
+            if v < 0:
+                write_str(2, "head: bad -N\n")
+                return 1
+            limit = v
+        else:
+            write_str(2, "head: expected -N\n")
+            return 1
+
+    buf: Array[256, uint8]
+    count: int32 = 0
+    while count < limit:
+        n: int64 = sys_read(0, &buf[0], 256)
+        if n <= 0:
+            return 0
+        # Scan the chunk for newlines but write in WHOLE spans. A
+        # one-syscall-per-byte loop wastes time and amplifies the
+        # interleaving with kernel exit-log printks. Walk forward
+        # bumping `cut`; when we hit the Nth newline write
+        # buf[0..cut] in one shot and return. If we exhaust the
+        # chunk without hitting the limit, flush it all and read
+        # more.
+        cut: uint64 = 0
+        i: uint64 = 0
+        nu: uint64 = cast[uint64](n)
+        done: int32 = 0
+        while i < nu:
+            if buf[i] == 10:
+                count = count + 1
+                if count >= limit:
+                    cut = i + 1
+                    done = 1
+                    break
+            i = i + 1
+        if done != 0:
+            sys_write(1, &buf[0], cut)
+            return 0
+        sys_write(1, &buf[0], nu)
+    return 0

@@ -467,6 +467,15 @@ def task_exit_code(slot: int32) -> int64:
     return task_table[cast[uint64](slot)].exit_code
 
 
+def task_reap(slot: int32):
+    # Caller has consumed the exit code; mark the slot FREE so a
+    # future create_user_task can claim it. Stacks are still leaked
+    # (no kfree path for kstack/ustack yet — separate slab work),
+    # but the slot is reusable.
+    su: uint64 = cast[uint64](slot)
+    task_table[su].state = STATE_FREE
+
+
 def task_pid_at(slot: int32) -> uint64:
     return task_table[cast[uint64](slot)].pid
 

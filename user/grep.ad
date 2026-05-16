@@ -1,0 +1,87 @@
+# user/grep.ad
+#
+# Minimal Hamnix `grep`: reads stdin, splits on newlines, prints
+# lines that contain the substring from argv[1]. Plain literal
+# matching — no regex, no -i, no -v. Composes with pipes:
+#
+#   /cat /mnt/HELLO.TXT | /grep tmpfs
+
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def contains(hay: Ptr[uint8], hay_len: uint64,
+             needle: Ptr[uint8], needle_len: uint64) -> int32:
+    # Naive O(n*m) substring scan. Good enough for our needs;
+    # patterns and lines are both small (< 1 KiB).
+    if needle_len == 0:
+        return 1
+    if needle_len > hay_len:
+        return 0
+    i: uint64 = 0
+    limit: uint64 = hay_len - needle_len
+    while i <= limit:
+        j: uint64 = 0
+        hit: int32 = 1
+        while j < needle_len:
+            if hay[i + j] != needle[j]:
+                hit = 0
+                break
+            j = j + 1
+        if hit != 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+LINE_BUF: uint64 = 1024
+
+# Per-process line buffer + matching buffers — globals so they
+# don't blow up the kernel stack.
+line: Array[1024, uint8]
+
+
+def write_err(s: Ptr[uint8]):
+    sys_write(2, s, strlen_u8(s))
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_err("grep: usage: /grep PATTERN\n")
+        return 1
+    pattern: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    pat_len: uint64 = strlen_u8(pattern)
+
+    chunk: Array[256, uint8]
+    line_pos: uint64 = 0
+    while True:
+        n: int64 = sys_read(0, &chunk[0], 256)
+        if n <= 0:
+            break
+        i: uint64 = 0
+        while i < cast[uint64](n):
+            c: uint8 = chunk[i]
+            if c == 10:
+                # End of line — check pattern and emit.
+                if contains(&line[0], line_pos, pattern, pat_len) != 0:
+                    sys_write(1, &line[0], line_pos)
+                    sys_write(1, "\n", 1)
+                line_pos = 0
+            else:
+                if line_pos + 1 < LINE_BUF:
+                    line[line_pos] = c
+                    line_pos = line_pos + 1
+            i = i + 1
+    # Flush any trailing partial line (no terminating newline).
+    if line_pos > 0:
+        if contains(&line[0], line_pos, pattern, pat_len) != 0:
+            sys_write(1, &line[0], line_pos)
+            sys_write(1, "\n", 1)
+    return 0
