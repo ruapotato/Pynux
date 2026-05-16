@@ -58,6 +58,7 @@ from linux_abi.api_netlink import linux_abi_register_netlink
 from linux_abi.api_l49 import linux_abi_register_l49
 from linux_abi.api_l50 import linux_abi_register_l50
 from linux_abi.api_l51 import linux_abi_register_l51
+from linux_abi.api_l52 import linux_abi_register_l52
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -390,6 +391,17 @@ def linux_abi_exports_init():
     # runtime glue (fips_enabled DATA, __fortify_panic, sized_strscpy,
     # skcipher_register_instance, strnlen, __x86_indirect_thunk_r14).
     linux_abi_register_l51()
+    # L52: fcrypt + michael_mic + wp512 + streebog_generic + xcbc + vmac
+    # + cts + nhpoly1305 + pcbc + blowfish_generic + cast5_generic +
+    # cast6_generic. 9 new rows: blowfish_setkey (Blowfish key-schedule
+    # placeholder), cast_s1..s4 (CAST-5/6 substitution boxes — 4 × 1024
+    # byte DATA buffers, normally exported by cast_common.ko in stock
+    # Linux), poly1305_core_emit (Poly1305 tag-finalisation placeholder
+    # for nhpoly1305 runtime), crypto_cipher_decrypt_one (pcbc decrypt
+    # half — mirror of L51's crypto_cipher_encrypt_one), and
+    # skcipher_alloc_instance_simple (single-spawn skcipher instance
+    # allocator for templates that wrap one inner skcipher).
+    linux_abi_register_l52()
 
 
 def linux_abi_lookup(name: Ptr[char]) -> uint64:

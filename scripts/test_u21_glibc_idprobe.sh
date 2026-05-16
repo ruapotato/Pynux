@@ -21,7 +21,7 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-UBIN=tests/u-binary/u_idprobe
+UBIN=tests/u-binary/u_glibc_idprobe
 if [ ! -f "$UBIN" ]; then
     echo "[test_u21_glibc_idprobe] SKIP: $UBIN not staged"
     echo "    REQUIRES host cc + libc6-dev (static glibc)."
@@ -46,14 +46,14 @@ python3 -m compiler.adder compile \
     init/main.ad \
     -o "$ELF"
 
-echo "[test_u21_glibc_idprobe] (4/4) Boot QEMU + run /bin/u_idprobe via hamsh"
+echo "[test_u21_glibc_idprobe] (4/4) Boot QEMU + run /bin/u_glibc_idprobe via hamsh"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
 (
     sleep 3
-    printf 'u_idprobe\n'
+    printf 'u_glibc_idprobe\n'
     sleep 5
     printf 'exit\n'
     sleep 1

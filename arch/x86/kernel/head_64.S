@@ -37,3 +37,28 @@ halt_loop:
     cli
     hlt
     jmp     halt_loop
+
+/* ---------- kernel_image_end() ----------------------------------- *
+ * Returns the physical address one past the last byte the kernel
+ * image occupies (= __bss_end). The kernel is identity-mapped, so
+ * VMA == LMA == physical. mm/memblock callers bump their pool's base
+ * past this so freshly-allocated pages can't overlap kernel
+ * .text / .rodata / .data / .pgtables / .bss.
+ *
+ * Same trick as arch/x86/kernel/smp_asm.S's accessors: the linker
+ * symbol is an absolute value, so we stash it as a 32-bit word in
+ * .rodata and load via leaq + movl. That sidesteps the ELF32 R_X86_64
+ * relocation gap our elf32-i386 OUTPUT_FORMAT can't represent.
+ */
+    .section .rodata
+    .align 4
+__bss_end_word:
+    .long __bss_end
+
+    .section .text, "ax"
+    .align 16
+    .globl kernel_image_end
+kernel_image_end:
+    leaq    __bss_end_word(%rip), %rax
+    movl    (%rax), %eax
+    ret

@@ -37,6 +37,7 @@ from mm.memblock import memblock_set_region
 
 extern def get_mb_info() -> uint64
 extern def get_mb_magic() -> uint64
+extern def kernel_image_end() -> uint64
 
 MULTIBOOT_BOOTLOADER_MAGIC: uint64 = 0x2BADB002
 MULTIBOOT_INFO_MMAP_BIT:    uint64 = 0x40              # flags bit 6
@@ -47,11 +48,14 @@ MMAP_TYPE_ACPI_RECLAIM:     uint64 = 3
 MMAP_TYPE_NVS:              uint64 = 4
 MMAP_TYPE_BAD:              uint64 = 5
 
-# Floor for "usable" RAM. The kernel image, page tables, and very
-# early data sit below 2 MiB; ignoring everything under this address
-# keeps the allocator pool clear of them. Once we have a real
-# kernel-image reservation system this floor goes away.
-E820_MIN_BASE: uint64 = 0x00200000
+# Hard floor for "usable" RAM. Below 1 MiB lives BIOS / EBDA / video
+# RAM and similar that we never want in the allocator pool. The
+# kernel image itself (.text/.rodata/.data/.pgtables/.bss) is excluded
+# dynamically below by clamping the chosen region's base to
+# kernel_image_end() — that symbol slides forward whenever the kernel
+# (or its embedded .incbin'd initramfs blob) grows, so the static
+# floor no longer has to guess.
+E820_MIN_BASE: uint64 = 0x00100000
 
 
 def _type_name(t: uint64) -> Ptr[char]:
@@ -102,7 +106,23 @@ def e820_init():
     printk0("       idx  type   base               length\n")
 
     # Walk entries. Track the largest "available" region we see at
-    # or above E820_MIN_BASE so we can hand it to memblock.
+    # or above max(E820_MIN_BASE, kernel_image_end) so we can hand it
+    # to memblock. kernel_image_end is __bss_end from the linker
+    # script — without that clamp, memblock_alloc would return pages
+    # that physically overlap kernel .text / .rodata (the embedded
+    # initramfs blob lives there) / .data / .pgtables / .bss, which
+    # silently corrupts the kernel as soon as a user task touches its
+    # stack.
+    kern_end: uint64 = kernel_image_end()
+    # Page-align kern_end upward so memblock_alloc's 4 KiB-aligned
+    # carves land cleanly past the kernel's final byte.
+    kern_end = (kern_end + 4095) & ~cast[uint64](4095)
+    floor: uint64 = E820_MIN_BASE
+    if kern_end > floor:
+        floor = kern_end
+    printk2("e820: kernel image ends @ %p; allocator floor = %p\n",
+            kernel_image_end(), floor)
+
     best_base:    uint64 = 0
     best_length:  uint64 = 0
 
@@ -123,21 +143,23 @@ def e820_init():
         printk2("       %d    %s  ", idx, cast[uint64](_type_name(type_code)))
         printk2("%p  %p\n", base, length)
 
-        # Available region: clamp its base up to E820_MIN_BASE if the
-        # region straddles our floor (very common — the big "RAM"
-        # entry on a PC starts at 1 MiB, but we want to keep the
-        # kernel image area at 0x100000..~0x200000 reserved). If the
-        # clamped region still has positive length, consider it.
+        # Available region: clamp its base up to `floor` (= max of
+        # the static low-memory cutoff and the dynamic kernel-image
+        # end) if the region straddles our floor. Very common: the
+        # big "RAM" entry on a PC starts at 1 MiB but the kernel
+        # image + embedded initramfs blob extend well past that into
+        # multi-megabyte territory; everything in [base, floor) is
+        # reserved.
         if type_code == MMAP_TYPE_AVAILABLE:
             adj_base:   uint64 = base
             adj_length: uint64 = length
-            if adj_base < E820_MIN_BASE:
+            if adj_base < floor:
                 # How many bytes did we trim off the front?
-                shift: uint64 = E820_MIN_BASE - adj_base
+                shift: uint64 = floor - adj_base
                 if shift >= adj_length:
                     adj_length = 0
                 else:
-                    adj_base   = E820_MIN_BASE
+                    adj_base   = floor
                     adj_length = adj_length - shift
             if adj_length > best_length:
                 best_base   = adj_base

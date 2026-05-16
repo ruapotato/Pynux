@@ -1,0 +1,266 @@
+# linux_abi/api_l52.ad
+#
+# L52: shims for the ABI gap exposed by twelve stock Debian 6.12 modules
+# that all share the same "init = register one struct, tail-return"
+# shape. The full batch:
+#
+#   fcrypt.ko, michael_mic.ko, wp512.ko, streebog_generic.ko,
+#   xcbc.ko, vmac.ko, cts.ko, nhpoly1305.ko, pcbc.ko,
+#   blowfish_generic.ko, cast5_generic.ko, cast6_generic.ko.
+#
+# Init-path disassembly (objdump -drC of each *.ko's .init.text):
+#
+#   fcrypt.ko / blowfish_generic.ko / cast5_generic.ko / cast6_generic.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $&<cipher>_alg, %rdi
+#           jmp  crypto_register_alg          # L51: returns 0
+#
+#   michael_mic.ko / nhpoly1305.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $&<digest>_alg, %rdi
+#           jmp  crypto_register_shash        # L34: returns 0
+#
+#   wp512.ko (3 shashes) / streebog_generic.ko (2 shashes):
+#       init_module:
+#           call __fentry__
+#           mov  $<count>, %esi
+#           mov  $&<shash_algs>, %rdi
+#           jmp  crypto_register_shashes      # L34: returns 0
+#
+#   xcbc.ko / vmac.ko / cts.ko / pcbc.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $&<tmpl>, %rdi
+#           jmp  crypto_register_template     # L51: returns 0
+#
+# Coverage cross-check: of the union of all twelve modules' UND lists,
+# every symbol resolves through L1..L51 except NINE new ones (one
+# cipher key-schedule + four CAST S-box DATA buffers + one Poly1305
+# finaliser + one block-cipher decrypt + one skcipher instance
+# allocator), grouped below by milestone-internal theme.
+#
+#   * blowfish_setkey         — Blowfish key-schedule. Runtime only;
+#                                blowfish_generic.ko's init tail-jumps
+#                                to crypto_register_alg, never calls
+#                                setkey itself.
+#   * cast_s1 / cast_s2 /     — CAST-5/6 substitution boxes. Linux
+#     cast_s3 / cast_s4         ships these as four 1024-byte tables
+#                                in cast_common.ko, which both
+#                                cast5_generic.ko and cast6_generic.ko
+#                                EXPORT_SYMBOL_GPL against. Hamnix has
+#                                no inter-module symbol resolution yet,
+#                                so we expose the four tables here as
+#                                kernel-side DATA symbols (zero-filled).
+#                                Init-path callers only take addresses;
+#                                no encryption is performed during load.
+#   * poly1305_core_emit      — Poly1305 finalisation. nhpoly1305 uses
+#                                Poly1305 as its hash core; the emit
+#                                step is reached only on a digest()
+#                                call, which init never performs.
+#   * crypto_cipher_decrypt_one — pcbc.ko's decrypt half (the encrypt
+#                                half is _l_crypto_cipher_encrypt_one
+#                                from L51). Runtime path only; pcbc's
+#                                init just registers a template.
+#   * skcipher_alloc_instance_simple — single-spawn skcipher instance
+#                                allocator for templates that wrap one
+#                                inner skcipher (pcbc / xcbc-class
+#                                templates). Runtime only.
+#
+# As with L49 / L50 / L51, any runtime UND that isn't on the init path
+# still resolves through this file — the loader's relocation pass binds
+# the address even though the call site never fires during module load.
+# Future milestones grow these stubs into real implementations without
+# touching call sites.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree
+
+
+# =====================================================================
+# Group 1: blowfish_setkey
+# =====================================================================
+#
+# Linux: int blowfish_setkey(struct crypto_tfm *tfm,
+#                            const u8 *key, unsigned int keylen);
+#
+# Blowfish accepts a variable-length key (32..448 bits = 4..56 bytes).
+# Real Linux's setkey runs the Blowfish P-array + S-box init: XOR the
+# key bytes into P[0..17] then encrypt 521 plaintext-zero blocks
+# successively through the cipher to fill the round-key tables.
+#
+# Stub: validate inputs, accept any keylen in [4,56], return 0.
+# init_module never calls this — it only registers the alg struct.
+
+def _l_blowfish_setkey(tfm: uint64, key: uint64, keylen: uint32) -> int32:
+    if tfm == 0:
+        return -22                                       # -EINVAL
+    if key == 0:
+        return -22
+    if keylen < 4:
+        return -22                                       # -EINVAL: too short
+    if keylen > 56:
+        return -22                                       # -EINVAL: too long
+    return 0
+
+
+# =====================================================================
+# Group 2: CAST-5/6 substitution boxes (DATA)
+# =====================================================================
+#
+# Linux: const u32 cast_s1[256];
+#        const u32 cast_s2[256];
+#        const u32 cast_s3[256];
+#        const u32 cast_s4[256];
+#
+# Each table is 256 32-bit entries (1024 bytes) of S-box values used in
+# the CAST-5 (RFC 2144) and CAST-6 (RFC 2612) round function. The two
+# cipher modules EXPORT_SYMBOL_GPL relocations against `cast_s[1..4]`
+# resolved by Linux's cast_common.ko at load time.
+#
+# Hamnix's loader has no inter-module ksymtab lookup yet (cast_common.ko
+# is itself a candidate for L53+), so the tables ship here as four
+# 1024-byte zero-filled buffers. Init-path callers only take addresses
+# (relocations against the symbol patch in `lea cast_sN(%rip), %reg`);
+# the runtime CAST round function dereferences each entry per encrypted
+# byte, which init never performs. A future milestone that wires real
+# CAST encryption fills these from RFC 2144 §A.
+#
+# Sized as Array[1024, uint8] (not Array[256, uint32]) because Adder's
+# globals path is more battle-tested for byte arrays. The module-side
+# loads (`mov cast_s1(,%rax,4), %eax`) read 4 bytes at a time, so byte
+# alignment is unaffected.
+
+cast_s1_buf: Array[1024, uint8]
+cast_s2_buf: Array[1024, uint8]
+cast_s3_buf: Array[1024, uint8]
+cast_s4_buf: Array[1024, uint8]
+
+
+# =====================================================================
+# Group 3: poly1305_core_emit
+# =====================================================================
+#
+# Linux: void poly1305_core_emit(const struct poly1305_state *state,
+#                                 const u32 *nonce, void *dst);
+#
+# Final step of the Poly1305 MAC: reduce the accumulator mod 2^130-5,
+# add the nonce, and write the 128-bit tag to dst. nhpoly1305.ko uses
+# Poly1305 as the bulk-data hash core inside its NH-Poly1305 universal
+# hash; emit fires only on the digest()-completion path, which init
+# never reaches.
+#
+# Stub: NULL-checks + zero the destination (a zero tag is the
+# "everything was zero" answer, which is safe for a never-executed
+# code path).
+
+def _l_poly1305_core_emit(state: uint64, nonce: uint64, dst: uint64):
+    if dst == 0:
+        return
+    # Tag is 16 bytes; zero-fill to give the caller a deterministic
+    # output if some forward path ever does land here.
+    pd: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    i: uint64 = 0
+    while i < 16:
+        pd[i] = 0
+        i = i + 1
+
+
+# =====================================================================
+# Group 4: pcbc runtime — crypto_cipher_decrypt_one
+# =====================================================================
+#
+# Linux: void crypto_cipher_decrypt_one(struct crypto_cipher *tfm,
+#                                        u8 *dst, const u8 *src);
+#
+# Decrypts one block under tfm's cipher. Mirror of crypto_cipher_
+# encrypt_one (L51) for the decrypt direction. pcbc.ko uses both
+# halves — encrypt for the forward chain, decrypt for the reverse.
+# Stub: identity copy over 16 bytes (most common block size, matches
+# the L51 encrypt-one stub's behaviour for symmetry).
+
+def _l_crypto_cipher_decrypt_one(tfm: uint64, dst: uint64, src: uint64):
+    if dst == 0:
+        return
+    if src == 0:
+        return
+    pd: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    ps: Ptr[uint8] = cast[Ptr[uint8]](src)
+    i: uint64 = 0
+    while i < 16:
+        pd[i] = ps[i]
+        i = i + 1
+
+
+# =====================================================================
+# Group 5: skcipher_alloc_instance_simple
+# =====================================================================
+#
+# Linux: struct skcipher_instance *
+#        skcipher_alloc_instance_simple(struct crypto_template *tmpl,
+#                                        struct rtattr **tb);
+#
+# Helper for templates that wrap exactly one inner skcipher (pcbc,
+# keywrap, similar). Allocates a skcipher_instance, grabs the inner
+# alg via a single spawn, fills the instance's algorithm name to
+# "<tmpl>(<inner>)", and returns the instance ready for the caller
+# to fill in the encrypt/decrypt/setkey function pointers.
+#
+# Real Linux: allocates ~256 bytes via crypto_alloc_instance + crypto_
+# grab_skcipher; returns ERR_PTR on failure. Runtime only — pcbc's
+# template-create path runs only when an instance is being made, never
+# during module-load. Stub: kmalloc a 256-byte zeroed buffer so the
+# returned pointer is non-NULL and unique. Any subsequent dereference
+# of instance fields is undefined, but no forward path in this batch
+# does that.
+
+def _l_skcipher_alloc_instance_simple(tmpl: uint64, tb: uint64) -> uint64:
+    if tmpl == 0:
+        # Linux returns ERR_PTR(-EINVAL); the typical ERR_PTR encoding
+        # is the negative errno cast to a pointer in the top page.
+        # Hamnix's callers in this batch never look at the pointer
+        # (instance creation is unreachable from init), so returning
+        # 0 is enough — the test fixture's load path doesn't probe it.
+        return 0
+    return kmalloc(256)
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_l52():
+    # Called from linux_abi_exports_init() after L51's xts rows.
+    # Adds 9 exports for the L52 batch (1 cipher key-schedule + 4 CAST
+    # S-box DATA buffers + 1 Poly1305 finaliser + 1 block-cipher
+    # decrypt + 1 skcipher instance allocator).
+
+    # Group 1: blowfish key schedule (1 export).
+    _add_export("blowfish_setkey",
+                cast[uint64](&_l_blowfish_setkey))
+
+    # Group 2: CAST S-boxes (4 data exports). Address of the first
+    # byte of each backing buffer is what gets patched into the
+    # module's `lea cast_sN(%rip), %reg` relocations.
+    _add_export("cast_s1",
+                cast[uint64](&cast_s1_buf[0]))
+    _add_export("cast_s2",
+                cast[uint64](&cast_s2_buf[0]))
+    _add_export("cast_s3",
+                cast[uint64](&cast_s3_buf[0]))
+    _add_export("cast_s4",
+                cast[uint64](&cast_s4_buf[0]))
+
+    # Group 3: Poly1305 emit (1 export).
+    _add_export("poly1305_core_emit",
+                cast[uint64](&_l_poly1305_core_emit))
+
+    # Group 4: pcbc decrypt half (1 export).
+    _add_export("crypto_cipher_decrypt_one",
+                cast[uint64](&_l_crypto_cipher_decrypt_one))
+
+    # Group 5: skcipher single-spawn instance allocator (1 export).
+    _add_export("skcipher_alloc_instance_simple",
+                cast[uint64](&_l_skcipher_alloc_instance_simple))

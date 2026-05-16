@@ -38,15 +38,12 @@ else
 ifeq ($(CAN_SPIE),no)
 	@echo "[glibc_idprobe] SKIP install (no static-pie glibc)"
 else
-	# Install as u_idprobe (not u_glibc_idprobe) — the longer name
-	# pushed the argv0 byte count high enough that some user-stack
-	# buffer downstream of _build_user_argv_linux overflowed. The
-	# binary loads + runs fine under shorter argv0 (verified by
-	# launching the same ELF through U22's `u_glibc_demo` path).
-	# Fix lives upstream of u_syscalls.ad, which we can't touch this
-	# milestone; the rename keeps U21 green without breaking the
-	# read-only-edit constraint.
-	cp hello ../../u_idprobe
+	# U23 fixed the underlying bug (the kernel image was overlapping
+	# the memblock pool; e820_init now clamps the allocator floor to
+	# kernel_image_end()), so we can install under the intended name
+	# /bin/u_glibc_idprobe again. The U21-era /bin/u_idprobe workaround
+	# rename is gone.
+	cp hello ../../u_glibc_idprobe
 endif
 endif
 
