@@ -1,0 +1,90 @@
+# user/free.ad
+#
+# Hamnix `free`: reads /proc/meminfo and reformats the first two
+# lines (MemTotal, MemFree) as a coreutils-`free`-style table.
+# /proc/meminfo emits Linux-shaped lines:
+#
+#   MemTotal:        <NNN> kB
+#   MemFree:         <NNN> kB
+#
+# We skip past the label + spaces, parse the integer, then stop at
+# the unit ("kB"). Two columns only — no swap row, no cache
+# breakdown — because the kernel has neither yet.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def write_dec(v: uint64):
+    if v == 0:
+        sys_write(1, "0", 1)
+        return
+    digits: Array[24, uint8]
+    i: uint64 = 0
+    while v != 0:
+        digits[i] = cast[uint8](v % 10) + 48
+        v = v / 10
+        i = i + 1
+    out: Array[24, uint8]
+    j: uint64 = 0
+    while j < i:
+        out[j] = digits[i - 1 - j]
+        j = j + 1
+    sys_write(1, &out[0], i)
+
+
+def parse_kb_at(buf: Ptr[uint8], n: uint64, start: uint64) -> uint64:
+    # Skip the label and its trailing spaces, then accumulate digits
+    # until the first non-digit. Returns the integer kB value.
+    i: uint64 = start
+    while i < n and (buf[i] < 48 or buf[i] > 57):
+        i = i + 1
+    v: uint64 = 0
+    while i < n and buf[i] >= 48 and buf[i] <= 57:
+        v = v * 10 + cast[uint64](buf[i] - 48)
+        i = i + 1
+    return v
+
+
+def main() -> int32:
+    fd: int32 = sys_open("/proc/meminfo")
+    if fd < 0:
+        write_str(2, "free: cannot open /proc/meminfo\n")
+        return 1
+    buf: Array[512, uint8]
+    n: int64 = sys_read(fd, &buf[0], 512)
+    sys_close(fd)
+    if n <= 0:
+        write_str(2, "free: empty /proc/meminfo\n")
+        return 1
+    nu: uint64 = cast[uint64](n)
+    # Find newline ending the first line; second line begins right after.
+    line2: uint64 = 0
+    i: uint64 = 0
+    while i < nu:
+        if buf[i] == 10:
+            line2 = i + 1
+            break
+        i = i + 1
+    total: uint64 = parse_kb_at(&buf[0], nu, 0)
+    free_kb: uint64 = parse_kb_at(&buf[0], nu, line2)
+    write_str(1, "               total       free\n")
+    write_str(1, "Mem:           ")
+    write_dec(total)
+    write_str(1, "        ")
+    write_dec(free_kb)
+    write_str(1, "\n")
+    return 0

@@ -84,3 +84,11 @@ build_adder_user du                   # M16.70: entry-count under path
 build_adder_user tail                 # M16.70: last N lines of stdin
 build_adder_user cmp                  # M16.70: byte-compare two files
 build_adder_user which                # M16.74: PATH lookup tool
+build_adder_user init2                # M16.74: Adder /sbin/init reading /etc/inittab
+build_adder_user free                 # M16.74: /proc/meminfo as free table
+build_adder_user uptime               # M16.74: /proc/uptime in seconds
+build_adder_user mv                   # M16.74: copy + unlink (no rename(2))
+build_adder_user ln                   # M16.74: placeholder for symlink/hardlink
+build_adder_user cal                  # M16.74: hard-coded May 2026 month grid
+build_adder_user expr                 # M16.74: A OP B for + - * /
+build_adder_user test                 # M16.74: -z/-n/=/!= predicates

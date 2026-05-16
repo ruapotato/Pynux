@@ -1,0 +1,51 @@
+# user/uptime.ad
+#
+# Hamnix `uptime`: reads /proc/uptime, parses the leading centisecond
+# count, and emits "up N seconds\n". /proc/uptime renders as
+# "<cs> cs (<j> jiffies)\n" — first non-digit terminates the count.
+# Simpler than `date`: no fractional column.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+def write_dec(v: uint64):
+    if v == 0:
+        sys_write(1, "0", 1)
+        return
+    digits: Array[24, uint8]
+    i: uint64 = 0
+    while v != 0:
+        digits[i] = cast[uint8](v % 10) + 48
+        v = v / 10
+        i = i + 1
+    out: Array[24, uint8]
+    j: uint64 = 0
+    while j < i:
+        out[j] = digits[i - 1 - j]
+        j = j + 1
+    sys_write(1, &out[0], i)
+
+
+def main() -> int32:
+    fd: int32 = sys_open("/proc/uptime")
+    if fd < 0:
+        sys_write(2, "uptime: cannot open /proc/uptime\n", 33)
+        return 1
+    buf: Array[64, uint8]
+    n: int64 = sys_read(fd, &buf[0], 64)
+    sys_close(fd)
+    if n <= 0:
+        return 1
+    cs: uint64 = 0
+    i: uint64 = 0
+    nu: uint64 = cast[uint64](n)
+    while i < nu and buf[i] >= 48 and buf[i] <= 57:
+        cs = cs * 10 + cast[uint64](buf[i] - 48)
+        i = i + 1
+    sys_write(1, "up ", 3)
+    write_dec(cs / 100)
+    sys_write(1, " seconds\n", 9)
+    return 0

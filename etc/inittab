@@ -1,0 +1,3 @@
+# /etc/inittab — last non-comment line is exec'd by /sbin/init2
+# (when wired as /init). Comments start with `#`; blank lines OK.
+/bin/hamsh

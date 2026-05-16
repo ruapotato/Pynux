@@ -62,11 +62,13 @@ cat "$LOG"
 echo "[test_signals] --- end output ---"
 
 fail=0
-# cat is pid 2 (hamsh is pid 1). SIGINT default exit code is 128+2=130.
-if grep -E -q "task: pid 2 exited \(code=130\)" "$LOG"; then
+# cat is killed by SIGINT — default exit code is 128+2=130. PID is
+# no longer hardcoded to 2 since /etc/rc now spawns several tasks
+# before the prompt opens, so we match any pid with exit code 130.
+if grep -E -q "task: pid [0-9]+ exited \(code=130\)" "$LOG"; then
     echo "[test_signals] OK: cat killed by SIGINT (exit code 130)"
 else
-    echo "[test_signals] MISS: 'task: pid 2 exited (code=130)' not found"
+    echo "[test_signals] MISS: 'task: pid N exited (code=130)' not found"
     fail=1
 fi
 # hamsh ('[hamsh] bye.') still ran after the child died — meaning

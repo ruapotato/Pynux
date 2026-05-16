@@ -1,0 +1,101 @@
+# user/expr.ad
+#
+# Hamnix `expr A OP B`: tiny coreutils-style integer evaluator.
+# Supported ops: + - * /. Exits 2 on syntax errors (GNU's "bad
+# expression" exit code) so shell scripts using `expr` for arith
+# can branch on the failure path correctly.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def parse_int_strict(s: Ptr[uint8], ok: Ptr[int32]) -> int64:
+    # Strict — empty input or any non-digit body byte fails. The
+    # caller checks *ok before trusting the returned value.
+    ok[0] = 0
+    i: uint64 = 0
+    neg: int64 = 1
+    if s[0] == 45:
+        neg = -1
+        i = 1
+    if s[i] == 0:
+        return 0
+    n: int64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return 0
+        n = n * 10 + cast[int64](c - 48)
+        i = i + 1
+    ok[0] = 1
+    return n * neg
+
+
+def put_dec(n: int64):
+    if n == 0:
+        sys_write(1, "0\n", 2)
+        return
+    if n < 0:
+        sys_write(1, "-", 1)
+        n = -n
+    digits: Array[24, uint8]
+    i: uint64 = 0
+    v: uint64 = cast[uint64](n)
+    while v != 0:
+        digits[i] = cast[uint8](v % 10) + 48
+        v = v / 10
+        i = i + 1
+    out: Array[25, uint8]
+    j: uint64 = 0
+    while j < i:
+        out[j] = digits[i - 1 - j]
+        j = j + 1
+    out[i] = 10
+    sys_write(1, &out[0], i + 1)
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc != 4:
+        write_str(2, "expr: usage: expr A OP B\n")
+        return 2
+    ok: Array[1, int32]
+    a: int64 = parse_int_strict(cast[Ptr[uint8]](argv[1]), &ok[0])
+    if ok[0] == 0:
+        write_str(2, "expr: non-integer argument\n")
+        return 2
+    b: int64 = parse_int_strict(cast[Ptr[uint8]](argv[3]), &ok[0])
+    if ok[0] == 0:
+        write_str(2, "expr: non-integer argument\n")
+        return 2
+    op: Ptr[uint8] = cast[Ptr[uint8]](argv[2])
+    if op[1] != 0:
+        write_str(2, "expr: unknown operator\n")
+        return 2
+    result: int64 = 0
+    c: uint8 = op[0]
+    if c == 43:
+        result = a + b
+    elif c == 45:
+        result = a - b
+    elif c == 42:
+        result = a * b
+    elif c == 47:
+        if b == 0:
+            write_str(2, "expr: division by zero\n")
+            return 2
+        result = a / b
+    else:
+        write_str(2, "expr: unknown operator\n")
+        return 2
+    put_dec(result)
+    return 0
