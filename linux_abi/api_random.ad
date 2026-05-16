@@ -1,0 +1,162 @@
+# linux_abi/api_random.ad
+#
+# L16: random + uaccess shims. Two unrelated-in-spirit-but-co-located
+# Linux APIs that every other module reaches for at some point:
+#
+#   void get_random_bytes(void *buf, int nbytes);
+#   unsigned long _copy_to_user(void __user *to,
+#                                const void *from, unsigned long n);
+#   unsigned long _copy_from_user(void *to,
+#                                  const void __user *from,
+#                                  unsigned long n);
+#
+# M8.1 + M10.1 in the regression .ko suite test get_random_bytes; M5.1
+# (the chrdev read/write fixture, once it grows a userland round-trip)
+# leans on _copy_to_user / _copy_from_user.
+#
+# Implementation strategy:
+#
+# get_random_bytes: a Linear Congruential Generator seeded from
+# get_jiffies(). Not cryptographically secure — anyone who reads
+# /dev/urandom expecting CSPRNG output is going to be disappointed —
+# but it produces non-zero, jiffies-dependent output that varies
+# between invocations. The M8.1 fixture checks "any byte non-zero"
+# and that's exactly what we deliver. The 64-bit Numerical Recipes
+# constants are used (a = 6364136223846793005, c = 1442695040888963407);
+# they're a well-known full-period 64-bit LCG that's fine for testing.
+#
+# _copy_to_user / _copy_from_user: Hamnix has no MMU isolation between
+# kernel and userland yet — userland pointers are just kernel pointers.
+# Both shims devolve to memcpy. Linux's return convention is "number
+# of bytes that could NOT be copied" (0 = full success); we always
+# succeed, so we always return 0. When a future milestone adds page
+# tables for user space, these shims grow a copy-with-fault-check
+# wrapper (the real Linux implementation uses ex_table lookups to
+# turn page faults into a partial-copy return value).
+
+from kernel.printk.printk import printk0
+from linux_abi.exports import _add_export
+from arch.x86.kernel.time import get_jiffies
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# --- LCG state ------------------------------------------------------
+#
+# rand_state is the current 64-bit LCG state. It's lazily seeded on
+# the first call to get_random_bytes via get_jiffies() — at boot the
+# very first call gets a small jiffies value (likely 0..50), but the
+# multiplier + addend immediately scramble it into a full 64-bit
+# space. Subsequent calls carry state forward, so back-to-back calls
+# produce different output even without an intervening tick.
+#
+# A non-zero rand_state value also serves as the "have we been seeded
+# yet?" flag — we don't bother with a separate boolean.
+
+rand_state: uint64 = 0
+
+# Numerical Recipes' 64-bit LCG constants (Press et al, 3rd ed). Full
+# period 2^64, decent low-bit quality once you discard the bottom 8.
+LCG_MULT: uint64 = 6364136223846793005
+LCG_ADD:  uint64 = 1442695040888963407
+
+
+def _rand_step() -> uint64:
+    # One LCG step. We use the top byte of the state for output (the
+    # low byte of an LCG is the weakest) — Numerical Recipes
+    # recommends taking the high bits of the state for this reason.
+    # Returns a fresh uint64; caller picks whichever slice it wants.
+    rand_state = rand_state * LCG_MULT + LCG_ADD
+    return rand_state
+
+
+def _rand_seed_if_needed():
+    # Lazy seed: first call to get_random_bytes pulls a tick count
+    # from get_jiffies(). Even at boot when jiffies is small, the LCG
+    # step immediately stretches it across the full 64-bit space, so
+    # the FIRST byte we emit is non-trivial (the M8.1 "any non-zero"
+    # check passes even on the very first invocation from module_init,
+    # which often runs in the first few ticks after boot).
+    if rand_state == 0:
+        seed: uint64 = get_jiffies()
+        # If get_jiffies() somehow returns 0 (the timer ISR hasn't
+        # ticked yet — possible during very early module init), fall
+        # back to a non-zero constant so the LCG actually advances on
+        # the first step. The constant is itself the LCG_ADD value,
+        # which guarantees a non-trivial first output.
+        if seed == 0:
+            seed = LCG_ADD
+        rand_state = seed
+
+
+# --- L16 shims -------------------------------------------------------
+
+def _l_get_random_bytes(buf: Ptr[uint8], nbytes: int32):
+    # Linux: void get_random_bytes(void *buf, int nbytes);
+    # No return value, no failure path — the caller assumes it works.
+    # We fill `nbytes` bytes with the high byte of successive LCG
+    # outputs. Tolerate NULL / non-positive nbytes by no-oping.
+    if cast[uint64](buf) == 0:
+        return
+    if nbytes <= 0:
+        return
+    _rand_seed_if_needed()
+    n: uint64 = cast[uint64](nbytes)
+    i: uint64 = 0
+    while i < n:
+        v: uint64 = _rand_step()
+        # Take bits 56..63 — the LCG's high byte has the best
+        # statistical quality. (Bits 0..7 are essentially a counter
+        # mod some small power-of-two, which is why we avoid them.)
+        buf[i] = cast[uint8](v >> 56)
+        i = i + 1
+
+
+def _l_copy_to_user(to: Ptr[uint8], src: Ptr[uint8], n: uint64) -> uint64:
+    # Linux: returns the number of bytes that could NOT be copied. A
+    # successful full copy returns 0. With no MMU isolation yet, the
+    # destination pointer is just a kernel address — memcpy handles it.
+    # Tolerate the n == 0 case explicitly (memcpy is also a no-op
+    # there, but skipping the call avoids a wasted register shuffle).
+    if n == 0:
+        return 0
+    if cast[uint64](to) == 0:
+        # NULL destination: Linux would take a fault and return n.
+        # We mirror that — pretend the whole copy failed.
+        return n
+    if cast[uint64](src) == 0:
+        return n
+    memcpy(to, src, n)
+    return 0
+
+
+def _l_copy_from_user(to: Ptr[uint8], src: Ptr[uint8], n: uint64) -> uint64:
+    # Mirror of _l_copy_to_user. The "from" side has the same fault
+    # convention in Linux (return bytes-not-copied) — we never fault
+    # because there's no MMU isolation, so a successful path returns
+    # 0. NULL on either side mimics the fault case.
+    if n == 0:
+        return 0
+    if cast[uint64](to) == 0:
+        return n
+    if cast[uint64](src) == 0:
+        return n
+    memcpy(to, src, n)
+    return 0
+
+
+# --- registration ----------------------------------------------------
+
+def linux_abi_register_random():
+    # Two Linux symbols, three exports: get_random_bytes plus the
+    # underscore-prefixed copy_*_user pair (the names with leading
+    # underscore are the ABI-stable kernel entry points; the
+    # non-underscore copy_to_user / copy_from_user are inline wrappers
+    # in <linux/uaccess.h> that resolve to these symbols at compile
+    # time). Modules link against the underscore form.
+    _add_export("get_random_bytes",
+                cast[uint64](&_l_get_random_bytes))
+    _add_export("_copy_to_user",
+                cast[uint64](&_l_copy_to_user))
+    _add_export("_copy_from_user",
+                cast[uint64](&_l_copy_from_user))

@@ -1,0 +1,246 @@
+# linux_abi/api_irq.ad - L11 shims (Linux IRQ ABI).
+#
+# Stock Linux drivers wire interrupts through one of two near-identical
+# entry points. The classic top-half-only form is request_irq; drivers
+# that want to do the bulk of their work in a kernel thread reach for
+# request_threaded_irq, where `handler` runs in IRQ context just long
+# enough to ACK the device and decide whether the threaded `thread_fn`
+# should be woken. M4.1 in the .ko regression suite walks this surface:
+#
+#   typedef irqreturn_t (*irq_handler_t)(int irq, void *dev_id);
+#
+#   int  request_irq(unsigned int irq, irq_handler_t handler,
+#                    unsigned long flags, const char *name, void *dev);
+#   int  request_threaded_irq(unsigned int irq, irq_handler_t handler,
+#                             irq_handler_t thread_fn,
+#                             unsigned long flags, const char *name,
+#                             void *dev);
+#   void free_irq(unsigned int irq, void *dev_id);
+#   void synchronize_irq(unsigned int irq);
+#
+# Implementation strategy (L11 scope):
+#
+# Hamnix doesn't yet route hardware IDT vectors into module-registered
+# handlers. The point of L11 is purely the registration shape: a module
+# must be able to call request_irq() in its init path and free_irq()
+# in its exit path without the loader exploding, and the matching slot
+# bookkeeping has to be in place so a later milestone can wire it into
+# the real ISR dispatch (arch/x86/kernel/idt.ad picks up the slot table
+# and demuxes incoming vectors against handler_addr at that point).
+#
+# A 16-slot static table parallels the layout used by api_proc.ad and
+# api_chrdev.ad — parallel arrays, indexed by slot, with the IRQ number
+# itself used as a uniqueness key (irq 0 sentinels "free"). Linux's
+# usual IRQ space goes 0..223 on x86_64 (the high vectors are reserved
+# for IPIs and the local APIC); the M4.1 fixture uses 0x42 = 66, well
+# inside that range.
+#
+# Threaded variant: the secondary thread_fn pointer is recorded but
+# not started. When idt.ad lands, it'll spawn a kthread per non-NULL
+# thread_fn slot using the L8 kthread machinery; for now we just keep
+# the address live so the symmetric free_irq path can reason about it.
+#
+# free_irq's Linux prototype is `void free_irq(unsigned int, void *)`,
+# but the kernel's actual implementation returns the dev_id cookie via
+# its internal __free_irq path. The exported symbol is `void`-typed,
+# so the caller discards anything we return — we keep uint64 here for
+# the loader's uniform 8-byte relocation slot (same convention used by
+# _l_unregister_chrdev in api_chrdev.ad).
+#
+# IRQF_* flags: Linux's <linux/interrupt.h> defines a couple dozen of
+# these. M4.1 passes 0 (no flags), so for L11 we just expose the names
+# that real drivers commonly reference at compile time. The shim itself
+# stashes the flag bits verbatim — the IDT dispatcher in a later
+# milestone is what acts on IRQF_SHARED / IRQF_TRIGGER_* / etc.
+
+from linux_abi.exports import _add_export
+
+
+# --- IRQF_* flag constants ------------------------------------------
+#
+# Values match include/linux/interrupt.h in Linux 6.12. We expose them
+# here as named globals so future ad-side code (the IDT wire-in) can
+# check the stored flag bits by name rather than magic numbers. Modules
+# themselves carry these as their own #defines from <linux/interrupt.h>;
+# the loader doesn't need to resolve them as symbols, but documenting
+# them in this file keeps the L11 surface self-contained.
+
+IRQF_TRIGGER_NONE:    uint64 = 0x00000000
+IRQF_TRIGGER_RISING:  uint64 = 0x00000001
+IRQF_TRIGGER_FALLING: uint64 = 0x00000002
+IRQF_TRIGGER_HIGH:    uint64 = 0x00000004
+IRQF_TRIGGER_LOW:     uint64 = 0x00000008
+IRQF_SHARED:          uint64 = 0x00000080
+IRQF_PROBE_SHARED:    uint64 = 0x00000100
+IRQF_TIMER:           uint64 = 0x00000200
+IRQF_PERCPU:          uint64 = 0x00000400
+IRQF_NOBALANCING:     uint64 = 0x00000800
+IRQF_IRQPOLL:         uint64 = 0x00001000
+IRQF_ONESHOT:         uint64 = 0x00002000
+IRQF_NO_SUSPEND:      uint64 = 0x00004000
+IRQF_FORCE_RESUME:    uint64 = 0x00008000
+IRQF_NO_THREAD:       uint64 = 0x00010000
+IRQF_EARLY_RESUME:    uint64 = 0x00020000
+IRQF_COND_SUSPEND:    uint64 = 0x00040000
+
+
+# --- 16-slot static IRQ registration table --------------------------
+#
+# Slot layout (parallel arrays, same pattern as api_chrdev.ad):
+#   irq_slot_irq      : IRQ number; 0 means "free slot"
+#                       (Linux IRQ 0 is the timer and is never claimed
+#                        via request_irq from a module, so 0 stays
+#                        usable as a free-slot sentinel)
+#   irq_slot_handler  : top-half handler address (irq_handler_t)
+#   irq_slot_thread   : threaded handler address; 0 if not threaded
+#   irq_slot_flags    : IRQF_* bits passed in at request time
+#   irq_slot_name     : caller-owned Ptr[char] cast to uint64
+#   irq_slot_dev      : the void *dev cookie; passed back to the
+#                       handler and required to match on free_irq.
+
+MAX_IRQ_SLOTS: uint64 = 16
+
+irq_slot_irq:     Array[16, uint32]
+irq_slot_handler: Array[16, uint64]
+irq_slot_thread:  Array[16, uint64]
+irq_slot_flags:   Array[16, uint64]
+irq_slot_name:    Array[16, uint64]
+irq_slot_dev:     Array[16, uint64]
+
+
+def _irq_find_free_slot() -> int32:
+    # Returns slot index 0..MAX_IRQ_SLOTS-1, or -1 if full.
+    i: uint64 = 0
+    while i < MAX_IRQ_SLOTS:
+        if irq_slot_irq[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _irq_find_by_irq(irq: uint32, dev: uint64) -> int32:
+    # Linux looks up by (irq, dev_id) — shared IRQs (IRQF_SHARED) can
+    # have multiple registrations on the same line, distinguished by
+    # dev_id. We don't materialize shared chains yet, but the dev_id
+    # match below is still the right key: a free_irq() on (irq, dev)
+    # has to find the slot whose dev_cookie matches what was passed
+    # to the corresponding request_irq().
+    i: uint64 = 0
+    while i < MAX_IRQ_SLOTS:
+        if irq_slot_irq[i] == irq:
+            if irq_slot_dev[i] == dev:
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- request_irq / request_threaded_irq -----------------------------
+
+def _l_request_irq(irq: uint32, handler: uint64, flags: uint64,
+                   name: uint64, dev: uint64) -> int32:
+    # Linux semantics:
+    #   irq == 0 is the timer — modules aren't supposed to claim it.
+    #   We accept it anyway (no negative-errno return here is harmless
+    #   for L11) so M4.1's fixed-pick of irq 0x42 isn't a special case.
+    # Returns 0 on success, -EBUSY (-16) if the IRQ is already claimed
+    # by a non-shareable handler, -ENOMEM (-12) if the slot table is
+    # full.
+    #
+    # L11 does NOT touch the IDT. The handler is recorded for the
+    # later milestone that wires arch/x86/kernel/idt.ad to consult
+    # this table — at that point a real interrupt on `irq` calls
+    # handler(irq, dev). Until then it's pure bookkeeping.
+
+    # Reject IRQF_SHARED collisions only when dev_id matches — Linux's
+    # rule is "two non-shared handlers on the same line is -EBUSY".
+    # For L11 we approximate that with a simpler "any existing slot
+    # for this irq with the same dev_id is a collision".
+    if _irq_find_by_irq(irq, dev) >= 0:
+        return -16                                # -EBUSY
+
+    slot: int32 = _irq_find_free_slot()
+    if slot < 0:
+        return -12                                # -ENOMEM
+
+    s: uint64 = cast[uint64](slot)
+    irq_slot_irq[s]     = irq
+    irq_slot_handler[s] = handler
+    irq_slot_thread[s]  = 0
+    irq_slot_flags[s]   = flags
+    irq_slot_name[s]    = name
+    irq_slot_dev[s]     = dev
+    return 0
+
+
+def _l_request_threaded_irq(irq: uint32, handler: uint64,
+                             thread_fn: uint64, flags: uint64,
+                             name: uint64, dev: uint64) -> int32:
+    # Threaded variant: same bookkeeping plus the secondary thread_fn
+    # pointer. The IDT wire-in milestone is what'll spawn a kthread
+    # against thread_fn; for L11 we just keep the address live. A
+    # NULL `handler` with a non-NULL `thread_fn` is the "default
+    # primary handler" pattern (Linux's __setup_irq inserts
+    # irq_default_primary_handler in that case) — we accept it as-is.
+    if _irq_find_by_irq(irq, dev) >= 0:
+        return -16                                # -EBUSY
+
+    slot: int32 = _irq_find_free_slot()
+    if slot < 0:
+        return -12                                # -ENOMEM
+
+    s: uint64 = cast[uint64](slot)
+    irq_slot_irq[s]     = irq
+    irq_slot_handler[s] = handler
+    irq_slot_thread[s]  = thread_fn
+    irq_slot_flags[s]   = flags
+    irq_slot_name[s]    = name
+    irq_slot_dev[s]     = dev
+    return 0
+
+
+def _l_free_irq(irq: uint32, dev: uint64) -> uint64:
+    # Linux: void free_irq(unsigned int, void *) — but kernel-internal
+    # __free_irq returns the dev_id cookie of the removed registration.
+    # The exported symbol is void-typed; uniformly returning uint64
+    # here keeps the loader's relocation slot regular (see api_chrdev.ad
+    # _l_unregister_chrdev for the same pattern).
+    #
+    # A free_irq() on an unregistered (irq, dev) pair is a soft warning
+    # in real Linux (printk + WARN_ON); for L11 we silently no-op so
+    # the M4.1 teardown path stays clean.
+    slot: int32 = _irq_find_by_irq(irq, dev)
+    if slot < 0:
+        return 0
+    s: uint64 = cast[uint64](slot)
+    irq_slot_irq[s]     = 0
+    irq_slot_handler[s] = 0
+    irq_slot_thread[s]  = 0
+    irq_slot_flags[s]   = 0
+    irq_slot_name[s]    = 0
+    irq_slot_dev[s]     = 0
+    return 0                                      # NULL (matches Linux's void)
+
+
+def _l_synchronize_irq(irq: uint32):
+    # Real Linux: spins until any in-flight handler for `irq` has
+    # returned, then returns. On a uniprocessor + cooperative kernel
+    # with no IDT routing yet, no handler can ever be in flight, so
+    # the post-condition holds trivially. No-op.
+    return
+
+
+# --- registration ---------------------------------------------------
+
+def linux_abi_register_irq():
+    # Called once from linux_abi_exports_init alongside the other
+    # per-subsystem registrations. Order doesn't matter — the export
+    # table is name-keyed — but grouping by milestone keeps the boot
+    # log readable.
+    _add_export("request_irq",
+                cast[uint64](&_l_request_irq))
+    _add_export("request_threaded_irq",
+                cast[uint64](&_l_request_threaded_irq))
+    _add_export("free_irq",
+                cast[uint64](&_l_free_irq))
+    _add_export("synchronize_irq",
+                cast[uint64](&_l_synchronize_irq))

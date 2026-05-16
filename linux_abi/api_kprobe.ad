@@ -1,0 +1,217 @@
+# linux_abi/api_kprobe.ad
+#
+# L13: Linux kprobe + kretprobe ABI shims. kprobes are the kernel's
+# dynamic-instrumentation primitive — a module registers a struct
+# kprobe with a target symbol name and a pre/post handler pair, and
+# the kprobes core patches the target's first instruction with a
+# breakpoint that traps into the registered handler. kretprobes layer
+# on top to catch the *return* of a function (used heavily by
+# perf / bcc / bpftrace for entry+exit pairing). M7.1, M14.1, and
+# M14.2 in the regression .ko suite walk this surface to verify the
+# kprobe registration path accepts module-side struct kprobe layouts.
+#
+# Linux signatures (include/linux/kprobes.h, kernel/kprobes.c):
+#   int  register_kprobe(struct kprobe *p);
+#   void unregister_kprobe(struct kprobe *p);
+#   int  register_kretprobe(struct kretprobe *rp);
+#   void unregister_kretprobe(struct kretprobe *rp);
+#
+# Implementation strategy:
+#
+# We DO NOT patch kernel text at L13. That would require:
+#   - INT3 breakpoint insertion at p->addr (or symbol_name lookup);
+#   - a kprobe trap handler in arch/x86/kernel/idt.ad that walks our
+#     slot table on every #BP, runs pre/post handlers, and single-steps
+#     the displaced instruction off a scratch page;
+#   - text-poke RCU dance for live-patching.
+#
+# All of which is M-track work in its own right. For L13 we record
+# (probe_ptr, symbol, pre_handler, post_handler) in a 16-slot static
+# table and return success — exactly the pattern the L5/L8/L10 shims
+# use for their "registration-shaped only" semantics. The handlers
+# never get called (because no INT3 fires), but module_init /
+# module_exit happily complete and the regression suite sees a
+# non-failing register_kprobe return.
+#
+# struct kprobe layout (Linux 6.12, simplified — we only read three
+# fields):
+#   offset  0   struct hlist_node hlist          (16 bytes)
+#   offset 16   struct list_head list            (16 bytes)
+#   offset 32   unsigned long nmissed
+#   offset 40   kprobe_opcode_t *addr            (target address)
+#   offset 48   const char *symbol_name          (preferred: symbol lookup)
+#   offset 56   kprobe_pre_handler_t pre_handler
+#   offset 64   kprobe_post_handler_t post_handler
+#   ... (fault_handler, opcode, ainsn, flags follow; ignored)
+#
+# struct kretprobe wraps struct kprobe at offset 0 and adds a return
+# handler at offset ~80; we only need to read the embedded kprobe's
+# symbol_name, so we treat kretprobes as kprobes for the purpose of
+# the slot table.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+
+
+# --- 16-slot static kprobe table ------------------------------------
+#
+# A kprobe slot is "free" when kprobe_ptrs[i] == 0. The handle isn't
+# exposed to module code (register_kprobe returns 0/-ENOMEM, not a
+# cookie); we still keep the table so unregister_kprobe can find and
+# clear the matching entry by probe pointer.
+
+MAX_KPROBES: uint64 = 16
+
+kprobe_ptrs:    Array[16, uint64]   # struct kprobe *  (0 = free)
+kprobe_symbols: Array[16, uint64]   # const char *symbol_name
+kprobe_addrs:   Array[16, uint64]   # kprobe_opcode_t *addr
+kprobe_pre:     Array[16, uint64]   # pre_handler function pointer
+kprobe_post:    Array[16, uint64]   # post_handler function pointer
+kprobe_kind:    Array[16, uint64]   # 0 = kprobe, 1 = kretprobe
+
+
+# struct kprobe field offsets (see header comment above).
+KPROBE_ADDR_OFFSET:    uint64 = 40
+KPROBE_SYMBOL_OFFSET:  uint64 = 48
+KPROBE_PRE_OFFSET:     uint64 = 56
+KPROBE_POST_OFFSET:    uint64 = 64
+
+
+# -ENOMEM. Linux's register_kprobe returns negative errno; we only
+# ever surface -ENOMEM (table full). Other failure modes (symbol not
+# found, addr in non-text region) would need real patching to detect,
+# which we don't do.
+ERR_ENOMEM: int32 = -12
+
+
+def _kprobe_find_slot(probe_ptr: uint64) -> uint64:
+    # +1-biased slot index, or 0 if not found. Same convention as the
+    # L9/L10 timer tables — callers that pass a never-registered probe
+    # get a silent 0 back (matches Linux's "unregister of unknown
+    # probe is a debug WARN, not a crash").
+    i: uint64 = 0
+    while i < MAX_KPROBES:
+        if kprobe_ptrs[i] == probe_ptr:
+            return i + 1
+        i = i + 1
+    return 0
+
+
+def _kprobe_alloc_slot(probe_ptr: uint64, kind: uint64) -> uint64:
+    # Returns (slot + 1) on success, 0 if the table is full. Mirrors
+    # the api_proc.ad allocator's idempotent re-registration:
+    # registering the same struct kprobe * twice returns the existing
+    # slot rather than wasting a row.
+    found: uint64 = _kprobe_find_slot(probe_ptr)
+    if found != 0:
+        return found
+    i: uint64 = 0
+    while i < MAX_KPROBES:
+        if kprobe_ptrs[i] == 0:
+            kprobe_ptrs[i]    = probe_ptr
+            kprobe_symbols[i] = 0
+            kprobe_addrs[i]   = 0
+            kprobe_pre[i]     = 0
+            kprobe_post[i]    = 0
+            kprobe_kind[i]    = kind
+            return i + 1
+        i = i + 1
+    return 0
+
+
+def _kprobe_record_fields(slot: uint64, probe_ptr: uint64):
+    # Read struct kprobe's symbol_name / addr / pre_handler /
+    # post_handler at the offsets defined above. The slot index is
+    # already +1-biased (handle form) when callers pass it in; convert
+    # back to a raw array index here.
+    idx: uint64 = slot - 1
+    sym_slot:  Ptr[uint64] = cast[Ptr[uint64]](
+        probe_ptr + KPROBE_SYMBOL_OFFSET)
+    addr_slot: Ptr[uint64] = cast[Ptr[uint64]](
+        probe_ptr + KPROBE_ADDR_OFFSET)
+    pre_slot:  Ptr[uint64] = cast[Ptr[uint64]](
+        probe_ptr + KPROBE_PRE_OFFSET)
+    post_slot: Ptr[uint64] = cast[Ptr[uint64]](
+        probe_ptr + KPROBE_POST_OFFSET)
+    kprobe_symbols[idx] = sym_slot[0]
+    kprobe_addrs[idx]   = addr_slot[0]
+    kprobe_pre[idx]     = pre_slot[0]
+    kprobe_post[idx]    = post_slot[0]
+
+
+def _kprobe_free_slot(probe_ptr: uint64):
+    # unregister_kprobe(NULL) is rare but tolerated — Linux's path
+    # WARN_ON's it; we silently no-op. Likewise an unknown probe is a
+    # no-op (the module's exit path is the only sensible caller).
+    if probe_ptr == 0:
+        return
+    handle: uint64 = _kprobe_find_slot(probe_ptr)
+    if handle == 0:
+        return
+    idx: uint64 = handle - 1
+    kprobe_ptrs[idx]    = 0
+    kprobe_symbols[idx] = 0
+    kprobe_addrs[idx]   = 0
+    kprobe_pre[idx]     = 0
+    kprobe_post[idx]    = 0
+    kprobe_kind[idx]    = 0
+
+
+# --- Linux-ABI shims -------------------------------------------------
+
+def _l_register_kprobe(probe_ptr: uint64) -> int32:
+    # Linux: int register_kprobe(struct kprobe *p). Returns 0 on
+    # success, -errno otherwise. We surface -ENOMEM if the slot table
+    # is full and 0 otherwise — neither symbol-not-found nor
+    # addr-not-in-text are detectable without a real symbol resolver
+    # / text-poke layer, both of which are deferred.
+    if probe_ptr == 0:
+        return ERR_ENOMEM
+    handle: uint64 = _kprobe_alloc_slot(probe_ptr, 0)
+    if handle == 0:
+        printk0("register_kprobe: slot table full\n")
+        return ERR_ENOMEM
+    _kprobe_record_fields(handle, probe_ptr)
+    return 0
+
+
+def _l_unregister_kprobe(probe_ptr: uint64):
+    # Linux: void unregister_kprobe(struct kprobe *p). No return value;
+    # any error becomes a kernel WARN at most. Slot clear + done.
+    _kprobe_free_slot(probe_ptr)
+
+
+def _l_register_kretprobe(rprobe_ptr: uint64) -> int32:
+    # Linux: int register_kretprobe(struct kretprobe *rp). struct
+    # kretprobe embeds a struct kprobe at offset 0, so the symbol /
+    # pre / post field offsets we read above land on the embedded
+    # kprobe's slot — exactly the same record layout. The return
+    # handler at the kretprobe's tail (offset ~80) is also recorded
+    # by no slot in our table; that's fine for L13 (no exec path).
+    if rprobe_ptr == 0:
+        return ERR_ENOMEM
+    handle: uint64 = _kprobe_alloc_slot(rprobe_ptr, 1)
+    if handle == 0:
+        printk0("register_kretprobe: slot table full\n")
+        return ERR_ENOMEM
+    _kprobe_record_fields(handle, rprobe_ptr)
+    return 0
+
+
+def _l_unregister_kretprobe(rprobe_ptr: uint64):
+    # Same teardown shape as unregister_kprobe — the slot table
+    # doesn't care which kind sits in the row, only that the pointer
+    # matches.
+    _kprobe_free_slot(rprobe_ptr)
+
+
+# --- registration ----------------------------------------------------
+
+def linux_abi_register_kprobe():
+    # Called from start_kernel after the L1..L12 registrations land.
+    # Order doesn't matter (flat name-keyed table) but grouping by
+    # milestone keeps the boot log readable.
+    _add_export("register_kprobe",      cast[uint64](&_l_register_kprobe))
+    _add_export("unregister_kprobe",    cast[uint64](&_l_unregister_kprobe))
+    _add_export("register_kretprobe",   cast[uint64](&_l_register_kretprobe))
+    _add_export("unregister_kretprobe", cast[uint64](&_l_unregister_kretprobe))

@@ -32,6 +32,11 @@ from linux_abi.api_timer import linux_abi_register_timer
 from linux_abi.api_hrtimer import linux_abi_register_hrtimer
 from linux_abi.api_waitq import linux_abi_register_waitq
 from linux_abi.api_kthread import linux_abi_register_kthread
+from linux_abi.api_irq import linux_abi_register_irq
+from linux_abi.api_kprobe import linux_abi_register_kprobe
+from linux_abi.api_debugfs import linux_abi_register_debugfs
+from linux_abi.api_crypto import linux_abi_register_crypto
+from linux_abi.api_random import linux_abi_register_random
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -186,6 +191,16 @@ def linux_abi_exports_init():
     linux_abi_register_waitq()
     # L8: kthread + workqueue.
     linux_abi_register_kthread()
+    # L11: IRQ.
+    linux_abi_register_irq()
+    # L13: kprobe / kretprobe.
+    linux_abi_register_kprobe()
+    # L14: debugfs.
+    linux_abi_register_debugfs()
+    # L15: crypto.
+    linux_abi_register_crypto()
+    # L16: random + uaccess.
+    linux_abi_register_random()
     # L9: timer_list.
     linux_abi_register_timer()
     # L10: hrtimer.

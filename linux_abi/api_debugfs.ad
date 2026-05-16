@@ -1,0 +1,177 @@
+# linux_abi/api_debugfs.ad
+#
+# L14: Linux debugfs ABI shims. debugfs is the kernel's
+# debugging-only filesystem (normally mounted at /sys/kernel/debug),
+# used by drivers to expose tunables, counters, and ad-hoc state.
+# Unlike procfs, debugfs entries are explicitly "no stable ABI" — so
+# the registration surface is what stock drivers actually depend on,
+# not the read-path semantics. M11.2 in the regression .ko suite walks
+# this surface to verify a hamnix_l14/counter pair is accepted.
+#
+# Linux signatures (include/linux/debugfs.h, fs/debugfs/inode.c):
+#   struct dentry *debugfs_create_dir(const char *name,
+#                                      struct dentry *parent);
+#   struct dentry *debugfs_create_file(const char *name, umode_t mode,
+#                                      struct dentry *parent,
+#                                      void *data,
+#                                      const struct file_operations *fops);
+#   struct dentry *debugfs_create_u32(const char *name, umode_t mode,
+#                                      struct dentry *parent,
+#                                      u32 *value);
+#   void debugfs_remove(struct dentry *dentry);
+#
+# Implementation strategy:
+#
+# Same shape as the L5 procfs slot table — debugfs and procfs are
+# near-twins at the registration level (both hand back an opaque
+# struct dentry */proc_dir_entry * cookie that the driver passes back
+# at remove time). A 16-slot static table holds (name, kind, mode,
+# data) per entry. debugfs_create_dir uses kind=0, _file uses kind=1,
+# _u32 uses kind=2; the read-path dispatcher (deferred) will switch on
+# kind to decide whether to invoke fops->read, render a u32 in
+# decimal, or enumerate children.
+#
+# The handle we return is (slot + 1) cast to uint64 — non-zero so
+# module code's `if (!d) goto err;` checks stay correct, reversible
+# back to a slot index by subtracting 1. The handle aliases the
+# struct dentry * type at the C side (modules treat it as opaque).
+#
+# debugfs in stock Linux returns ERR_PTR(-ENODEV) when CONFIG_DEBUG_FS
+# is disabled — we don't model that; CONFIG_DEBUG_FS is implicitly y
+# from a Hamnix module's perspective, and our failure mode is the
+# slot-table-full case (handle = 0 / NULL).
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+
+
+# --- 16-slot static debugfs table -----------------------------------
+#
+# Parallel arrays (same layout discipline as api_proc.ad: dodges the
+# globally-declared-struct-with-Ptr-fields layout pothole called out
+# in exports.ad). A slot is free when names[i] == 0.
+
+MAX_DEBUGFS_SLOTS: uint64 = 16
+
+debugfs_names:  Array[16, uint64]    # const char *name (0 = free slot)
+debugfs_kind:   Array[16, uint64]    # 0=dir, 1=file, 2=u32
+debugfs_mode:   Array[16, uint64]    # umode_t (widened)
+debugfs_data:   Array[16, uint64]    # void *data (or u32 * for _u32)
+debugfs_parent: Array[16, uint64]    # parent handle (0 = root)
+debugfs_fops:   Array[16, uint64]    # struct file_operations * (kind=1 only)
+
+
+# kind tags. The read-path dispatcher (deferred) will switch on these.
+DEBUGFS_KIND_DIR:  uint64 = 0
+DEBUGFS_KIND_FILE: uint64 = 1
+DEBUGFS_KIND_U32:  uint64 = 2
+
+
+def _debugfs_alloc_slot(name: uint64, kind: uint64, mode: uint64,
+                         parent: uint64, data: uint64,
+                         fops: uint64) -> uint64:
+    # Linear scan for the first free row. Returns the +1-biased
+    # handle, or 0 if the table is full (which translates to NULL at
+    # the C boundary — matches debugfs_create_*'s failure return).
+    i: uint64 = 0
+    while i < MAX_DEBUGFS_SLOTS:
+        if debugfs_names[i] == 0:
+            debugfs_names[i]  = name
+            debugfs_kind[i]   = kind
+            debugfs_mode[i]   = mode
+            debugfs_data[i]   = data
+            debugfs_parent[i] = parent
+            debugfs_fops[i]   = fops
+            return i + 1
+        i = i + 1
+    return 0
+
+
+def _debugfs_free_slot(handle: uint64):
+    # debugfs_remove(NULL) is a documented no-op in Linux — drivers
+    # routinely call it on cleanup paths where the registration may
+    # have failed earlier. We mirror that, plus tolerate out-of-range
+    # handles (already-removed entries).
+    if handle == 0:
+        return
+    idx: uint64 = handle - 1
+    if idx >= MAX_DEBUGFS_SLOTS:
+        return
+    debugfs_names[idx]  = 0
+    debugfs_kind[idx]   = 0
+    debugfs_mode[idx]   = 0
+    debugfs_data[idx]   = 0
+    debugfs_parent[idx] = 0
+    debugfs_fops[idx]   = 0
+
+
+# --- Linux-ABI shims -------------------------------------------------
+
+def _l_debugfs_create_dir(name: Ptr[char], parent: uint64) -> uint64:
+    # Linux: struct dentry *debugfs_create_dir(name, parent).
+    # parent==NULL means "create under /sys/kernel/debug root". We
+    # treat the parent as an opaque handle and record it; the
+    # read-path dispatcher will walk parent-chains when it lands.
+    handle: uint64 = _debugfs_alloc_slot(
+        cast[uint64](name), DEBUGFS_KIND_DIR, 0o755, parent, 0, 0)
+    if handle == 0:
+        printk0("debugfs_create_dir: slot table full\n")
+    return handle
+
+
+def _l_debugfs_create_file(name: Ptr[char], mode: uint64,
+                            parent: uint64, data: uint64,
+                            fops: uint64) -> uint64:
+    # Linux: struct dentry *debugfs_create_file(name, mode, parent,
+    #                                            data, fops).
+    # `data` is stashed in inode->i_private at file-open time; `fops`
+    # is the read/write/llseek vector. Neither is invoked at L14 (no
+    # read-path), but both are recorded so the dispatcher can wire
+    # them up later.
+    handle: uint64 = _debugfs_alloc_slot(
+        cast[uint64](name), DEBUGFS_KIND_FILE, mode, parent, data, fops)
+    if handle == 0:
+        printk0("debugfs_create_file: slot table full\n")
+    return handle
+
+
+def _l_debugfs_create_u32(name: Ptr[char], mode: uint64,
+                           parent: uint64, value: uint64) -> uint64:
+    # Linux: struct dentry *debugfs_create_u32(name, mode, parent,
+    #                                           u32 *value).
+    # The kernel's implementation actually allocates a small fops
+    # vector that renders *value in decimal on read; we just stash
+    # the u32 * in data and let the eventual dispatcher do the
+    # rendering. From module-init's perspective the only observable
+    # behaviour at L14 is "got a non-NULL dentry back."
+    handle: uint64 = _debugfs_alloc_slot(
+        cast[uint64](name), DEBUGFS_KIND_U32, mode, parent, value, 0)
+    if handle == 0:
+        printk0("debugfs_create_u32: slot table full\n")
+    return handle
+
+
+def _l_debugfs_remove(dentry: uint64):
+    # Linux: void debugfs_remove(struct dentry *dentry). Tears down
+    # one entry; for directories the kernel recursively removes
+    # children. We don't model the recursive case yet — M11.2's
+    # fixture removes children explicitly before the parent, so the
+    # flat free is correct for the regression path. When the
+    # read-path dispatcher lands, this grows a parent-walk.
+    _debugfs_free_slot(dentry)
+
+
+# --- registration ----------------------------------------------------
+
+def linux_abi_register_debugfs():
+    # Called from start_kernel after linux_abi_register_kprobe (or any
+    # earlier L-track row — order doesn't matter, the export table is
+    # name-keyed).
+    _add_export("debugfs_create_dir",
+                cast[uint64](&_l_debugfs_create_dir))
+    _add_export("debugfs_create_file",
+                cast[uint64](&_l_debugfs_create_file))
+    _add_export("debugfs_create_u32",
+                cast[uint64](&_l_debugfs_create_u32))
+    _add_export("debugfs_remove",
+                cast[uint64](&_l_debugfs_remove))
