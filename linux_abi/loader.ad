@@ -38,6 +38,8 @@ from linux_abi.exports import linux_abi_lookup
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+extern def local_irq_enable()
+extern def local_irq_disable()
 
 
 # --- ELF constants (from include/uapi/linux/elf.h) ------------------
@@ -718,7 +720,17 @@ def kmod_linux_load(image: Ptr[uint8], size: uint64) -> int32:
     else:
         printk1("kmod_linux: init_module @ %p — calling\n", init_addr)
         init_fn: Ptr[uint8] = cast[Ptr[uint8]](init_addr)
+        # SYS_INIT_MODULE enters via syscall with IF cleared (IA32_FMASK
+        # masks IF on SYSCALL entry — see arch/x86/kernel/syscall.ad).
+        # Long-running module init code (raid6_pq.ko's algorithm bench
+        # spins on `jiffies` for ~1 second) requires the timer tick to
+        # advance, which can only happen with IRQs enabled. Real Linux
+        # mirrors this: do_init_module() runs with IRQs on. Re-enable
+        # them across the init_fn() call only, then restore the masked
+        # state before returning to the syscall epilogue.
+        local_irq_enable()
         rc_init = init_fn()
+        local_irq_disable()
         printk2("kmod_linux: init returned %d; slot=%d\n",
                 cast[uint64](rc_init), slot)
 

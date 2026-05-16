@@ -1,0 +1,215 @@
+# linux_abi/api_raid6.ad
+#
+# L45: shims for the ABI gap exposed by raid6_pq.ko (stock Debian 6.12).
+# raid6_pq.ko is the RAID6 P+Q syndrome math library — its init path
+# benchmarks every compiled-in raid6 algorithm and picks the fastest.
+# The init sequence (.init.text, lightly paraphrased from objdump -dr
+# of /lib/modules/$(uname -r)/kernel/lib/raid6/raid6_pq.ko.xz):
+#
+#     init_module:
+#         buf = get_free_pages_noprof(GFP_KERNEL=0xcc0, order=3)  # 32 KiB
+#         if !buf: _printk("OOM"); return -ENOMEM
+#         for algo in raid6_algos[]:
+#             if algo->valid: skip if !algo->valid()
+#             preempt_disable()                # inc %gs:pcpu_hot+4
+#             j0 = jiffies; while j0 == jiffies: pause   # wait tick edge
+#             j1 = jiffies + 16
+#             count = 0
+#             while jiffies - 16 < j1:
+#                 algo->gen_syndrome(...)      # call *%rax (via thunk)
+#                 count++
+#             preempt_enable()                 # dec %gs:pcpu_hot+4;
+#                                              # if zero & need_resched:
+#                                              #   __SCT__preempt_schedule
+#             record (algo, count) if best
+#         _printk("using %s (%d MB/s)\n", best->name, ...)
+#         raid6_call = *best                   # bulk copy struct
+#         pick recov algo similarly (smaller bench)
+#         _printk("recovery: %s\n", best_recov->name)
+#         free_pages(buf, order=3)
+#         return 0
+#
+# The cross-check against linux_abi/exports.ad reduced raid6_pq's 16
+# UND symbols to 7 not yet exported:
+#
+#     __SCT__preempt_schedule       function (no-op ret)
+#     free_pages                    function (forward to page_alloc)
+#     kernel_fpu_begin_mask         function (no-op for now)
+#     kernel_fpu_end                function (no-op for now)
+#     __x86_indirect_thunk_rcx      function (pop rbp; jmp *rcx)
+#     get_free_pages_noprof         function (forward to alloc_pages)
+#     __x86_indirect_thunk_r8       function (pop rbp; jmp *r8)
+#
+# Init-time only touches: __SCT__preempt_schedule, free_pages,
+# get_free_pages_noprof, __x86_indirect_thunk_rax (already L44). The
+# FPU pair and the rcx/r8 thunks are only invoked from raid6's
+# .text recovery paths (raid6_datap_recov_ssse3, raid6_2data_recov_avx2,
+# ...) that init never calls — but their addresses must still resolve
+# at load time or the loader logs an unresolved external and refuses
+# the module.
+#
+# Design notes:
+#
+# * get_free_pages_noprof / free_pages forward to mm.page_alloc.
+#   Linux signature: `unsigned long get_free_pages_noprof(gfp_t flags,
+#   unsigned int order);` — returns the virt-addr base of a 2^order
+#   contiguous page run, or 0 on OOM. Hamnix's alloc_pages takes order
+#   (int32) and returns the same base address. GFP flags are ignored
+#   (Hamnix's allocator has one zone and no atomic/dma distinction
+#   yet — same pattern as the kmalloc shim).
+#
+# * __SCT__preempt_schedule is the static-call landing pad for
+#   `preempt_schedule()`. Linux 5.10+ rewrites the call site at boot
+#   to either the real preempt_schedule (CONFIG_PREEMPT) or to a
+#   "return without doing anything" stub (CONFIG_PREEMPT_VOLUNTARY/
+#   CONFIG_PREEMPT_NONE). Hamnix has no scheduler preemption yet, so
+#   the no-op stub variant is the truthful body. It's reached after
+#   preempt_enable() if the preempt-counter decrement leaves the count
+#   at zero with TIF_NEED_RESCHED set — that path is never live here
+#   because we never set TIF_NEED_RESCHED in the bench loop's tight
+#   window.
+#
+# * kernel_fpu_begin_mask / kernel_fpu_end are the FPU-context
+#   save/restore pair around SIMD kernel code. raid6_pq's init only
+#   benchmarks the integer raid6_intx* algorithms on this CPU (the
+#   SSE2/SSSE3/AVX2 `.valid()` callbacks read boot_cpu_data.x86_capability
+#   which L39 exports as 64 zero bytes — all SIMD algos are filtered out
+#   at bench time). So FPU shims are never live at init; they exist
+#   only so the loader can resolve them. The body is a bare return —
+#   if a future L-track milestone routes a non-init code path through
+#   here we'll wire kernel_fpu_begin_mask to stts/clts or fxsave/fxrstor
+#   then. For now the symbol must just exist.
+#
+# * __x86_indirect_thunk_rcx / __x86_indirect_thunk_r8 mirror the rax
+#   thunk shipped in L44 (see api_lib80211.ad for the rationale). The
+#   prologue (push rbp) must be undone before jumping, so the callee's
+#   eventual `ret` lands at the original call site rather than into
+#   the saved-rbp slot. Init never reaches these thunks; the recovery
+#   paths that do (e.g. raid6_datap_recov_ssse3 uses %rcx, the AVX2
+#   recovery paths use %r8) would only fire if the kernel actually
+#   asked raid6_pq to reconstruct a missing disk, which we don't.
+
+from linux_abi.exports import _add_export
+from mm.page_alloc import alloc_pages, free_pages
+
+
+# ---------------------------------------------------------------------
+# get_free_pages_noprof + free_pages
+#
+# Linux 6.12 renamed `__get_free_pages` to `get_free_pages_noprof` as
+# part of the memory-allocation profiling work (CONFIG_MEM_ALLOC_PROFILING).
+# Old and new symbols share the same calling convention.
+#
+# Signature: unsigned long get_free_pages_noprof(gfp_t flags,
+#                                                unsigned int order);
+# Returns base virt-addr of 2^order contiguous 4 KiB pages, or 0 on OOM.
+#
+# raid6_pq's init path requests order=3 (8 pages = 32 KiB) with
+# GFP_KERNEL (0xcc0) to hold its bench scratch buffers. Hamnix's
+# alloc_pages serves up to MAX_ORDER, which is comfortably above order=3.
+
+def _l_get_free_pages_noprof(flags: uint64, order: uint64) -> uint64:
+    # GFP flags ignored; Hamnix's allocator has one zone.
+    return alloc_pages(cast[int32](order))
+
+
+def _l_free_pages(addr: uint64, order: uint64):
+    # NULL-safe: Linux's free_pages(0, order) is documented as no-op.
+    if addr == 0:
+        return
+    free_pages(addr, cast[int32](order))
+
+
+# ---------------------------------------------------------------------
+# __SCT__preempt_schedule
+#
+# Static-call landing pad for preempt_schedule(). Hamnix has no
+# preemptive scheduler yet, so the truthful body is a bare return.
+# Adder's emitted prologue/epilogue (push rbp / pop rbp / ret) is
+# semantically equivalent to the CONFIG_PREEMPT_NONE static-call
+# default that real Linux patches in at boot.
+#
+# Caller convention: zero arguments. Returns normally; rax preserved
+# is fine (the call site doesn't consume a return value).
+
+def _l_sct_preempt_schedule():
+    return
+
+
+# ---------------------------------------------------------------------
+# kernel_fpu_begin_mask + kernel_fpu_end
+#
+# Linux's kernel_fpu_begin_mask(mask) saves user FPU state and enables
+# the requested FPU feature mask (KFPU_MXCSR for SSE, etc.); the
+# matching kernel_fpu_end restores user state. Pairs around SIMD
+# kernel code.
+#
+# Hamnix runs raid6_pq's init on a CPU whose x86_capability bitmap is
+# zero (boot_cpu_data is L39's 64-byte zero buffer), so every SIMD
+# `.valid()` callback returns false and the bench only touches
+# raid6_intx* (pure integer) algorithms. The FPU pair is never invoked
+# during init. We export bodies anyway because the loader rejects
+# modules with unresolved externs, and these symbols appear in
+# raid6_pq's .text recovery paths.
+#
+# When a future milestone wires real SIMD raid6 (or any kernel-FPU
+# user), kernel_fpu_begin_mask grows a `clts; fxsave area` body and
+# kernel_fpu_end grows the matching `fxrstor; stts`. For L45 a bare
+# return is correct and minimal.
+
+def _l_kernel_fpu_begin_mask(mask: uint64):
+    return
+
+
+def _l_kernel_fpu_end():
+    return
+
+
+# ---------------------------------------------------------------------
+# __x86_indirect_thunk_rcx + __x86_indirect_thunk_r8
+#
+# Retpoline replacements for `call *%rcx` / `call *%r8`. See the rax
+# variant in api_lib80211.ad (L44) for the call-frame rationale: we
+# must undo Adder's prologue (pop %rbp) before transferring control,
+# so the callee's `ret` lands at the original `call thunk` site.
+#
+# Adder emits a standard prologue (push %rbp; mov %rsp, %rbp). The
+# popq %rbp inside the asm_volatile reverses that push, leaving the
+# stack exactly as the caller's `call __x86_indirect_thunk_rN`
+# expected: the call-site return address sits on top of stack, and
+# the indirect jmp dispatches to the target.
+
+def _l_x86_indirect_thunk_rcx():
+    asm_volatile("""
+        popq %rbp
+        jmpq *%rcx
+    """)
+
+
+def _l_x86_indirect_thunk_r8():
+    asm_volatile("""
+        popq %rbp
+        jmpq *%r8
+    """)
+
+
+# ---------------------------------------------------------------------
+# Registration
+
+def linux_abi_register_raid6():
+    # Called from linux_abi_exports_init() after L44's lib80211 rows
+    # are populated.
+    _add_export("get_free_pages_noprof",
+                cast[uint64](&_l_get_free_pages_noprof))
+    _add_export("free_pages",
+                cast[uint64](&_l_free_pages))
+    _add_export("__SCT__preempt_schedule",
+                cast[uint64](&_l_sct_preempt_schedule))
+    _add_export("kernel_fpu_begin_mask",
+                cast[uint64](&_l_kernel_fpu_begin_mask))
+    _add_export("kernel_fpu_end",
+                cast[uint64](&_l_kernel_fpu_end))
+    _add_export("__x86_indirect_thunk_rcx",
+                cast[uint64](&_l_x86_indirect_thunk_rcx))
+    _add_export("__x86_indirect_thunk_r8",
+                cast[uint64](&_l_x86_indirect_thunk_r8))

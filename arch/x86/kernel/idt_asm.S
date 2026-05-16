@@ -99,10 +99,27 @@ common_trap:
     pushq %r10
     pushq %r11
 
-    /* %rsp + 72 == saved `vector` slot (9 quads of registers above). */
-    movq  72(%rsp), %rdi
-    /* %rsp + 80 == saved error code slot. */
-    movq  80(%rsp), %rsi
+    /* Stack layout right now (low → high):
+     *    0: r11
+     *    8: r10
+     *   16: r9
+     *   24: r8
+     *   32: rdi
+     *   40: rsi
+     *   48: rdx
+     *   56: rcx
+     *   64: rax
+     *   72: vector       (pushed by stub)
+     *   80: error_code   (pushed by CPU or stub)
+     *   88: rip          (pushed by CPU on exception entry)
+     *   96: cs
+     *  104: rflags
+     *  112: rsp_user
+     *  120: ss
+     */
+    movq  72(%rsp), %rdi    /* arg 1 = vector */
+    movq  80(%rsp), %rsi    /* arg 2 = error_code */
+    movq  88(%rsp), %rdx    /* arg 3 = saved RIP (U13 diag) */
 
     /* Align stack to 16 before the call (we pushed 9 quads + the
      * interrupt frame already had vector+ec). Easier: just align

@@ -75,6 +75,12 @@ ap_trampoline_pm:
     /* Enable PAE (CR4.PAE = bit 5). */
     movl    %cr4, %eax
     orl     $(1 << 5), %eax
+    /* U13: enable SSE/SSE2 on this AP too — match BSP's CR4 state from
+     * arch/x86/boot/header.S so user threads scheduled onto an AP can use
+     * xmm registers without trapping #UD. See the BSP path for rationale.
+     *   bit 9  CR4.OSFXSR
+     *   bit 10 CR4.OSXMMEXCPT  */
+    orl     $(1 << 9) | (1 << 10), %eax
     movl    %eax, %cr4
 
     /* Enable long-mode in EFER (EFER.LME = bit 8 of MSR 0xC0000080). */
@@ -86,6 +92,12 @@ ap_trampoline_pm:
     /* Enable paging — turns on long-mode since LME was set. */
     movl    %cr0, %eax
     orl     $(1 << 31), %eax
+    /* U13: normalise CR0 for SSE on the AP (see BSP path for rationale).
+     *   bit 1 CR0.MP = 1
+     *   bit 2 CR0.EM = 0
+     *   bit 3 CR0.TS = 0  */
+    orl     $(1 << 1), %eax
+    andl    $~((1 << 2) | (1 << 3)), %eax
     movl    %eax, %cr0
 
     /* Far jump to flush prefetch + load 64-bit CS (selector 0x18 in

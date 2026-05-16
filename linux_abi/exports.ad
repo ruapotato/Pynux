@@ -52,6 +52,7 @@ from linux_abi.api_devclass import linux_abi_register_devclass
 from linux_abi.api_kernel import linux_abi_register_kernel
 from linux_abi.api_pernet import linux_abi_register_pernet
 from linux_abi.api_lib80211 import linux_abi_register_lib80211
+from linux_abi.api_raid6 import linux_abi_register_raid6
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -323,6 +324,11 @@ def linux_abi_exports_init():
     # __x86_indirect_thunk_rax, module_put, add_timer, init_timer_key,
     # __kmalloc_cache_noprof, jiffies, kmalloc_caches).
     linux_abi_register_lib80211()
+    # L45: raid6_pq scaffolding
+    # (get_free_pages_noprof, free_pages, __SCT__preempt_schedule,
+    # kernel_fpu_begin_mask, kernel_fpu_end, __x86_indirect_thunk_rcx,
+    # __x86_indirect_thunk_r8).
+    linux_abi_register_raid6()
 
 
 def linux_abi_lookup(name: Ptr[char]) -> uint64:

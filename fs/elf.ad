@@ -35,6 +35,13 @@
 from mm.memblock import memblock_alloc
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.panic import panic
+# U11: vDSO entry-point addresses surfaced through _lookup_dynsym so
+# dynamic relocations against __vdso_* names resolve at ELF-load time.
+# These are functions, not values — we take &name to get their text
+# address and patch it into the binary's .got / .data slot.
+from linux_abi.vdso import (
+    vdso_clock_gettime, vdso_gettimeofday, vdso_time, vdso_getcpu,
+)
 # Note: elf_load_blob no longer flips is_linux_userspace itself —
 # the caller (SYS_SPAWN / SYS_EXECVE in arch/x86/kernel/syscall.ad)
 # reads elf_last_was_linux and applies it to the correct task slot.
@@ -55,14 +62,20 @@ EI_ABIVERSION: uint64 = 8
 ELFOSABI_SYSV:  uint8 = 0
 ELFOSABI_LINUX: uint8 = 3
 
-# .dynamic section d_tag values (sub-set used by static-PIE binaries).
+# .dynamic section d_tag values (sub-set used by static-PIE binaries
+# plus U11's symbol-resolving relocs).
 # include/uapi/linux/elf.h #defines DT_NULL=0, DT_PLTRELSZ=2, DT_RELA=7,
-# DT_RELASZ=8, DT_RELAENT=9, DT_JMPREL=23.
+# DT_RELASZ=8, DT_RELAENT=9, DT_JMPREL=23, DT_STRTAB=5, DT_SYMTAB=6,
+# DT_STRSZ=10, DT_SYMENT=11.
 DT_NULL:     uint64 = 0
 DT_PLTRELSZ: uint64 = 2
+DT_STRTAB:   uint64 = 5
+DT_SYMTAB:   uint64 = 6
 DT_RELA:     uint64 = 7
 DT_RELASZ:   uint64 = 8
 DT_RELAENT:  uint64 = 9
+DT_STRSZ:    uint64 = 10
+DT_SYMENT:   uint64 = 11
 DT_JMPREL:   uint64 = 23
 
 # x86_64 relocation types we apply for dynamic relocations
@@ -148,8 +161,82 @@ elf_reloc_applied: uint64 = 0
 elf_reloc_skipped: uint64 = 0
 
 
+def _elf_streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # NUL-terminated byte equality. Same body as linux_abi/exports.ad
+    # _streq and linux_abi/loader.ad _ldr_streq, kept local so this
+    # module has no run-time dependency on those (otherwise the
+    # transitive-import set for any user-binary load path would pull
+    # the kmod loader in as well).
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _lookup_dynsym(sym_index: uint64,
+                   symtab_addr: uint64, strtab_addr: uint64,
+                   region: uint64, lowest_v: uint64) -> uint64:
+    # Resolve dynamic symbol index `sym_index` to a runtime address.
+    # Returns 0 on "not found / undefined and unknown to Hamnix".
+    #
+    # ELF64 symbol layout (Elf64_Sym, 24 bytes):
+    #   0   st_name   (uint32) offset into .dynstr
+    #   4   st_info   (uint8)
+    #   5   st_other  (uint8)
+    #   6   st_shndx  (uint16)  0 = SHN_UNDEF (external)
+    #   8   st_value  (uint64)
+    #   16  st_size   (uint64)
+    #
+    # If st_shndx is non-zero the symbol is defined inside the image
+    # itself; rebase it the same way PT_LOAD did (region + (st_value -
+    # lowest_v)). Otherwise the name must live in our hard-coded vDSO
+    # table — see the bottom of this function. Anything else is logged
+    # and resolved to 0 so the calling reloc applier counts it under
+    # "skipped".
+    if symtab_addr == 0:
+        return 0
+    sym_ent: uint64 = symtab_addr + sym_index * 24
+    st_name:  uint32 = _read_u32(cast[Ptr[uint8]](sym_ent + 0))
+    st_shndx: uint32 = cast[uint32](_read_u16(
+        cast[Ptr[uint8]](sym_ent + 6)))
+    st_value: uint64 = _read_u64(cast[Ptr[uint8]](sym_ent + 8))
+
+    if st_shndx != 0:
+        # Defined-in-image: rebase by the load region.
+        return region + (st_value - lowest_v)
+
+    # SHN_UNDEF: look up the name in the kernel-side stub table. The
+    # U11 surface only ships the four vDSO entry points; anything
+    # else returns 0 and is reported by the caller. When U12+ grows a
+    # real libc shim, this becomes a longer if-ladder (and eventually
+    # a hash-table lookup) — same pattern as linux_abi/exports.ad for
+    # kernel-module imports.
+    if strtab_addr == 0:
+        return 0
+    name: Ptr[uint8] = cast[Ptr[uint8]](
+        strtab_addr + cast[uint64](st_name))
+
+    if _elf_streq(name, cast[Ptr[uint8]]("__vdso_clock_gettime")) == 1:
+        return cast[uint64](&vdso_clock_gettime)
+    if _elf_streq(name, cast[Ptr[uint8]]("__vdso_gettimeofday")) == 1:
+        return cast[uint64](&vdso_gettimeofday)
+    if _elf_streq(name, cast[Ptr[uint8]]("__vdso_time")) == 1:
+        return cast[uint64](&vdso_time)
+    if _elf_streq(name, cast[Ptr[uint8]]("__vdso_getcpu")) == 1:
+        return cast[uint64](&vdso_getcpu)
+
+    printk1("elf64: unresolved dynamic symbol '%s'\n", cast[uint64](name))
+    return 0
+
+
 def _apply_dyn_relocs(rela_addr: uint64, rela_size: uint64,
-                      region: uint64, lowest_v: uint64):
+                      region: uint64, lowest_v: uint64,
+                      symtab_addr: uint64, strtab_addr: uint64):
     # Walk a contiguous .rela.dyn / .rela.plt table and apply each
     # relocation in place. rela_addr is the runtime address (already
     # rebased: region + (rela_vaddr - lowest_v)). Counts go into the
@@ -161,13 +248,17 @@ def _apply_dyn_relocs(rela_addr: uint64, rela_size: uint64,
     #   8   r_info   (uint64)  high 32 = sym index, low 32 = type
     #   16  r_addend (int64)
     #
-    # The only relocation type a static-PIE x86_64 binary emits in
-    # bulk is R_X86_64_RELATIVE — the linker uses it to fix up every
-    # absolute pointer (function-pointer tables, .data quad-of-string,
-    # ctor/dtor arrays). Body: *(uint64*)(load_base + r_offset) =
-    # load_base + r_addend. The other supported types resolve symbols;
-    # static-PIE has no .dynsym entries to chase, so they only matter
-    # if a future U milestone wires ld.so.
+    # The two reloc families:
+    #   R_X86_64_RELATIVE (8) — no symbol involved. Body:
+    #     *(uint64*)target = load_base + r_addend.
+    #     Linker emits these for every absolute pointer in static-PIE
+    #     .data (function-pointer tables, ctor arrays, .quad string).
+    #
+    #   R_X86_64_64 (1) / GLOB_DAT (6) / JUMP_SLOT (7) — symbol-bound.
+    #     Body: *(uint64*)target = sym_addr + r_addend.
+    #     sym_addr comes from _lookup_dynsym(); 0 means "unknown
+    #     extern", reported via printk and counted as skipped so the
+    #     gap is visible in the load summary.
     nr_entries: uint64 = rela_size / 24
     j: uint64 = 0
     while j < nr_entries:
@@ -176,7 +267,8 @@ def _apply_dyn_relocs(rela_addr: uint64, rela_size: uint64,
         r_info:   uint64 = _read_u64(cast[Ptr[uint8]](ent + 8))
         r_addend: uint64 = _read_u64(cast[Ptr[uint8]](ent + 16))
 
-        r_type: uint32 = cast[uint32](r_info & 0xFFFFFFFF)
+        r_type:    uint32 = cast[uint32](r_info & 0xFFFFFFFF)
+        sym_index: uint64 = r_info >> 32
         # Rebase the patch site: r_offset is a link-time virtual
         # address. Subtract lowest_v then add region to get the
         # runtime address of the 8-byte slot we're rewriting.
@@ -193,13 +285,19 @@ def _apply_dyn_relocs(rela_addr: uint64, rela_size: uint64,
         elif r_type == R_X86_64_64_DYN \
                 or r_type == R_X86_64_GLOB_DAT \
                 or r_type == R_X86_64_JUMP_SLOT:
-            # *(uint64*)target = sym_addr + addend. For U10 we don't
-            # resolve symbols (no .dynsym walker yet) — static-PIE
-            # binaries don't emit these. Log and skip so a future
-            # ld.so port can see the count rise.
-            printk1("elf64: dyn-reloc sym-resolved type %d skipped (no dynsym)\n",
-                    cast[uint64](r_type))
-            elf_reloc_skipped = elf_reloc_skipped + 1
+            # *(uint64*)target = sym_addr + addend.
+            sym_addr: uint64 = _lookup_dynsym(
+                sym_index, symtab_addr, strtab_addr, region, lowest_v)
+            if sym_addr == 0:
+                # Unknown extern. _lookup_dynsym already logged the
+                # name; bump the skipped counter and leave the slot
+                # at whatever the linker pre-filled it with (typically
+                # zero) so a downstream deref segfaults cleanly.
+                elf_reloc_skipped = elf_reloc_skipped + 1
+            else:
+                _write_u64(cast[Ptr[uint8]](target),
+                           sym_addr + r_addend)
+                elf_reloc_applied = elf_reloc_applied + 1
         elif r_type == R_X86_64_NONE_DYN:
             pass
         else:
@@ -217,10 +315,11 @@ def _process_dynamic(blob: Ptr[uint8], dyn_offset: uint64,
                      region: uint64, lowest_v: uint64):
     # Walk the .dynamic array at file offset `dyn_offset` (taken from
     # the PT_DYNAMIC phdr's p_offset), cache the addresses + sizes of
-    # the rela tables, then invoke _apply_dyn_relocs on each. We parse
-    # the .dynamic table from the *file image* (cheaper than walking
-    # the rebased copy and avoids depending on the .dynamic section's
-    # own PT_LOAD having been processed before us).
+    # the rela tables AND the dynsym / dynstr addresses (U11), then
+    # invoke _apply_dyn_relocs on each rela table. We parse the
+    # .dynamic table from the *file image* (cheaper than walking the
+    # rebased copy and avoids depending on the .dynamic section's own
+    # PT_LOAD having been processed before us).
     #
     # Entries are 16 bytes each: d_tag (int64) at +0, d_un (uint64) at
     # +8, terminated by d_tag == DT_NULL (0). Real-world .dynamic
@@ -231,6 +330,15 @@ def _process_dynamic(blob: Ptr[uint8], dyn_offset: uint64,
     rela_ent:   uint64 = 24
     jmprel_va:  uint64 = 0
     jmprel_sz:  uint64 = 0
+    symtab_va:  uint64 = 0
+    strtab_va:  uint64 = 0
+    sym_ent:    uint64 = 24
+    # strsz is captured for completeness but not enforced — string
+    # lookups go through trusted in-image memory, and bounds-checking
+    # against a potentially-bogus DT_STRSZ would not protect us from
+    # a malformed binary anyway. Recorded so the kernel log can show
+    # the parsed value if a future walker grows a sanity-check pass.
+    strsz:      uint64 = 0
 
     p: uint64 = cast[uint64](blob) + dyn_offset
     # Cap the walk at 256 entries so a bogus or unterminated .dynamic
@@ -251,10 +359,34 @@ def _process_dynamic(blob: Ptr[uint8], dyn_offset: uint64,
             jmprel_va = d_un
         elif d_tag == DT_PLTRELSZ:
             jmprel_sz = d_un
+        elif d_tag == DT_SYMTAB:
+            symtab_va = d_un
+        elif d_tag == DT_STRTAB:
+            strtab_va = d_un
+        elif d_tag == DT_SYMENT:
+            sym_ent = d_un
+        elif d_tag == DT_STRSZ:
+            strsz = d_un
         k = k + 1
 
     if rela_ent != 24 and rela_ent != 0:
         printk1("elf64: unexpected DT_RELAENT=%d (want 24)\n", rela_ent)
+    if sym_ent != 24 and sym_ent != 0:
+        printk1("elf64: unexpected DT_SYMENT=%d (want 24)\n", sym_ent)
+
+    # Rebase the symtab / strtab to runtime addresses. Both live inside
+    # a PT_LOAD that's already been copied into `region`, so the same
+    # `region + (va - lowest_v)` rebase that every other section uses
+    # turns the link-time vaddr into the runtime address.
+    symtab_addr: uint64 = 0
+    strtab_addr: uint64 = 0
+    if symtab_va != 0:
+        symtab_addr = region + (symtab_va - lowest_v)
+    if strtab_va != 0:
+        strtab_addr = region + (strtab_va - lowest_v)
+    if symtab_addr != 0 or strtab_addr != 0:
+        printk2("elf64: .dynsym @ 0x%x .dynstr @ 0x%x\n",
+                symtab_va, strtab_va)
 
     if rela_va != 0 and rela_sz != 0:
         # rela_va is a virtual address inside the image — rebase like
@@ -263,12 +395,14 @@ def _process_dynamic(blob: Ptr[uint8], dyn_offset: uint64,
         # what's in the file at the same offset.
         rela_runtime: uint64 = region + (rela_va - lowest_v)
         printk2("elf64: .rela.dyn @ 0x%x size=%d\n", rela_va, rela_sz)
-        _apply_dyn_relocs(rela_runtime, rela_sz, region, lowest_v)
+        _apply_dyn_relocs(rela_runtime, rela_sz, region, lowest_v,
+                          symtab_addr, strtab_addr)
 
     if jmprel_va != 0 and jmprel_sz != 0:
         jmprel_runtime: uint64 = region + (jmprel_va - lowest_v)
         printk2("elf64: .rela.plt @ 0x%x size=%d\n", jmprel_va, jmprel_sz)
-        _apply_dyn_relocs(jmprel_runtime, jmprel_sz, region, lowest_v)
+        _apply_dyn_relocs(jmprel_runtime, jmprel_sz, region, lowest_v,
+                          symtab_addr, strtab_addr)
 
 
 def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
@@ -307,8 +441,22 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     printk2("elf64: entry=0x%x phnum=%d\n", e_entry,
             cast[uint64](e_phnum))
 
-    lowest_v:  uint64 = 0xFFFFFFFFFFFFFFFF
-    highest_v: uint64 = 0
+    # First pass: span the PT_LOAD vaddrs.
+    #
+    # Adder's `<` lowers to `setl` (signed). For uint64 the obvious
+    # `if p_vaddr < lowest_v` with `lowest_v` pre-seeded to UINT64_MAX
+    # is wrong — UINT64_MAX has the sign bit set, signed-`<` reads it
+    # as -1, every positive p_vaddr fails the comparison, and
+    # lowest_v never updates. The earlier ELF32 path got away with
+    # this because every native Hamnix binary has exactly one PT_LOAD
+    # at p_vaddr=0; for U12 we get four PT_LOADs from a musl static-
+    # PIE binary and the resulting +1 shift breaks .rodata's 16-byte
+    # alignment for the movdqa in main(). Work around the compiler
+    # quirk locally with an explicit "seen one" flag so we don't
+    # depend on a signed/unsigned compare of `lowest_v`.
+    have_lowest: int32  = 0
+    lowest_v:    uint64 = 0
+    highest_v:   uint64 = 0
     i: uint32 = 0
     while i < e_phnum:
         ph: uint64 = cast[uint64](blob) + e_phoff \
@@ -317,7 +465,10 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
         if p_type == PT_LOAD:
             p_vaddr: uint64 = _read_u64(cast[Ptr[uint8]](ph + 16))
             p_memsz: uint64 = _read_u64(cast[Ptr[uint8]](ph + 40))
-            if p_vaddr < lowest_v:
+            if have_lowest == 0:
+                lowest_v   = p_vaddr
+                have_lowest = 1
+            elif p_vaddr < lowest_v:
                 lowest_v = p_vaddr
             if p_vaddr + p_memsz > highest_v:
                 highest_v = p_vaddr + p_memsz
@@ -417,8 +568,14 @@ def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
             cast[uint64](e_entry), cast[uint64](e_phnum))
 
     # First pass: find the lowest and highest vaddr across PT_LOAD
-    # segments so we can size the single allocation.
-    lowest_v:  uint32 = 0xFFFFFFFF
+    # segments so we can size the single allocation. See the ELF64
+    # path above for why we can't pre-seed lowest_v to UINT32_MAX
+    # and rely on `<`: Adder lowers `<` to `setl` (signed), and the
+    # sign bit on the sentinel makes every positive p_vaddr compare
+    # "greater", leaving lowest_v at the sentinel. Use an explicit
+    # "have one" flag instead.
+    have_lowest: int32  = 0
+    lowest_v:  uint32 = 0
     highest_v: uint32 = 0
     i: uint32 = 0
     while i < e_phnum:
@@ -429,7 +586,10 @@ def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
         if p_type == PT_LOAD:
             p_vaddr: uint32 = _read_u32(cast[Ptr[uint8]](ph + 8))
             p_memsz: uint32 = _read_u32(cast[Ptr[uint8]](ph + 20))
-            if p_vaddr < lowest_v:
+            if have_lowest == 0:
+                lowest_v    = p_vaddr
+                have_lowest = 1
+            elif p_vaddr < lowest_v:
                 lowest_v = p_vaddr
             if p_vaddr + p_memsz > highest_v:
                 highest_v = p_vaddr + p_memsz

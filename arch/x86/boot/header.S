@@ -85,6 +85,15 @@ _start:
     /* ----- Enable PAE, load CR3, set EFER.LME, then CR0.PG ---------- */
     movl    %cr4, %eax
     orl     $(1 << 5), %eax         /* CR4.PAE */
+    /* U13: enable SSE/SSE2 hardware. Without these bits any xmm-touching
+     * instruction (incl. musl's pxor %xmm0,%xmm0 in _start_c) traps #UD
+     * at CPL=3. We set them here, BEFORE CR0.PG / long-mode entry, so
+     * the BSP enters 64-bit code with FXSAVE/FXRSTOR + #XF wired up.
+     *   bit 9  CR4.OSFXSR       — OS supports FXSAVE/FXRSTOR; enables SSE
+     *   bit 10 CR4.OSXMMEXCPT   — OS supports unmasked SIMD FP exception
+     * Context-switch save/restore of xmm state is deferred to U14; U12's
+     * binary exits before any preemption so the lazy approach is safe. */
+    orl     $(1 << 9) | (1 << 10), %eax
     movl    %eax, %cr4
 
     movl    $pml4, %eax
@@ -97,6 +106,17 @@ _start:
 
     movl    %cr0, %eax
     orl     $(1 << 31), %eax        /* CR0.PG  - paging on, enter IA-32e */
+    /* U13: also normalise CR0 for SSE.
+     *   bit 1 CR0.MP = 1   pair with CR4.OSFXSR; #NM on WAIT/FWAIT only
+     *                      if TS is set (it isn't), harmless to set
+     *   bit 2 CR0.EM = 0   do NOT emulate x87 — required for SSE
+     *   bit 3 CR0.TS = 0   no "task switched" lazy-FPU flag; SSE wouldn't
+     *                      trap #NM today, but be explicit
+     * Reset values are MP=0, EM=0, TS=0, so the meaningful change is MP=1.
+     * Clearing EM/TS is defensive against future code accidentally setting
+     * them before reaching userspace. */
+    orl     $(1 << 1), %eax         /* CR0.MP */
+    andl    $~((1 << 2) | (1 << 3)), %eax  /* clear CR0.EM, CR0.TS */
     movl    %eax, %cr0
 
     /* Load 64-bit GDT and far-jump to flush CS into the 64-bit segment. */

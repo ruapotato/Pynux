@@ -25,11 +25,41 @@ def print_hex8(value: uint64):
     early_putc(hex_digit(value & 0xF))
 
 
-def do_trap(vector: uint64, error_code: uint64):
+def print_hex64(value: uint64):
+    # 16-hex-digit print of a 64-bit quantity, MSB first, no prefix.
+    # Loop unrolled to avoid signed/unsigned shift-count subtleties in
+    # the early-trap path (we may have already taken a fault and want
+    # the diag output to be as boring as possible).
+    early_putc(hex_digit((value >> 60) & 0xF))
+    early_putc(hex_digit((value >> 56) & 0xF))
+    early_putc(hex_digit((value >> 52) & 0xF))
+    early_putc(hex_digit((value >> 48) & 0xF))
+    early_putc(hex_digit((value >> 44) & 0xF))
+    early_putc(hex_digit((value >> 40) & 0xF))
+    early_putc(hex_digit((value >> 36) & 0xF))
+    early_putc(hex_digit((value >> 32) & 0xF))
+    early_putc(hex_digit((value >> 28) & 0xF))
+    early_putc(hex_digit((value >> 24) & 0xF))
+    early_putc(hex_digit((value >> 20) & 0xF))
+    early_putc(hex_digit((value >> 16) & 0xF))
+    early_putc(hex_digit((value >> 12) & 0xF))
+    early_putc(hex_digit((value >> 8) & 0xF))
+    early_putc(hex_digit((value >> 4) & 0xF))
+    early_putc(hex_digit(value & 0xF))
+
+
+def do_trap(vector: uint64, error_code: uint64, rip: uint64):
+    # idt_asm.S loads the saved RIP (the address of the offending
+    # instruction for most synchronous faults; the address of the
+    # *next* instruction for traps like #DB) into %rdx as the SysV
+    # third arg. Printing it makes user-mode faults debuggable
+    # without dragging in the full pt_regs plumbing.
     early_puts("\nTRAP: vector 0x")
     print_hex8(vector)
     early_puts(" err=0x")
     print_hex8(error_code)
+    early_puts(" rip=0x")
+    print_hex64(rip)
     early_puts("\n")
     # Halt with interrupts off so we don't spin on whatever fired this.
     asm_volatile("cli")
