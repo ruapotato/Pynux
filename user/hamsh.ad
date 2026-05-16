@@ -56,6 +56,62 @@ seg_pid:   Array[5, int32]
 # 2 fds per pipe (rfd, wfd) stored back-to-back.
 pipe_fds:  Array[8, int32]
 
+# Last command's exit status — exposed to user input as `$?` and
+# returned as our own exit code on the natural `exit` builtin.
+# 0 by default so a fresh shell's `$?` reads as success.
+last_exit_code: int32 = 0
+
+# Backing storage for $? expansion. Holds the ASCII decimal of
+# last_exit_code with a NUL terminator. tokenize substitutes the
+# `$?` literal token with a pointer into this buffer.
+exit_str_buf: Array[8, uint8]
+
+
+def _render_exit_code(v: int32):
+    # Populate exit_str_buf with the decimal ASCII of `v` + NUL.
+    # Handles negatives via a leading '-' (waitpid signals etc).
+    n: uint32 = 0
+    if v < 0:
+        exit_str_buf[0] = 45                       # '-'
+        n = cast[uint32](-v)
+        # Convert n to decimal at positions [1..].
+        if n == 0:
+            exit_str_buf[1] = 48                   # '0'
+            exit_str_buf[2] = 0
+            return
+        # Determine length: simple digit counter.
+        digits: Array[8, uint8]
+        di: uint32 = 0
+        while n > 0:
+            digits[di] = cast[uint8]((n % 10) + 48)
+            n = n / 10
+            di = di + 1
+        # Reverse-copy into output starting at index 1.
+        oi: uint32 = 1
+        while di > 0:
+            di = di - 1
+            exit_str_buf[oi] = digits[di]
+            oi = oi + 1
+        exit_str_buf[oi] = 0
+        return
+    n = cast[uint32](v)
+    if n == 0:
+        exit_str_buf[0] = 48
+        exit_str_buf[1] = 0
+        return
+    digits: Array[8, uint8]
+    di: uint32 = 0
+    while n > 0:
+        digits[di] = cast[uint8]((n % 10) + 48)
+        n = n / 10
+        di = di + 1
+    oi: uint32 = 0
+    while di > 0:
+        di = di - 1
+        exit_str_buf[oi] = digits[di]
+        oi = oi + 1
+    exit_str_buf[oi] = 0
+
 
 def strlen_u8(s: Ptr[uint8]) -> uint64:
     n: uint64 = 0
@@ -196,10 +252,34 @@ def main() -> int32:
             nu = LINE_MAX - 1
         line_buf[nu] = 0
 
+        # Comment lines: `#` at the start of the first non-blank
+        # column means the entire line is ignored. Matches sh
+        # syntax. We skip BEFORE tokenize so `#!/hamsh` shebangs
+        # in scripts (M16.70+) also fly through silently.
+        scan: uint64 = 0
+        while scan < nu and is_space(line_buf[scan]) != 0:
+            scan = scan + 1
+        if scan < nu and line_buf[scan] == 35:    # '#'
+            continue
+
         argc: uint64 = tokenize(&line_buf[0], nu,
                                 &argv_buf[0], ARGV_MAX)
         if argc == 0:
             continue
+
+        # `$?` substitution: any token literally equal to "$?" is
+        # rewritten to point at exit_str_buf, which holds the ASCII
+        # decimal of last_exit_code. Single-shot — we don't recurse
+        # into substrings (`prefix$?suffix` stays literal). This is
+        # done before redirect / pipeline parsing so the substituted
+        # value participates as a normal argv element.
+        _render_exit_code(last_exit_code)
+        ai: uint64 = 0
+        while ai < argc:
+            tok: Ptr[uint8] = cast[Ptr[uint8]](argv_buf[ai])
+            if tok[0] == 36 and tok[1] == 63 and tok[2] == 0:
+                argv_buf[ai] = cast[uint64](&exit_str_buf[0])
+            ai = ai + 1
 
         # 1. Parse '> /tmp/file' redirect (last ">" wins, bash-style).
         #    Trim it + its target out of argv so the spawned command
@@ -332,9 +412,14 @@ def main() -> int32:
 
         # Wait for every spawned child. Order doesn't matter — we
         # just need each one's exit_code drained so the slot frees.
+        # Capture the LAST stage's exit code (sh convention: a
+        # pipeline's exit status is the last command's) into
+        # last_exit_code so future `$?` substitutions can read it.
         si = 0
         while si < nseg:
             if seg_pid[si] >= 0:
-                sys_waitpid(seg_pid[si])
+                code: int64 = sys_waitpid(seg_pid[si])
+                if si + 1 == nseg:
+                    last_exit_code = cast[int32](code)
             si = si + 1
     return 0
