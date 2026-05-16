@@ -1,0 +1,87 @@
+# user/tail.ad
+#
+# Hamnix `tail`: print the last N lines of stdin (default 10).
+# `tail -N` overrides the line count. Bounded by an 8 KiB stdin
+# buffer; longer input loses the head. Mirrors `tail` from GNU
+# coreutils at the smallest meaningful scope (no -f, no -c).
+
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+INPUT_MAX:    uint64 = 8192
+INDEX_MAX:    uint64 = 512    # max line offsets we'll track
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def parse_int(s: Ptr[uint8]) -> int32:
+    n: int32 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int32](c - 48)
+        i = i + 1
+    return n
+
+
+input_buf:   Array[8192, uint8]
+line_starts: Array[512, uint32]
+line_ends:   Array[512, uint32]
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    limit: int32 = 10
+    if argc >= 2:
+        arg: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        if arg[0] == 45:                            # '-N'
+            v: int32 = parse_int(cast[Ptr[uint8]](
+                cast[uint64](arg) + 1))
+            if v < 0:
+                sys_write(2, "tail: bad -N\n", 13)
+                return 1
+            limit = v
+
+    # Slurp stdin into input_buf.
+    total: uint64 = 0
+    while total < INPUT_MAX:
+        n: int64 = sys_read(0, &input_buf[total],
+                            INPUT_MAX - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+
+    # Index line starts/ends. A "line" runs up to and including '\n';
+    # a trailing fragment without '\n' counts as one line too.
+    nlines: uint64 = 0
+    line_starts[0] = 0
+    i: uint64 = 0
+    while i < total:
+        if input_buf[i] == 10:
+            line_ends[nlines] = cast[uint32](i + 1)
+            nlines = nlines + 1
+            if nlines >= INDEX_MAX:
+                break
+            line_starts[nlines] = cast[uint32](i + 1)
+        i = i + 1
+    if nlines < INDEX_MAX and line_starts[nlines] < cast[uint32](total):
+        line_ends[nlines] = cast[uint32](total)
+        nlines = nlines + 1
+
+    # Pick the last `limit` lines.
+    start_line: uint64 = 0
+    if cast[uint64](limit) < nlines:
+        start_line = nlines - cast[uint64](limit)
+
+    while start_line < nlines:
+        s: uint32 = line_starts[start_line]
+        e: uint32 = line_ends[start_line]
+        sys_write(1, &input_buf[s], cast[uint64](e - s))
+        start_line = start_line + 1
+    return 0

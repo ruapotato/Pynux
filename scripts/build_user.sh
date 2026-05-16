@@ -79,3 +79,7 @@ build_adder_user more                 # M16.67: 24-line pager over stdin
 build_adder_user find                 # M16.67: recursive listdir walk
 build_adder_user diff                 # M16.67: byte-compare two files
 build_adder_user motd  # M16.68: print /etc/motd
+build_adder_user df                   # M16.70: dump /proc/mounts
+build_adder_user du                   # M16.70: entry-count under path
+build_adder_user tail                 # M16.70: last N lines of stdin
+build_adder_user cmp                  # M16.70: byte-compare two files
