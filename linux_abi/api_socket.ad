@@ -1,0 +1,241 @@
+# linux_abi/api_socket.ad
+#
+# L28 of the Hamnix Linux-ABI track: in-kernel socket API.
+#
+# Stock Linux 6.12 modules that talk to the network from kernel context
+# (nfsd, lockd, ksmbd, iscsi, drbd, sunrpc) all funnel through the same
+# small set of `kernel_*` helpers. Userspace's socket(2) reaches the
+# kernel through sys_socket; in-kernel callers skip the syscall layer
+# and use:
+#
+#   int  sock_create_kern(struct net *net, int family, int type,
+#                         int protocol, struct socket **res);
+#   int  kernel_bind(struct socket *sock, struct sockaddr *addr,
+#                    int addrlen);
+#   int  kernel_sendto(struct socket *sock, void *buf, size_t len,
+#                      int flags, struct sockaddr *addr, int addrlen);
+#   int  kernel_recvfrom(struct socket *sock, void *buf, size_t len,
+#                        int flags, struct sockaddr *addr, int *addrlen);
+#   void sock_release(struct socket *sock);
+#
+# All five symbols live behind shims here; the L1 loader's name-keyed
+# resolver finds them through linux_abi/exports.ad (once that file gets
+# the wire-up — under the L28 constraint we ship only the shim file).
+#
+# L28 SCOPE — minimum viable:
+#   The L28 fixture (tests/linux-modules/src/socket/) just does
+#   sock_create_kern + sock_release in module_init / module_exit and
+#   prints a banner. It does NOT bind, send, or recv. Hamnix has no
+#   network stack yet, so:
+#     - sock_create_kern hands back a slot-table cookie (struct socket *
+#       opaque handle) and writes it through *res. It validates the
+#       family/type/protocol triplet only to the extent of "is anything
+#       implausibly out of range" — the fixture passes AF_INET +
+#       SOCK_STREAM, but a future fixture with AF_UNIX or AF_PACKET
+#       would also be accepted.
+#     - kernel_bind / kernel_sendto / kernel_recvfrom RECORD the
+#       request in the slot and return success (or len). They don't
+#       actually move bytes — there is no network stack to move them
+#       through.
+#     - sock_release frees the slot.
+#   A 16-slot static table catches create/release symmetry the same
+#   way api_chrdev.ad and api_fs.ad track their registrations.
+#
+# When a later L milestone (call it "L net") lands a real TCP/IP stack,
+# this slot table becomes the bridge between the module's kernel_*
+# call and the stack's send/recv path. The register/release shape
+# stays unchanged; only the bodies of bind/send/recv grow real
+# implementations.
+#
+# struct socket opaque-handle layout:
+#   Real Linux struct socket is ~64 bytes (state, type, flags, file,
+#   sk pointer, ops pointer, wq). Modules read it through accessor
+#   functions and never lay out their own copy. We hand back a cookie
+#   of the form (slot + 1) cast to uint64, distinguishable from NULL
+#   and reversible by subtracting 1. The *res out-param receives this
+#   cookie verbatim.
+#
+# Address-family / type / protocol constants we recognize (informational
+# — we don't gate on them at L28, but the slot records them so a future
+# stack can route appropriately):
+#   AF_UNIX=1, AF_INET=2, AF_INET6=10, AF_PACKET=17
+#   SOCK_STREAM=1, SOCK_DGRAM=2, SOCK_RAW=3
+#   IPPROTO_TCP=6, IPPROTO_UDP=17
+
+from linux_abi.exports import _add_export
+
+
+# --- Slot table -----------------------------------------------------
+#
+# 16 slots is enough for L28 (the fixture uses 1; even a full nfsd would
+# rarely sit on more than 4 long-lived kernel sockets concurrently —
+# accept + per-client sockets are pushed into userspace via sock_alloc /
+# fd plumbing, which isn't in scope here).
+#
+# Parallel arrays — same Ptr-in-struct-global pitfall that exports.ad
+# warns about, and that the rest of linux_abi/ applies the same way.
+#
+# Slot layout:
+#   sock_in_use   : 0 = free, 1 = allocated.
+#   sock_family   : AF_* value passed to sock_create_kern.
+#   sock_type     : SOCK_* value.
+#   sock_protocol : IPPROTO_* value (or 0 for "default").
+#   sock_bound    : 1 if kernel_bind was called against this slot.
+
+MAX_SOCK_SLOTS: uint64 = 16
+
+sock_in_use:   Array[16, uint64]
+sock_family:   Array[16, int32]
+sock_type:     Array[16, int32]
+sock_protocol: Array[16, int32]
+sock_bound:    Array[16, uint64]
+
+
+def _sock_alloc_slot() -> int32:
+    # Linear scan for a free slot. Returns slot index 0..MAX_SOCK_SLOTS-1
+    # or -1 if the table is full. Cookie returned to the module is
+    # (slot + 1) so 0 stays as the "creation failed" sentinel.
+    i: uint64 = 0
+    while i < MAX_SOCK_SLOTS:
+        if sock_in_use[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _sock_cookie_to_slot(cookie: uint64) -> int32:
+    # Reverse of (slot + 1) -> cookie. Returns -1 if the cookie is out
+    # of range or refers to a freed slot (defensive: stock modules
+    # sometimes hand back a stale pointer during error-recovery
+    # teardown, and we'd rather no-op than corrupt a fresh slot).
+    if cookie == 0:
+        return -1
+    idx: uint64 = cookie - 1
+    if idx >= MAX_SOCK_SLOTS:
+        return -1
+    if sock_in_use[idx] == 0:
+        return -1
+    return cast[int32](idx)
+
+
+# --- Shims: sock_create_kern / sock_release -------------------------
+
+def _l_sock_create_kern(net: uint64, family: int32, type_: int32,
+                         protocol: int32, res: uint64) -> int32:
+    # Linux semantics:
+    #   Returns 0 and writes the new struct socket * into *res on success.
+    #   Returns -EAFNOSUPPORT (-97) if no protocol family handler is
+    #     registered for `family`; -ESOCKTNOSUPPORT (-94) if the type
+    #     is wrong; -EPROTONOSUPPORT (-93) if the family+type pair
+    #     doesn't support `protocol`. We don't model those rejections
+    #     at L28 — any reasonable triple succeeds; the test fixture
+    #     passes AF_INET / SOCK_STREAM / 0.
+    #
+    # `net` (struct net *) selects the network namespace; Hamnix has
+    # exactly one namespace so we ignore it. `res` is the out-param;
+    # we write the cookie there if non-NULL. A NULL res is a kernel
+    # bug in the caller, but we tolerate it (Linux would oops).
+    if res == 0:
+        return -22                                  # -EINVAL (NULL res)
+    slot: int32 = _sock_alloc_slot()
+    if slot < 0:
+        return -23                                  # -ENFILE (no free slot)
+    s: uint64 = cast[uint64](slot)
+    sock_in_use[s]   = 1
+    sock_family[s]   = family
+    sock_type[s]     = type_
+    sock_protocol[s] = protocol
+    sock_bound[s]    = 0
+    # Cookie is (slot + 1) so a NULL-check on *res still works for the
+    # caller. Same convention as api_kthread's task_struct handle.
+    cookie: uint64 = s + 1
+    out: Ptr[uint64] = cast[Ptr[uint64]](res)
+    out[0] = cookie
+    return 0
+
+
+def _l_sock_release(sock: uint64):
+    # Linux's sock_release: drops the socket's ref, fires its ->release
+    # op, frees the struct socket. At L28 we just free the slot.
+    # Tolerate NULL (Linux warns but doesn't oops) and stale cookies
+    # (defensive — see _sock_cookie_to_slot).
+    slot: int32 = _sock_cookie_to_slot(sock)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    sock_in_use[s]   = 0
+    sock_family[s]   = 0
+    sock_type[s]     = 0
+    sock_protocol[s] = 0
+    sock_bound[s]    = 0
+
+
+# --- Shims: kernel_bind / kernel_sendto / kernel_recvfrom -----------
+
+def _l_kernel_bind(sock: uint64, addr: uint64, addrlen: int32) -> int32:
+    # Linux: forwards to sock->ops->bind. We just RECORD the bind so
+    # the slot reflects "this socket would route incoming traffic to
+    # the bound address if the stack existed."
+    slot: int32 = _sock_cookie_to_slot(sock)
+    if slot < 0:
+        return -88                                  # -ENOTSOCK
+    if addr == 0 or addrlen <= 0:
+        return -22                                  # -EINVAL
+    s: uint64 = cast[uint64](slot)
+    sock_bound[s] = 1
+    return 0
+
+
+def _l_kernel_sendto(sock: uint64, buf: uint64, len_: uint64,
+                      flags: int32, addr: uint64, addrlen: int32) -> int32:
+    # Linux: returns the number of bytes actually sent, or a negative
+    # errno. With no network stack we report "all bytes accepted" —
+    # the truthful answer would be 0 (nothing left this machine), but
+    # 0 from sendto signals "peer closed" in many module idioms, and
+    # we'd rather not surface a spurious EOF. Returning `len_` lets
+    # the caller's "did we write everything?" check pass.
+    slot: int32 = _sock_cookie_to_slot(sock)
+    if slot < 0:
+        return -88                                  # -ENOTSOCK
+    if buf == 0 or len_ == 0:
+        return 0
+    # len_ is uint64 but the return type is int32 — kernel modules
+    # never send more than INT_MAX in one call (the syscall layer
+    # caps it at MAX_RW_COUNT). Clamp defensively.
+    if len_ > 0x7FFFFFFF:
+        return 0x7FFFFFFF
+    return cast[int32](len_)
+
+
+def _l_kernel_recvfrom(sock: uint64, buf: uint64, len_: uint64,
+                        flags: int32, addr: uint64, addrlen: uint64) -> int32:
+    # Linux: returns the number of bytes received, 0 on orderly shutdown,
+    # or a negative errno. With no network stack we have nothing to
+    # deliver — return -EAGAIN (-11) so a non-blocking caller treats
+    # the socket as "no data right now" and loops; a blocking caller
+    # would loop forever in real Linux, but at L28 nothing actually
+    # calls recvfrom (the fixture stops at sock_release).
+    slot: int32 = _sock_cookie_to_slot(sock)
+    if slot < 0:
+        return -88                                  # -ENOTSOCK
+    if buf == 0 or len_ == 0:
+        return -22                                  # -EINVAL
+    return -11                                      # -EAGAIN (no data)
+
+
+# --- Export-table registration --------------------------------------
+
+def linux_abi_register_socket():
+    # Called from linux_abi_exports_init after the L1..L10 registrations
+    # (and any later L milestones that may interleave). Order doesn't
+    # matter — the export table is name-keyed.
+    _add_export("sock_create_kern",
+                cast[uint64](&_l_sock_create_kern))
+    _add_export("kernel_bind",
+                cast[uint64](&_l_kernel_bind))
+    _add_export("kernel_sendto",
+                cast[uint64](&_l_kernel_sendto))
+    _add_export("kernel_recvfrom",
+                cast[uint64](&_l_kernel_recvfrom))
+    _add_export("sock_release",
+                cast[uint64](&_l_sock_release))

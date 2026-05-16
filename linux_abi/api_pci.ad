@@ -1,0 +1,473 @@
+# linux_abi/api_pci.ad
+#
+# L21: Linux PCI core ABI shims. Stock kernel drivers spell their
+# bus-attach dance the same way — declare a `struct pci_driver`,
+# pass an id_table of (vendor, device) pairs, register it via
+# pci_register_driver(), and on probe call pci_enable_device +
+# pci_set_master + pci_request_regions + pci_iomap.
+#
+# Linux signatures we mirror (include/linux/pci.h, drivers/pci/*):
+#
+#   int  __pci_register_driver(struct pci_driver *drv,
+#                              struct module *owner,
+#                              const char *mod_name);
+#   void pci_unregister_driver(struct pci_driver *drv);
+#
+#   int  pci_read_config_byte(const struct pci_dev *dev,
+#                             int where, u8  *val);
+#   int  pci_read_config_word(const struct pci_dev *dev,
+#                             int where, u16 *val);
+#   int  pci_read_config_dword(const struct pci_dev *dev,
+#                              int where, u32 *val);
+#   int  pci_write_config_byte(struct pci_dev *dev,
+#                              int where, u8  val);
+#   int  pci_write_config_word(struct pci_dev *dev,
+#                              int where, u16 val);
+#   int  pci_write_config_dword(struct pci_dev *dev,
+#                               int where, u32 val);
+#
+#   int  pci_enable_device(struct pci_dev *dev);
+#   void pci_disable_device(struct pci_dev *dev);
+#   void pci_set_master(struct pci_dev *dev);
+#
+#   int  pci_request_regions(struct pci_dev *dev, const char *res_name);
+#   void pci_release_regions(struct pci_dev *dev);
+#
+#   void __iomem *pci_iomap(struct pci_dev *dev, int bar,
+#                           unsigned long maxlen);
+#   void pci_iounmap(struct pci_dev *dev, void __iomem *addr);
+#
+# L21 SCOPE — registration-shaped only:
+#   The L21 test fixture declares a `struct pci_driver`, calls
+#   pci_register_driver, and prints a banner. The probe callback is
+#   not invoked yet — Hamnix's PCI bus already enumerates devices
+#   (drivers/pci/pci.ad), but wiring the bus walk into the registered
+#   driver table is later work. For L21 we record (driver, callbacks)
+#   in a static 16-slot table so unregister symmetry can be verified
+#   and a later milestone can swap in real bus-match dispatch.
+#
+# Config-space helpers do go all the way through to the real
+# 0xCF8 / 0xCFC accessors — that part is cheap and lets drivers that
+# poke control registers at probe time work without further plumbing.
+# To read PCI config the shim needs a (bus, dev, fn) tuple; we extract
+# those from the first three fields of the `struct pci_dev` the
+# module hands us (matching Linux's layout: u8 bus, u8 devfn at
+# offsets 0..). At L21 we don't actually construct pci_devs ourselves,
+# so the module-supplied pointer is whatever the (not-yet-wired) probe
+# would have received — i.e. the test fixture's writes/reads are
+# inert until the bus-walk gets connected. The accessors are ready
+# for that day.
+#
+# pci_iomap: returns the BAR's raw address from Hamnix's pci_read_bar.
+# For MEM BARs the low 4 bits encode type and are masked off; for IO
+# BARs the low bit is set and we mask bit 0 only. Hamnix is identity-
+# mapped, so the "iomap" is just the physical address widened to a
+# pointer — no ioremap_pgtable walk needed.
+#
+# pci_request_regions / pci_release_regions: BAR reservations live in
+# a static table parallel to the driver table. We record (dev, name)
+# tuples so duplicate requests can be diagnosed; the actual address-
+# space reservation is a no-op because nobody else asks.
+
+from linux_abi.exports import _add_export
+from drivers.pci.pci import pci_config_read_dword, pci_config_write_dword
+from drivers.pci.pci import pci_read_bar, pci_pack_bdf
+
+
+# --- struct pci_dev field offsets (Linux 6.12 ballpark) -------------
+#
+# Real struct pci_dev is ~1.5 KB; the only fields we touch at L21 are
+# the bus/devfn pair that lives near the top. Linux's layout (after
+# the embedded struct list_head and the bus backpointer) puts devfn
+# at byte 16 and the parent bus pointer at byte 8. We don't follow
+# the bus pointer — for L21 the device-side bus number is read out
+# of a sibling field we treat as offset 24 (real Linux puts `bus->number`
+# one indirection away; the L21 stub avoids the indirection by reading
+# a synthetic cached copy that the future bus-walker will populate).
+
+PCI_DEV_DEVFN_OFFSET: uint64 = 16     # u32 devfn (Linux uses unsigned int)
+PCI_DEV_BUSNR_OFFSET: uint64 = 24     # u32 cached bus number (Hamnix extension)
+
+
+def _pci_dev_bus(dev_ptr: uint64) -> uint32:
+    # Pull the cached bus number out of the struct. NULL handles get
+    # bus 0 — Linux's accessors would BUG on NULL, but for L21 the
+    # caller of these shims is the not-yet-wired probe path, so we
+    # stay quiet.
+    if dev_ptr == 0:
+        return 0
+    p: Ptr[uint32] = cast[Ptr[uint32]](dev_ptr + PCI_DEV_BUSNR_OFFSET)
+    return p[0]
+
+
+def _pci_dev_devfn(dev_ptr: uint64) -> uint32:
+    if dev_ptr == 0:
+        return 0
+    p: Ptr[uint32] = cast[Ptr[uint32]](dev_ptr + PCI_DEV_DEVFN_OFFSET)
+    return p[0]
+
+
+def _pci_dev_dev(dev_ptr: uint64) -> uint32:
+    # devfn packs device in bits 7..3, function in bits 2..0 (PCI's
+    # standard layout — note this differs from Hamnix's BDF packing,
+    # which uses bits 15..11 for device).
+    return (_pci_dev_devfn(dev_ptr) >> 3) & 0x1F
+
+
+def _pci_dev_fn(dev_ptr: uint64) -> uint32:
+    return _pci_dev_devfn(dev_ptr) & 0x7
+
+
+# --- L21 driver-registration table ----------------------------------
+#
+# Same 16-slot parallel-array idiom used by api_chrdev / api_proc. A
+# slot is "free" when pci_drv_ptrs[i] == 0. The handle handed back to
+# the module is the return value of __pci_register_driver, which Linux
+# defines as 0 on success / negative errno on failure — so unlike the
+# other tables we don't expose a slot index.
+
+MAX_PCI_DRIVERS: uint64 = 16
+
+pci_drv_ptrs:   Array[16, uint64]   # struct pci_driver *  (0 = free)
+pci_drv_owners: Array[16, uint64]   # struct module *
+pci_drv_names:  Array[16, uint64]   # Ptr[char] mod_name
+
+
+def _pci_drv_find_free() -> int32:
+    i: uint64 = 0
+    while i < MAX_PCI_DRIVERS:
+        if pci_drv_ptrs[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _pci_drv_find_by_ptr(drv: uint64) -> int32:
+    i: uint64 = 0
+    while i < MAX_PCI_DRIVERS:
+        if pci_drv_ptrs[i] == drv:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- L21 region-reservation table -----------------------------------
+#
+# pci_request_regions / pci_release_regions don't have to do real
+# resource arbitration at L21 (Hamnix has no /proc/iomem and no
+# competing claimants). We still record (dev, name) so a double-request
+# returns -EBUSY the way Linux does, and so release-without-request is
+# a deterministic no-op rather than a crash.
+
+MAX_PCI_REGIONS: uint64 = 16
+
+pci_rgn_devs:  Array[16, uint64]   # struct pci_dev *  (0 = free)
+pci_rgn_names: Array[16, uint64]   # const char *
+
+
+def _pci_rgn_find_free() -> int32:
+    i: uint64 = 0
+    while i < MAX_PCI_REGIONS:
+        if pci_rgn_devs[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _pci_rgn_find_by_dev(dev: uint64) -> int32:
+    i: uint64 = 0
+    while i < MAX_PCI_REGIONS:
+        if pci_rgn_devs[i] == dev:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- Driver registration shims --------------------------------------
+
+def _l_pci_register_driver(drv: uint64, owner: uint64,
+                           mod_name: uint64) -> int32:
+    # Linux: int __pci_register_driver(drv, owner, name). Returns 0
+    # on success, negative errno on failure. The real implementation
+    # walks the bus and calls drv->probe(pdev) for every device whose
+    # id_table entry matches; at L21 we just claim the slot.
+    if drv == 0:
+        return -22                              # -EINVAL
+    if _pci_drv_find_by_ptr(drv) >= 0:
+        # Duplicate registration — Linux returns -EBUSY here.
+        return -16                              # -EBUSY
+    slot: int32 = _pci_drv_find_free()
+    if slot < 0:
+        return -12                              # -ENOMEM
+    s: uint64 = cast[uint64](slot)
+    pci_drv_ptrs[s]   = drv
+    pci_drv_owners[s] = owner
+    pci_drv_names[s]  = mod_name
+    return 0
+
+
+def _l_pci_unregister_driver(drv: uint64):
+    # Linux: void pci_unregister_driver(drv). Walk every device the
+    # driver claimed and call drv->remove; at L21 there's no claimed-
+    # device list, so we just free the slot.
+    if drv == 0:
+        return
+    slot: int32 = _pci_drv_find_by_ptr(drv)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    pci_drv_ptrs[s]   = 0
+    pci_drv_owners[s] = 0
+    pci_drv_names[s]  = 0
+
+
+# --- Config-space accessors -----------------------------------------
+#
+# Linux's pci_read_config_* return 0 on success / PCIBIOS_BAD_REGISTER
+# (-EINVAL-equivalent) on failure. We always succeed because the
+# legacy 0xCF8/0xCFC path can't fail synchronously — a missing device
+# returns 0xFFFF/0xFF and the caller checks the value.
+
+def _l_pci_read_config_byte(dev: uint64, where: int32,
+                             val: uint64) -> int32:
+    if val == 0:
+        return -22                              # -EINVAL
+    bus: uint32 = _pci_dev_bus(dev)
+    devnr: uint32 = _pci_dev_dev(dev)
+    fn:  uint32 = _pci_dev_fn(dev)
+    off: uint32 = cast[uint32](where)
+    d: uint32 = pci_config_read_dword(bus, devnr, fn, off & 0xFC)
+    byte_val: uint8 = cast[uint8]((d >> ((off & 0x3) * 8)) & 0xFF)
+    out: Ptr[uint8] = cast[Ptr[uint8]](val)
+    out[0] = byte_val
+    return 0
+
+
+def _l_pci_read_config_word(dev: uint64, where: int32,
+                             val: uint64) -> int32:
+    if val == 0:
+        return -22
+    bus: uint32 = _pci_dev_bus(dev)
+    devnr: uint32 = _pci_dev_dev(dev)
+    fn:  uint32 = _pci_dev_fn(dev)
+    off: uint32 = cast[uint32](where)
+    d: uint32 = pci_config_read_dword(bus, devnr, fn, off & 0xFC)
+    word_val: uint16 = cast[uint16]((d >> ((off & 0x2) * 8)) & 0xFFFF)
+    out: Ptr[uint16] = cast[Ptr[uint16]](val)
+    out[0] = word_val
+    return 0
+
+
+def _l_pci_read_config_dword(dev: uint64, where: int32,
+                              val: uint64) -> int32:
+    if val == 0:
+        return -22
+    bus: uint32 = _pci_dev_bus(dev)
+    devnr: uint32 = _pci_dev_dev(dev)
+    fn:  uint32 = _pci_dev_fn(dev)
+    off: uint32 = cast[uint32](where)
+    d: uint32 = pci_config_read_dword(bus, devnr, fn, off & 0xFC)
+    out: Ptr[uint32] = cast[Ptr[uint32]](val)
+    out[0] = d
+    return 0
+
+
+def _l_pci_write_config_byte(dev: uint64, where: int32,
+                              val: uint32) -> int32:
+    # Read-modify-write of the containing dword. The 0xCF8/0xCFC path
+    # is dword-wide; sub-dword writes must preserve the surrounding
+    # bytes. PCI itself has byte-enable lanes, but our PIO path doesn't
+    # use them.
+    bus: uint32 = _pci_dev_bus(dev)
+    devnr: uint32 = _pci_dev_dev(dev)
+    fn:  uint32 = _pci_dev_fn(dev)
+    off: uint32 = cast[uint32](where)
+    aligned: uint32 = off & 0xFC
+    shift: uint32 = (off & 0x3) * 8
+    old: uint32 = pci_config_read_dword(bus, devnr, fn, aligned)
+    mask: uint32 = 0xFF << shift
+    new_val: uint32 = (old & (~mask)) | ((val & 0xFF) << shift)
+    pci_config_write_dword(bus, devnr, fn, aligned, new_val)
+    return 0
+
+
+def _l_pci_write_config_word(dev: uint64, where: int32,
+                              val: uint32) -> int32:
+    bus: uint32 = _pci_dev_bus(dev)
+    devnr: uint32 = _pci_dev_dev(dev)
+    fn:  uint32 = _pci_dev_fn(dev)
+    off: uint32 = cast[uint32](where)
+    aligned: uint32 = off & 0xFC
+    shift: uint32 = (off & 0x2) * 8
+    old: uint32 = pci_config_read_dword(bus, devnr, fn, aligned)
+    mask: uint32 = 0xFFFF << shift
+    new_val: uint32 = (old & (~mask)) | ((val & 0xFFFF) << shift)
+    pci_config_write_dword(bus, devnr, fn, aligned, new_val)
+    return 0
+
+
+def _l_pci_write_config_dword(dev: uint64, where: int32,
+                               val: uint32) -> int32:
+    bus: uint32 = _pci_dev_bus(dev)
+    devnr: uint32 = _pci_dev_dev(dev)
+    fn:  uint32 = _pci_dev_fn(dev)
+    off: uint32 = cast[uint32](where)
+    pci_config_write_dword(bus, devnr, fn, off & 0xFC, val)
+    return 0
+
+
+# --- Enable / master / region shims ---------------------------------
+
+def _l_pci_enable_device(dev: uint64) -> int32:
+    # Linux: flip MEM/IO enable in the PCI command register. We poke
+    # both bits because virtio devices come up with neither asserted.
+    # No power-management transition (Hamnix has no PCI PM state
+    # machine yet — D3 → D0 is whatever the BIOS left us).
+    if dev == 0:
+        return -22
+    bus: uint32 = _pci_dev_bus(dev)
+    devnr: uint32 = _pci_dev_dev(dev)
+    fn:  uint32 = _pci_dev_fn(dev)
+    cmd_lo: uint32 = pci_config_read_dword(bus, devnr, fn, 0x04) & 0xFFFF
+    cmd_lo = cmd_lo | 0x01 | 0x02                   # IO + MEM
+    upper: uint32 = pci_config_read_dword(bus, devnr, fn, 0x04) & 0xFFFF0000
+    pci_config_write_dword(bus, devnr, fn, 0x04, upper | cmd_lo)
+    return 0
+
+
+def _l_pci_disable_device(dev: uint64):
+    # Symmetric: clear IO + MEM enable. Bus-master stays as it is
+    # (some drivers' remove paths clear it explicitly via a follow-up
+    # pci_clear_master; we don't get involved).
+    if dev == 0:
+        return
+    bus: uint32 = _pci_dev_bus(dev)
+    devnr: uint32 = _pci_dev_dev(dev)
+    fn:  uint32 = _pci_dev_fn(dev)
+    cmd_lo: uint32 = pci_config_read_dword(bus, devnr, fn, 0x04) & 0xFFFF
+    cmd_lo = cmd_lo & (~cast[uint32](0x03))
+    upper: uint32 = pci_config_read_dword(bus, devnr, fn, 0x04) & 0xFFFF0000
+    pci_config_write_dword(bus, devnr, fn, 0x04, upper | cmd_lo)
+
+
+def _l_pci_set_master(dev: uint64):
+    # Linux: set Bus Master Enable bit (0x04). Mirrors the existing
+    # pci_enable_io_and_master in drivers/pci/pci.ad, but for arbitrary
+    # devices rather than a known BDF.
+    if dev == 0:
+        return
+    bus: uint32 = _pci_dev_bus(dev)
+    devnr: uint32 = _pci_dev_dev(dev)
+    fn:  uint32 = _pci_dev_fn(dev)
+    cmd_lo: uint32 = pci_config_read_dword(bus, devnr, fn, 0x04) & 0xFFFF
+    cmd_lo = cmd_lo | 0x04
+    upper: uint32 = pci_config_read_dword(bus, devnr, fn, 0x04) & 0xFFFF0000
+    pci_config_write_dword(bus, devnr, fn, 0x04, upper | cmd_lo)
+
+
+def _l_pci_request_regions(dev: uint64, res_name: uint64) -> int32:
+    # Linux: walks all 6 BARs, calls request_mem_region on each. We
+    # just record (dev, name) and return success. Duplicate request
+    # returns -EBUSY so well-behaved error-handling paths in module
+    # code still see a Linux-shaped error.
+    if dev == 0:
+        return -22
+    if _pci_rgn_find_by_dev(dev) >= 0:
+        return -16                              # -EBUSY
+    slot: int32 = _pci_rgn_find_free()
+    if slot < 0:
+        return -12                              # -ENOMEM
+    s: uint64 = cast[uint64](slot)
+    pci_rgn_devs[s]  = dev
+    pci_rgn_names[s] = res_name
+    return 0
+
+
+def _l_pci_release_regions(dev: uint64):
+    if dev == 0:
+        return
+    slot: int32 = _pci_rgn_find_by_dev(dev)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    pci_rgn_devs[s]  = 0
+    pci_rgn_names[s] = 0
+
+
+# --- BAR mapping shims -----------------------------------------------
+
+def _l_pci_iomap(dev: uint64, bar: int32, maxlen: uint64) -> uint64:
+    # Linux: return a void __iomem * the driver dereferences via
+    # readb/readl/writel etc. For Hamnix the physical address from the
+    # BAR is already directly addressable (identity-mapped pages), so
+    # we just hand it back unwrapped. maxlen is a hint cap — we don't
+    # enforce it because Hamnix has no per-mapping fault domain yet.
+    if dev == 0:
+        return 0
+    bus: uint32 = _pci_dev_bus(dev)
+    devnr: uint32 = _pci_dev_dev(dev)
+    fn:  uint32 = _pci_dev_fn(dev)
+    bdf: uint32 = pci_pack_bdf(bus, devnr, fn)
+    raw: uint32 = pci_read_bar(bdf, cast[uint32](bar))
+    # Strip the type bits: bit 0 indicates IO (low bit set) vs MEM
+    # (low bit clear); for MEM the low 4 bits are type+prefetch flags.
+    addr: uint32 = raw
+    if (raw & 0x01) == 1:
+        addr = raw & (~cast[uint32](0x03))      # IO: mask bit 0..1
+    else:
+        addr = raw & (~cast[uint32](0x0F))      # MEM: mask bits 0..3
+    return cast[uint64](addr)
+
+
+def _l_pci_iounmap(dev: uint64, addr: uint64):
+    # No mapping to tear down — pci_iomap returned the raw physical.
+    # Linux's iounmap drops the per-CPU TLB shootdown that the matching
+    # ioremap reserved; we never reserved anything, so this is a
+    # symmetric no-op.
+    return
+
+
+# --- Export-table registration --------------------------------------
+
+def linux_abi_register_pci():
+    # Called from start_kernel after the L1/L2 cores are wired up.
+    # The Linux 6.x symbol is __pci_register_driver (the macro
+    # pci_register_driver expands to __pci_register_driver(drv,
+    # THIS_MODULE, KBUILD_MODNAME)). We export both spellings so a
+    # module compiled with either header generation finds a match.
+    _add_export("__pci_register_driver",
+                cast[uint64](&_l_pci_register_driver))
+    _add_export("pci_register_driver",
+                cast[uint64](&_l_pci_register_driver))
+    _add_export("pci_unregister_driver",
+                cast[uint64](&_l_pci_unregister_driver))
+
+    _add_export("pci_read_config_byte",
+                cast[uint64](&_l_pci_read_config_byte))
+    _add_export("pci_read_config_word",
+                cast[uint64](&_l_pci_read_config_word))
+    _add_export("pci_read_config_dword",
+                cast[uint64](&_l_pci_read_config_dword))
+    _add_export("pci_write_config_byte",
+                cast[uint64](&_l_pci_write_config_byte))
+    _add_export("pci_write_config_word",
+                cast[uint64](&_l_pci_write_config_word))
+    _add_export("pci_write_config_dword",
+                cast[uint64](&_l_pci_write_config_dword))
+
+    _add_export("pci_enable_device",
+                cast[uint64](&_l_pci_enable_device))
+    _add_export("pci_disable_device",
+                cast[uint64](&_l_pci_disable_device))
+    _add_export("pci_set_master",
+                cast[uint64](&_l_pci_set_master))
+
+    _add_export("pci_request_regions",
+                cast[uint64](&_l_pci_request_regions))
+    _add_export("pci_release_regions",
+                cast[uint64](&_l_pci_release_regions))
+
+    _add_export("pci_iomap",
+                cast[uint64](&_l_pci_iomap))
+    _add_export("pci_iounmap",
+                cast[uint64](&_l_pci_iounmap))

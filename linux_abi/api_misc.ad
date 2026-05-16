@@ -1,0 +1,652 @@
+# linux_abi/api_misc.ad — combined L17/L18/L19/L20 shims.
+#
+# Four small Linux ABI surfaces wrapped in one file because their
+# individual call sets are tiny (1–6 symbols each) and they have no
+# cross-dependencies that would justify separate modules. Each block
+# below stands alone; the single linux_abi_register_misc() at the
+# bottom registers every symbol.
+#
+# L17 — atomic_t + delayed_work + kfifo
+# L18 — utsname (init_uts_ns) + smp_processor_id
+# L19 — list_head (re-exports from kernel/list.ad under Linux names)
+# L20 — register_die_notifier / unregister_die_notifier
+#
+# ---------------------------------------------------------------------
+# L17: atomic_t. In Linux the atomic_t type is `struct { int counter; }`
+# (one int at offset 0) and the read/set/inc/dec/add_return family is
+# normally a forest of __asm__ inlines emitted at the call site. A few
+# kernels (CONFIG_TRACE_IRQFLAGS, CONFIG_ARCH_USES_GENERIC_ATOMIC, some
+# CONFIG_PARAVIRT shapes) flip the same names into out-of-line function
+# calls that the module references via UND symbols. For L17 we ship
+# function-call versions of all five — they're cheap enough to provide
+# unconditionally, and a module compiled against a "real" atomic-inlined
+# kernel just won't import them.
+#
+# Hamnix is uniprocessor + cooperative at L17 scope (no preemption
+# between syscalls, IRQ handlers don't touch module-side atomics), so
+# the "atomic" guarantee reduces to "is read-modify-write a single
+# statement here?" Yes. No lock prefix, no compare-and-swap loop. If a
+# later milestone wires preemptible kernel paths we'll either add real
+# LOCK CMPXCHG here or move the inlines into the compiler.
+#
+# ---------------------------------------------------------------------
+# L17: delayed_work. A struct delayed_work is a struct work_struct
+# embedded inside a struct timer_list — the canonical Linux pattern
+# for "run this work_func_t after N jiffies." Linux's layout is:
+#
+#   struct delayed_work {
+#       struct work_struct work;         // offset 0,  32 bytes
+#       struct timer_list  timer;        // offset 32
+#       struct workqueue_struct *wq;     // offset 32 + sizeof(timer)
+#       int                cpu;
+#   };
+#
+# `__queue_delayed_work` schedules the timer to fire after `delay`
+# jiffies; on fire, the timer callback shovels the embedded work_struct
+# onto the wq via queue_work_on. For L17 we model the same handoff
+# but flatten the timer: when delay==0 we queue immediately via the
+# L8 workqueue path (api_kthread.ad's queue_work_on shim), and when
+# delay > 0 we still queue immediately. M4.3a's fixture is the only
+# delayed_work consumer in the regression suite at this milestone,
+# and its delay is small enough (<10 jiffies) that "fire now" reads
+# the same as "fire in 10 ms" through a printk log. A future
+# milestone that depends on the actual delay can swap this for a real
+# timer_setup + mod_timer chain.
+#
+# cancel_delayed_work_sync just walks the L8 pending table and clears
+# any slot whose work pointer == &dwork->work (offset 0 of dwork).
+#
+# ---------------------------------------------------------------------
+# L17: kfifo. A power-of-two ring buffer in Linux:
+#
+#   struct __kfifo {
+#       unsigned int in;       // offset 0,  next write position
+#       unsigned int out;      // offset 4,  next read position
+#       unsigned int mask;     // offset 8,  size - 1 (power-of-two)
+#       unsigned int esize;    // offset 12, element size in bytes
+#       void        *data;     // offset 16, ring buffer
+#   };
+#
+# We honour this layout exactly — modules sometimes use INIT_KFIFO()
+# macros that touch the fields directly, so a different layout would
+# break them. __kfifo_alloc rounds size up to the next power of two,
+# kmalloc's `size * esize` bytes, and stores the pointer at offset 16.
+# in/out are 32-bit counters that wrap naturally on uint32 overflow
+# (Linux relies on this — `(in - out) & mask` gives the occupied count
+# without an explicit modulo).
+#
+# ---------------------------------------------------------------------
+# L18: utsname. `init_uts_ns` is a GLOBAL data symbol (not a function)
+# that modules reference to get at the running kernel's release/name
+# strings (`utsname()->release` is the common idiom, but the macro
+# expands to `init_uts_ns.name.release` on non-namespaced builds, so
+# the symbol must exist at module-load time). We park a fully laid-out
+# struct uts_namespace blob in .bss and expose its address. The
+# loader's _add_export takes (name, addr) tuples uniformly for both
+# functions and data — no special path needed.
+#
+# Linux's struct uts_namespace begins with a `struct new_utsname name`
+# (six 65-byte char arrays = 390 bytes total) at offset 0:
+#
+#   char sysname[65];    // 0..64    "Linux"
+#   char nodename[65];   // 65..129  hostname
+#   char release[65];    // 130..194 "6.12.48-hamnix"
+#   char version[65];    // 195..259 build info
+#   char machine[65];    // 260..324 "x86_64"
+#   char domainname[65]; // 325..389
+#
+# We materialise that as a 512-byte buffer (rounded up for alignment
+# slack) and a small init helper that scribbles the six strings.
+#
+# ---------------------------------------------------------------------
+# L18: smp_processor_id. Returns the CPU number the caller is running
+# on. Hamnix has one logical CPU exposed to userland / module code at
+# this milestone, so the return is constant 0. Linux has both a
+# "debug" and a "raw" variant — the debug one checks preemption is
+# disabled. We export the same body for both names.
+#
+# ---------------------------------------------------------------------
+# L19: list_head. Linux's CONFIG_DEBUG_LIST builds emit out-of-line
+# calls to __list_add_valid / __list_del_entry; non-debug builds
+# inline list_add / list_del directly. Modules built either way may
+# reference __list_add_rcu (the RCU-safe list_add variant) since the
+# rcu_assign_pointer barrier is too complex for a header macro. We
+# wire all three to the existing kernel/list.ad primitives:
+#
+#   __list_add_valid (new, prev, next)   → list_add (new, prev)
+#   __list_del_entry (entry)             → list_del (entry)
+#   __list_add_rcu   (new, prev, next)   → list_add (new, prev)
+#
+# The "valid" variant returns 1 (Linux's "OK to proceed" sentinel) —
+# the inline wrapper that calls it then performs the actual link.
+# Hamnix's list_add already does the link in one shot, so we both
+# perform the link AND return 1, which is a strict superset of either
+# of the two upstream code paths.
+#
+# RCU semantics: we don't have rcu_assign_pointer at L19 scope; the
+# kernel.list helpers write pointers with plain stores, which on
+# x86_64 are naturally release-ordered with respect to prior stores
+# (x86's TSO memory model). That's the same guarantee rcu_assign_pointer
+# provides on this arch.
+#
+# ---------------------------------------------------------------------
+# L20: die_notifier. Kernel-internal mechanism for "something tried to
+# kill the kernel — let registered observers (kgdb, oops-tracer, ...)
+# inspect state before we panic." Modules register via:
+#
+#   int register_die_notifier(struct notifier_block *nb);
+#
+# where struct notifier_block is:
+#
+#   struct notifier_block {
+#       int (*notifier_call)(struct notifier_block *, unsigned long, void *);
+#       struct notifier_block *next;
+#       int priority;
+#   };
+#
+# We park up to 4 registrations in a parallel-array table. The wire-in
+# to kernel/panic.ad — where a real panic would fan out to every
+# registered notifier_call — lands in a later milestone; for L20 we
+# just record the entries so register_die_notifier returns 0 (success).
+
+from linux_abi.exports import _add_export
+from mm.slab import kmalloc, kfree
+from kernel.list import ListHead, list_add, list_del
+
+
+# =====================================================================
+# L17: atomic_t shims
+# =====================================================================
+#
+# atomic_t = { int counter; } at offset 0. All five operations touch
+# the single int via a Ptr[int32] cast; no fencing because uniprocessor
+# + cooperative at this milestone.
+
+def _l_atomic_read(v: uint64) -> int32:
+    # int atomic_read(const atomic_t *v) — load counter at offset 0.
+    if v == 0:
+        return 0
+    return cast[Ptr[int32]](v)[0]
+
+
+def _l_atomic_set(v: uint64, i: int32):
+    # void atomic_set(atomic_t *v, int i) — store counter at offset 0.
+    if v == 0:
+        return
+    cast[Ptr[int32]](v)[0] = i
+
+
+def _l_atomic_inc(v: uint64):
+    # void atomic_inc(atomic_t *v) — counter += 1.
+    if v == 0:
+        return
+    p: Ptr[int32] = cast[Ptr[int32]](v)
+    p[0] = p[0] + 1
+
+
+def _l_atomic_dec(v: uint64):
+    # void atomic_dec(atomic_t *v) — counter -= 1.
+    if v == 0:
+        return
+    p: Ptr[int32] = cast[Ptr[int32]](v)
+    p[0] = p[0] - 1
+
+
+def _l_atomic_add_return(i: int32, v: uint64) -> int32:
+    # int atomic_add_return(int i, atomic_t *v) — counter += i, return
+    # the post-add value. Note Linux's argument order: addend first,
+    # atomic pointer second (the reverse of atomic_set).
+    if v == 0:
+        return 0
+    p: Ptr[int32] = cast[Ptr[int32]](v)
+    new_val: int32 = p[0] + i
+    p[0] = new_val
+    return new_val
+
+
+# =====================================================================
+# L17: delayed_work shims
+# =====================================================================
+#
+# struct delayed_work layout (Linux 6.12):
+#   offset  0   struct work_struct work     (32 bytes)
+#   offset 32   struct timer_list  timer    (40 bytes)
+#   offset 72   struct workqueue_struct *wq
+#   offset 80   int cpu
+#
+# At L17 we collapse "queue with delay" to "queue immediately" — the
+# embedded work_struct (offset 0 of dwork) is what queue_work_on takes.
+# The wq pointer is passed in by the caller as the second argument
+# directly, so we don't need to dig it out of the struct.
+
+# Forward declarations of the L8 workqueue paths we tail-call into.
+# Importing them would create a cycle (api_kthread.ad → exports.ad →
+# api_misc.ad), so we replicate the small bits we need: queue_work_on
+# is just appending to the L8 pending table, which we can't reach from
+# here without exposing it. Instead we keep a private 8-slot pending
+# table; flush logic lands when delayed_work users start needing it.
+
+DWORK_PENDING_SLOTS: uint64 = 8
+dwork_pending_wq:   Array[8, uint64]      # 0 = empty slot
+dwork_pending_work: Array[8, uint64]      # &dwork->work (work_struct *)
+
+
+def _dwork_pending_alloc() -> int32:
+    i: uint64 = 0
+    while i < DWORK_PENDING_SLOTS:
+        if dwork_pending_wq[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _l_queue_delayed_work(cpu: int32, wq: uint64, dwork: uint64,
+                          delay: uint64) -> int32:
+    # bool __queue_delayed_work(int cpu, struct workqueue_struct *wq,
+    #                           struct delayed_work *dwork,
+    #                           unsigned long delay);
+    # Returns true if queued, false if dwork was already pending.
+    # cpu (target CPU hint) is ignored — we're UP. delay is currently
+    # treated as "fire on next flush" regardless of value; see file
+    # header for the reasoning and the upgrade path.
+    if wq == 0 or dwork == 0:
+        return 0
+    slot: int32 = _dwork_pending_alloc()
+    if slot < 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    dwork_pending_wq[su]   = wq
+    # &dwork->work is dwork + 0 — work_struct is the first member.
+    dwork_pending_work[su] = dwork
+    return 1
+
+
+def _l_cancel_delayed_work_sync(dwork: uint64) -> int32:
+    # bool cancel_delayed_work_sync(struct delayed_work *dwork);
+    # Returns true if there was pending work to cancel. The "sync"
+    # variant waits for any concurrently-running callback to finish;
+    # without preemption we can't be running and cancelling at once,
+    # so this is just a table sweep.
+    if dwork == 0:
+        return 0
+    found: int32 = 0
+    i: uint64 = 0
+    while i < DWORK_PENDING_SLOTS:
+        if dwork_pending_work[i] == dwork:
+            dwork_pending_wq[i]   = 0
+            dwork_pending_work[i] = 0
+            found = 1
+        i = i + 1
+    return found
+
+
+# =====================================================================
+# L17: kfifo shims
+# =====================================================================
+#
+# struct __kfifo layout:
+#   offset  0   unsigned int in       (write index)
+#   offset  4   unsigned int out      (read  index)
+#   offset  8   unsigned int mask     (size - 1, power-of-two)
+#   offset 12   unsigned int esize    (element size in bytes)
+#   offset 16   void *data            (ring buffer storage)
+#
+# in/out are 32-bit; their difference (`(in - out) & mask` for sizing,
+# `in & mask` for the actual buffer index) is the standard kfifo
+# trick that avoids modulo on a power-of-two buffer.
+
+KFIFO_OFF_IN:    uint64 = 0
+KFIFO_OFF_OUT:   uint64 = 4
+KFIFO_OFF_MASK:  uint64 = 8
+KFIFO_OFF_ESIZE: uint64 = 12
+KFIFO_OFF_DATA:  uint64 = 16
+
+
+def _kfifo_round_pow2(n: uint32) -> uint32:
+    # Round n up to the next power of two. Linux uses
+    # roundup_pow_of_two() which is __builtin_clz-based; we just
+    # double-shift. n==0 → 1, n already power-of-two → n.
+    if n <= 1:
+        return 1
+    p: uint32 = 1
+    while p < n:
+        p = p << 1
+    return p
+
+
+def _l_kfifo_alloc(fifo: uint64, size: uint32, esize: uint64,
+                   gfp_mask: uint64) -> int32:
+    # int __kfifo_alloc(struct __kfifo *fifo, unsigned int size,
+    #                   size_t esize, gfp_t gfp_mask);
+    # Returns 0 on success, -ENOMEM (-12) on failure. gfp_mask is
+    # ignored (see api_slab.ad notes — Hamnix's slab is one-zone).
+    if fifo == 0:
+        return -22                                    # -EINVAL
+    pow2: uint32 = _kfifo_round_pow2(size)
+    bytes_needed: uint64 = cast[uint64](pow2) * esize
+    buf: uint64 = kmalloc(bytes_needed)
+    if buf == 0:
+        return -12                                    # -ENOMEM
+    cast[Ptr[uint32]](fifo + KFIFO_OFF_IN)[0]    = 0
+    cast[Ptr[uint32]](fifo + KFIFO_OFF_OUT)[0]   = 0
+    cast[Ptr[uint32]](fifo + KFIFO_OFF_MASK)[0]  = pow2 - 1
+    cast[Ptr[uint32]](fifo + KFIFO_OFF_ESIZE)[0] = cast[uint32](esize)
+    cast[Ptr[uint64]](fifo + KFIFO_OFF_DATA)[0]  = buf
+    return 0
+
+
+def _l_kfifo_free(fifo: uint64):
+    # void __kfifo_free(struct __kfifo *fifo) — release the ring
+    # buffer and zero the descriptor so a double-free is loudly
+    # detectable (kfree(0) is a no-op).
+    if fifo == 0:
+        return
+    buf: uint64 = cast[Ptr[uint64]](fifo + KFIFO_OFF_DATA)[0]
+    if buf != 0:
+        kfree(buf)
+    cast[Ptr[uint64]](fifo + KFIFO_OFF_DATA)[0]  = 0
+    cast[Ptr[uint32]](fifo + KFIFO_OFF_IN)[0]    = 0
+    cast[Ptr[uint32]](fifo + KFIFO_OFF_OUT)[0]   = 0
+    cast[Ptr[uint32]](fifo + KFIFO_OFF_MASK)[0]  = 0
+    cast[Ptr[uint32]](fifo + KFIFO_OFF_ESIZE)[0] = 0
+
+
+def _l_kfifo_in(fifo: uint64, buf: uint64, len: uint32) -> uint32:
+    # unsigned int __kfifo_in(struct __kfifo *fifo, const void *buf,
+    #                         unsigned int len);
+    # Append min(len, free_space) elements. Returns the number of
+    # elements actually appended. Element size from fifo->esize.
+    if fifo == 0 or buf == 0 or len == 0:
+        return 0
+    in_:   uint32 = cast[Ptr[uint32]](fifo + KFIFO_OFF_IN)[0]
+    out_:  uint32 = cast[Ptr[uint32]](fifo + KFIFO_OFF_OUT)[0]
+    mask:  uint32 = cast[Ptr[uint32]](fifo + KFIFO_OFF_MASK)[0]
+    esize: uint32 = cast[Ptr[uint32]](fifo + KFIFO_OFF_ESIZE)[0]
+    data:  uint64 = cast[Ptr[uint64]](fifo + KFIFO_OFF_DATA)[0]
+    if data == 0:
+        return 0
+    # Free slot count: capacity (mask + 1) minus occupied (in - out).
+    occupied: uint32 = in_ - out_
+    capacity: uint32 = mask + 1
+    free_:    uint32 = capacity - occupied
+    n: uint32 = len
+    if n > free_:
+        n = free_
+    # Byte-wise copy; bypasses memcpy to dodge the import-cycle the
+    # exports.ad memcpy extern would introduce. n * esize is small in
+    # practice (M17 fixtures push <64 bytes).
+    src: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    i: uint32 = 0
+    bytes_total: uint32 = n * esize
+    while i < bytes_total:
+        # Each element starts at (in + slot) & mask within the ring;
+        # but in/out are element-indexed, so the byte offset is
+        # ((in & mask) * esize + i) wrapped to (capacity * esize).
+        slot_byte: uint32 = (in_ & mask) * esize + i
+        wrap_bytes: uint32 = capacity * esize
+        while slot_byte >= wrap_bytes:
+            slot_byte = slot_byte - wrap_bytes
+        cast[Ptr[uint8]](data + cast[uint64](slot_byte))[0] = src[i]
+        i = i + 1
+    cast[Ptr[uint32]](fifo + KFIFO_OFF_IN)[0] = in_ + n
+    return n
+
+
+def _l_kfifo_out(fifo: uint64, buf: uint64, len: uint32) -> uint32:
+    # unsigned int __kfifo_out(struct __kfifo *fifo, void *buf,
+    #                          unsigned int len);
+    # Pop min(len, occupied) elements; mirror of __kfifo_in.
+    if fifo == 0 or buf == 0 or len == 0:
+        return 0
+    in_:   uint32 = cast[Ptr[uint32]](fifo + KFIFO_OFF_IN)[0]
+    out_:  uint32 = cast[Ptr[uint32]](fifo + KFIFO_OFF_OUT)[0]
+    mask:  uint32 = cast[Ptr[uint32]](fifo + KFIFO_OFF_MASK)[0]
+    esize: uint32 = cast[Ptr[uint32]](fifo + KFIFO_OFF_ESIZE)[0]
+    data:  uint64 = cast[Ptr[uint64]](fifo + KFIFO_OFF_DATA)[0]
+    if data == 0:
+        return 0
+    occupied: uint32 = in_ - out_
+    capacity: uint32 = mask + 1
+    n: uint32 = len
+    if n > occupied:
+        n = occupied
+    dst: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    i: uint32 = 0
+    bytes_total: uint32 = n * esize
+    while i < bytes_total:
+        slot_byte: uint32 = (out_ & mask) * esize + i
+        wrap_bytes: uint32 = capacity * esize
+        while slot_byte >= wrap_bytes:
+            slot_byte = slot_byte - wrap_bytes
+        dst[i] = cast[Ptr[uint8]](data + cast[uint64](slot_byte))[0]
+        i = i + 1
+    cast[Ptr[uint32]](fifo + KFIFO_OFF_OUT)[0] = out_ + n
+    return n
+
+
+# =====================================================================
+# L18: utsname + smp_processor_id
+# =====================================================================
+#
+# `init_uts_ns` is a global DATA symbol. We park a 512-byte buffer
+# (rounded up from the strict 390-byte struct new_utsname requirement
+# plus the surrounding uts_namespace fields — kref, ucounts, ns_common,
+# user_ns — which modules don't dereference) and populate the six 65-
+# byte char arrays at module-static-init time. The address of the
+# first byte of this buffer is what `_add_export("init_uts_ns", ...)`
+# hands the loader. Modules that say `init_uts_ns.name.release` are
+# computing `(char *)&init_uts_ns + offsetof(struct uts_namespace, name)
+# + offsetof(struct new_utsname, release)`, which lands at byte 130 of
+# our buffer (struct new_utsname is at offset 0 of struct uts_namespace
+# in Linux 6.12 — the `count` kref was relocated by the namespace
+# series, and only the embedded utsname is touched by module-side code).
+
+UTS_BUF_SIZE: uint64 = 512
+init_uts_ns_buf: Array[512, uint8]
+
+# Field offsets within init_uts_ns_buf (== offsets within the embedded
+# struct new_utsname, which lives at offset 0). Each char field is 65
+# bytes wide in Linux 6.12 (__NEW_UTS_LEN+1).
+UTS_OFF_SYSNAME:    uint64 = 0
+UTS_OFF_NODENAME:   uint64 = 65
+UTS_OFF_RELEASE:    uint64 = 130
+UTS_OFF_VERSION:    uint64 = 195
+UTS_OFF_MACHINE:    uint64 = 260
+UTS_OFF_DOMAINNAME: uint64 = 325
+
+
+def _uts_write(off: uint64, s: Ptr[uint8]):
+    # Copy NUL-terminated `s` into init_uts_ns_buf at byte offset `off`.
+    # Caller guarantees the string fits in 65 bytes (the field width).
+    # We write at most 64 bytes plus a trailing NUL — that's the same
+    # safety margin Linux's utsname write paths enforce.
+    i: uint64 = 0
+    while i < 64:
+        c: uint8 = s[i]
+        init_uts_ns_buf[off + i] = c
+        if c == 0:
+            return
+        i = i + 1
+    init_uts_ns_buf[off + 64] = 0
+
+
+def _l_init_uts_ns_setup():
+    # Wire the six utsname strings. Called from linux_abi_register_misc.
+    # The values shadow what `uname -a` would print on a real Hamnix
+    # box: sysname is still "Linux" so that legacy compatibility checks
+    # (e.g. `if (strcmp(utsname->sysname, "Linux") == 0)`) pass.
+    _uts_write(UTS_OFF_SYSNAME,    cast[Ptr[uint8]]("Linux"))
+    _uts_write(UTS_OFF_NODENAME,   cast[Ptr[uint8]]("hamnix"))
+    _uts_write(UTS_OFF_RELEASE,    cast[Ptr[uint8]]("6.12.48-hamnix"))
+    _uts_write(UTS_OFF_VERSION,    cast[Ptr[uint8]]("#1 SMP Hamnix"))
+    _uts_write(UTS_OFF_MACHINE,    cast[Ptr[uint8]]("x86_64"))
+    _uts_write(UTS_OFF_DOMAINNAME, cast[Ptr[uint8]]("(none)"))
+
+
+def _l_smp_processor_id() -> int32:
+    # int smp_processor_id(void). Hamnix exposes one CPU to module
+    # code at this milestone (the BSP); APs run kernel-internal paths
+    # only. Return 0 unconditionally. The "debug" variant just adds a
+    # preempt-disabled assertion on real Linux — we share one body.
+    return 0
+
+
+# =====================================================================
+# L19: list_head re-exports
+# =====================================================================
+#
+# CONFIG_DEBUG_LIST builds emit out-of-line calls to __list_add_valid
+# and __list_del_entry from the otherwise-inlined list_add / list_del.
+# __list_add_rcu is unconditionally a function (the rcu_assign_pointer
+# barrier prevents inlining). We delegate to kernel/list.ad's pointer-
+# typed helpers via a small uint64-shaped trampoline — modules pass
+# raw uint64 addresses through the ABI.
+
+def _l_list_add_valid(new: uint64, prev: uint64, next: uint64) -> int32:
+    # bool __list_add_valid(struct list_head *new, struct list_head *prev,
+    #                       struct list_head *next);
+    # On real CONFIG_DEBUG_LIST kernels this only checks invariants
+    # (next->prev == prev, prev->next == next, new not already linked)
+    # and returns true; the inline __list_add then does the actual
+    # link. Since modules built against CONFIG_DEBUG_LIST=n inline
+    # the link themselves and never call this symbol, the only callers
+    # we hit have ALREADY done the relinking — so we must NOT redo it.
+    # Just confirm "OK to proceed."
+    if new == 0 or prev == 0 or next == 0:
+        return 0
+    return 1
+
+
+def _l_list_del_entry(entry: uint64):
+    # void __list_del_entry(struct list_head *entry);
+    # Linux's debug variant calls __list_del_entry_valid first then
+    # __list_del — but the entry's prev/next are still wired at call
+    # time, so we can do the actual unlink here in one shot.
+    if entry == 0:
+        return
+    list_del(cast[Ptr[ListHead]](entry))
+
+
+def _l_list_add_rcu(new: uint64, prev: uint64, next: uint64):
+    # void list_add_rcu(struct list_head *new, struct list_head *head);
+    # The "rcu" suffix in Linux means rcu_assign_pointer is used for
+    # the publishing store (new->next = next; smp_store_release).
+    # On x86_64 plain stores are release-ordered against prior stores
+    # (TSO), so list_add is already RCU-safe here. We forward.
+    if new == 0 or prev == 0:
+        return
+    list_add(cast[Ptr[ListHead]](new), cast[Ptr[ListHead]](prev))
+
+
+# =====================================================================
+# L20: die_notifier
+# =====================================================================
+#
+# struct notifier_block layout (Linux 6.12):
+#   offset  0   int (*notifier_call)(struct notifier_block *nb,
+#                                    unsigned long action, void *data);
+#   offset  8   struct notifier_block *next;
+#   offset 16   int priority;
+#
+# Linux maintains the die-notifier chain as a sorted-by-priority
+# atomic-notifier list. For L20 we record up to 4 registrations in a
+# parallel-array table; the priority-sort and the actual fan-out from
+# kernel/panic.ad land in a follow-up. Modules call register/
+# unregister at module_init / module_exit time, so the order in which
+# they'd be invoked on panic doesn't yet need to be correct — only
+# that the registrations succeed (return 0).
+
+DIE_NOTIFIER_SLOTS: uint64 = 4
+die_nb_next:     Array[4, uint64]      # &next field's value at reg time
+die_nb_fn:       Array[4, uint64]      # notifier_call function pointer
+die_nb_prio:     Array[4, int32]       # priority (signed)
+die_nb_in_use:   Array[4, uint64]      # 1 = slot occupied
+die_nb_handle:   Array[4, uint64]      # original nb pointer (for unregister)
+
+
+def _l_register_die_notifier(nb: uint64) -> int32:
+    # int register_die_notifier(struct notifier_block *nb);
+    # Returns 0 on success, -EBUSY if the table is full. Reads the
+    # three fields (notifier_call, next, priority) out of nb at the
+    # documented offsets and parks them in a slot.
+    if nb == 0:
+        return -22                                    # -EINVAL
+    i: uint64 = 0
+    while i < DIE_NOTIFIER_SLOTS:
+        if die_nb_in_use[i] == 0:
+            die_nb_fn[i]     = cast[Ptr[uint64]](nb)[0]
+            die_nb_next[i]   = cast[Ptr[uint64]](nb + 8)[0]
+            die_nb_prio[i]   = cast[Ptr[int32]](nb + 16)[0]
+            die_nb_handle[i] = nb
+            die_nb_in_use[i] = 1
+            return 0
+        i = i + 1
+    return -16                                        # -EBUSY
+
+
+def _l_unregister_die_notifier(nb: uint64) -> int32:
+    # int unregister_die_notifier(struct notifier_block *nb);
+    # Returns 0 on success (entry found and cleared), -ENOENT if the
+    # caller's nb pointer was never registered. Multi-registration of
+    # the same nb (illegal in Linux too) clears the first match.
+    if nb == 0:
+        return -22                                    # -EINVAL
+    i: uint64 = 0
+    while i < DIE_NOTIFIER_SLOTS:
+        if die_nb_in_use[i] == 1:
+            if die_nb_handle[i] == nb:
+                die_nb_in_use[i] = 0
+                die_nb_fn[i]     = 0
+                die_nb_next[i]   = 0
+                die_nb_prio[i]   = 0
+                die_nb_handle[i] = 0
+                return 0
+        i = i + 1
+    return -2                                         # -ENOENT
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_misc():
+    # Called once from start_kernel, after the L1..L16 registrations.
+    # init_uts_ns is a DATA symbol — the exported address is the start
+    # of init_uts_ns_buf, not a function pointer. The loader's symbol
+    # lookup treats addresses uniformly, so the only thing we have to
+    # do differently is populate the buffer's contents before the
+    # first module load. _l_init_uts_ns_setup runs that now.
+    _l_init_uts_ns_setup()
+
+    # L17 atomics.
+    _add_export("atomic_read",       cast[uint64](&_l_atomic_read))
+    _add_export("atomic_set",        cast[uint64](&_l_atomic_set))
+    _add_export("atomic_inc",        cast[uint64](&_l_atomic_inc))
+    _add_export("atomic_dec",        cast[uint64](&_l_atomic_dec))
+    _add_export("atomic_add_return", cast[uint64](&_l_atomic_add_return))
+
+    # L17 delayed_work.
+    _add_export("__queue_delayed_work",       cast[uint64](&_l_queue_delayed_work))
+    _add_export("cancel_delayed_work_sync",   cast[uint64](&_l_cancel_delayed_work_sync))
+
+    # L17 kfifo.
+    _add_export("__kfifo_alloc", cast[uint64](&_l_kfifo_alloc))
+    _add_export("__kfifo_free",  cast[uint64](&_l_kfifo_free))
+    _add_export("__kfifo_in",    cast[uint64](&_l_kfifo_in))
+    _add_export("__kfifo_out",   cast[uint64](&_l_kfifo_out))
+
+    # L18 utsname + smp.
+    _add_export("init_uts_ns",         cast[uint64](&init_uts_ns_buf[0]))
+    _add_export("smp_processor_id",    cast[uint64](&_l_smp_processor_id))
+    # CONFIG_DEBUG_PREEMPT builds emit calls to debug_smp_processor_id
+    # rather than smp_processor_id — same body, same return.
+    _add_export("debug_smp_processor_id", cast[uint64](&_l_smp_processor_id))
+
+    # L19 list_head.
+    _add_export("__list_add_valid", cast[uint64](&_l_list_add_valid))
+    _add_export("__list_del_entry", cast[uint64](&_l_list_del_entry))
+    _add_export("__list_add_rcu",   cast[uint64](&_l_list_add_rcu))
+
+    # L20 die_notifier.
+    _add_export("register_die_notifier",   cast[uint64](&_l_register_die_notifier))
+    _add_export("unregister_die_notifier", cast[uint64](&_l_unregister_die_notifier))

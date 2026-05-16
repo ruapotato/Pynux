@@ -1,0 +1,308 @@
+# linux_abi/api_virtio.ad
+#
+# L23 of the Hamnix Linux-ABI track: virtio core.
+#
+# Stock Linux modules that drive virtio devices (virtio-blk, virtio-net,
+# virtio-console, virtio-rng, ...) all flow through the same small core
+# in drivers/virtio/virtio.c + drivers/virtio/virtio_ring.c. The seven
+# kernel symbols every virtio module reaches for are:
+#
+#   int  register_virtio_driver(struct virtio_driver *drv);
+#   void unregister_virtio_driver(struct virtio_driver *drv);
+#   int  register_virtio_device(struct virtio_device *dev);
+#   void unregister_virtio_device(struct virtio_device *dev);
+#   int  virtqueue_add_sgs(struct virtqueue *_vq,
+#                          struct scatterlist *sgs[],
+#                          unsigned int out_sgs,
+#                          unsigned int in_sgs,
+#                          void *data, gfp_t gfp);
+#   bool virtqueue_kick(struct virtqueue *vq);
+#   void *virtqueue_get_buf(struct virtqueue *_vq, unsigned int *len);
+#
+# L23 SCOPE — minimum viable:
+#
+#   The M-style fixture (tests/linux-modules/src/virtio/virtio.c) just
+#   registers a virtio_driver for VIRTIO_ID_BLOCK and prints a banner.
+#   It does NOT actually drive a queue. So for L23 we only need:
+#
+#     - register/unregister to track structs in 16-slot tables so
+#       symmetry can be verified and duplicate-registration rejected.
+#     - virtqueue_add_sgs/kick/get_buf to be callable without crashing.
+#       They record the chain pointer in a per-vq "last submission"
+#       slot and return success. When a later L milestone wants to
+#       actually move data, virtqueue_add_sgs grows a dispatch to
+#       drivers/virtio/virtio_ring.ad's virtq_add_chain3 +
+#       virtq_kick_and_wait — the slot table is already where it
+#       needs to be.
+#
+# Linux's virtio_driver / virtio_device / virtqueue structs are large
+# (~200, ~250, ~80 bytes respectively in 6.12). The L23 shims treat
+# them as opaque blobs: we never read or write into them, we just
+# track the pointer. When BTF-driven layout-awareness lands at L0
+# completion, the .id_table + .probe-style fields become reachable;
+# until then we don't need offsets.
+#
+# Auto-index numbering: we hand out sequential device-id slots
+# starting from 0 the same way Linux's bus infrastructure does. The
+# index isn't surfaced to the module — it's just our internal handle.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0, printk1
+
+
+# --- Opaque struct sizes (Linux 6.12 ballpark) ----------------------
+#
+# Modules allocate these statically (a single global per module), so
+# we only need a number that's "big enough" for the .ko's compiler-
+# emitted layout to fit. Exact offsets live in BTF; L23 doesn't read
+# them.
+
+VIRTIO_DRIVER_SIZE: uint64 = 256     # struct virtio_driver ~ 200 B
+VIRTIO_DEVICE_SIZE: uint64 = 320     # struct virtio_device ~ 250 B
+VIRTQUEUE_SIZE:     uint64 = 128     # struct virtqueue     ~ 80 B
+
+
+# --- Slot tables ----------------------------------------------------
+#
+# 16-slot tables for each of drivers, devices, and per-queue
+# bookkeeping. Parallel arrays (same Ptr-in-struct-global pitfall
+# that exports.ad calls out — globals of struct type with embedded
+# pointers go through a different layout path than primitive globals).
+#
+#   virtio_drv_ptrs   : struct virtio_driver *      (0 = free)
+#   virtio_dev_ptrs   : struct virtio_device *      (0 = free)
+#   virtio_vq_ptrs    : struct virtqueue *          (0 = free)
+#   virtio_vq_last    : last chain `data` cookie submitted via add_sgs
+#                       (returned by virtqueue_get_buf as the buffer
+#                       identifier — Linux's protocol)
+#   virtio_vq_pending : 1 if a submission is outstanding (cleared on
+#                       get_buf), 0 if the queue is idle.
+
+MAX_VIRTIO_SLOTS: uint64 = 16
+
+virtio_drv_ptrs:   Array[16, uint64]
+virtio_dev_ptrs:   Array[16, uint64]
+virtio_vq_ptrs:    Array[16, uint64]
+virtio_vq_last:    Array[16, uint64]
+virtio_vq_pending: Array[16, uint64]
+
+
+# --- Helpers --------------------------------------------------------
+
+def _virtio_drv_find_free() -> int32:
+    i: uint64 = 0
+    while i < MAX_VIRTIO_SLOTS:
+        if virtio_drv_ptrs[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _virtio_drv_find(drv: uint64) -> int32:
+    i: uint64 = 0
+    while i < MAX_VIRTIO_SLOTS:
+        if virtio_drv_ptrs[i] == drv:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _virtio_dev_find_free() -> int32:
+    i: uint64 = 0
+    while i < MAX_VIRTIO_SLOTS:
+        if virtio_dev_ptrs[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _virtio_dev_find(dev: uint64) -> int32:
+    i: uint64 = 0
+    while i < MAX_VIRTIO_SLOTS:
+        if virtio_dev_ptrs[i] == dev:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _virtio_vq_find_or_alloc(vq: uint64) -> int32:
+    # virtqueue handles aren't pre-registered — Linux modules get them
+    # back from find_vqs(). At L23 we lazily allocate a slot the first
+    # time we see one. Returns -1 if all slots are taken.
+    if vq == 0:
+        return -1
+    i: uint64 = 0
+    while i < MAX_VIRTIO_SLOTS:
+        if virtio_vq_ptrs[i] == vq:
+            return cast[int32](i)
+        i = i + 1
+    i = 0
+    while i < MAX_VIRTIO_SLOTS:
+        if virtio_vq_ptrs[i] == 0:
+            virtio_vq_ptrs[i]    = vq
+            virtio_vq_last[i]    = 0
+            virtio_vq_pending[i] = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- Shims: register_virtio_driver / unregister_virtio_driver -------
+
+def _l_register_virtio_driver(drv: uint64) -> int32:
+    # Linux: int register_virtio_driver(struct virtio_driver *drv).
+    # Returns 0 on success, -errno on failure. The real implementation
+    # walks the device list and invokes drv->probe for every device
+    # whose id_table entry matches; we don't have a device-population
+    # path yet (L23 just tracks the driver), so probe is not called.
+    if drv == 0:
+        return -22                              # -EINVAL
+    if _virtio_drv_find(drv) >= 0:
+        return -17                              # -EEXIST
+    slot: int32 = _virtio_drv_find_free()
+    if slot < 0:
+        printk0("virtio: register_virtio_driver: table full\n")
+        return -12                              # -ENOMEM
+    s: uint64 = cast[uint64](slot)
+    virtio_drv_ptrs[s] = drv
+    printk1("L23: virtio_driver registered slot=%d\n", s)
+    return 0
+
+
+def _l_unregister_virtio_driver(drv: uint64):
+    # Linux: void unregister_virtio_driver(struct virtio_driver *drv).
+    # Hamnix returns int32 from the shim so the loader's relocation
+    # slot is uniform 8 bytes; the module discards it the same way it
+    # would for a void return.
+    if drv == 0:
+        return
+    slot: int32 = _virtio_drv_find(drv)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    virtio_drv_ptrs[s] = 0
+
+
+# --- Shims: register_virtio_device / unregister_virtio_device -------
+
+def _l_register_virtio_device(dev: uint64) -> int32:
+    # Linux: int register_virtio_device(struct virtio_device *dev).
+    # Assigns dev->index, adds to the bus, and triggers driver match.
+    # L23 just slots the pointer; the matching is a no-op until L24+
+    # actually probes anything.
+    if dev == 0:
+        return -22                              # -EINVAL
+    if _virtio_dev_find(dev) >= 0:
+        return -17                              # -EEXIST
+    slot: int32 = _virtio_dev_find_free()
+    if slot < 0:
+        printk0("virtio: register_virtio_device: table full\n")
+        return -12                              # -ENOMEM
+    s: uint64 = cast[uint64](slot)
+    virtio_dev_ptrs[s] = dev
+    return 0
+
+
+def _l_unregister_virtio_device(dev: uint64):
+    if dev == 0:
+        return
+    slot: int32 = _virtio_dev_find(dev)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    virtio_dev_ptrs[s] = 0
+
+
+# --- Shims: virtqueue_add_sgs / virtqueue_kick / virtqueue_get_buf --
+
+def _l_virtqueue_add_sgs(vq: uint64, sgs: uint64,
+                          out_sgs: uint32, in_sgs: uint32,
+                          data: uint64, gfp: uint64) -> int32:
+    # Linux: int virtqueue_add_sgs(struct virtqueue *_vq,
+    #     struct scatterlist *sgs[], unsigned int out_sgs,
+    #     unsigned int in_sgs, void *data, gfp_t gfp).
+    #
+    # `data` is an opaque cookie the device gets back via
+    # virtqueue_get_buf — Linux drivers stash a request pointer there.
+    # We record (vq, data) so get_buf can hand it back. The actual
+    # scatterlist (sgs/out_sgs/in_sgs) is ignored at L23 — when a
+    # future milestone wires this to drivers/virtio/virtio_ring.ad's
+    # virtq_add_chain3, the sgs walk lands here.
+    #
+    # gfp flags are ignored same as kmalloc shim.
+    if vq == 0:
+        return -22                              # -EINVAL
+    slot: int32 = _virtio_vq_find_or_alloc(vq)
+    if slot < 0:
+        return -12                              # -ENOMEM (no slot)
+    s: uint64 = cast[uint64](slot)
+    virtio_vq_last[s]    = data
+    virtio_vq_pending[s] = 1
+    return 0
+
+
+def _l_virtqueue_kick(vq: uint64) -> int32:
+    # Linux: bool virtqueue_kick(struct virtqueue *vq).
+    # Returns true if the kick was delivered (false if the device
+    # signalled "no kick needed" via VIRTIO_F_NOTIFY_ON_EMPTY). The
+    # L23 shim returns 1 unconditionally — the real notify path is
+    # drivers/virtio/virtio_ring.ad's virtq_kick_and_wait, which will
+    # be hoisted into here when L24+ needs actual I/O.
+    if vq == 0:
+        return 0
+    # Touch the slot so the lazy-alloc records a kick even with no
+    # prior add_sgs (some drivers kick at startup to drain stale).
+    slot: int32 = _virtio_vq_find_or_alloc(vq)
+    if slot < 0:
+        return 0
+    return 1
+
+
+def _l_virtqueue_get_buf(vq: uint64, len_out: uint64) -> uint64:
+    # Linux: void *virtqueue_get_buf(struct virtqueue *_vq,
+    #                                unsigned int *len).
+    # Returns the `data` cookie of the next completed buffer (or NULL
+    # if none), and writes the consumed length into *len.
+    #
+    # L23 returns the cookie we stashed in add_sgs, then clears the
+    # pending flag so a second call returns NULL (i.e., we model
+    # exactly one completion per submission). The length is left as
+    # 0 — at this scope the module doesn't read it for any error
+    # path (virtio-blk's request handler does check, but the L23
+    # fixture doesn't drive actual I/O).
+    if vq == 0:
+        return 0
+    slot: int32 = _virtio_vq_find_or_alloc(vq)
+    if slot < 0:
+        return 0
+    s: uint64 = cast[uint64](slot)
+    if virtio_vq_pending[s] == 0:
+        return 0
+    cookie: uint64 = virtio_vq_last[s]
+    virtio_vq_pending[s] = 0
+    if len_out != 0:
+        out: Ptr[uint32] = cast[Ptr[uint32]](len_out)
+        out[0] = 0
+    return cookie
+
+
+# --- Export-table registration --------------------------------------
+
+def linux_abi_register_virtio():
+    # Called from start_kernel after the L1..L22 registrations. Order
+    # within linux_abi_exports_init doesn't matter — the export table
+    # is name-keyed by linux_abi_lookup.
+    _add_export("register_virtio_driver",
+                cast[uint64](&_l_register_virtio_driver))
+    _add_export("unregister_virtio_driver",
+                cast[uint64](&_l_unregister_virtio_driver))
+    _add_export("register_virtio_device",
+                cast[uint64](&_l_register_virtio_device))
+    _add_export("unregister_virtio_device",
+                cast[uint64](&_l_unregister_virtio_device))
+    _add_export("virtqueue_add_sgs",
+                cast[uint64](&_l_virtqueue_add_sgs))
+    _add_export("virtqueue_kick",
+                cast[uint64](&_l_virtqueue_kick))
+    _add_export("virtqueue_get_buf",
+                cast[uint64](&_l_virtqueue_get_buf))

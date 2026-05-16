@@ -442,8 +442,13 @@ def _log_modinfo(image: Ptr[uint8]):
         elif _starts_with(cur, "name=") == 1:
             printk1("kmod_linux: name=%s\n",
                     cast[uint64](cast[Ptr[char]](base + i + 5)))
-        # Advance past this record's NUL terminator.
-        while i < size and cast[Ptr[uint8]](base + i)[0] != 0:
+        # Advance past this record's NUL terminator. Adder's `and`
+        # is not short-circuit, so split the bound check from the
+        # byte-read into nested loops to avoid a one-past-end deref
+        # on a malformed (unterminated) .modinfo section.
+        while i < size:
+            if cast[Ptr[uint8]](base + i)[0] == 0:
+                break
             i = i + 1
         i = i + 1                                # step over NUL
 

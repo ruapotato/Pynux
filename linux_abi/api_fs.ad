@@ -1,0 +1,273 @@
+# linux_abi/api_fs.ad
+#
+# L27 of the Hamnix Linux-ABI track: filesystem registration.
+#
+# Stock Linux 6.12 filesystem modules (ext4.ko, fat.ko, nfs.ko, ...) all
+# touch the same small handful of VFS-side primitives during module_init
+# / module_exit:
+#
+#   int register_filesystem(struct file_system_type *fs);
+#   int unregister_filesystem(struct file_system_type *fs);
+#
+# ...and during their fill_super / mount paths:
+#
+#   struct dentry *mount_nodev(struct file_system_type *fs_type, int flags,
+#                              void *data,
+#                              int (*fill_super)(struct super_block *,
+#                                                void *, int));
+#   void kill_litter_super(struct super_block *sb);
+#   struct inode *iget_locked(struct super_block *sb, unsigned long ino);
+#   void unlock_new_inode(struct inode *inode);
+#   void iput(struct inode *inode);
+#
+# All seven symbols live behind shims here; the L1 loader's name-keyed
+# resolver finds them through linux_abi/exports.ad (once that file gets
+# the wire-up — under the L27 constraint we ship only the shim file).
+#
+# L27 SCOPE — minimum viable:
+#   The L27 fixture (tests/linux-modules/src/fs/) just does
+#   register_filesystem + unregister_filesystem in module_init / module_exit
+#   and prints a banner. It does NOT call mount() — Hamnix's VFS doesn't
+#   route a real mount(2) into a module's get_tree / mount callback yet.
+#   So the mount path (mount_nodev / kill_litter_super) and the inode
+#   path (iget_locked / unlock_new_inode / iput) are RECORD-and-return
+#   shims at this scope: they exist so a module that REFERENCES the
+#   symbols (e.g. for an embedded fill_super never invoked at L27) loads
+#   cleanly. The 16-slot static table catches register/unregister
+#   symmetry the same way api_chrdev.ad does for register_chrdev.
+#
+# When a later L milestone wires the kernel VFS through this table, the
+# slot already records what it needs (fs_type pointer, name pointer,
+# the mount callback fs_type->mount the kernel would dispatch to). At
+# that point this file gains a "consult fs_slots when a mount(2) targets
+# the registered name" path; the register/unregister surface itself
+# stays unchanged.
+#
+# struct file_system_type opaque-blob handling:
+#   Stock module code passes the address of a static struct
+#   file_system_type. The first cache line of that struct holds
+#   (name, fs_flags, init_fs_context, parameters, mount, kill_sb, ...).
+#   We read `name` from offset 0 (Linux 6.12 layout: const char *name
+#   is the leading field) so the registration log can identify the fs.
+#   We don't introspect any other fields at L27.
+#
+# struct inode / struct dentry / struct super_block handles:
+#   Real Linux objects, each a few hundred bytes. The L27 fixture never
+#   dereferences them; we hand back opaque uint64 cookies (slot + 1)
+#   from a small pool so a future caller's NULL/non-NULL check stays
+#   sane. The pools are sized to match the slot tables of nearby L
+#   milestones (proc/chrdev use 16; we follow suit).
+
+from linux_abi.exports import _add_export
+
+
+# --- Slot table -----------------------------------------------------
+#
+# 16 slots is enough for L27's needs (the fixture uses 1). When a later
+# milestone needs more (think "modprobe ext4 + fat + tmpfs all loaded"),
+# bump MAX_FS_SLOTS and the Array dimensions together.
+#
+# Parallel arrays — same Ptr-in-struct-global pitfall that exports.ad
+# calls out (and that api_chrdev / api_proc apply the same way).
+#
+# Slot layout:
+#   fs_type_ptr : address of the module's struct file_system_type
+#                 (0 = free slot — Linux modules never legitimately
+#                 register a NULL fs_type, so the sentinel is safe).
+#   fs_name_ptr : Ptr[char] cast to uint64, copied from
+#                 fs_type->name (offset 0) at register time. We don't
+#                 strdup; the module owns the string. Linux behaves
+#                 the same way (the file_system_types list just holds
+#                 a back-pointer into the module's .rodata).
+
+MAX_FS_SLOTS: uint64 = 16
+
+fs_type_ptr: Array[16, uint64]
+fs_name_ptr: Array[16, uint64]
+
+
+def _fs_find_free_slot() -> int32:
+    # Returns slot index 0..MAX_FS_SLOTS-1, or -1 if the table is full.
+    i: uint64 = 0
+    while i < MAX_FS_SLOTS:
+        if fs_type_ptr[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _fs_find_by_type(fs: uint64) -> int32:
+    # Locate the slot currently holding `fs`. Returns -1 if not present.
+    # Matching is by pointer identity — Linux modules register the same
+    # static struct on every module load, so identity matching is
+    # exactly the "is this fs registered?" predicate.
+    i: uint64 = 0
+    while i < MAX_FS_SLOTS:
+        if fs_type_ptr[i] == fs:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- Inode / super_block / dentry opaque-handle pools ---------------
+#
+# L27 doesn't dispatch through these — they're just "hand back a
+# non-NULL cookie so the module's NULL-check passes." A counter that
+# wraps within the slot range is enough; we don't need a free-list.
+
+INODE_POOL_SLOTS:  uint64 = 16
+SB_POOL_SLOTS:     uint64 = 16
+DENTRY_POOL_SLOTS: uint64 = 16
+
+inode_next:  uint64 = 1
+sb_next:     uint64 = 1
+dentry_next: uint64 = 1
+
+
+def _alloc_inode_cookie() -> uint64:
+    # Wraps in [1, INODE_POOL_SLOTS]. Returning a stable non-NULL value
+    # is all the L27 fixture relies on; inode lifetime tracking lands
+    # alongside the VFS read-path wiring in a later milestone.
+    c: uint64 = inode_next
+    inode_next = inode_next + 1
+    if inode_next > INODE_POOL_SLOTS:
+        inode_next = 1
+    return c
+
+
+def _alloc_sb_cookie() -> uint64:
+    c: uint64 = sb_next
+    sb_next = sb_next + 1
+    if sb_next > SB_POOL_SLOTS:
+        sb_next = 1
+    return c
+
+
+def _alloc_dentry_cookie() -> uint64:
+    c: uint64 = dentry_next
+    dentry_next = dentry_next + 1
+    if dentry_next > DENTRY_POOL_SLOTS:
+        dentry_next = 1
+    return c
+
+
+# --- Shims: register_filesystem / unregister_filesystem -------------
+
+def _l_register_filesystem(fs: uint64) -> int32:
+    # Linux semantics:
+    #   Returns 0 on success.
+    #   -EBUSY (-16) if a filesystem with the same name is already
+    #     registered.
+    #   -EINVAL (-22) if fs is NULL.
+    #
+    # We map "table full" onto -ENOMEM (-12), matching how
+    # api_chrdev._l_register_chrdev reports a full slot table.
+    if fs == 0:
+        return -22                                  # -EINVAL
+    if _fs_find_by_type(fs) >= 0:
+        return -16                                  # -EBUSY (re-register)
+    slot: int32 = _fs_find_free_slot()
+    if slot < 0:
+        return -12                                  # -ENOMEM (table full)
+    # Read fs_type->name from offset 0 (Linux 6.12 layout: the leading
+    # field of struct file_system_type is `const char *name`). For L27
+    # the value is just stashed for diagnostics; a future milestone's
+    # mount(2) dispatch will compare it against the requested fs name.
+    name: uint64 = cast[Ptr[uint64]](fs)[0]
+    s: uint64 = cast[uint64](slot)
+    fs_type_ptr[s] = fs
+    fs_name_ptr[s] = name
+    return 0
+
+
+def _l_unregister_filesystem(fs: uint64) -> int32:
+    # Linux's prototype returns int (-EINVAL if `fs` wasn't registered);
+    # we mirror that. A double-unregister is the common case here, and
+    # surfacing the error lets the regression suite assert symmetry.
+    if fs == 0:
+        return -22                                  # -EINVAL
+    slot: int32 = _fs_find_by_type(fs)
+    if slot < 0:
+        return -22                                  # -EINVAL (not registered)
+    s: uint64 = cast[uint64](slot)
+    fs_type_ptr[s] = 0
+    fs_name_ptr[s] = 0
+    return 0
+
+
+# --- Shims: mount_nodev / kill_litter_super -------------------------
+
+def _l_mount_nodev(fs_type: uint64, flags: int32, data: uint64,
+                   fill_super: uint64) -> uint64:
+    # Real Linux: allocates a struct super_block via sget(), invokes
+    # fill_super(sb, data, silent), and on success returns a root
+    # dentry attached to that sb. For L27 we return a non-zero opaque
+    # dentry cookie without invoking fill_super — Hamnix's VFS doesn't
+    # plumb a registered fs_type's mount callback to a real mount(2)
+    # path yet, so executing fill_super would crash trying to populate
+    # a sb that nothing will dereference. The fixture doesn't call
+    # mount_nodev; the shim exists to satisfy stray symbol references
+    # in modules whose .text mentions mount_nodev even when init never
+    # reaches it.
+    if fs_type == 0:
+        return 0
+    return _alloc_dentry_cookie()
+
+
+def _l_kill_litter_super(sb: uint64):
+    # The teardown half of a simple_fs sb. At L27 we have nothing to
+    # release — the sb cookie is a counter, not a heap object. Accept
+    # the call and return.
+    return
+
+
+# --- Shims: iget_locked / unlock_new_inode / iput -------------------
+
+def _l_iget_locked(sb: uint64, ino: uint64) -> uint64:
+    # Linux: looks up `ino` in sb's inode hash; if absent, allocates a
+    # new struct inode in the I_NEW state and returns it. fs modules
+    # check I_NEW to decide whether to run their on-disk read path.
+    # For L27 we always return a fresh cookie — the caller's I_NEW
+    # check is unobservable through the cookie (no struct dereference)
+    # so this matches both branches the module might take.
+    if sb == 0:
+        return 0
+    return _alloc_inode_cookie()
+
+
+def _l_unlock_new_inode(inode: uint64):
+    # The "I_NEW done, publish it" sibling of iget_locked. Real Linux
+    # clears I_NEW and wakes any waiters on the inode hash. We have
+    # nothing waiting at L27.
+    return
+
+
+def _l_iput(inode: uint64):
+    # iput drops a reference; on the last put the inode is evicted.
+    # L27's cookies don't refcount, so this is a no-op. When the inode
+    # pool grows into a real LRU, this shim becomes the put-and-evict
+    # path.
+    return
+
+
+# --- Export-table registration --------------------------------------
+
+def linux_abi_register_fs():
+    # Called from linux_abi_exports_init after the L1..L10 (and any
+    # interleaving L milestones) registrations. The export table is
+    # name-keyed so order doesn't matter beyond "before any module is
+    # loaded that resolves these names."
+    _add_export("register_filesystem",
+                cast[uint64](&_l_register_filesystem))
+    _add_export("unregister_filesystem",
+                cast[uint64](&_l_unregister_filesystem))
+    _add_export("mount_nodev",
+                cast[uint64](&_l_mount_nodev))
+    _add_export("kill_litter_super",
+                cast[uint64](&_l_kill_litter_super))
+    _add_export("iget_locked",
+                cast[uint64](&_l_iget_locked))
+    _add_export("unlock_new_inode",
+                cast[uint64](&_l_unlock_new_inode))
+    _add_export("iput",
+                cast[uint64](&_l_iput))

@@ -1,0 +1,332 @@
+# linux_abi/api_netdev.ad
+#
+# L25: Linux netdev ABI shims. Every stock Ethernet-flavoured driver
+# (virtio_net, e1000e, r8169, ...) walks the same ten-symbol surface
+# at registration time: alloc_etherdev_mqs -> register_netdev ->
+# netif_start_queue / netif_carrier_on at link-up -> dev_alloc_skb /
+# kfree_skb / eth_type_trans on the RX path -> netif_stop_queue /
+# unregister_netdev / free_netdev on teardown. The L25 fixture in
+# tests/linux-modules/src/netdev/ walks the registration half of that
+# (no real packets) and prints a banner so the regression .ko run
+# can confirm the shims accept the calls without panicking.
+#
+# Linux signatures (include/linux/netdevice.h, include/linux/skbuff.h,
+#                   include/linux/etherdevice.h):
+#   struct net_device *alloc_etherdev_mqs(int sizeof_priv,
+#                                         unsigned int txqs,
+#                                         unsigned int rxqs);
+#   void  free_netdev(struct net_device *dev);
+#   int   register_netdev(struct net_device *dev);
+#   void  unregister_netdev(struct net_device *dev);
+#   void  netif_start_queue(struct net_device *dev);
+#   void  netif_stop_queue(struct net_device *dev);
+#   void  netif_carrier_on(struct net_device *dev);
+#   void  netif_carrier_off(struct net_device *dev);
+#   struct sk_buff *dev_alloc_skb(unsigned int length);
+#   void  kfree_skb(struct sk_buff *skb);
+#   __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev);
+#
+# L25 scope: registration-shaped only. Drivers that just want their
+# net_device handle accepted and recorded get a working ABI; drivers
+# that depend on real RX/TX queues (or carrier-state observability
+# through ethtool) will need follow-on work. The pattern parallels
+# api_chrdev.ad's "we take the call, record the registration in a
+# 16-slot static table, and a later milestone wires it into the rest
+# of the kernel" approach.
+#
+# Memory layout:
+#   net_device     -> kzalloc(2 KiB).   Real Linux 6.12 layout is
+#                     ~2200 bytes; 2 KiB is close enough that module
+#                     code reading any field offset BTF picked out
+#                     lands inside the blob. The caller never sees
+#                     the actual size — only the pointer it returns.
+#   sk_buff buffer -> kzalloc(size + 256).  We hand back the buffer
+#                     + 128, leaving 128 bytes of headroom (enough
+#                     for a typical Ethernet + IPv4 + TCP push) and
+#                     128 bytes of tail slack. The original alloc
+#                     base is recoverable as (skb - 128) for kfree_skb;
+#                     kfree itself doesn't care about offsets since
+#                     Hamnix's slab front-end recovers the owning
+#                     slab from the page header.
+#
+# The 16-slot tables are independent of api_chrdev / api_proc /
+# api_timer's tables — same shape, different scope. Slot 0..15 hold
+# net_device handles handed out by alloc_etherdev_mqs; modules call
+# register_netdev / unregister_netdev with the same pointer.
+#
+# eth_type_trans returns the L3 protocol from the Ethernet header at
+# offset 12..13. It's __be16 (big-endian) in Linux; we read the two
+# bytes raw and pack them MSB-first, which is what __be16's wire
+# format already looks like. If the skb pointer is bogus we return
+# 0 (ETH_P_LOOP would be more strictly correct, but the L25 fixture
+# never reaches eth_type_trans without a real RX path).
+
+from linux_abi.exports import _add_export
+from mm.slab import kmalloc, kfree, kzalloc
+
+
+# --- Sizing constants -----------------------------------------------
+#
+# NET_DEVICE_SIZE is the blob we hand back from alloc_etherdev_mqs;
+# 2 KiB is comfortably larger than the real Linux 6.12 layout. The
+# headroom carveout for dev_alloc_skb is symmetric: 128 bytes before
+# the returned data pointer, 128 after, so a driver that does
+# skb_reserve(skb, 64) + skb_put(skb, frame_len) on a 1500-byte
+# allocation still fits inside the slab object.
+
+NET_DEVICE_SIZE: uint64 = 2048
+SKB_HEADROOM:    uint64 = 128
+SKB_TAILROOM:    uint64 = 128
+
+
+# --- 16-slot static net_device table --------------------------------
+#
+# Parallel arrays — same global-struct-layout pothole avoidance as
+# api_proc.ad / api_chrdev.ad calls out. dev_handle is the pointer
+# returned by alloc_etherdev_mqs (cast to uint64); dev_state tracks
+# the lifecycle (0 = free, 1 = allocated, 2 = registered). The
+# carrier / queue bits are separate so netif_carrier_on/off and
+# netif_start/stop_queue are observable for any future "ethtool-
+# shaped" diagnostic that wants to inspect link state.
+
+MAX_NETDEV_SLOTS: uint64 = 16
+
+netdev_handle:  Array[16, uint64]   # net_device * cast to uint64 (0 = free slot)
+netdev_state:   Array[16, uint64]   # 0=free, 1=allocated, 2=registered
+netdev_carrier: Array[16, uint64]   # 0 = carrier off, 1 = carrier on
+netdev_queue:   Array[16, uint64]   # 0 = queue stopped, 1 = queue running
+
+
+def _netdev_find_slot_by_handle(handle: uint64) -> int32:
+    # Locate the slot currently holding `handle`. Returns -1 if the
+    # pointer isn't one we handed out — the caller treats that as a
+    # silent no-op the same way Linux warns and continues on
+    # spurious unregister.
+    if handle == 0:
+        return -1
+    i: uint64 = 0
+    while i < MAX_NETDEV_SLOTS:
+        if netdev_handle[i] == handle:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _netdev_find_free_slot() -> int32:
+    # Linear scan for a slot with state == 0. Returns -1 if the table
+    # is full — alloc_etherdev_mqs translates that into NULL (Linux's
+    # convention for "allocation failed").
+    i: uint64 = 0
+    while i < MAX_NETDEV_SLOTS:
+        if netdev_state[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- Shims: alloc / free / register / unregister --------------------
+
+def _l_alloc_etherdev_mqs(sizeof_priv: int32, txqs: uint32,
+                          rxqs: uint32) -> uint64:
+    # txqs / rxqs are the requested TX/RX queue counts; sizeof_priv is
+    # the trailing bytes the driver wants past net_device for its own
+    # state (accessed via netdev_priv()). For L25 we ignore all three
+    # — the 2 KiB blob is bigger than the typical priv (a few hundred
+    # bytes) plus net_device itself, and netdev_priv() (not yet shimmed)
+    # would just return dev + sizeof(struct net_device). When that
+    # symbol gets exported we'll size the alloc as
+    # NET_DEVICE_SIZE + sizeof_priv.
+    slot: int32 = _netdev_find_free_slot()
+    if slot < 0:
+        return 0
+    blob: uint64 = kzalloc(NET_DEVICE_SIZE)
+    if blob == 0:
+        return 0
+    s: uint64 = cast[uint64](slot)
+    netdev_handle[s]  = blob
+    netdev_state[s]   = 1                          # allocated, not registered
+    netdev_carrier[s] = 0
+    netdev_queue[s]   = 0
+    return blob
+
+
+def _l_free_netdev(dev: uint64):
+    # Linux's free_netdev is a no-op on NULL; mirror that. Releasing a
+    # registered net_device without first calling unregister_netdev is
+    # legal in Linux (it just emits a warning), so we don't gate the
+    # free on state == 1.
+    if dev == 0:
+        return
+    slot: int32 = _netdev_find_slot_by_handle(dev)
+    if slot >= 0:
+        s: uint64 = cast[uint64](slot)
+        netdev_handle[s]  = 0
+        netdev_state[s]   = 0
+        netdev_carrier[s] = 0
+        netdev_queue[s]   = 0
+    kfree(dev)
+
+
+def _l_register_netdev(dev: uint64) -> int32:
+    # Promotes the slot from "allocated" to "registered". A stray
+    # register on a pointer we never handed out is treated as -EINVAL;
+    # that mirrors Linux's behaviour where the function dereferences
+    # dev->name and would oops on a bogus pointer (we just fail safe).
+    slot: int32 = _netdev_find_slot_by_handle(dev)
+    if slot < 0:
+        return -22                                  # -EINVAL
+    s: uint64 = cast[uint64](slot)
+    netdev_state[s] = 2
+    return 0
+
+
+def _l_unregister_netdev(dev: uint64):
+    # Unregister is symmetric: slot stays alive (the blob is still
+    # owned by the driver) but goes back to "allocated". free_netdev
+    # is what reclaims the slot. netif_stop_queue + carrier_off would
+    # normally be called by the driver before unregister, but we
+    # clear them defensively so subsequent re-registration starts
+    # from a known state.
+    slot: int32 = _netdev_find_slot_by_handle(dev)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    netdev_state[s]   = 1
+    netdev_carrier[s] = 0
+    netdev_queue[s]   = 0
+
+
+# --- Shims: netif_* state bits --------------------------------------
+#
+# All four toggle a single bit in the slot table. The driver's view of
+# "queue running" / "carrier up" is normally a derived bit inside
+# struct net_device; we don't write it there at L25 because the
+# offset depends on BTF and no module reads it back via that field
+# yet — the M8.3 dummy ethernet driver in kernel-modules/m8-netdev
+# never reads dev->state, so the side table is sufficient.
+
+def _l_netif_start_queue(dev: uint64):
+    slot: int32 = _netdev_find_slot_by_handle(dev)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    netdev_queue[s] = 1
+
+
+def _l_netif_stop_queue(dev: uint64):
+    slot: int32 = _netdev_find_slot_by_handle(dev)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    netdev_queue[s] = 0
+
+
+def _l_netif_carrier_on(dev: uint64):
+    slot: int32 = _netdev_find_slot_by_handle(dev)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    netdev_carrier[s] = 1
+
+
+def _l_netif_carrier_off(dev: uint64):
+    slot: int32 = _netdev_find_slot_by_handle(dev)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    netdev_carrier[s] = 0
+
+
+# --- Shims: skb allocation -----------------------------------------
+#
+# Real struct sk_buff is a ~232-byte control structure plus a separate
+# data buffer pointed to by skb->head/data/tail/end. At L25 we squash
+# both into one allocation: the returned pointer aliases as both the
+# control struct (the module's accessors at offsets 0..) and the data
+# buffer (the bytes after the 128-byte headroom). Modules that only
+# touch the dev_alloc_skb / kfree_skb pair without reading skb fields
+# work; modules that walk skb->len or skb->data won't yet — they'll
+# need the real layout, which is a later milestone.
+
+def _l_dev_alloc_skb(size: uint64) -> uint64:
+    # Allocate size + SKB_HEADROOM + SKB_TAILROOM bytes. The caller
+    # sees a pointer SKB_HEADROOM into the alloc, leaving 128 bytes
+    # of headroom for skb_push (Ethernet/IP/TCP push). Returns 0
+    # (NULL) on allocation failure — drivers NULL-check this exactly
+    # like Linux's dev_alloc_skb.
+    total: uint64 = size + SKB_HEADROOM + SKB_TAILROOM
+    base: uint64 = kzalloc(total)
+    if base == 0:
+        return 0
+    return base + SKB_HEADROOM
+
+
+def _l_kfree_skb(skb: uint64):
+    # Recover the alloc base by subtracting SKB_HEADROOM and forward
+    # to kfree. NULL-safe (Linux's kfree_skb is, since 5.10). The
+    # value we hand to kfree must be the same pointer kzalloc handed
+    # us — Hamnix's slab recovers the owning slab from the page
+    # header on that base address.
+    if skb == 0:
+        return
+    kfree(skb - SKB_HEADROOM)
+
+
+# --- Shim: eth_type_trans ------------------------------------------
+#
+# eth_type_trans pulls the L3 protocol out of the Ethernet header,
+# advances skb->data past the 14-byte ethhdr (real Linux also sets
+# skb->dev = dev, skb->mac_header, and computes skb->pkt_type), and
+# returns the protocol field as __be16. The L25 fixture doesn't read
+# this return value, but the symbol has to resolve or the module
+# won't load.
+#
+# We read the two protocol bytes at skb offset 12..13. Because Linux's
+# __be16 is wire-order (MSB first), we pack them MSB-first into the
+# return value. No byteswap: the caller of eth_type_trans typically
+# either compares against an ntohs() constant or feeds the value into
+# a protocol dispatch table that itself expects __be16.
+
+def _l_eth_type_trans(skb: uint64, dev: uint64) -> uint32:
+    # __be16 is a 16-bit type; we widen to uint32 here so the export
+    # table's uniform 8-byte return slot is happy. Module code that
+    # assigns the result back to a __be16 variable will see the low
+    # 16 bits, which is the protocol field.
+    if skb == 0:
+        return 0
+    data: Ptr[uint8] = cast[Ptr[uint8]](skb)
+    hi: uint32 = cast[uint32](data[12])
+    lo: uint32 = cast[uint32](data[13])
+    return (hi << 8) | lo
+
+
+# --- Export-table registration --------------------------------------
+
+def linux_abi_register_netdev():
+    # Called from start_kernel after the earlier L milestones have
+    # populated their rows. Order doesn't matter (the export table is
+    # name-keyed) but grouping by milestone keeps the boot log
+    # scannable. Pairs with linux_abi_register_netfilter for the
+    # L25 + L26 networking-shim landing.
+    _add_export("alloc_etherdev_mqs",
+                cast[uint64](&_l_alloc_etherdev_mqs))
+    _add_export("free_netdev",
+                cast[uint64](&_l_free_netdev))
+    _add_export("register_netdev",
+                cast[uint64](&_l_register_netdev))
+    _add_export("unregister_netdev",
+                cast[uint64](&_l_unregister_netdev))
+    _add_export("netif_start_queue",
+                cast[uint64](&_l_netif_start_queue))
+    _add_export("netif_stop_queue",
+                cast[uint64](&_l_netif_stop_queue))
+    _add_export("netif_carrier_on",
+                cast[uint64](&_l_netif_carrier_on))
+    _add_export("netif_carrier_off",
+                cast[uint64](&_l_netif_carrier_off))
+    _add_export("dev_alloc_skb",
+                cast[uint64](&_l_dev_alloc_skb))
+    _add_export("kfree_skb",
+                cast[uint64](&_l_kfree_skb))
+    _add_export("eth_type_trans",
+                cast[uint64](&_l_eth_type_trans))

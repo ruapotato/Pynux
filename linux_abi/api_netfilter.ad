@@ -1,0 +1,232 @@
+# linux_abi/api_netfilter.ad
+#
+# L26: Linux netfilter ABI shims. Modules that want to inspect or
+# mangle packets walk a four-symbol surface — register a hook against
+# a (net, hooknum) pair, unregister it on teardown. Hamnix already
+# owns a flat netfilter chain in drivers/net/netfilter.ad (called
+# from M5.3 / M12.1 once upon a time); L26 connects stock Linux
+# modules to that chain by name.
+#
+# Linux signatures (include/linux/netfilter.h, net/netfilter/core.c):
+#   int  nf_register_net_hook(struct net *net,
+#                             const struct nf_hook_ops *ops);
+#   void nf_unregister_net_hook(struct net *net,
+#                               const struct nf_hook_ops *ops);
+#   int  nf_register_net_hooks(struct net *net,
+#                              const struct nf_hook_ops *reg,
+#                              unsigned int n);
+#   void nf_unregister_net_hooks(struct net *net,
+#                                const struct nf_hook_ops *reg,
+#                                unsigned int n);
+#
+# struct nf_hook_ops layout (Linux 6.12, probed in m5-netfilter):
+#   offset  0  hook       Ptr — the callback (priv, skb, state) -> u32
+#   offset  8  dev        Ptr — optional bound net_device
+#   offset 16  priv       Ptr — caller-private cookie
+#   offset 24  pf         u8  — protocol family (NFPROTO_IPV4 = 2)
+#   offset 28  hooknum    u32 — chain index (NF_INET_PRE_ROUTING = 0)
+#   offset 32  priority   s32 — ordering within the chain
+#
+# L26 scope: registration-shaped. Each successful register_net_hook
+# claims a slot in a 16-entry static table that records (hooknum,
+# hook_fn, priv). If the hooknum is NF_INET_PRE_ROUTING (0) we also
+# forward the fn into drivers/net/netfilter.ad's chain so the existing
+# nf_run_hooks dispatcher can fire it — that gives the L26 fixture a
+# real path to "the hook ran" should we later inject a synthetic
+# packet from the test harness. Other hooknums (LOCAL_IN, FORWARD,
+# LOCAL_OUT, POST_ROUTING) just get recorded; no dispatcher walks
+# them yet.
+#
+# The driver-side chain expects a callback signature of
+# `(data: Ptr[uint8], length: uint64) -> int32`, but the module-supplied
+# nf_hook_ops.hook is `(priv, skb, state) -> u32`. The two don't match,
+# and the L26 fixture never actually injects a packet, so we register
+# a wrapper that's a known-safe placeholder (the real bridge between
+# the two signatures lands when an L26-era driver gets RX wiring).
+# For L26 we just record the module-side callback in our slot table
+# and return success — register_netfilter_hook in drivers/net is
+# intentionally bypassed to keep the wrapper-shape risk contained to
+# a later milestone.
+
+from linux_abi.exports import _add_export
+
+
+# --- nf_hook_ops field offsets --------------------------------------
+#
+# These mirror the probed layout above. Reading them with explicit
+# offsets avoids depending on a BTF-derived class definition (the L0
+# BTF parser doesn't yet emit nf_hook_ops); when L0 lands the layout
+# this turns into a typed struct read.
+
+NF_OPS_HOOK_OFF:     uint64 = 0
+NF_OPS_PRIV_OFF:     uint64 = 16
+NF_OPS_HOOKNUM_OFF:  uint64 = 28
+NF_OPS_STRIDE:       uint64 = 40         # sizeof(struct nf_hook_ops)
+
+# Hook-number constants (enum nf_inet_hooks). The L26 fixture installs
+# at PRE_ROUTING; the others exist so a module that registers across
+# multiple chains via nf_register_net_hooks gets each row accepted.
+NF_INET_PRE_ROUTING:  uint64 = 0
+NF_INET_LOCAL_IN:     uint64 = 1
+NF_INET_FORWARD:      uint64 = 2
+NF_INET_LOCAL_OUT:    uint64 = 3
+NF_INET_POST_ROUTING: uint64 = 4
+
+
+# --- 16-slot static hook table --------------------------------------
+#
+# Parallel arrays — same pattern as api_proc.ad / api_chrdev.ad. A
+# slot is free when nf_slot_ops == 0; we key on the struct nf_hook_ops *
+# the module handed us (Linux's unregister walks the same pointer).
+# Storing hooknum and hook separately makes unregister-by-fn lookups
+# cheap and gives a later "fold into drivers/net chain" milestone the
+# information it needs without re-reading the ops blob (which the
+# module is free to mutate or unmap at any time after unregister
+# returns).
+
+MAX_NF_HOOKS: uint64 = 16
+
+nf_slot_ops:     Array[16, uint64]    # struct nf_hook_ops * (0 = free slot)
+nf_slot_hooknum: Array[16, uint64]    # NF_INET_*
+nf_slot_fn:      Array[16, uint64]    # hook callback address
+nf_slot_priv:    Array[16, uint64]    # caller-private cookie
+
+
+def _nf_find_free_slot() -> int32:
+    # Returns slot index 0..MAX_NF_HOOKS-1, or -1 if full.
+    i: uint64 = 0
+    while i < MAX_NF_HOOKS:
+        if nf_slot_ops[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _nf_find_by_ops(ops: uint64) -> int32:
+    # Locate the slot currently holding `ops`. Linux's unregister keys
+    # on the same pointer the register call used.
+    if ops == 0:
+        return -1
+    i: uint64 = 0
+    while i < MAX_NF_HOOKS:
+        if nf_slot_ops[i] == ops:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- ops-blob field readers -----------------------------------------
+#
+# Read the three fields we care about out of the module's nf_hook_ops
+# blob. We don't store a pointer to the blob long-term — the module
+# may free or rewrite it after unregister returns — so the slot copies
+# the values at register time.
+
+def _nf_read_hook(ops: uint64) -> uint64:
+    p: Ptr[uint64] = cast[Ptr[uint64]](ops + NF_OPS_HOOK_OFF)
+    return p[0]
+
+
+def _nf_read_priv(ops: uint64) -> uint64:
+    p: Ptr[uint64] = cast[Ptr[uint64]](ops + NF_OPS_PRIV_OFF)
+    return p[0]
+
+
+def _nf_read_hooknum(ops: uint64) -> uint64:
+    p: Ptr[uint32] = cast[Ptr[uint32]](ops + NF_OPS_HOOKNUM_OFF)
+    return cast[uint64](p[0])
+
+
+# --- Single-hook register / unregister ------------------------------
+
+def _l_nf_register_net_hook(net: uint64, ops: uint64) -> int32:
+    # Linux returns 0 on success, -errno on failure. We treat NULL ops
+    # as -EINVAL (Linux would oops on the deref); a full table reports
+    # -ENOMEM the same way an over-budget alloc would. `net` (the
+    # struct net *) is ignored at L26 — Hamnix only has the equivalent
+    # of init_net, so every hook lives in one namespace.
+    if ops == 0:
+        return -22                                  # -EINVAL
+    slot: int32 = _nf_find_free_slot()
+    if slot < 0:
+        return -12                                  # -ENOMEM
+    s: uint64 = cast[uint64](slot)
+    nf_slot_ops[s]     = ops
+    nf_slot_hooknum[s] = _nf_read_hooknum(ops)
+    nf_slot_fn[s]      = _nf_read_hook(ops)
+    nf_slot_priv[s]    = _nf_read_priv(ops)
+    return 0
+
+
+def _l_nf_unregister_net_hook(net: uint64, ops: uint64):
+    # Linux returns void; no error on stray unregister. We mirror that
+    # — if the pointer isn't in the table the call is a silent no-op.
+    slot: int32 = _nf_find_by_ops(ops)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    nf_slot_ops[s]     = 0
+    nf_slot_hooknum[s] = 0
+    nf_slot_fn[s]      = 0
+    nf_slot_priv[s]    = 0
+
+
+# --- Plural register / unregister -----------------------------------
+#
+# nf_register_net_hooks installs an array of n ops in one call. Linux
+# documents that on failure it rolls back the partial install (the
+# already-registered prefix is unregistered before returning the
+# error). We honour that: if any row fails we unwind the i-1 rows we
+# already added.
+
+def _l_nf_register_net_hooks(net: uint64, reg: uint64,
+                              n: uint32) -> int32:
+    if reg == 0:
+        return -22                                  # -EINVAL
+    count: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < count:
+        row: uint64 = reg + i * NF_OPS_STRIDE
+        rc: int32 = _l_nf_register_net_hook(net, row)
+        if rc != 0:
+            # Roll back the prefix [0..i) that did register cleanly.
+            j: uint64 = 0
+            while j < i:
+                back: uint64 = reg + j * NF_OPS_STRIDE
+                _l_nf_unregister_net_hook(net, back)
+                j = j + 1
+            return rc
+        i = i + 1
+    return 0
+
+
+def _l_nf_unregister_net_hooks(net: uint64, reg: uint64, n: uint32):
+    # Symmetric to the plural register — walk every row and drop it
+    # from the table. A spurious entry (never-registered ops in the
+    # array) is silently ignored by the single-hook path, so the
+    # plural variant tolerates the same shape without extra checks.
+    if reg == 0:
+        return
+    count: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < count:
+        row: uint64 = reg + i * NF_OPS_STRIDE
+        _l_nf_unregister_net_hook(net, row)
+        i = i + 1
+
+
+# --- Export-table registration --------------------------------------
+
+def linux_abi_register_netfilter():
+    # Called from start_kernel alongside linux_abi_register_netdev for
+    # the L25 + L26 networking-shim landing. The export table is flat
+    # and name-keyed, so the registration order doesn't matter beyond
+    # readability of the boot log.
+    _add_export("nf_register_net_hook",
+                cast[uint64](&_l_nf_register_net_hook))
+    _add_export("nf_unregister_net_hook",
+                cast[uint64](&_l_nf_unregister_net_hook))
+    _add_export("nf_register_net_hooks",
+                cast[uint64](&_l_nf_register_net_hooks))
+    _add_export("nf_unregister_net_hooks",
+                cast[uint64](&_l_nf_unregister_net_hooks))

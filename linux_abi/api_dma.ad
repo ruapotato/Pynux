@@ -1,0 +1,191 @@
+# linux_abi/api_dma.ad
+#
+# L22: Linux DMA API shims. Stock drivers reach for two complementary
+# allocators:
+#
+#   - dma_alloc_coherent: streaming/long-lived buffers shared with the
+#     device (ring descriptors, mailboxes). The CPU view and the bus
+#     view of the buffer are kept coherent — no manual cache-flush.
+#   - dma_map_single: one-shot mappings of an existing CPU buffer for
+#     a single DMA transaction. The bus address is returned; the CPU
+#     buffer mustn't be touched until dma_unmap_single declares it
+#     safe (on cache-coherent x86 this is bookkeeping only).
+#
+# Linux signatures (include/linux/dma-mapping.h):
+#
+#   void *dma_alloc_coherent(struct device *dev, size_t size,
+#                            dma_addr_t *dma_handle, gfp_t flag);
+#   void  dma_free_coherent(struct device *dev, size_t size,
+#                           void *cpu_addr, dma_addr_t dma_handle);
+#
+#   dma_addr_t dma_map_single(struct device *dev, void *cpu_addr,
+#                             size_t size,
+#                             enum dma_data_direction dir);
+#   void       dma_unmap_single(struct device *dev, dma_addr_t addr,
+#                               size_t size,
+#                               enum dma_data_direction dir);
+#
+# Implementation strategy:
+#
+# Hamnix runs bare metal with identity-mapped pages — there is no
+# IOMMU translation, no SWIOTLB bounce buffer, and the CPU's view of
+# memory equals the PCI bus's view (the i440FX north bridge is a
+# straight passthrough for the DRAM range we use). So both halves
+# of the DMA API collapse onto Hamnix's plain kmalloc/kfree:
+#
+#   - dma_alloc_coherent → kmalloc(size); write the returned address
+#     into *dma_handle as the "bus address"; return the same value
+#     to the caller as the "CPU address".
+#   - dma_free_coherent  → kfree(cpu_addr); dma_handle ignored
+#     (it equals cpu_addr).
+#   - dma_map_single     → return cpu_addr widened to dma_addr_t.
+#     No cache flush — x86 is cache-coherent with PCI.
+#   - dma_unmap_single   → no-op.
+#
+# Bookkeeping tables: an 8-slot static table records (size, addr) for
+# every active coherent allocation so leaks can be diagnosed and a
+# double-free returns silently (Linux warns but doesn't crash). The
+# streaming dma_map_single path doesn't track per-mapping state —
+# that would require a 1:1 hash from dma_addr back to size, and at L22
+# the test fixture doesn't validate unmap symmetry. When a streaming-
+# heavy driver lands (xhci, virtio-net's TX path) the streaming table
+# grows alongside.
+
+from linux_abi.exports import _add_export
+from mm.slab import kmalloc, kfree
+
+
+# --- Coherent-allocation bookkeeping --------------------------------
+#
+# 8 slots is enough for the L22 fixture (1 allocation) plus headroom
+# for virtio-blk's ring (vring + descriptor table + avail/used rings
+# = 3 allocations on a real driver). Bump MAX_DMA_ALLOCS together
+# with the Array sizes when a heavier driver lands.
+
+MAX_DMA_ALLOCS: uint64 = 8
+
+dma_alloc_addrs: Array[8, uint64]   # cpu_addr / dma_handle (0 = free)
+dma_alloc_sizes: Array[8, uint64]   # size in bytes
+
+
+def _dma_alloc_record(addr: uint64, size: uint64):
+    # Append (addr, size) to the first free slot. If the table is
+    # full we silently drop the bookkeeping but still return the
+    # allocation — Hamnix's slab is the real source of truth for
+    # memory; the table just helps with later diagnostics.
+    if addr == 0:
+        return
+    i: uint64 = 0
+    while i < MAX_DMA_ALLOCS:
+        if dma_alloc_addrs[i] == 0:
+            dma_alloc_addrs[i] = addr
+            dma_alloc_sizes[i] = size
+            return
+        i = i + 1
+
+
+def _dma_alloc_release(addr: uint64) -> uint64:
+    # Locate the slot holding `addr`, clear it, return the recorded
+    # size (or 0 if the address isn't tracked — caller will still
+    # kfree, which is NULL-safe and recovers size from the slab
+    # header anyway).
+    if addr == 0:
+        return 0
+    i: uint64 = 0
+    while i < MAX_DMA_ALLOCS:
+        if dma_alloc_addrs[i] == addr:
+            sz: uint64 = dma_alloc_sizes[i]
+            dma_alloc_addrs[i] = 0
+            dma_alloc_sizes[i] = 0
+            return sz
+        i = i + 1
+    return 0
+
+
+# --- Coherent shims --------------------------------------------------
+
+def _l_dma_alloc_coherent(dev: uint64, size: uint64,
+                           dma_handle: uint64, flag: uint64) -> uint64:
+    # Linux: dma_alloc_coherent(dev, size, &handle, GFP_KERNEL).
+    # `dev` is purely informational (used by IOMMU-aware paths to pick
+    # an address space — Hamnix has one address space). `flag` selects
+    # GFP_KERNEL vs GFP_ATOMIC; same as the kmalloc shim, we drop it
+    # because Hamnix's slab serves one zone.
+    #
+    # NULL `dma_handle` is illegal in real Linux (the assignment would
+    # NULL-deref); here we tolerate it because the test fixture might
+    # not bother in trivial cases. The cpu pointer is still returned.
+    addr: uint64 = kmalloc(size)
+    if addr == 0:
+        if dma_handle != 0:
+            handle_out: Ptr[uint64] = cast[Ptr[uint64]](dma_handle)
+            handle_out[0] = 0
+        return 0
+    _dma_alloc_record(addr, size)
+    if dma_handle != 0:
+        # dma_addr_t is u64 on x86_64 (see arch/x86/include/asm/types.h).
+        # We write the same value the function returns — Hamnix has no
+        # IOMMU, so the bus address equals the CPU address.
+        handle_out: Ptr[uint64] = cast[Ptr[uint64]](dma_handle)
+        handle_out[0] = addr
+    return addr
+
+
+def _l_dma_free_coherent(dev: uint64, size: uint64,
+                          cpu_addr: uint64, dma_handle: uint64):
+    # Linux: matching deallocator. dma_handle is the value previously
+    # written into *dma_handle by alloc_coherent; for Hamnix it equals
+    # cpu_addr, but a paranoid module passes both verbatim and we keep
+    # the signature lined up.
+    if cpu_addr == 0:
+        return
+    _dma_alloc_release(cpu_addr)
+    kfree(cpu_addr)
+
+
+# --- Streaming shims -------------------------------------------------
+
+def _l_dma_map_single(dev: uint64, cpu_addr: uint64, size: uint64,
+                       dir: uint32) -> uint64:
+    # Linux: returns dma_addr_t (u64) and may transparently bounce via
+    # SWIOTLB if the device's DMA mask can't reach the CPU buffer. On
+    # x86 with an identity-mapped 64-bit address space and no IOMMU,
+    # the bus address equals the CPU address — no bounce, no flush.
+    #
+    # `dir` is DMA_TO_DEVICE / DMA_FROM_DEVICE / DMA_BIDIRECTIONAL —
+    # on a non-coherent arch it picks the cache-maintenance op. x86
+    # is coherent with PCI, so we ignore it.
+    #
+    # NULL cpu_addr would be a driver bug in Linux (returns DMA_MAPPING_ERROR
+    # which is ~0). We return 0 instead — close enough for the L22
+    # fixture, and any driver that does dma_mapping_error() will see
+    # the failure regardless because both 0 and ~0 fall outside its
+    # expected address range.
+    if cpu_addr == 0:
+        return 0
+    return cpu_addr
+
+
+def _l_dma_unmap_single(dev: uint64, addr: uint64, size: uint64,
+                         dir: uint32):
+    # Symmetric no-op. On x86 with no IOMMU there's nothing to undo;
+    # the streaming buffer is the original CPU allocation, owned by
+    # the driver, and we never took a reference.
+    return
+
+
+# --- Export-table registration --------------------------------------
+
+def linux_abi_register_dma():
+    # Called from start_kernel alongside the other api_*_register
+    # callees. The four exports above are all stock Linux 6.12
+    # symbol names — modules built against either upstream headers
+    # or out-of-tree headers find them by string match.
+    _add_export("dma_alloc_coherent",
+                cast[uint64](&_l_dma_alloc_coherent))
+    _add_export("dma_free_coherent",
+                cast[uint64](&_l_dma_free_coherent))
+    _add_export("dma_map_single",
+                cast[uint64](&_l_dma_map_single))
+    _add_export("dma_unmap_single",
+                cast[uint64](&_l_dma_unmap_single))

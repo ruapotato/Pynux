@@ -38,6 +38,15 @@ from linux_abi.api_debugfs import linux_abi_register_debugfs
 from linux_abi.api_crypto import linux_abi_register_crypto
 from linux_abi.api_random import linux_abi_register_random
 from linux_abi.api_sysfs import linux_abi_register_sysfs
+from linux_abi.api_misc import linux_abi_register_misc
+from linux_abi.api_pci import linux_abi_register_pci
+from linux_abi.api_virtio import linux_abi_register_virtio
+from linux_abi.api_fs import linux_abi_register_fs
+from linux_abi.api_dma import linux_abi_register_dma
+from linux_abi.api_block import linux_abi_register_block
+from linux_abi.api_netdev import linux_abi_register_netdev
+from linux_abi.api_socket import linux_abi_register_socket
+from linux_abi.api_netfilter import linux_abi_register_netfilter
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -204,6 +213,24 @@ def linux_abi_exports_init():
     linux_abi_register_crypto()
     # L16: random + uaccess.
     linux_abi_register_random()
+    # L17..L20: atomic + delayed_work + kfifo + utsname + list + die_notifier.
+    linux_abi_register_misc()
+    # L21: PCI core.
+    linux_abi_register_pci()
+    # L22: DMA API.
+    linux_abi_register_dma()
+    # L23: virtio core.
+    linux_abi_register_virtio()
+    # L24: block layer.
+    linux_abi_register_block()
+    # L25: netdev.
+    linux_abi_register_netdev()
+    # L26: netfilter.
+    linux_abi_register_netfilter()
+    # L27: fs registration.
+    linux_abi_register_fs()
+    # L28: kernel sockets.
+    linux_abi_register_socket()
     # L9: timer_list.
     linux_abi_register_timer()
     # L10: hrtimer.

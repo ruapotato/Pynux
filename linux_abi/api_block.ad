@@ -1,0 +1,321 @@
+# linux_abi/api_block.ad
+#
+# L24 of the Hamnix Linux-ABI track: the block layer.
+#
+# Linux's block layer has two registration APIs every block driver
+# eventually touches:
+#
+#   gendisk-only flow (older, simpler, used by ramdisks):
+#     struct gendisk *blk_alloc_disk(int node_id);
+#     int  add_disk(struct gendisk *disk);
+#     void del_gendisk(struct gendisk *gp);
+#     void set_capacity(struct gendisk *disk, sector_t size);
+#
+#   blk-mq flow (modern, what virtio-blk + every real driver uses):
+#     int  blk_mq_alloc_tag_set(struct blk_mq_tag_set *set);
+#     void blk_mq_free_tag_set(struct blk_mq_tag_set *set);
+#     struct gendisk *blk_mq_alloc_disk(struct blk_mq_tag_set *set,
+#                                       void *queuedata);
+#
+#   bio completion (everyone, from both paths):
+#     void bio_endio(struct bio *bio);
+#
+# L24 SCOPE — minimum viable:
+#
+#   The M-style fixture (tests/linux-modules/src/block/block.c) just
+#   allocates a 1-MiB pretend gendisk via blk_alloc_disk + add_disk
+#   and prints a banner. No actual I/O is submitted. So for L24 we
+#   only need:
+#
+#     - blk_alloc_disk: return a non-NULL pointer to a tracked slot
+#       so add_disk can match it later.
+#     - add_disk: record the disk as "live" and return 0.
+#     - del_gendisk: symmetric clear.
+#     - blk_mq_alloc_tag_set / free: track the tag-set struct in a
+#       parallel slot table; reject double-init.
+#     - blk_mq_alloc_disk: returns a gendisk slot the same way the
+#       non-mq path does, with the tag-set association recorded.
+#     - set_capacity: write into the gendisk slot's capacity field;
+#       the fixture asserts via the printed banner only.
+#     - bio_endio: no-op until L24+ wires actual bio submission. Linux
+#       drivers call this from their request_fn; the L24 fixture
+#       doesn't reach that code path.
+#
+# Hamnix already has a real block layer in kernel/block/blk.ad
+# (register_blockdev / blk_read_sectors / etc.) — but that surface
+# is the Hamnix-internal vtable shape used by FAT/EXT4, NOT the
+# Linux gendisk+blk_mq surface. They will be bridged by a future
+# milestone (an "L24-bridge" that translates Linux's gendisk into
+# Hamnix's BlockDevice); until then, this file keeps the two block
+# APIs cleanly separate. The M-style fixture only exercises the
+# Linux surface and never tries to read sectors.
+#
+# Struct sizes (Linux 6.12 ballpark):
+#   struct gendisk          ~ 600 B  (we track 16 of them, 16 KiB total)
+#   struct blk_mq_tag_set   ~ 150 B
+#   struct request_queue    ~ 1200 B (not modelled — never derefed)
+#   struct bio              ~ 100 B  (not modelled — bio_endio is no-op)
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0, printk1
+
+
+# --- Opaque struct sizes (informational) ----------------------------
+
+GENDISK_SIZE:      uint64 = 640
+TAGSET_SIZE:       uint64 = 160
+
+
+# --- gendisk slot table ---------------------------------------------
+#
+# 16 slots is enough for L24 (the fixture uses 1; real systems rarely
+# need more than 4 or 5 block devices in the early-boot window when
+# .ko modules are loaded). Slot layout (parallel arrays — same
+# Ptr-in-struct-global pitfall the rest of linux_abi/ calls out):
+#
+#   gendisk_storage : the in-Hamnix gendisk "blob" (we hand out a
+#                     pointer to this slot's blob as the gendisk *).
+#                     A small per-slot scratch is enough because L24
+#                     doesn't model Linux's real gendisk layout —
+#                     modules never read the struct fields, they
+#                     just pass the pointer back to other block APIs.
+#   gendisk_used    : 1 = slot is allocated, 0 = free.
+#   gendisk_live    : 1 = add_disk has been called for this slot.
+#   gendisk_cap     : capacity in 512-byte sectors (set_capacity).
+#   gendisk_tagset  : associated blk_mq_tag_set pointer, or 0 if the
+#                     disk came from the bio-based blk_alloc_disk path.
+#   gendisk_qdata   : queuedata cookie from blk_mq_alloc_disk.
+#
+# We use one uint64 per slot for the "storage" — that's just a 8-byte
+# anchor whose ADDRESS is what we hand back; modules treat the
+# pointer as opaque and we never write through it.
+
+MAX_GENDISK_SLOTS: uint64 = 16
+
+gendisk_storage: Array[16, uint64]
+gendisk_used:    Array[16, uint64]
+gendisk_live:    Array[16, uint64]
+gendisk_cap:     Array[16, uint64]
+gendisk_tagset:  Array[16, uint64]
+gendisk_qdata:   Array[16, uint64]
+
+
+# --- tag_set slot table ---------------------------------------------
+#
+# Linux's blk_mq_tag_set holds the per-driver multi-queue config
+# (nr_hw_queues, queue_depth, ops vtable). We don't model the
+# fields — just track which set pointers have been initialised, so
+# blk_mq_alloc_disk can validate its `set` arg and blk_mq_free_tag_set
+# can verify symmetry.
+
+MAX_TAGSET_SLOTS: uint64 = 16
+tagset_ptrs: Array[16, uint64]      # 0 = free
+
+
+# --- Helpers --------------------------------------------------------
+
+def _gendisk_find_free() -> int32:
+    i: uint64 = 0
+    while i < MAX_GENDISK_SLOTS:
+        if gendisk_used[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _gendisk_slot_of(disk: uint64) -> int32:
+    # The pointer we hand back is &gendisk_storage[slot]. Locate
+    # the slot by linear scan — 16 entries is too small for the
+    # arithmetic-on-address shortcut to be worth the rounding risk.
+    i: uint64 = 0
+    while i < MAX_GENDISK_SLOTS:
+        if cast[uint64](&gendisk_storage[i]) == disk:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _tagset_find_free() -> int32:
+    i: uint64 = 0
+    while i < MAX_TAGSET_SLOTS:
+        if tagset_ptrs[i] == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _tagset_find(set_ptr: uint64) -> int32:
+    i: uint64 = 0
+    while i < MAX_TAGSET_SLOTS:
+        if tagset_ptrs[i] == set_ptr:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- gendisk shims --------------------------------------------------
+
+def _l_blk_alloc_disk(node_id: int32) -> uint64:
+    # Linux: struct gendisk *blk_alloc_disk(int node_id).
+    # (Older API took (lim, node_id); 6.12 settled on a single node_id
+    # arg with limits applied later via blk_set_default_limits.)
+    # node_id is the NUMA hint — Hamnix is UMA so it's ignored.
+    #
+    # Returns a non-NULL gendisk pointer on success, NULL on OOM. We
+    # hand out the address of our per-slot storage; the slot is marked
+    # used but not live until add_disk is called.
+    slot: int32 = _gendisk_find_free()
+    if slot < 0:
+        printk0("blk: blk_alloc_disk: gendisk table full\n")
+        return 0
+    s: uint64 = cast[uint64](slot)
+    gendisk_storage[s] = 0
+    gendisk_used[s]    = 1
+    gendisk_live[s]    = 0
+    gendisk_cap[s]     = 0
+    gendisk_tagset[s]  = 0
+    gendisk_qdata[s]   = 0
+    return cast[uint64](&gendisk_storage[s])
+
+
+def _l_add_disk(disk: uint64) -> int32:
+    # Linux: int add_disk(struct gendisk *disk). Walks the partition
+    # table, creates /dev nodes, registers with udev. None of that
+    # exists at L24 — we just flip the live flag and return 0.
+    if disk == 0:
+        return -22                              # -EINVAL
+    slot: int32 = _gendisk_slot_of(disk)
+    if slot < 0:
+        printk0("blk: add_disk: unknown gendisk\n")
+        return -22                              # -EINVAL
+    s: uint64 = cast[uint64](slot)
+    if gendisk_used[s] == 0:
+        return -22                              # -EINVAL
+    gendisk_live[s] = 1
+    printk1("L24: gendisk live capacity=%d sectors\n", gendisk_cap[s])
+    return 0
+
+
+def _l_del_gendisk(disk: uint64):
+    # Linux: void del_gendisk(struct gendisk *gp). Reverse of add_disk
+    # + (with put_disk) blk_alloc_disk. We collapse both halves of the
+    # teardown into del_gendisk so the slot is fully reclaimed — the
+    # L24 fixture doesn't expose put_disk as a separate symbol yet
+    # (a later milestone will when ref-counted disks land).
+    if disk == 0:
+        return
+    slot: int32 = _gendisk_slot_of(disk)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    gendisk_used[s]    = 0
+    gendisk_live[s]    = 0
+    gendisk_cap[s]     = 0
+    gendisk_tagset[s]  = 0
+    gendisk_qdata[s]   = 0
+
+
+def _l_set_capacity(disk: uint64, size: uint64):
+    # Linux: void set_capacity(struct gendisk *disk, sector_t size).
+    # size is in 512-byte sectors. Stored for the add_disk-time banner.
+    if disk == 0:
+        return
+    slot: int32 = _gendisk_slot_of(disk)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    gendisk_cap[s] = size
+
+
+# --- blk_mq shims ---------------------------------------------------
+
+def _l_blk_mq_alloc_tag_set(set_ptr: uint64) -> int32:
+    # Linux: int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set).
+    # Module pre-populates set->ops, set->nr_hw_queues, set->queue_depth,
+    # then calls this. The real implementation builds the per-hw-queue
+    # tag bitmap + per-request scratch space; L24 just records the
+    # pointer so blk_mq_alloc_disk's set arg can be validated.
+    if set_ptr == 0:
+        return -22                              # -EINVAL
+    if _tagset_find(set_ptr) >= 0:
+        return -17                              # -EEXIST (double init)
+    slot: int32 = _tagset_find_free()
+    if slot < 0:
+        printk0("blk: blk_mq_alloc_tag_set: table full\n")
+        return -12                              # -ENOMEM
+    s: uint64 = cast[uint64](slot)
+    tagset_ptrs[s] = set_ptr
+    return 0
+
+
+def _l_blk_mq_free_tag_set(set_ptr: uint64):
+    # Linux: void blk_mq_free_tag_set(struct blk_mq_tag_set *set).
+    # Symmetric clear. Spurious free of an unregistered set is a no-op.
+    if set_ptr == 0:
+        return
+    slot: int32 = _tagset_find(set_ptr)
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    tagset_ptrs[s] = 0
+
+
+def _l_blk_mq_alloc_disk(set_ptr: uint64, queuedata: uint64) -> uint64:
+    # Linux: struct gendisk *blk_mq_alloc_disk(struct blk_mq_tag_set
+    #     *set, void *queuedata).
+    # Equivalent to blk_alloc_disk + an associated request_queue
+    # backed by the tag set. We grab a gendisk slot and stamp the
+    # tag-set + queuedata cookie into it; the caller wires limits
+    # and capacity afterwards and then calls add_disk.
+    if set_ptr == 0:
+        return 0
+    if _tagset_find(set_ptr) < 0:
+        printk0("blk: blk_mq_alloc_disk: tag_set not initialised\n")
+        return 0
+    slot: int32 = _gendisk_find_free()
+    if slot < 0:
+        printk0("blk: blk_mq_alloc_disk: gendisk table full\n")
+        return 0
+    s: uint64 = cast[uint64](slot)
+    gendisk_storage[s] = 0
+    gendisk_used[s]    = 1
+    gendisk_live[s]    = 0
+    gendisk_cap[s]     = 0
+    gendisk_tagset[s]  = set_ptr
+    gendisk_qdata[s]   = queuedata
+    return cast[uint64](&gendisk_storage[s])
+
+
+# --- bio_endio ------------------------------------------------------
+
+def _l_bio_endio(bio: uint64):
+    # Linux: void bio_endio(struct bio *bio).
+    # Real implementation runs the bi_end_io callback (offset varies
+    # by kernel config — Linux 6.12 puts it after the bvec_iter, ~64
+    # bytes in) and decrements the bio's reference count. At L24 no
+    # one submits a bio, so completing one is unreachable in the
+    # fixture; we keep the symbol resolvable as a no-op so a module
+    # whose error path drops a bio doesn't fault.
+    return
+
+
+# --- Export-table registration --------------------------------------
+
+def linux_abi_register_block():
+    # Called from start_kernel after the L1..L23 registrations.
+    _add_export("blk_alloc_disk",
+                cast[uint64](&_l_blk_alloc_disk))
+    _add_export("add_disk",
+                cast[uint64](&_l_add_disk))
+    _add_export("del_gendisk",
+                cast[uint64](&_l_del_gendisk))
+    _add_export("set_capacity",
+                cast[uint64](&_l_set_capacity))
+    _add_export("blk_mq_alloc_tag_set",
+                cast[uint64](&_l_blk_mq_alloc_tag_set))
+    _add_export("blk_mq_free_tag_set",
+                cast[uint64](&_l_blk_mq_free_tag_set))
+    _add_export("blk_mq_alloc_disk",
+                cast[uint64](&_l_blk_mq_alloc_disk))
+    _add_export("bio_endio",
+                cast[uint64](&_l_bio_endio))
