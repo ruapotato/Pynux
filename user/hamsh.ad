@@ -340,6 +340,38 @@ def _concat_path(prefix: Ptr[uint8], name: Ptr[uint8]) -> uint64:
     return pi
 
 
+def _try_spawn_with_prefix(prefix_start: Ptr[uint8],
+                            prefix_len: uint64,
+                            cmd: Ptr[uint8],
+                            argv: Ptr[uint64],
+                            stdin_fd: int32,
+                            stdout_fd: int32) -> int32:
+    # Build path_buf = prefix + '/' + cmd + NUL, then sys_spawn it.
+    # `prefix_len == 0` means the prefix is empty (don't prepend
+    # anything — used for the CWD-style "." segment in PATH).
+    pi: uint64 = 0
+    j: uint64 = 0
+    while j < prefix_len:
+        path_buf[pi] = prefix_start[j]
+        pi = pi + 1
+        j = j + 1
+    # Insert '/' between prefix and cmd unless the prefix already
+    # ended with one (avoid "/bin//ls" — cosmetic only, but matches
+    # bash's PATH-resolver shape).
+    if pi == 0 or path_buf[pi - 1] != 47:
+        path_buf[pi] = 47                           # '/'
+        pi = pi + 1
+    ni: uint64 = 0
+    while cmd[ni] != 0:
+        path_buf[pi] = cmd[ni]
+        pi = pi + 1
+        ni = ni + 1
+    path_buf[pi] = 0
+    argv[0] = cast[uint64](&path_buf[0])
+    return sys_spawn(cast[Ptr[char]](&path_buf[0]),
+                     argv, stdin_fd, stdout_fd)
+
+
 def spawn_cmd(argv: Ptr[uint64], stdin_fd: int32, stdout_fd: int32) -> int32:
     cmd: Ptr[uint8] = cast[Ptr[uint8]](argv[0])
     # Absolute path → spawn as-is, no PATH walk.
@@ -352,22 +384,48 @@ def spawn_cmd(argv: Ptr[uint64], stdin_fd: int32, stdout_fd: int32) -> int32:
             write_str(2, "\n")
         return pid
 
-    # Bare name — walk the hardcoded PATH dirs. First successful
-    # spawn wins; we swap argv[0] to the resolved path so the
-    # child's argv[0] reflects what actually ran (like bash).
     saved_argv0: uint64 = argv[0]
-    i: uint32 = 0
-    while True:
-        prefix: Ptr[uint8] = _path_dir(i)
-        if cast[uint64](prefix) == 0:
-            break
-        _concat_path(prefix, cmd)
-        argv[0] = cast[uint64](&path_buf[0])
-        pid: int32 = sys_spawn(cast[Ptr[char]](&path_buf[0]),
-                               argv, stdin_fd, stdout_fd)
-        if pid >= 0:
-            return pid
-        i = i + 1
+
+    # M16.79: prefer the user-set PATH variable. If $PATH is set,
+    # split on ':' and try each segment. Empty segments mean CWD
+    # (the same semantic bash uses). If $PATH is unset, fall back
+    # to the M16.72 hardcoded list (/bin, /sbin, /usr/bin).
+    path_var: Ptr[uint8] = var_get("PATH")
+    if cast[uint64](path_var) != 0:
+        i: uint64 = 0
+        while True:
+            # Find the next ':' (or end-of-string).
+            seg_start: uint64 = i
+            while path_var[i] != 0 and path_var[i] != 58:
+                i = i + 1
+            seg_len: uint64 = i - seg_start
+            pid: int32 = _try_spawn_with_prefix(
+                cast[Ptr[uint8]](cast[uint64](path_var) + seg_start),
+                seg_len, cmd, argv, stdin_fd, stdout_fd)
+            if pid >= 0:
+                return pid
+            if path_var[i] == 0:
+                break
+            i = i + 1                              # skip the ':'
+    else:
+        i: uint32 = 0
+        while True:
+            prefix: Ptr[uint8] = _path_dir(i)
+            if cast[uint64](prefix) == 0:
+                break
+            # Hardcoded prefixes already end in '/' — trim it so
+            # _try_spawn_with_prefix's auto-slash doesn't duplicate.
+            plen: uint64 = 0
+            while prefix[plen] != 0:
+                plen = plen + 1
+            if plen > 0 and prefix[plen - 1] == 47:
+                plen = plen - 1
+            pid: int32 = _try_spawn_with_prefix(
+                prefix, plen, cmd, argv, stdin_fd, stdout_fd)
+            if pid >= 0:
+                return pid
+            i = i + 1
+
     # Nothing matched — restore argv[0] for any caller inspection
     # and report the failure against the original bare name.
     argv[0] = saved_argv0
