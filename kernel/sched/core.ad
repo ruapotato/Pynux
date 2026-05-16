@@ -77,6 +77,16 @@ class TaskStruct:
     # M16.47: per-task current working directory. NUL-terminated.
     # Inherited at spawn from the parent.
     cwd:          Array[128, uint8]   # offset 544..672
+    # U1: per-task syscall ABI selector. 0 = native Hamnix numbering
+    # (the existing 0..22 + 175/176 ladder in do_syscall), 1 = Linux
+    # x86_64 numbering (forwarded to linux_u_syscall_dispatch). All
+    # existing tasks stay at 0; the loader for Linux-ELF user binaries
+    # flips this on the freshly-created child before its first iretq
+    # to user mode. Placed at the end of TaskStruct so adding it does
+    # not shift any earlier offset — sched_asm.S still finds `sp` at
+    # offset 0, and the per-task fd table still lives where vfs.ad
+    # expects it.
+    is_linux_userspace: int32         # offset 672
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -221,6 +231,10 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     # Kernel threads share the BSP's page table (no per-task mappings
     # for them yet — and they don't need user pages anyway).
     task_table[s].cr3         = get_bsp_cr3()
+    # U1: kernel threads never speak Linux ABI; flag explicitly so a
+    # stale .bss value (already zero, but be defensive after reap +
+    # re-claim) can't route a kthread through the linux dispatch.
+    task_table[s].is_linux_userspace = 0
     _init_fd_table(s)
     next_pid = next_pid + 1
     return slot
@@ -288,6 +302,11 @@ def create_user_task_argv(entry: uint64, name0: uint64,
     memcpy(cast[Ptr[uint8]](new_pml4),
            cast[Ptr[uint8]](get_bsp_cr3()), 4096)
     task_table[s].cr3 = new_pml4
+    # U1: default new user tasks to native Hamnix ABI. The Linux ELF
+    # loader path (future U-series milestone) will call
+    # set_linux_userspace_mode(slot, 1) after this returns to flip the
+    # child into Linux-numbered dispatch before its first iretq.
+    task_table[s].is_linux_userspace = 0
     _init_fd_table(s)
     _inherit_cwd_from_parent(s)
     next_pid = next_pid + 1
@@ -484,6 +503,26 @@ def task_reap(slot: int32):
 
 def task_pid_at(slot: int32) -> uint64:
     return task_table[cast[uint64](slot)].pid
+
+
+def set_linux_userspace_mode(slot: int32, on: int32):
+    # U1: flip the per-task syscall ABI selector. Called by the Linux
+    # ELF loader after create_user_task_argv returns the slot id but
+    # before schedule() ever picks the new task. Idempotent and safe
+    # to call on any STATE_READY / STATE_RUNNING task; we don't gate
+    # on state because there's no race here at uniprocessor scale
+    # (the field is only read on syscall entry by the running task
+    # itself). `on` is the int32 0/1 value to store — matches the
+    # field type and avoids a cast at every call site.
+    su: uint64 = cast[uint64](slot)
+    task_table[su].is_linux_userspace = on
+
+
+def task_is_linux_userspace(slot: int32) -> int32:
+    # Read accessor — used by the procfs renderer (future M-track) and
+    # as a debug aid. The hot-path syscall dispatch reads the field
+    # off current_task() directly to avoid the slot lookup.
+    return task_table[cast[uint64](slot)].is_linux_userspace
 
 
 def task_name0_at(slot: int32) -> uint64:

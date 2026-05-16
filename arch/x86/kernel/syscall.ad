@@ -45,6 +45,7 @@ from fs.vfs import (
 from fs.elf import elf_load_blob
 from mm.page_alloc import alloc_page
 from linux_abi.loader import kmod_linux_load, kmod_linux_unload
+from linux_abi.u_syscalls import linux_u_syscall_dispatch
 
 extern def do_execve_finish(new_rip: uint64, new_rsp: uint64,
                             argc: uint64, argv: uint64)
@@ -230,6 +231,24 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
     # other async post (SYS_KILL on self, etc.). Mid-syscall yields
     # check their own pending state in yield_to_others.
     signal_check_and_handle()
+    # U1: per-task syscall ABI fork. Tasks created by the (future)
+    # Linux ELF loader will have task_struct.is_linux_userspace==1
+    # and route to linux_u_syscall_dispatch, which interprets `nr`
+    # using Linux x86_64 numbering (read=0, write=1, ...). Hamnix-
+    # native binaries — everything currently in initramfs — leave the
+    # field at 0 and fall through to the existing 0..22 + 175/176
+    # ladder unchanged. The syscall entry stub only forwards 4 args
+    # (a0..a3) into this function today, so a4/a5 are zeroed for the
+    # Linux path. Linux syscalls that need a4/a5 (mmap's 6-arg form,
+    # etc.) all return -ENOSYS at this scaffold scale, so the missing
+    # args are not yet observable; widening the asm shuffle to pass
+    # r8/r9 lands with the first Linux syscall that needs them.
+    task: Ptr[TaskStruct] = current_task()
+    if task[0].is_linux_userspace != 0:
+        rc: int64 = linux_u_syscall_dispatch(nr, a0, a1, a2, a3,
+                                             cast[uint64](0),
+                                             cast[uint64](0))
+        return cast[uint64](rc)
     if nr == SYS_PUTC:
         early_putc(cast[int32](a0 & 0xFF))
         return 0
