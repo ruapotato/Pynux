@@ -2,12 +2,12 @@
 # scripts/test_hamsh_logic.sh — M16.71 verification.
 #
 # Exercises hamsh's `;`, `&&`, `||` separators:
-#   /true && /echo AFTER_AND_TRUE      → executes
-#   /false && /echo AFTER_AND_FALSE    → skipped
-#   /true || /echo AFTER_OR_TRUE       → skipped
-#   /false || /echo AFTER_OR_FALSE     → executes
-#   /echo SEQ1 ; /echo SEQ2            → both execute
-#   /false ; /echo AFTER_SEMI          → executes (sequencing ignores prev exit)
+#   true && echo AFTER_AND_TRUE      → executes
+#   false && echo AFTER_AND_FALSE    → skipped
+#   true || echo AFTER_OR_TRUE       → skipped
+#   false || echo AFTER_OR_FALSE     → executes
+#   echo SEQ1 ; echo SEQ2            → both execute
+#   false ; echo AFTER_SEMI          → executes (sequencing ignores prev exit)
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,17 +27,17 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/true && /echo AFTER_AND_TRUE\n'
+    printf 'true && echo AFTER_AND_TRUE\n'
     sleep 1
-    printf '/false && /echo AFTER_AND_FALSE\n'
+    printf 'false && echo AFTER_AND_FALSE\n'
     sleep 1
-    printf '/true || /echo AFTER_OR_TRUE\n'
+    printf 'true || echo AFTER_OR_TRUE\n'
     sleep 1
-    printf '/false || /echo AFTER_OR_FALSE\n'
+    printf 'false || echo AFTER_OR_FALSE\n'
     sleep 1
-    printf '/echo SEQ1 ; /echo SEQ2\n'
+    printf 'echo SEQ1 ; echo SEQ2\n'
     sleep 1
-    printf '/false ; /echo AFTER_SEMI\n'
+    printf 'false ; echo AFTER_SEMI\n'
     sleep 1
     printf 'exit\n'
     sleep 1

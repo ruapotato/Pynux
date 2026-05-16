@@ -3,8 +3,8 @@
 #
 # Drives hamsh through:
 #
-#     /cat /mnt/HELLO.TXT             (root-level read, regression)
-#     /cat /mnt/SUBDIR/NESTED.TXT     (subdir traversal)
+#     cat /mnt/HELLO.TXT             (root-level read, regression)
+#     cat /mnt/SUBDIR/NESTED.TXT     (subdir traversal)
 #
 # and checks the markers from each. Proves fat_lookup's path-
 # component walker descends into a directory entry (attr & 0x10)
@@ -40,9 +40,9 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/cat /mnt/HELLO.TXT\n'
+    printf 'cat /mnt/HELLO.TXT\n'
     sleep 1
-    printf '/cat /mnt/SUBDIR/NESTED.TXT\n'
+    printf 'cat /mnt/SUBDIR/NESTED.TXT\n'
     sleep 1
     printf 'exit\n'
     sleep 1

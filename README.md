@@ -124,6 +124,32 @@ The end-game is a fully Hamnix-authored kernel.
 | M16.31 | `SYS_EXECVE` — userspace exec() via direct SYSRETQ to new RIP/RSP with new ELF; pid preserved across image replace | **Done** |
 | M16.32 | Loadable kernel modules — insmod-equivalent; `mod/kmod_hello.S` loaded at runtime, calls back via API function-pointer table | **Done** |
 | M16.33 | `x86_64-adder-user` compiler target — userland programs written in Hamnix; `user/hello.py` runs as a real CPL-3 ELF | **Done** |
+| M16.34 | UART RX + `sys_read` on stdin — line-buffered serial input drives interactive userland | **Done** |
+| M16.35 | `hamsh` shell + `SYS_EXECVE(path, argv)` + `SYS_SPAWN` + `SYS_WAITPID` — interactive command runner with builtins | **Done** |
+| M16.36 | `/proc/{version,uptime,tasks}` + `ps` — dynamic procfs snapshots rendered on open | **Done** |
+| M16.37–M16.41 | Pipes (`\|`), `dup`/`dup2`, redirect (`>`), tmpfs (`/tmp/*`), multi-stage pipelines | **Done** |
+| M16.42 | SIGINT delivery via Ctrl-C — kernel signals user tasks on intercept of `0x03` from the UART | **Done** |
+| M16.43–M16.46 | FAT32 read-only driver — BPB parse, FAT chain walk, subdir traversal, listdir, multi-component path lookup (mirrors `fs/fat/`) | **Done** |
+| M16.47–M16.49 | Per-task CWD + relative paths + `.` / `..` resolution — `sys_chdir` / `sys_getcwd` | **Done** |
+| M16.50 | 7+ function parameters via SysV stack-arg ABI (compiler-side lift of 6-param cap) | **Done** |
+| M16.51–M16.54 | EXT4 read-only — superblock, group descriptors, inode read, inline leaf extents, dir walk (mirrors `fs/ext4/`) | **Done** |
+| M16.55 | `ls /ext` listdir wiring through VFS | **Done** |
+| M16.56 | EXT4 multi-component path lookup — `cat /ext/sub/dir/file.txt` resolves through nested directories | **Done** |
+| M16.57 | `/head` `/wc` `/grep` coreutils + two latent kernel bugs (task slot leak in waitpid, partial-read on transient stdin) | **Done** |
+| M16.58 | EXT4 index extents (depth > 0) + 48-bit physical addresses — files past ~48 KiB and 16 TB filesystems | **Done** |
+| M16.59 | EXT4 multi-block directories — dir walks every data block, not just block 0 | **Done** |
+| M16.60 | Block-write path — `BlockDeviceOps.write_sectors`, virtio-blk `VIRTIO_BLK_T_OUT`, brd memcpy write | **Done** |
+| M16.61–M16.62 | EXT4 block-bitmap + inode-bitmap allocators — first-fit alloc/free with on-disk bitmap write-back | **Done** |
+| M16.63 | EXT4 file create end-to-end — alloc inode + alloc block + write inode + splice dirent | **Done** |
+| M16.64 | EXT4 write through `>` redirect — `echo X > /ext/file` works from the shell | **Done** |
+| M16.65 | tmpfs unlink + `SYS_UNLINK` + `SYS_MKDIR` no-op + `/rm` `/touch` `/mkdir` userland | **Done** |
+| M16.66 | 9 more coreutils — `/seq` `/uname` `/true` `/false` `/yes` `/sleep` `/sort` `/tee` `/rev` | **Done** |
+| M16.67 | EXT4 unlink (full delete: free inode + free block + tombstone dirent) | **Done** |
+| M16.68 | `/dev/null` + `/dev/zero` + CMOS RTC driver + 15 more coreutils + `/etc/{hostname,passwd,group,motd,issue,os-release}` baseline | **Done** |
+| M16.69 | hamsh — `#` comment lines + `$?` last-exit-code substitution | **Done** |
+| M16.70 | `/df` `/du` `/tail` `/cmp` coreutils | **Done** |
+| M16.71 | hamsh — `;`, `&&`, `\|\|` sub-command separators with conjunction-based skip | **Done** |
+| M16.72 | Userland moved to `/bin/<name>`; hamsh PATH walker resolves bare command names (`/bin`, `/sbin`, `/usr/bin`) | **Done** |
 
 
 ## How it works

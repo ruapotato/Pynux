@@ -3,11 +3,11 @@
 #
 # Drives hamsh through:
 #
-#     /echo pipe payload | /cat
+#     echo pipe payload | /cat
 #     exit
 #
 # Expects "pipe payload" to appear on serial once — meaning /echo
-# wrote to the pipe, the kernel buffered the bytes, /cat (running
+# wrote to the pipe, the kernel buffered the bytes, cat (running
 # with stdin = pipe rfd) drained them and wrote to serial. Proves
 # the SYS_PIPE / fd inheritance / blocking-read / writers-closed-EOF
 # chain works end to end.
@@ -39,7 +39,7 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/echo pipe payload | /cat\n'
+    printf 'echo pipe payload | cat\n'
     sleep 2
     printf 'exit\n'
     sleep 1
@@ -60,7 +60,7 @@ cat "$LOG"
 echo "[test_pipe] --- end output ---"
 
 fail=0
-# /cat's reads and writes interleave with the kernel's exit-log
+# cat's reads and writes interleave with the kernel's exit-log
 # printk ("task: pid N exited (code=M)") AND its own chunk
 # boundaries (4-byte "pipe", 1-byte " ", 7-byte "payload" hit the
 # pipe in separate writes). To assert delivery robustly, strip the

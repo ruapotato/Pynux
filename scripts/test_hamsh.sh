@@ -2,12 +2,12 @@
 # scripts/test_hamsh.sh - end-to-end test for the M16.35 Hamnix shell.
 #
 # Boots a kernel whose /init is build/user/hamsh.elf, pipes a short
-# sequence of commands (help → /hello → exit) into QEMU's serial
+# sequence of commands (help → hello → exit) into QEMU's serial
 # stdio, and greps the captured serial log for evidence that:
 #
 #   1. the hamsh banner appeared        → main() ran
 #   2. the help builtin output appeared → tokenize + builtin dispatch
-#   3. the /hello child banner appeared → SYS_SPAWN + ELF load worked
+#   3. the hello child banner appeared → SYS_SPAWN + ELF load worked
 #   4. the hamsh "bye" line appeared    → SYS_WAITPID returned and
 #                                          the shell's main loop
 #                                          continued to the exit
@@ -50,7 +50,7 @@ set +e
     sleep 3
     printf 'help\n'
     sleep 1
-    printf '/hello\n'
+    printf 'hello\n'
     sleep 2
     printf 'exit\n'
     sleep 1

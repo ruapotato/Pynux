@@ -4,8 +4,8 @@
 # Drives hamsh through:
 #
 #     cd /mnt
-#     /ls               (no arg → uses CWD)
-#     /cat HELLO.TXT    (relative path; kernel resolves to /mnt/HELLO.TXT)
+#     ls               (no arg → uses CWD)
+#     cat HELLO.TXT    (relative path; kernel resolves to /mnt/HELLO.TXT)
 #     exit
 #
 # Greps the captured serial for HELLO.TXT (from /ls) and the
@@ -45,9 +45,9 @@ set +e
     sleep 3
     printf 'cd /mnt\n'
     sleep 1
-    printf '/ls\n'
+    printf 'ls\n'
     sleep 1
-    printf '/cat HELLO.TXT\n'
+    printf 'cat HELLO.TXT\n'
     sleep 1
     printf 'exit\n'
     sleep 1
@@ -70,13 +70,13 @@ echo "[test_relpath] --- end output ---"
 
 fail=0
 if grep -F -q "HELLO.TXT" "$LOG"; then
-    echo "[test_relpath] OK: /ls with no arg returned CWD's entries"
+    echo "[test_relpath] OK: ls with no arg returned CWD's entries"
 else
-    echo "[test_relpath] MISS: HELLO.TXT not in /ls output"
+    echo "[test_relpath] MISS: HELLO.TXT not in ls output"
     fail=1
 fi
 if grep -F -q "FAT32_MARKER" "$LOG"; then
-    echo "[test_relpath] OK: /cat HELLO.TXT resolved + read"
+    echo "[test_relpath] OK: cat HELLO.TXT resolved + read"
 else
     echo "[test_relpath] MISS: FAT32_MARKER not produced by relative /cat"
     fail=1

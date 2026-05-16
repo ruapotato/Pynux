@@ -92,12 +92,10 @@ def build_archive() -> bytes:
               f"{p.relative_to(here) if p.is_relative_to(here) else p}) "
               f"[INIT_ELF override]")
 
-    # Userland ELFs: anything in build/user/ becomes a cpio entry
-    # named "/" + binary name (without .elf). /init must exist for
-    # the kernel boot path to work; others (e.g. /hello) are extras
-    # for SYS_EXECVE demos. Skipped if (a) INIT_ELF already covered
-    # /init (we drop build/user/init.elf to avoid a duplicate entry)
-    # or (b) the path matches the override exactly (already embedded).
+    # Userland ELFs: anything in build/user/ lands at /bin/<name>.
+    # Exception: init.elf is the kernel's boot entrypoint and
+    # always goes to /init (unless overridden via INIT_ELF above).
+    # Everything else is found by hamsh's PATH walker.
     user_dir = here / "build" / "user"
     if user_dir.is_dir():
         for elf in sorted(user_dir.glob("*.elf")):
@@ -107,9 +105,16 @@ def build_archive() -> bytes:
                 if elf.name == "init.elf":
                     continue          # /init slot is taken by override
             data = elf.read_bytes()
-            name = "/" + elf.stem
-            blob += cpio_entry(name, data)
-            print(f"  embedded {name} ({len(data)} bytes from "
+            if elf.name == "init.elf" and init_override_real is None:
+                # Default /init = the asm-built init.elf — kernel
+                # reads this at boot.
+                blob += cpio_entry("/init", data)
+                print(f"  embedded /init ({len(data)} bytes from "
+                      f"build/user/{elf.name})")
+                continue
+            bin_name = "/bin/" + elf.stem
+            blob += cpio_entry(bin_name, data)
+            print(f"  embedded {bin_name} ({len(data)} bytes from "
                   f"build/user/{elf.name})")
 
     # Baseline /etc files: anything in etc/ gets embedded as /etc/<name>

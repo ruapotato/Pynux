@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test_fat.sh - M16.43 verification.
 #
-# Boot hamsh, run "/cat /mnt/HELLO.TXT", grep the marker that
+# Boot hamsh, run "cat /mnt/HELLO.TXT", grep the marker that
 # scripts/build_diskimg.py planted in HELLO.TXT. Proves end-to-end:
 # brd registers, fat_init parses the BPB, vfs_open routes /mnt/*
 # to fat_open, vfs_read walks the FAT chain via blk_read_sectors,
@@ -37,7 +37,7 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/cat /mnt/HELLO.TXT\n'
+    printf 'cat /mnt/HELLO.TXT\n'
     sleep 1
     printf 'exit\n'
     sleep 1

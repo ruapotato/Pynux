@@ -3,9 +3,9 @@
 #
 # Drives hamsh through:
 #
-#     /pwd           (expect "/" — default cwd)
+#     pwd           (expect "/" — default cwd)
 #     cd /mnt
-#     /pwd           (expect "/mnt" — inherited from hamsh's chdir)
+#     pwd           (expect "/mnt" — inherited from hamsh's chdir)
 #     exit
 
 set -euo pipefail
@@ -35,11 +35,11 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/pwd\n'
+    printf 'pwd\n'
     sleep 1
     printf 'cd /mnt/SUBDIR\n'
     sleep 1
-    printf '/pwd\n'
+    printf 'pwd\n'
     sleep 1
     printf 'exit\n'
     sleep 1
@@ -63,14 +63,14 @@ fail=0
 # Strip "task: pid N exited" lines so multi-line greps are reliable.
 cleaned=$(sed 's/task: pid -*[0-9]* exited (code=-*[0-9]*)//g' "$LOG")
 
-# Sanity: /pwd before cd prints "/" on its own line.
+# Sanity: pwd before cd prints "/" on its own line.
 if echo "$cleaned" | grep -E -q "^/$"; then
     echo "[test_cwd] OK: default cwd '/' printed"
 else
     echo "[test_cwd] MISS: default '/' line"
     fail=1
 fi
-# After cd, /pwd should print /mnt/SUBDIR.
+# After cd, pwd should print /mnt/SUBDIR.
 if echo "$cleaned" | grep -F -q "/mnt/SUBDIR"; then
     echo "[test_cwd] OK: cwd inherited /mnt/SUBDIR"
 else

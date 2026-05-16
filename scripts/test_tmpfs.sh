@@ -3,17 +3,17 @@
 #
 # Drives hamsh through:
 #
-#     /echo hello tmpfs world > /tmp/x
-#     /cat /tmp/x
+#     echo hello tmpfs world > /tmp/x
+#     cat /tmp/x
 #     exit
 #
 # and checks that:
-#   - /echo's banner is NOT printed to serial (it was redirected)
-#   - /cat /tmp/x prints "hello tmpfs world" back to serial
+#   - echo's banner is NOT printed to serial (it was redirected)
+#   - cat /tmp/x prints "hello tmpfs world" back to serial
 #
 # That proves: hamsh's `>` parser ran, SYS_SPAWN wired the child's
-# fd 1 to a tmpfs entry, /echo wrote to it, the entry persisted past
-# the child's exit, and /cat reopened it for read.
+# fd 1 to a tmpfs entry, echo wrote to it, the entry persisted past
+# the child's exit, and cat reopened it for read.
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -42,9 +42,9 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/echo hello tmpfs world > /tmp/x\n'
+    printf 'echo hello tmpfs world > /tmp/x\n'
     sleep 1
-    printf '/cat /tmp/x\n'
+    printf 'cat /tmp/x\n'
     sleep 1
     printf 'exit\n'
     sleep 1
@@ -74,7 +74,7 @@ fi
 
 # Sanity: the literal line should appear EXACTLY ONCE — once /cat
 # replays it. If it appears twice, the redirect didn't catch and
-# /echo also wrote to serial. (Boot logs may contain other "hello"
+# echo also wrote to serial. (Boot logs may contain other "hello"
 # words; we anchor on the exact phrase to avoid false positives.)
 count=$(grep -F -c "hello tmpfs world" "$LOG" || true)
 if [ "$count" != "1" ]; then

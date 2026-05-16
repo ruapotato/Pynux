@@ -3,7 +3,7 @@
 #
 # Drives hamsh through a 3-stage pipeline:
 #
-#     /echo three stage pipeline | /cat | /cat
+#     echo three stage pipeline | cat | /cat
 #
 # Each stage runs as a separate task. The phrase has to pass
 # through two kernel pipes — proving that hamsh correctly sliced
@@ -38,7 +38,7 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/echo three-stage-pipeline | /cat | /cat\n'
+    printf 'echo three-stage-pipeline | cat | cat\n'
     sleep 3
     printf 'exit\n'
     sleep 1

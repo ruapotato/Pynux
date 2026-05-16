@@ -4,11 +4,11 @@
 # Drives hamsh through:
 #
 #     cd /mnt/SUBDIR
-#     /pwd                  → /mnt/SUBDIR
+#     pwd                  → /mnt/SUBDIR
 #     cd ..
-#     /pwd                  → /mnt
+#     pwd                  → /mnt
 #     cd /a/./b/../c
-#     /pwd                  → /a/c
+#     pwd                  → /a/c
 #     exit
 #
 # Tests both ".." popping a component and "." being skipped.
@@ -44,15 +44,15 @@ set +e
     sleep 3
     printf 'cd /mnt/SUBDIR\n'
     sleep 1
-    printf '/pwd\n'
+    printf 'pwd\n'
     sleep 1
     printf 'cd ..\n'
     sleep 1
-    printf '/pwd\n'
+    printf 'pwd\n'
     sleep 1
     printf 'cd /a/./b/../c\n'
     sleep 1
-    printf '/pwd\n'
+    printf 'pwd\n'
     sleep 1
     printf 'exit\n'
     sleep 1

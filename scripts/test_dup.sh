@@ -4,17 +4,17 @@
 # Drives hamsh through:
 #
 #     /dup_demo
-#     /cat /tmp/dup
+#     cat /tmp/dup
 #     exit
 #
-# /dup_demo uses sys_dup to save the current stdout, sys_dup2 to
+# dup_demo uses sys_dup to save the current stdout, sys_dup2 to
 # point fd 1 at /tmp/dup, writes a marker (which lands in the file,
 # NOT serial), then dup2's stdout back. The test asserts:
 #
 #   - "(restored)" appears on serial → dup_demo's post-restore write
 #     reached the actual console (so dup2-to-old-stdout worked).
 #   - "DUP_DEMO_MARKER" appears EXACTLY ONCE in the captured log
-#     (only after /cat reads it back; never on serial directly).
+#     (only after cat reads it back; never on serial directly).
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,9 +43,9 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/dup_demo\n'
+    printf 'dup_demo\n'
     sleep 1
-    printf '/cat /tmp/dup\n'
+    printf 'cat /tmp/dup\n'
     sleep 1
     printf 'exit\n'
     sleep 1

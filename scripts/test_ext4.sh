@@ -4,12 +4,12 @@
 # Boots the kernel with build/ext4.img attached via virtio-blk so
 # vda is detected as ext4 (FAT magic absent at sector 0). The
 # ext4 driver mounts at /ext via the standard probe path. The
-# test drives hamsh through `/cat /ext/HELLO.TXT` and asserts:
+# test drives hamsh through `cat /ext/HELLO.TXT` and asserts:
 #
 #   1. The superblock log lines appeared (M16.51).
 #   2. ext4_read_inode produced inode 2 with mode 0x41ED (M16.52).
 #   3. The boot-time dirent dump found HELLO.TXT (M16.53).
-#   4. /cat /ext/HELLO.TXT delivered the marker — meaning the full
+#   4. cat /ext/HELLO.TXT delivered the marker — meaning the full
 #      read path (root lookup → inode → extent → block → VFS →
 #      user) works (M16.54).
 
@@ -43,46 +43,46 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/cat /ext/HELLO.TXT\n'
+    printf 'cat /ext/HELLO.TXT\n'
     sleep 1
-    printf '/ls /ext/SUB\n'
+    printf 'ls /ext/SUB\n'
     sleep 1
-    printf '/cat /ext/SUB/NESTED.TXT\n'
+    printf 'cat /ext/SUB/NESTED.TXT\n'
     sleep 1
-    printf '/cat /ext/BIG.TXT\n'
+    printf 'cat /ext/BIG.TXT\n'
     sleep 1
     # M16.63: SMOKE.TXT was created by the kernel at boot via
-    # ext4_create_file. /cat verifies the read path sees the new
+    # ext4_create_file. cat verifies the read path sees the new
     # dirent, the new inode, and the new data block end-to-end.
-    printf '/cat /ext/SMOKE.TXT\n'
+    printf 'cat /ext/SMOKE.TXT\n'
     sleep 1
     # M16.59: FILE49.TXT lives in the second block of the root dir
     # (which spans 2 blocks after we plant 50 extras). Resolving it
     # exercises the multi-block dir walk; a single-block walker
     # would silently miss it.
-    printf '/cat /ext/FILE49.TXT\n'
+    printf 'cat /ext/FILE49.TXT\n'
     sleep 1
     # ext4_listdir should now stream entries from BOTH blocks of
-    # the root dir — pipe through /wc to get a line count. With
+    # the root dir — pipe through wc to get a line count. With
     # entries: . .. lost+found HELLO.TXT BIG.TXT FILE00..FILE49 SUB
     # = 55 lines.
-    printf '/ls /ext | /wc\n'
+    printf 'ls /ext | wc\n'
     sleep 2
-    # M16.64: ext4 write through shell `>` redirect. /echo writes
-    # "WRITE_VIA_SHELL\n" into a new ext4 file; /cat reads it back.
-    printf '/echo WRITE_VIA_SHELL > /ext/USERMADE.TXT\n'
+    # M16.64: ext4 write through shell `>` redirect. echo writes
+    # "WRITE_VIA_SHELL\n" into a new ext4 file; cat reads it back.
+    printf 'echo WRITE_VIA_SHELL > /ext/USERMADE.TXT\n'
     sleep 2
-    printf '/cat /ext/USERMADE.TXT\n'
+    printf 'cat /ext/USERMADE.TXT\n'
     sleep 2
-    # M16.67: ext4 unlink. /rm removes the file we just made; a
-    # second /cat should fail to find it. We test by then
+    # M16.67: ext4 unlink. rm removes the file we just made; a
+    # second cat should fail to find it. We test by then
     # creating /ext/UNLINKED_OK.TXT — if unlink left the inode
     # bitmap in a bad state, this create would fail.
-    printf '/rm /ext/USERMADE.TXT\n'
+    printf 'rm /ext/USERMADE.TXT\n'
     sleep 2
-    printf '/echo UNLINKED_OK > /ext/UNLINKED_OK.TXT\n'
+    printf 'echo UNLINKED_OK > /ext/UNLINKED_OK.TXT\n'
     sleep 2
-    printf '/cat /ext/UNLINKED_OK.TXT\n'
+    printf 'cat /ext/UNLINKED_OK.TXT\n'
     sleep 2
     printf 'exit\n'
     sleep 1
@@ -128,17 +128,17 @@ done
 
 # M16.59 multi-block dir assertions: FILE49.TXT lives in the second
 # block of the root dir; resolving it via cat exercises the
-# multi-block ext4_dir_lookup walk. The /wc count line is a stricter
+# multi-block ext4_dir_lookup walk. The wc count line is a stricter
 # regression: cleaned stdout includes the literal "55 55 ..." token.
 cleaned=$(sed 's/task: pid -*[0-9]* exited (code=-*[0-9]*)//g' "$LOG" \
           | tr '\n' ' ' | tr -s ' ')
 
-# /cat /ext/FILE49.TXT outputs BIG.TXT's body (the source we wrote it
+# cat /ext/FILE49.TXT outputs BIG.TXT's body (the source we wrote it
 # from) — first 14 bytes are unique enough to grep for.
 if echo "$cleaned" | grep -F -q "DEPTH1_MARKER ext4 index extents work"; then
     : # already asserted above by the loop
 fi
-if grep -F -q "/cat /ext/FILE49.TXT" "$LOG"; then
+if grep -F -q "cat /ext/FILE49.TXT" "$LOG"; then
     # If we see the prompt before AND a non-empty file-not-found
     # error, the lookup failed. Direct positive check: the second
     # cat (in the same session) emits its body to stdout, which
@@ -152,7 +152,7 @@ if grep -F -q "/cat /ext/FILE49.TXT" "$LOG"; then
     fi
 fi
 
-# /ls /ext | /wc — root dir has 57 entries before the shell write
+# ls /ext | wc — root dir has 57 entries before the shell write
 # (., .., lost+found, HELLO.TXT, BIG.TXT, SUB, FILE00..FILE49,
 # SMOKE.TXT). SMOKE.TXT was created by ext4_create_smoke_test at
 # kernel init; the count verifies that BOTH the multi-block listdir
@@ -161,9 +161,9 @@ fi
 # created USERMADE.TXT comes LATER in the session so it doesn't
 # affect this count.
 if echo "$cleaned" | grep -E -q "(^| )57 57 "; then
-    echo "[test_ext4] OK: /ls /ext listed all 57 entries (multi-block + create)"
+    echo "[test_ext4] OK: ls /ext listed all 57 entries (multi-block + create)"
 else
-    echo "[test_ext4] MISS: /ls /ext | /wc didn't show 57-line count"
+    echo "[test_ext4] MISS: ls /ext | wc didn't show 57-line count"
     fail=1
 fi
 

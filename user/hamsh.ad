@@ -227,14 +227,77 @@ def builtin_help():
     write_str(1, "  /echo two words | /cat\n")
 
 
+# PATH lookup buffer. spawn_cmd builds resolved paths here when a
+# bare command name (no leading /) needs disambiguation. Sized for
+# the longest legal path we might construct — PATH dir + name.
+path_buf: Array[256, uint8]
+
+# Hardcoded PATH. Real shells get this from the env; we don't have
+# env yet, so the search list lives here. Order matters — first
+# match wins. /bin is the canonical user-bin location, /sbin is
+# kept for future system-admin tools.
+def _path_dir(i: uint32) -> Ptr[uint8]:
+    if i == 0:
+        return "/bin/"
+    if i == 1:
+        return "/sbin/"
+    if i == 2:
+        return "/usr/bin/"
+    return cast[Ptr[uint8]](0)
+
+
+def _concat_path(prefix: Ptr[uint8], name: Ptr[uint8]) -> uint64:
+    # Write prefix + name + NUL into path_buf. Returns the
+    # length written (excluding the NUL). Caller has already
+    # checked path_buf can fit.
+    pi: uint64 = 0
+    while prefix[pi] != 0:
+        path_buf[pi] = prefix[pi]
+        pi = pi + 1
+    ni: uint64 = 0
+    while name[ni] != 0:
+        path_buf[pi] = name[ni]
+        pi = pi + 1
+        ni = ni + 1
+    path_buf[pi] = 0
+    return pi
+
+
 def spawn_cmd(argv: Ptr[uint64], stdin_fd: int32, stdout_fd: int32) -> int32:
     cmd: Ptr[uint8] = cast[Ptr[uint8]](argv[0])
-    pid: int32 = sys_spawn(cast[Ptr[char]](cmd), argv, stdin_fd, stdout_fd)
-    if pid < 0:
-        write_str(2, "hamsh: not found: ")
-        write_str(2, cmd)
-        write_str(2, "\n")
-    return pid
+    # Absolute path → spawn as-is, no PATH walk.
+    if cmd[0] == 47:                                # '/'
+        pid: int32 = sys_spawn(cast[Ptr[char]](cmd), argv,
+                               stdin_fd, stdout_fd)
+        if pid < 0:
+            write_str(2, "hamsh: not found: ")
+            write_str(2, cmd)
+            write_str(2, "\n")
+        return pid
+
+    # Bare name — walk the hardcoded PATH dirs. First successful
+    # spawn wins; we swap argv[0] to the resolved path so the
+    # child's argv[0] reflects what actually ran (like bash).
+    saved_argv0: uint64 = argv[0]
+    i: uint32 = 0
+    while True:
+        prefix: Ptr[uint8] = _path_dir(i)
+        if cast[uint64](prefix) == 0:
+            break
+        _concat_path(prefix, cmd)
+        argv[0] = cast[uint64](&path_buf[0])
+        pid: int32 = sys_spawn(cast[Ptr[char]](&path_buf[0]),
+                               argv, stdin_fd, stdout_fd)
+        if pid >= 0:
+            return pid
+        i = i + 1
+    # Nothing matched — restore argv[0] for any caller inspection
+    # and report the failure against the original bare name.
+    argv[0] = saved_argv0
+    write_str(2, "hamsh: not found: ")
+    write_str(2, cmd)
+    write_str(2, "\n")
+    return -1
 
 
 # M16.71: sub-command splitting on `;`, `&&`, `||`. Per-iteration

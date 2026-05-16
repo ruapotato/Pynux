@@ -21,7 +21,7 @@ mkdir -p build/user
 ELF=build/hamnix-vmlinux.elf
 # Use a distinct stem (`pyhello.elf`) so we don't collide with the
 # hand-written user/hello.S that scripts/build_user.sh ships as the
-# /hello cpio entry (referenced by /init's SYS_EXECVE path).
+# hello cpio entry (referenced by /init's SYS_EXECVE path).
 HELLO_ELF=build/user/pyhello.elf
 BANNER="[hello.py] Hamnix user-mode banner from"
 

@@ -6,12 +6,12 @@
 #   * `$?` expands to the last command's exit code
 #
 # The boot session runs:
-#   1. /true            → exit 0
-#   2. /echo $?         → should print "0"
-#   3. /false           → exit 1
-#   4. /echo $?         → should print "1"
+#   1. true            → exit 0
+#   2. echo $?         → should print "0"
+#   3. false           → exit 1
+#   4. echo $?         → should print "1"
 #   5. # comment line   → silently ignored, no error
-#   6. /echo POST_COMMENT_OK
+#   6. echo POST_COMMENT_OK
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,22 +31,22 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/true\n'
+    printf 'true\n'
     sleep 1
-    # /echo TRUE_RC $?  →  hamsh substitutes the $? token to the
+    # echo TRUE_RC $?  →  hamsh substitutes the $? token to the
     # decimal of last_exit_code (0 after /true). The space-separated
     # form keeps M16.69's standalone-token substitution sufficient;
     # in-token substitution ("TRUE_RC=$?") is left for a later
     # M16.7x once we add a per-token expansion buffer.
-    printf '/echo TRUE_RC $?\n'
+    printf 'echo TRUE_RC $?\n'
     sleep 1
-    printf '/false\n'
+    printf 'false\n'
     sleep 1
-    printf '/echo FALSE_RC $?\n'
+    printf 'echo FALSE_RC $?\n'
     sleep 1
     printf '# this is a comment, should be ignored\n'
     sleep 1
-    printf '/echo POST_COMMENT_OK\n'
+    printf 'echo POST_COMMENT_OK\n'
     sleep 1
     printf 'exit\n'
     sleep 1
@@ -58,15 +58,15 @@ set -e
 
 fail=0
 if grep -F -q "TRUE_RC 0" "$LOG"; then
-    echo "[test_hamsh_extras] OK: \$? after /true is 0"
+    echo "[test_hamsh_extras] OK: \$? after true is 0"
 else
-    echo "[test_hamsh_extras] MISS: \$? after /true not 0"
+    echo "[test_hamsh_extras] MISS: \$? after true not 0"
     fail=1
 fi
 if grep -F -q "FALSE_RC 1" "$LOG"; then
-    echo "[test_hamsh_extras] OK: \$? after /false is 1"
+    echo "[test_hamsh_extras] OK: \$? after false is 1"
 else
-    echo "[test_hamsh_extras] MISS: \$? after /false not 1"
+    echo "[test_hamsh_extras] MISS: \$? after false not 1"
     fail=1
 fi
 if grep -F -q "POST_COMMENT_OK" "$LOG"; then

@@ -39,10 +39,10 @@ echo "[test_stdin] Boot QEMU with piped input"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 set +e
-# Delay the input until AFTER the kernel has booted and /echo is
+# Delay the input until AFTER the kernel has booted and echo is
 # blocked in SYS_READ. Without this, the chars arrive too early and
 # either overflow the 16-byte 16550 RX FIFO during boot prints or
-# get dropped on EOF before /echo gets to read them. The real fix
+# get dropped on EOF before echo gets to read them. The real fix
 # (interrupt-driven RX with a kernel-side buffer) lands in a later
 # milestone; for now, just time it right.
 (sleep 3; echo "$INPUT"; sleep 2) | timeout 10s qemu-system-x86_64 \

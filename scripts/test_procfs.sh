@@ -30,14 +30,14 @@ python3 -m compiler.adder compile \
     init/main.ad \
     -o "$ELF"
 
-echo "[test_procfs] (4/4) Boot QEMU and run /ps via hamsh"
+echo "[test_procfs] (4/4) Boot QEMU and run ps via hamsh"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
 (
     sleep 3
-    printf '/ps\n'
+    printf 'ps\n'
     sleep 2
     printf 'exit\n'
     sleep 1

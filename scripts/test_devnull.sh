@@ -2,13 +2,13 @@
 # scripts/test_devnull.sh — M16.68 verification.
 #
 # Exercises /dev/null and /dev/zero via the shell:
-#   /echo discarded > /dev/null    — sink consumes everything, no echo on stdout
-#   /cat /dev/null                  — immediate EOF, no output
-#   /cat /dev/zero | /head -c 0    — hand-edited: /head reads zero bytes, exits
+#   echo discarded > /dev/null    — sink consumes everything, no echo on stdout
+#   cat /dev/null                  — immediate EOF, no output
+#   cat /dev/zero | head -c 0    — hand-edited: head reads zero bytes, exits
 #
 # Asserts that:
 #   1. Writing to /dev/null doesn't echo "discarded" to stdout
-#   2. /cat /dev/null prints nothing (no "/dev/null" wrapper output either)
+#   2. cat /dev/null prints nothing (no "/dev/null" wrapper output either)
 #   3. The shell can put /dev/zero into a pipeline without panic
 
 set -euo pipefail
@@ -31,15 +31,15 @@ set +e
     sleep 3
     # Write to /dev/null — output should NOT contain DISCARDED_MARK
     # because the shell redirected stdout to the sink.
-    printf '/echo DISCARDED_MARK > /dev/null\n'
+    printf 'echo DISCARDED_MARK > /dev/null\n'
     sleep 1
     # Sentinel to confirm the shell survives writing to /dev/null.
-    printf '/echo POST_NULL_OK\n'
+    printf 'echo POST_NULL_OK\n'
     sleep 1
     # Reading /dev/null should produce nothing.
-    printf '/cat /dev/null\n'
+    printf 'cat /dev/null\n'
     sleep 1
-    printf '/echo POST_CAT_OK\n'
+    printf 'echo POST_CAT_OK\n'
     sleep 1
     printf 'exit\n'
     sleep 1
@@ -63,9 +63,9 @@ else
     fail=1
 fi
 if grep -F -q "POST_CAT_OK" "$LOG"; then
-    echo "[test_devnull] OK: shell survived /cat /dev/null"
+    echo "[test_devnull] OK: shell survived cat /dev/null"
 else
-    echo "[test_devnull] MISS: shell died on /cat /dev/null"
+    echo "[test_devnull] MISS: shell died on cat /dev/null"
     fail=1
 fi
 

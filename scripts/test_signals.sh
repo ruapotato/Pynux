@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # scripts/test_signals.sh - M16.39 verification.
 #
-# Boot hamsh, start /cat with no args (drains stdin via the UART
+# Boot hamsh, start cat with no args (drains stdin via the UART
 # RX FIFO and blocks), send a Ctrl-C byte (0x03), and verify:
 #
-#   - /cat exits with code 130 (= 128 + SIGINT/2) — the kernel's
+#   - cat exits with code 130 (= 128 + SIGINT/2) — the kernel's
 #     default-disposition signal path fired.
 #   - hamsh's sys_waitpid returns and the prompt reappears — the
 #     shell didn't die alongside the child.
@@ -32,14 +32,14 @@ python3 -m compiler.adder compile \
     init/main.ad \
     -o "$ELF"
 
-echo "[test_signals] (4/4) Boot QEMU; /cat then Ctrl-C"
+echo "[test_signals] (4/4) Boot QEMU; cat then Ctrl-C"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
 (
     sleep 3
-    printf '/cat\n'                            # /cat blocks reading stdin
+    printf 'cat\n'                            # cat blocks reading stdin
     sleep 1
     printf '\x03'                              # Ctrl-C → SIGINT to /cat
     sleep 1
@@ -62,9 +62,9 @@ cat "$LOG"
 echo "[test_signals] --- end output ---"
 
 fail=0
-# /cat is pid 2 (hamsh is pid 1). SIGINT default exit code is 128+2=130.
+# cat is pid 2 (hamsh is pid 1). SIGINT default exit code is 128+2=130.
 if grep -E -q "task: pid 2 exited \(code=130\)" "$LOG"; then
-    echo "[test_signals] OK: /cat killed by SIGINT (exit code 130)"
+    echo "[test_signals] OK: cat killed by SIGINT (exit code 130)"
 else
     echo "[test_signals] MISS: 'task: pid 2 exited (code=130)' not found"
     fail=1

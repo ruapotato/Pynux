@@ -38,7 +38,7 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/cat /mnt/HELLO.TXT\n'
+    printf 'cat /mnt/HELLO.TXT\n'
     sleep 1
     printf 'exit\n'
     sleep 1

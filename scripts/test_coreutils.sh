@@ -3,9 +3,9 @@
 #
 # Drives hamsh through three pipelines, one per new userland tool:
 #
-#     /cat /mnt/HELLO.TXT | /wc       → "1 8 59" (the FAT marker)
-#     /cat /mnt/HELLO.TXT | /head -1  → the marker, exactly one line
-#     /cat /mnt/HELLO.TXT | /grep FAT → the marker, since "FAT" is in it
+#     cat /mnt/HELLO.TXT | wc       → "1 8 59" (the FAT marker)
+#     cat /mnt/HELLO.TXT | head -1  → the marker, exactly one line
+#     cat /mnt/HELLO.TXT | grep FAT → the marker, since "FAT" is in it
 #
 # Also serves as a regression for the task-slot-reap fix that
 # landed alongside: without sys_waitpid releasing slots, we'd
@@ -45,11 +45,11 @@ set +e
 # overlapped the next prompt with a still-running tail.
 (
     sleep 3
-    printf '/cat /mnt/HELLO.TXT | /wc\n'
+    printf 'cat /mnt/HELLO.TXT | wc\n'
     sleep 2
-    printf '/cat /mnt/HELLO.TXT | /head -1\n'
+    printf 'cat /mnt/HELLO.TXT | head -1\n'
     sleep 2
-    printf '/cat /mnt/HELLO.TXT | /grep FAT\n'
+    printf 'cat /mnt/HELLO.TXT | grep FAT\n'
     sleep 2
     printf 'exit\n'
     sleep 1
@@ -77,19 +77,19 @@ fail=0
 # don't depend on exact line breaks.
 cleaned=$(sed 's/task: pid -*[0-9]* exited (code=-*[0-9]*)//g' "$LOG" | tr '\n' ' ' | tr -s ' ')
 
-# /wc output: 1 line, 8 words, 59 bytes (the FAT32_MARKER string).
+# wc output: 1 line, 8 words, 59 bytes (the FAT32_MARKER string).
 if echo "$cleaned" | grep -F -q "1 8 59"; then
-    echo "[test_coreutils] OK: /wc reported 1 8 59"
+    echo "[test_coreutils] OK: wc reported 1 8 59"
 else
     echo "[test_coreutils] MISS: '1 8 59' not seen"
     fail=1
 fi
-# /head and /grep both deliver the FAT marker — expect both
+# head and grep both deliver the FAT marker — expect both
 # instances. (Use a substring grep on the cleaned form so an
 # interrupted "FA<...>T32_MARKER..." still counts.)
 hits=$(echo "$cleaned" | grep -oF "FAT32_MARKER hello from /mnt/HELLO.TXT" | wc -l)
 if [ "$hits" -ge 2 ]; then
-    echo "[test_coreutils] OK: /head + /grep each emitted the marker"
+    echo "[test_coreutils] OK: head + grep each emitted the marker"
 else
     echo "[test_coreutils] MISS: marker count $hits < 2"
     fail=1

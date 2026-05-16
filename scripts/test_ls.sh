@@ -3,8 +3,8 @@
 #
 # Drives hamsh through:
 #
-#     /ls /mnt
-#     /ls /mnt/SUBDIR
+#     ls /mnt
+#     ls /mnt/SUBDIR
 #     exit
 #
 # Expects HELLO.TXT, SUBDIR, and NESTED.TXT to appear in the right
@@ -41,9 +41,9 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/ls /mnt\n'
+    printf 'ls /mnt\n'
     sleep 1
-    printf '/ls /mnt/SUBDIR\n'
+    printf 'ls /mnt/SUBDIR\n'
     sleep 1
     printf 'exit\n'
     sleep 1
@@ -69,7 +69,7 @@ for needle in "HELLO.TXT" "SUBDIR" "NESTED.TXT"; do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_ls] OK: '$needle' listed"
     else
-        echo "[test_ls] MISS: '$needle' not in /ls output"
+        echo "[test_ls] MISS: '$needle' not in ls output"
         fail=1
     fi
 done
