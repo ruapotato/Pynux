@@ -281,14 +281,28 @@ def _normalize_inplace(buf: Ptr[uint8]):
     # In-place is safe because write_pos always moves at most as fast
     # as read_pos; we only ever copy from a higher buffer index to a
     # lower one (or to itself).
+    #
+    # Bug-fix: the original implementation used `buf[read_pos] != 0`
+    # as the outer-loop termination. That breaks on inputs like
+    # "/etc/motd" where the second component ends exactly at the
+    # buffer NUL: after copying "motd" forward, the body writes
+    # buf[write_pos] = '/' at the SAME index the NUL was sitting in.
+    # The outer loop then re-reads that fresh '/' as if it were more
+    # input and walks off into uninitialised stack bytes — which on
+    # an unlucky stack produces /etc/motd/<garbage>\0 in the output.
+    # We snapshot the input length first and bound the outer loop on
+    # it, so writes can't extend the "live" region the loop reads.
+    end: uint64 = 0
+    while buf[end] != 0:
+        end = end + 1
     read_pos:  uint64 = 1                  # skip leading '/'
     write_pos: uint64 = 1
-    while buf[read_pos] != 0:
+    while read_pos < end:
         comp_start: uint64 = read_pos
-        while buf[read_pos] != 0 and buf[read_pos] != 47:
+        while read_pos < end and buf[read_pos] != 47:
             read_pos = read_pos + 1
         comp_len: uint64 = read_pos - comp_start
-        if buf[read_pos] == 47:
+        if read_pos < end and buf[read_pos] == 47:
             read_pos = read_pos + 1
         if comp_len == 0:
             # Empty (consecutive '/' or trailing '/'). Skip.

@@ -81,3 +81,5 @@ tests/u-binary/src/musl_argv/hello
 tests/u-binary/src/glibc_hello/hello
 tests/u-binary/src/musl_env/hello
 tests/u-binary/src/glibc_memcpy/hello
+tests/u-binary/src/glibc_demo/hello
+tests/u-binary/src/glibc_idprobe/hello

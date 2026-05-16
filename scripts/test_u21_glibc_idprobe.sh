@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# scripts/test_u21_glibc_idprobe.sh -- U21 milestone: identity / time /
+# sysinfo / futex syscall surface.
+#
+# Boots Hamnix with /bin/u_glibc_idprobe embedded in the initramfs and
+# drives hamsh to exec it. The fixture is a static-PIE glibc binary
+# that prints three "U21:" marker lines, each one keyed on a specific
+# syscall handler added in u_syscalls.ad:
+#
+#   getuid/getgid/getppid -> "U21: uid=0 gid=0 ppid=1"
+#   gettimeofday          -> "U21: time tv_sec=..."
+#   sysinfo               -> "U21: uptime=..."
+#
+# Skip-on-missing: if tests/u-binary/u_glibc_idprobe hasn't been built
+# on the host (`make -C tests/u-binary/src/glibc_idprobe install`),
+# exit 0 with a notice so CI without libc6-dev still passes.
+
+. "$(dirname "$0")/_build_lock.sh"
+
+set -euo pipefail
+PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJ_ROOT"
+
+UBIN=tests/u-binary/u_idprobe
+if [ ! -f "$UBIN" ]; then
+    echo "[test_u21_glibc_idprobe] SKIP: $UBIN not staged"
+    echo "    REQUIRES host cc + libc6-dev (static glibc)."
+    echo "    apt-get install -y libc6-dev  # (needs sudo)"
+    echo "    then: make -C tests/u-binary/src/glibc_idprobe install"
+    exit 0
+fi
+
+ELF=build/hamnix-vmlinux.elf
+HAMSH_ELF=build/user/hamsh.elf
+
+echo "[test_u21_glibc_idprobe] (1/4) Build userland (hamsh + helpers)"
+bash scripts/build_user.sh
+bash scripts/build_modules.sh
+
+echo "[test_u21_glibc_idprobe] (2/4) Swap /init = $HAMSH_ELF + embed u_idprobe"
+INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py
+
+echo "[test_u21_glibc_idprobe] (3/4) Rebuild kernel image"
+python3 -m compiler.adder compile \
+    --target=x86_64-bare-metal \
+    init/main.ad \
+    -o "$ELF"
+
+echo "[test_u21_glibc_idprobe] (4/4) Boot QEMU + run /bin/u_idprobe via hamsh"
+LOG=$(mktemp)
+trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+
+set +e
+(
+    sleep 3
+    printf 'u_idprobe\n'
+    sleep 5
+    printf 'exit\n'
+    sleep 1
+) | timeout 30s qemu-system-x86_64 \
+    -kernel "$ELF" \
+    -smp 2 \
+    -nographic \
+    -no-reboot \
+    -m 256M \
+    -monitor none \
+    -serial stdio \
+    > "$LOG" 2>&1
+rc=$?
+set -e
+
+echo "[test_u21_glibc_idprobe] --- captured output ---"
+cat "$LOG"
+echo "[test_u21_glibc_idprobe] --- end output ---"
+
+fail=0
+
+check_marker() {
+    local label="$1"
+    local needle="$2"
+    if grep -F -q "$needle" "$LOG"; then
+        echo "[test_u21_glibc_idprobe] OK: $label  ('$needle')"
+    else
+        echo "[test_u21_glibc_idprobe] MISS: $label  ('$needle')"
+        fail=1
+    fi
+}
+
+# Three required markers, one per syscall family added in U21.
+check_marker "getuid/getgid/getppid" "U21: uid=0 gid=0 ppid=1"
+check_marker "gettimeofday"          "U21: time tv_sec="
+check_marker "sysinfo"               "U21: uptime="
+
+# Diagnostics: surface the next-gap signal for triage.
+if grep -F -q "unknown syscall" "$LOG"; then
+    echo "[test_u21_glibc_idprobe] DIAG: kernel logged 'unknown syscall'"
+    grep -F "unknown syscall" "$LOG" | sort -u || true
+fi
+if grep -F -q "TRAP: vector" "$LOG"; then
+    echo "[test_u21_glibc_idprobe] DIAG: kernel reported a CPU exception"
+    grep -F "TRAP: vector" "$LOG" | head -5 || true
+fi
+if grep -F -q "linux_u:" "$LOG"; then
+    echo "[test_u21_glibc_idprobe] DIAG: linux_u trace lines"
+    grep -F "linux_u:" "$LOG" | head -20 || true
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "[test_u21_glibc_idprobe] FAIL (qemu rc=$rc)"
+    exit 1
+fi
+
+echo "[test_u21_glibc_idprobe] PASS -- uid/gid/ppid + gettimeofday + sysinfo work"

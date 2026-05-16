@@ -1,0 +1,489 @@
+# linux_abi/api_l51.ad
+#
+# L51: shims for the ABI gap exposed by six stock Debian 6.12 modules —
+# nls_cp437.ko, nls_iso8859-1.ko (character-set converters, used by
+# FAT/iso9660/joliet) plus four crypto-cipher modules:
+# camellia_generic.ko, serpent_generic.ko, twofish_generic.ko
+# (block-cipher implementations) and cmac.ko (CMAC MAC template).
+#
+# Every one of these modules has the same init-path shape: tail-jump
+# to a registration entry-point that returns 0, and the rest of the
+# UND set is *runtime* code (per-block cipher math, NLS character
+# translation, CMAC keying/folding).
+#
+# Init-path disassembly (objdump -drC of each *.ko's .init.text):
+#
+#   nls_cp437.ko / nls_iso8859-1.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $&__this_module, %rsi    # owner = this module
+#           mov  $&<table>, %rdi          # struct nls_table
+#           jmp  __register_nls           # L51: returns 0
+#
+#   camellia_generic.ko / serpent_generic.ko / twofish_generic.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $&<cipher>_alg, %rdi
+#           jmp  crypto_register_alg      # L51: returns 0
+#
+#   cmac.ko:
+#       init_module:
+#           call __fentry__
+#           mov  $&crypto_cmac_tmpl, %rdi
+#           jmp  crypto_register_template # L51: returns 0
+#
+# Cross-check against existing exports.ad + api_*.ad reduced the union
+# of these six .ko's UND lists to SIXTEEN distinct symbols not yet
+# exported, grouped below.
+#
+# Following the L49 / L50 convention: any runtime UND that isn't on
+# the init path still resolves through this file — the loader's
+# relocation pass binds the address even though the call site never
+# fires during module load. Future milestones grow these stubs into
+# real implementations without touching call sites.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree
+
+
+# =====================================================================
+# Group 1: NLS (Native Language Support) registration
+# =====================================================================
+#
+# Linux: int __register_nls(struct nls_table *table, struct module *owner);
+#        int unregister_nls(struct nls_table *table);
+#
+# A struct nls_table carries (charset name, table ptrs for uni2char /
+# char2uni, default character, optional case-folding map). Real Linux
+# links the table into a singly-linked global list `nls_list` so that
+# FAT/iso9660/etc. can look up a converter by charset name. At L51
+# Hamnix has no FAT/iso9660 driver yet — the converters are dead code
+# from a runtime perspective — but the symbols must resolve so the
+# modules' init-path tail-jump returns 0.
+#
+# `load_nls("cp437")` style lookups will return NULL until a future
+# milestone wires the registry walk. The two NLS modules in this batch
+# (cp437, iso8859-1) are the standard FAT default + Western-European
+# Latin-1 set; the next batch will likely ship nls_utf8 / nls_ascii.
+
+def _l___register_nls(table: uint64, owner: uint64) -> int32:
+    # No registry walk yet; just validate the table pointer. Real
+    # Linux returns -EINVAL if table is NULL, 0 on success, -EEXIST
+    # if a converter with the same charset name is already registered.
+    if table == 0:
+        return -22                                       # -EINVAL
+    return 0
+
+
+def _l_unregister_nls(table: uint64) -> int32:
+    # void return in pre-3.16 kernels; int (0/-ENOENT) since. Stub
+    # returns 0 for "successfully unregistered".
+    if table == 0:
+        return -22
+    return 0
+
+
+# =====================================================================
+# Group 2: crypto_register_alg / crypto_unregister_alg (singular)
+# =====================================================================
+#
+# Linux: int crypto_register_alg(struct crypto_alg *alg);
+#        void crypto_unregister_alg(struct crypto_alg *alg);
+#
+# Single-algorithm variants of the bulk crypto_register_algs / _algs
+# pair already shipped in L50. camellia_generic, serpent_generic and
+# twofish_generic each register one struct crypto_alg through these
+# entry-points; L50 doesn't cover the singular form because none of
+# its modules used it. Body mirrors the L50 _algs shim: validate the
+# pointer, return success.
+
+def _l_crypto_register_alg(alg: uint64) -> int32:
+    # Real Linux: walks alg->cra_list onto the crypto-core registry,
+    # runs the per-cra self-test if CRYPTO_ALG_TESTED is unset.
+    if alg == 0:
+        return -22
+    return 0
+
+
+def _l_crypto_unregister_alg(alg: uint64):
+    # Real Linux: drops the alg from the registry, decrements refcount.
+    return
+
+
+# =====================================================================
+# Group 3: twofish_setkey
+# =====================================================================
+#
+# Linux: int twofish_setkey(struct crypto_tfm *tfm,
+#                           const u8 *key, unsigned int keylen);
+#
+# Shared key-schedule routine between twofish_generic.ko's two registered
+# variants (twofish-cbc / twofish-ecb each call the same setkey through
+# a function pointer in struct crypto_alg). The setkey itself runs the
+# Twofish key expansion (16 round keys × 4 32-bit words + 4 S-box tables
+# per key — see lib/crypto/twofish-common.c). Init never calls this
+# directly; it's reached only when a tfm is allocated for the algorithm.
+# Stub validates inputs, returns success.
+
+def _l_twofish_setkey(tfm: uint64, key: uint64, keylen: uint32) -> int32:
+    # Real Linux: validates keylen ∈ {16, 24, 32}, then runs the
+    # twofish key-schedule into tfm's per-tfm context. Stub: just
+    # check arguments.
+    if tfm == 0:
+        return -22
+    if key == 0:
+        return -22
+    if keylen != 16:
+        if keylen != 24:
+            if keylen != 32:
+                return -22                               # -EINVAL: bad keylen
+    return 0
+
+
+# =====================================================================
+# Group 4: crypto_register_template / crypto_unregister_template (singular)
+# =====================================================================
+#
+# Linux: int crypto_register_template(struct crypto_template *tmpl);
+#        void crypto_unregister_template(struct crypto_template *tmpl);
+#
+# Single-template variants of the bulk crypto_register_templates pair
+# already shipped in L50. cmac.ko (and later xts.ko) registers one
+# crypto_template through this path; L50's plural variant covered the
+# chacha20poly1305 batch which registers two templates as an array.
+
+def _l_crypto_register_template(tmpl: uint64) -> int32:
+    if tmpl == 0:
+        return -22
+    return 0
+
+
+def _l_crypto_unregister_template(tmpl: uint64):
+    return
+
+
+# =====================================================================
+# Group 5: cmac runtime (crypto_cipher_* / crypto_grab_spawn /
+#          crypto_spawn_tfm / shash_register_instance / __crypto_xor)
+# =====================================================================
+#
+# cmac.ko's init only registers a single crypto_template (returns 0).
+# Every other UND is runtime — reached only when an actual CMAC instance
+# is created (cmac(<block-cipher>)) and used for MAC computation.
+#
+# CMAC = OMAC1 = "one-key MAC" — given a block cipher E_K, encrypts
+# successive 16-byte blocks of input under E_K, XOR'ing each plaintext
+# block with the previous ciphertext, with a key-derived subkey applied
+# to the final block (with or without padding). The runtime symbols
+# below are the per-instance machinery for that:
+#
+#   * crypto_cipher_setkey / encrypt_one — wrap a block-cipher tfm so
+#     CMAC can drive it block-by-block.
+#   * crypto_clone_cipher — duplicates a tfm for parallel state.
+#   * crypto_grab_spawn / crypto_spawn_tfm — bind the template parameter
+#     (the inner block cipher) to the CMAC instance and allocate a tfm
+#     for it.
+#   * crypto_inst_setname — fills the instance's algorithm name
+#     ("cmac(<inner>)").
+#   * shash_register_instance / shash_free_singlespawn_instance — push
+#     the synthesised shash_alg into the crypto registry / teardown
+#     symmetric.
+#   * __crypto_xor — 16-byte XOR helper (each CMAC block xors the
+#     previous ciphertext into the next plaintext).
+#
+# All stubs accept the calls, return success-shaped placeholders, and
+# the runtime path that would deref the returned pointers never fires
+# during the L51 PASS bar (init returned 0).
+
+def _l_crypto_cipher_setkey(tfm: uint64, key: uint64, keylen: uint32) -> int32:
+    # int crypto_cipher_setkey(struct crypto_cipher *tfm,
+    #                          const u8 *key, unsigned int keylen);
+    if tfm == 0:
+        return -22
+    if key == 0:
+        return -22
+    return 0
+
+
+def _l_crypto_cipher_encrypt_one(tfm: uint64, dst: uint64, src: uint64):
+    # void crypto_cipher_encrypt_one(struct crypto_cipher *tfm,
+    #                                u8 *dst, const u8 *src);
+    # Encrypts one block under tfm's cipher (block size depends on the
+    # cipher — 16 bytes for AES, 8 for DES, etc.). Stub: identity copy
+    # over 16 bytes (CMAC's most common use is over AES).
+    if dst == 0:
+        return
+    if src == 0:
+        return
+    pd: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    ps: Ptr[uint8] = cast[Ptr[uint8]](src)
+    i: uint64 = 0
+    while i < 16:
+        pd[i] = ps[i]
+        i = i + 1
+
+
+def _l_crypto_clone_cipher(tfm: uint64) -> uint64:
+    # struct crypto_cipher *crypto_clone_cipher(struct crypto_cipher *tfm);
+    # Duplicates a tfm. Stub returns the source pointer unchanged
+    # (caller's later free path will hit the destroy_tfm shim which
+    # accepts any pointer).
+    return tfm
+
+
+def _l_crypto_grab_spawn(spawn: uint64, inst: uint64,
+                          name: uint64, atype: uint32, mask: uint32) -> int32:
+    # int crypto_grab_spawn(struct crypto_spawn *spawn,
+    #                       struct crypto_instance *inst,
+    #                       const char *name, u32 type, u32 mask);
+    # Look up an algorithm by name, bump its refcount into the spawn.
+    # Stub returns success (spawn is left uninitialised — runtime
+    # paths that deref would fault, but init never reaches them).
+    return 0
+
+
+def _l_crypto_spawn_tfm(spawn: uint64, atype: uint32, mask: uint32) -> uint64:
+    # struct crypto_tfm *crypto_spawn_tfm(struct crypto_spawn *spawn,
+    #                                      u32 type, u32 mask);
+    # Allocate a tfm bound to the spawn's algorithm. Stub returns 0
+    # (NULL) — Linux's IS_ERR_OR_NULL idiom in callers treats NULL as
+    # -ENOMEM, which init never reaches.
+    return 0
+
+
+def _l_crypto_inst_setname(inst: uint64, name: uint64,
+                            alg: uint64) -> int32:
+    # int crypto_inst_setname(struct crypto_instance *inst,
+    #                          const char *name, struct crypto_alg *alg);
+    # Fills inst->alg.cra_name = "<name>(<alg->cra_name>)" and
+    # cra_driver_name = "<name>(<alg->cra_driver_name>)". Stub returns 0;
+    # the name fields stay whatever the caller already memset'd them to.
+    if inst == 0:
+        return -22
+    return 0
+
+
+def _l_shash_register_instance(tmpl: uint64, inst: uint64) -> int32:
+    # int shash_register_instance(struct crypto_template *tmpl,
+    #                              struct shash_instance *inst);
+    # Per-template instance variant of crypto_register_shash. Stub
+    # validates pointers, returns success.
+    if tmpl == 0:
+        return -22
+    if inst == 0:
+        return -22
+    return 0
+
+
+def _l_shash_free_singlespawn_instance(inst: uint64):
+    # void shash_free_singlespawn_instance(struct shash_instance *inst);
+    # Releases an instance allocated through shash_alloc_instance_simple.
+    # Stub no-op; kfree would be wrong (the instance is allocated with
+    # extra trailing storage for the spawn the caller hasn't tracked).
+    return
+
+
+def _l___crypto_xor(dst: uint64, src1: uint64, src2: uint64, n: uint64):
+    # void __crypto_xor(u8 *dst, const u8 *src1, const u8 *src2,
+    #                    unsigned int len);
+    # XOR's src1[0..n) ^ src2[0..n) into dst[0..n). Used by CMAC's
+    # block-chaining path. A real implementation matches Linux's
+    # lib/crypto/utils.c (does word-at-a-time XOR with alignment
+    # handling). The do-while shape is the right fit for "consume n
+    # bytes, walk at least once when n>0" — n is unsigned so an
+    # n==0 caller is rejected up-front.
+    if dst == 0:
+        return
+    if src1 == 0:
+        return
+    if src2 == 0:
+        return
+    if n == 0:
+        return
+    pd: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    p1: Ptr[uint8] = cast[Ptr[uint8]](src1)
+    p2: Ptr[uint8] = cast[Ptr[uint8]](src2)
+    i: uint64 = 0
+    do:
+        pd[i] = p1[i] ^ p2[i]
+        i = i + 1
+    while i < n
+
+
+# =====================================================================
+# Group 6: xts runtime (skcipher_register_instance + glibc-style strings)
+# =====================================================================
+#
+# xts.ko's init only registers a single crypto_template (returns 0;
+# covered by Group 4's crypto_register_template). Every other UND is
+# runtime — instance creation (skcipher_register_instance) and a
+# scattering of C-runtime symbols that gcc emits inline when
+# -D_FORTIFY_SOURCE>=1 expands strscpy / snprintf.
+#
+#   * fips_enabled       — int (data symbol). Linux's FIPS-mode flag;
+#                          xts's setkey reads it to gate weak-key
+#                          rejection. Zero = "not in FIPS mode".
+#   * __fortify_panic    — gcc-emitted fault handler for fortify-
+#                          source overflow detection. Should never fire
+#                          during legitimate execution; spins on entry.
+#   * sized_strscpy      — bounded strscpy variant (Linux 6.5+). Copies
+#                          NUL-terminated source into a fixed-size dest
+#                          and returns the length (or -E2BIG on truncate).
+#   * skcipher_register_instance — per-template skcipher_alg
+#                          registration. Mirror of shash_register_instance
+#                          (Group 5) for skcipher templates.
+#   * strnlen            — bounded strlen. NUL-terminated counter
+#                          capped at maxlen.
+#   * __x86_indirect_thunk_r14 — retpoline thunk for `jmp *%r14`.
+#                          Mirrors the rax/rcx/r8/r9/r11 variants
+#                          already in api_lib80211.ad and api_raid6.ad.
+
+fips_enabled_data: int32 = 0
+
+
+def _l___fortify_panic(func: uint64):
+    # void __fortify_panic(const char *name) __noreturn;
+    # Gcc inserts a call here when a fortify-source check trips
+    # (e.g. compile-time-known overflow in strcpy_chk). Real Linux
+    # routes through BUG_ON; Hamnix logs + spins.
+    printk0("__fortify_panic\n")
+    while True:
+        pass
+    return
+
+
+def _l_sized_strscpy(dst: uint64, src: uint64, count: uint64) -> int64:
+    # ssize_t sized_strscpy(char *dest, const char *src, size_t count);
+    # Copies a NUL-terminated source string into a fixed-size dest.
+    # Returns the count of bytes copied excluding the NUL on success,
+    # or -E2BIG (-7) if the source was longer than count.
+    if dst == 0:
+        return -22
+    if src == 0:
+        return -22
+    if count == 0:
+        return -7                                       # -E2BIG: no room
+    pd: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    ps: Ptr[uint8] = cast[Ptr[uint8]](src)
+    i: uint64 = 0
+    # count includes the trailing NUL slot; bounded copy stops at
+    # count-1 to leave room for the terminator.
+    while i < count - 1:
+        c: uint8 = ps[i]
+        if c == 0:
+            pd[i] = 0
+            return cast[int64](i)
+        pd[i] = c
+        i = i + 1
+    # Source longer than dest; NUL-terminate at the last slot and
+    # report truncation.
+    pd[count - 1] = 0
+    if ps[count - 1] == 0:
+        return cast[int64](count - 1)
+    return -7                                           # -E2BIG
+
+
+def _l_skcipher_register_instance(tmpl: uint64, inst: uint64) -> int32:
+    # int skcipher_register_instance(struct crypto_template *tmpl,
+    #                                 struct skcipher_instance *inst);
+    if tmpl == 0:
+        return -22
+    if inst == 0:
+        return -22
+    return 0
+
+
+def _l_strnlen(s: uint64, maxlen: uint64) -> uint64:
+    # size_t strnlen(const char *s, size_t maxlen);
+    # Returns min(strlen(s), maxlen). Walks bytes until either a NUL
+    # is found or maxlen bytes have been examined.
+    if s == 0:
+        return 0
+    if maxlen == 0:
+        return 0
+    p: Ptr[uint8] = cast[Ptr[uint8]](s)
+    i: uint64 = 0
+    while i < maxlen:
+        if p[i] == 0:
+            return i
+        i = i + 1
+    return maxlen
+
+
+def _l___x86_indirect_thunk_r14():
+    # Retpoline replacement for `call *%r14`. Mirrors the rax / rcx /
+    # r8 / r9 / r11 implementations in api_lib80211.ad / api_raid6.ad.
+    # Adder emits a `push %rbp; mov %rsp, %rbp` prologue we must undo
+    # before the indirect jump — otherwise the callee returns into
+    # the saved %rbp slot rather than the caller's return address.
+    asm_volatile("""
+        popq %rbp
+        jmpq *%r14
+    """)
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_l51():
+    # Called from linux_abi_exports_init() after L50's crypto rows.
+    # Adds 22 exports for the L51 batch: 2 NLS + 3 cipher (alg/setkey)
+    # + 2 template registration + 9 cmac runtime + 6 xts runtime.
+
+    # Group 1: NLS
+    _add_export("__register_nls",
+                cast[uint64](&_l___register_nls))
+    _add_export("unregister_nls",
+                cast[uint64](&_l_unregister_nls))
+
+    # Group 2: singular crypto_register_alg pair
+    _add_export("crypto_register_alg",
+                cast[uint64](&_l_crypto_register_alg))
+    _add_export("crypto_unregister_alg",
+                cast[uint64](&_l_crypto_unregister_alg))
+
+    # Group 3: twofish key schedule
+    _add_export("twofish_setkey",
+                cast[uint64](&_l_twofish_setkey))
+
+    # Group 4: singular crypto_register_template pair
+    _add_export("crypto_register_template",
+                cast[uint64](&_l_crypto_register_template))
+    _add_export("crypto_unregister_template",
+                cast[uint64](&_l_crypto_unregister_template))
+
+    # Group 5: cmac runtime glue
+    _add_export("crypto_cipher_setkey",
+                cast[uint64](&_l_crypto_cipher_setkey))
+    _add_export("crypto_cipher_encrypt_one",
+                cast[uint64](&_l_crypto_cipher_encrypt_one))
+    _add_export("crypto_clone_cipher",
+                cast[uint64](&_l_crypto_clone_cipher))
+    _add_export("crypto_grab_spawn",
+                cast[uint64](&_l_crypto_grab_spawn))
+    _add_export("crypto_spawn_tfm",
+                cast[uint64](&_l_crypto_spawn_tfm))
+    _add_export("crypto_inst_setname",
+                cast[uint64](&_l_crypto_inst_setname))
+    _add_export("shash_register_instance",
+                cast[uint64](&_l_shash_register_instance))
+    _add_export("shash_free_singlespawn_instance",
+                cast[uint64](&_l_shash_free_singlespawn_instance))
+    _add_export("__crypto_xor",
+                cast[uint64](&_l___crypto_xor))
+
+    # Group 6: xts runtime + glibc-style strings
+    _add_export("fips_enabled",
+                cast[uint64](&fips_enabled_data))
+    _add_export("__fortify_panic",
+                cast[uint64](&_l___fortify_panic))
+    _add_export("sized_strscpy",
+                cast[uint64](&_l_sized_strscpy))
+    _add_export("skcipher_register_instance",
+                cast[uint64](&_l_skcipher_register_instance))
+    _add_export("strnlen",
+                cast[uint64](&_l_strnlen))
+    _add_export("__x86_indirect_thunk_r14",
+                cast[uint64](&_l___x86_indirect_thunk_r14))

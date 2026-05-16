@@ -57,6 +57,7 @@ from linux_abi.api_nf_log import linux_abi_register_nf_log
 from linux_abi.api_netlink import linux_abi_register_netlink
 from linux_abi.api_l49 import linux_abi_register_l49
 from linux_abi.api_l50 import linux_abi_register_l50
+from linux_abi.api_l51 import linux_abi_register_l51
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -374,6 +375,21 @@ def linux_abi_exports_init():
     # crypto_grab_{ahash,skcipher}, crypto_skcipher_{setkey,encrypt,
     # decrypt}, crypto_spawn_tfm2).
     linux_abi_register_l50()
+    # L51: nls_cp437 + nls_iso8859-1 + camellia_generic + serpent_generic
+    # + twofish_generic + cmac + xts. 22 new rows split across six
+    # groups: __register_nls / unregister_nls (NLS table registration —
+    # character-set converters used by FAT/iso9660), crypto_register_alg
+    # / crypto_unregister_alg (singular variants — covers the three
+    # block-cipher modules), twofish_setkey (Twofish key-schedule
+    # placeholder), crypto_register_template / crypto_unregister_template
+    # (singular variants — covers cmac.ko / xts.ko init tail-jump), the
+    # cmac runtime glue (crypto_cipher_{setkey,encrypt_one},
+    # crypto_clone_cipher, crypto_grab_spawn, crypto_spawn_tfm,
+    # crypto_inst_setname, shash_register_instance,
+    # shash_free_singlespawn_instance, __crypto_xor), and the xts
+    # runtime glue (fips_enabled DATA, __fortify_panic, sized_strscpy,
+    # skcipher_register_instance, strnlen, __x86_indirect_thunk_r14).
+    linux_abi_register_l51()
 
 
 def linux_abi_lookup(name: Ptr[char]) -> uint64:

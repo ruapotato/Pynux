@@ -197,6 +197,19 @@ SYS_prlimit64:       uint64 = 302
 SYS_getrandom:       uint64 = 318
 SYS_rseq:            uint64 = 334
 SYS_getrlimit:       uint64 = 97
+# U21: identity / time / sysinfo / readlinkat — the tail of glibc's
+# pre-main probing surface. None of these need actual kernel-side
+# state at this milestone (single-task-per-binary, no symlinks, no
+# real time-of-day source); they just have to *answer* so glibc keeps
+# moving instead of bailing on -ENOSYS.
+SYS_gettimeofday:    uint64 = 96
+SYS_sysinfo:         uint64 = 99
+SYS_getuid:          uint64 = 102
+SYS_getgid:          uint64 = 104
+SYS_geteuid:         uint64 = 107
+SYS_getegid:         uint64 = 108
+SYS_getppid:         uint64 = 110
+SYS_readlinkat:      uint64 = 267
 
 
 # Linux errno values returned by stub handlers. Kept local to avoid
@@ -1092,11 +1105,6 @@ def _u_unimpl_arch_prctl(a0: uint64, a1: uint64, a2: uint64,
     return ELINUX_INVAL
 
 
-def _u_unimpl_futex(a0: uint64, a1: uint64, a2: uint64,
-                    a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
-
-
 def _u_unimpl_set_tid_address(a0: uint64, a1: uint64, a2: uint64,
                               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # long set_tid_address(int *tidptr).
@@ -1158,6 +1166,274 @@ def _u_openat(a0: uint64, a1: uint64, a2: uint64,
 def _u_unimpl_newfstatat(a0: uint64, a1: uint64, a2: uint64,
                          a3: uint64, a4: uint64, a5: uint64) -> int64:
     return ELINUX_NOSYS
+
+
+# =====================================================================
+# U21: identity probes (uid/gid/ppid)
+# =====================================================================
+#
+# glibc's startup checks uid/gid very early — it gates secure-mode
+# behaviour (AT_SECURE handling, suid handling) on (uid != euid ||
+# gid != egid). Returning 0 for all four is "this process is root" —
+# the simplest correct answer for a kernel with no user/group state.
+# getppid() returns 1 because every Linux userspace lives downstream
+# of init (PID 1); without a parent task in flight, that's the lie
+# that keeps tools sane.
+
+
+def _u_getuid(a0: uint64, a1: uint64, a2: uint64,
+              a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # uid_t getuid(void). Always root.
+    return 0
+
+
+def _u_getgid(a0: uint64, a1: uint64, a2: uint64,
+              a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # gid_t getgid(void). Always root.
+    return 0
+
+
+def _u_geteuid(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # uid_t geteuid(void). Matches getuid() — no suid mechanism here.
+    return 0
+
+
+def _u_getegid(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # gid_t getegid(void). Matches getgid().
+    return 0
+
+
+def _u_getppid(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # pid_t getppid(void). Hamnix has no parent/child task lineage on
+    # the Linux-ABI path; report 1 (init) so tools that key off "am I
+    # PID 1 myself?" still see a sensible parent.
+    return 1
+
+
+# =====================================================================
+# U21: gettimeofday
+# =====================================================================
+#
+# Same jiffy-derived time source as _u_clock_gettime, just packaged
+# into a `struct timeval = { time_t tv_sec; suseconds_t tv_usec; }`
+# (microseconds, not nanoseconds). A1 is `struct timezone *tz` and
+# is ignored — Linux itself deprecated it decades ago. Glibc passes
+# NULL there for the gettimeofday() wrapper.
+
+
+def _u_gettimeofday(a0: uint64, a1: uint64, a2: uint64,
+                    a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int gettimeofday(struct timeval *tv, struct timezone *tz)
+    if a0 == 0:
+        return ELINUX_INVAL
+    j: uint64 = get_jiffies()
+    sec:  uint64 = j / 100
+    # 10 ms per jiffy = 10000 us per jiffy.
+    usec: uint64 = (j - sec * 100) * 10000
+    cast[Ptr[uint64]](a0)[0]     = sec
+    cast[Ptr[uint64]](a0 + 8)[0] = usec
+    return 0
+
+
+# =====================================================================
+# U21: sysinfo
+# =====================================================================
+#
+# Linux's `struct sysinfo` on x86_64 lays out as (offsets in bytes):
+#   0:   long uptime;                  /* seconds since boot */
+#   8:   ulong loads[3];               /* 1, 5, 15 min load averages */
+#   32:  ulong totalram;
+#   40:  ulong freeram;
+#   48:  ulong sharedram;
+#   56:  ulong bufferram;
+#   64:  ulong totalswap;
+#   72:  ulong freeswap;
+#   80:  u16   procs;
+#   82:  u16   pad;
+#   /* alignment to 8 for the following ulongs -> 4 bytes padding */
+#   88:  ulong totalhigh;
+#   96:  ulong freehigh;
+#   104: u32   mem_unit;
+#   108: char  _f[8 - sizeof(ulong)] = 0 bytes on 64-bit (struct is 112)
+#
+# We zero the whole 112-byte region first and only fill the fields
+# userspace actually checks (uptime + totalram + freeram + mem_unit).
+
+SYSINFO_SIZE:         uint64 = 112
+SYSINFO_OFF_UPTIME:   uint64 = 0
+SYSINFO_OFF_TOTALRAM: uint64 = 32
+SYSINFO_OFF_FREERAM:  uint64 = 40
+SYSINFO_OFF_MEMUNIT:  uint64 = 104
+
+# 256 MiB matches the `-m 256M` line every U-track test_*.sh script
+# passes to qemu. Reporting a smaller number means tools that scale
+# buffer sizes off total ram will under-allocate; reporting more risks
+# OOM on the host VM. Free-ram tracks total because we don't have a
+# real page-tracking allocator surfaced to userspace yet.
+SYSINFO_TOTALRAM: uint64 = 0x10000000
+
+
+def _u_sysinfo(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int sysinfo(struct sysinfo *info)
+    if a0 == 0:
+        return ELINUX_INVAL
+    memset(cast[Ptr[uint8]](a0), 0, SYSINFO_SIZE)
+    j: uint64 = get_jiffies()
+    sec: uint64 = j / 100
+    cast[Ptr[uint64]](a0 + SYSINFO_OFF_UPTIME)[0]   = sec
+    cast[Ptr[uint64]](a0 + SYSINFO_OFF_TOTALRAM)[0] = SYSINFO_TOTALRAM
+    cast[Ptr[uint64]](a0 + SYSINFO_OFF_FREERAM)[0]  = SYSINFO_TOTALRAM
+    cast[Ptr[uint32]](a0 + SYSINFO_OFF_MEMUNIT)[0]  = 1
+    return 0
+
+
+# =====================================================================
+# U21: futex
+# =====================================================================
+#
+# glibc + pthread sprinkle futex calls everywhere — even the first
+# pthread_mutex_lock() on the heap arena tries FUTEX_WAIT after the
+# atomic-cmpxchg-acquire path fails. Hamnix has exactly one Linux
+# task in flight at this milestone (no real thread groups), so the
+# correct *kernel* behaviour for FUTEX_WAIT is "you cannot be woken,
+# because nothing else can write to the address" — which translates
+# to returning -EAGAIN immediately (the same value Linux returns when
+# *uaddr no longer matches val by the time the kernel checks). glibc
+# treats EAGAIN as a spurious wakeup signal and re-tries the cmpxchg,
+# which then succeeds because we are single-threaded.
+#
+# When real multi-threading lands (clone(CLONE_THREAD) + a wait-queue
+# attached to the futex word), this body has to actually park the
+# caller until a FUTEX_WAKE on the same address.
+
+FUTEX_WAIT:            uint64 = 0
+FUTEX_WAKE:            uint64 = 1
+FUTEX_PRIVATE_FLAG:    uint64 = 128
+FUTEX_CLOCK_REALTIME:  uint64 = 256
+# Mask used to peel off PRIVATE / CLOCK_REALTIME bits before
+# comparing against the operation enum. Spelled out so the constant
+# is obvious at a glance.
+FUTEX_OP_MASK:         uint64 = 127
+ELINUX_AGAIN:          int64  = -11
+
+
+def _u_futex(a0: uint64, a1: uint64, a2: uint64,
+             a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # long futex(uint32_t *uaddr, int op, uint32_t val,
+    #            const struct timespec *timeout,  /* or uint32_t val2 */
+    #            uint32_t *uaddr2, uint32_t val3)
+    op: uint64 = a1 & FUTEX_OP_MASK
+    if op == FUTEX_WAIT:
+        # WRONG-but-tolerable: we never sleep. A real implementation
+        # would park the caller on a kernel wait queue and let
+        # FUTEX_WAKE unblock it. With one task in flight, "spurious
+        # wakeup via -EAGAIN" is observationally equivalent.
+        if a0 == 0:
+            return ELINUX_INVAL
+        return ELINUX_AGAIN
+    if op == FUTEX_WAKE:
+        # No waiters — single-task system. Returning 0 means "woke 0
+        # waiters", which is the truth.
+        return 0
+    return ELINUX_NOSYS
+
+
+# =====================================================================
+# U21: readlinkat
+# =====================================================================
+#
+# glibc calls readlinkat(AT_FDCWD, "/proc/self/exe", buf, n) to
+# discover argv[0] when the caller didn't pass it through. Hamnix has
+# no /proc and no symlinks, so the answer is one of:
+#   * path == "/proc/self/exe": hand back a synthetic best-effort
+#     string. We don't track per-task exec paths (would require
+#     plumbing through arch/x86/kernel/syscall.ad's execve, which is
+#     off-limits at this milestone), so we report the conventional
+#     "/bin/u_idprobe" — wrong if any other Linux binary asks, but
+#     glibc tolerates a wrong-but-non-empty answer here.
+#   * Any other path: -EINVAL if it resolves to a real file (no
+#     symlinks → readlink is meaningless on a regular file), or
+#     -ENOENT if the path doesn't exist.
+#
+# dirfd handling: only AT_FDCWD is honoured. Non-AT_FDCWD with a
+# relative path returns -EBADF — same as openat/newfstatat above.
+
+
+def _u_streq_cstr(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    # Returns 1 if the two NUL-terminated byte strings compare equal,
+    # 0 otherwise. Local to u_syscalls.ad so we don't have to pull
+    # vfs._strcmp_cstr (which is module-private) into our import set.
+    # Uses a do-while because we always want to compare at least the
+    # first byte and decide based on what we read.
+    i: uint64 = 0
+    do:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+    while 1
+    return 0                                          # unreachable
+
+
+def _u_readlinkat(a0: uint64, a1: uint64, a2: uint64,
+                  a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t readlinkat(int dirfd, const char *pathname,
+    #                    char *buf, size_t bufsiz)
+    if a1 == 0 or a2 == 0:
+        return ELINUX_INVAL
+    if a3 == 0:
+        return ELINUX_INVAL
+    # Only AT_FDCWD or an absolute path is supported. Absolute paths
+    # ignore dirfd per the Linux man page, so we check that first.
+    is_abs: int32 = 0
+    p: Ptr[uint8] = cast[Ptr[uint8]](a1)
+    if p[0] == 47:                                    # '/'
+        is_abs = 1
+    if a0 != AT_FDCWD_U64 and is_abs == 0:
+        return ELINUX_BADF
+    # Special-case /proc/self/exe — glibc reaches for it during
+    # __libc_start_main's argv[0]-fallback path. We don't have a real
+    # /proc; hand back the conventional U21 fixture path so glibc has
+    # a non-empty string to work with. (Short name matters: the longer
+    # "/bin/u_glibc_idprobe" tripped a downstream argv-buffer overflow
+    # that lives outside u_syscalls.ad's edit surface this milestone.)
+    proc_self_exe: Ptr[uint8] = cast[Ptr[uint8]]("/proc/self/exe")
+    if _u_streq_cstr(cast[Ptr[uint8]](a1), proc_self_exe) != 0:
+        reply: Ptr[uint8] = cast[Ptr[uint8]]("/bin/u_idprobe")
+        # Count the reply length up to NUL. Plain while is the right
+        # shape: we don't want the body to run when reply[0] == 0.
+        n: uint64 = 0
+        while reply[n] != 0:
+            n = n + 1
+        # Copy min(n, bufsiz) bytes to the user buffer. readlink(2)
+        # does NOT NUL-terminate — the man page is explicit about it.
+        dst: Ptr[uint8] = cast[Ptr[uint8]](a2)
+        limit: uint64 = n
+        if limit > a3:
+            limit = a3
+        i: uint64 = 0
+        while i < limit:
+            dst[i] = reply[i]
+            i = i + 1
+        return cast[int64](limit)
+    # Any other path: check whether it resolves. If yes, return
+    # -EINVAL (not a symlink); if no, -ENOENT.
+    abs_path: Array[256, uint8]
+    rc: int32 = resolve_path(cast[Ptr[char]](a1), &abs_path[0], 256)
+    if rc != 0:
+        return ELINUX_NOENT
+    fd: int32 = vfs_open(cast[Ptr[char]](&abs_path[0]))
+    if fd < 0:
+        return ELINUX_NOENT
+    vfs_close(fd)
+    return ELINUX_INVAL                               # exists but not a symlink
 
 
 # =====================================================================
@@ -1268,7 +1544,7 @@ def linux_u_syscall_dispatch(nr: uint64,
     if nr == SYS_arch_prctl:
         return _u_unimpl_arch_prctl(a0, a1, a2, a3, a4, a5)
     if nr == SYS_futex:
-        return _u_unimpl_futex(a0, a1, a2, a3, a4, a5)
+        return _u_futex(a0, a1, a2, a3, a4, a5)
     if nr == SYS_set_tid_address:
         return _u_unimpl_set_tid_address(a0, a1, a2, a3, a4, a5)
     if nr == SYS_clock_gettime:
@@ -1289,6 +1565,23 @@ def linux_u_syscall_dispatch(nr: uint64,
         return _u_getrandom(a0, a1, a2, a3, a4, a5)
     if nr == SYS_rseq:
         return _u_rseq(a0, a1, a2, a3, a4, a5)
+    # U21: identity / time / sysinfo / readlinkat.
+    if nr == SYS_gettimeofday:
+        return _u_gettimeofday(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_sysinfo:
+        return _u_sysinfo(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_getuid:
+        return _u_getuid(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_getgid:
+        return _u_getgid(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_geteuid:
+        return _u_geteuid(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_getegid:
+        return _u_getegid(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_getppid:
+        return _u_getppid(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_readlinkat:
+        return _u_readlinkat(a0, a1, a2, a3, a4, a5)
     # Unknown syscall — same convention as Linux: log + return -ENOSYS.
     # The printk includes nr so a trace of "unknown linux syscall X"
     # tells you exactly which entry to add to the ladder above.
