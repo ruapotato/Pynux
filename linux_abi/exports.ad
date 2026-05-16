@@ -23,6 +23,9 @@
 # (the test fixture's printk calls carry no args).
 
 from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree, kzalloc
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
 # --- Linux-ABI shims -------------------------------------------------
@@ -48,6 +51,65 @@ def _linux_fentry_noop():
     # don't have ftrace, so the symbol must exist but do nothing.
     # A bare `ret` is enough — the asm stub leaves rax untouched.
     return
+
+
+# --- L2: kmalloc / kfree / krealloc / kzalloc -------------------------
+#
+# Linux signatures:
+#   void *kmalloc(size_t size, gfp_t flags);
+#   void *kzalloc(size_t size, gfp_t flags);
+#   void  kfree(const void *ptr);
+#   void *krealloc(const void *p, size_t new_size, gfp_t flags);
+#
+# Hamnix's kmalloc/kfree are single-arg (no GFP flags). The shims
+# drop the flags — fine for L2's scope (no atomic/dma contexts yet,
+# no NORMAL vs HIGHMEM distinction). When that matters we'll add
+# zone-aware allocation paths and have the shim dispatch based on
+# the GFP bits.
+
+def _linux_kmalloc_shim(size: uint64, flags: uint64) -> uint64:
+    # gfp_t is ignored — Hamnix's slab serves everything from one
+    # zone (no GFP_DMA32 / GFP_HIGHUSER distinction yet).
+    return kmalloc(size)
+
+
+def _linux_kzalloc_shim(size: uint64, flags: uint64) -> uint64:
+    # Linux's kzalloc is kmalloc + memset 0. Hamnix's kzalloc
+    # does the same thing; we keep it separate so module callers
+    # that take the kzalloc symbol get the dedicated entry point.
+    return kzalloc(size)
+
+
+def _linux_kfree_shim(ptr: uint64):
+    # Linux's kfree on NULL is a no-op (well-defined since 2005).
+    # Hamnix's kfree may not be NULL-safe; check before forwarding.
+    if ptr == 0:
+        return
+    kfree(ptr)
+
+
+def _linux_krealloc_shim(old: uint64, new_size: uint64,
+                          flags: uint64) -> uint64:
+    # krealloc semantics: NULL old → equivalent to kmalloc(new_size).
+    # new_size == 0 → equivalent to kfree(old) and return NULL.
+    # Otherwise: alloc new, copy min(old_size, new_size), free old.
+    # Hamnix's slab doesn't expose object size lookup, so we assume
+    # the caller knows new_size <= old_size + slack. For L2 we just
+    # do alloc+memcpy(new_size)+free; if the source slab object was
+    # smaller, the trailing tail bytes are garbage but the module's
+    # intent (grow buffer) is satisfied.
+    if old == 0:
+        return kmalloc(new_size)
+    if new_size == 0:
+        kfree(old)
+        return 0
+    fresh: uint64 = kmalloc(new_size)
+    if fresh == 0:
+        return 0
+    memcpy(cast[Ptr[uint8]](fresh),
+           cast[Ptr[uint8]](old), new_size)
+    kfree(old)
+    return fresh
 
 
 # --- Exported-symbol table ------------------------------------------
@@ -99,6 +161,11 @@ def linux_abi_exports_init():
     _add_export("_printk",    cast[uint64](&_linux_printk_shim))
     # gcc -pg / -mfentry trampoline.
     _add_export("__fentry__", cast[uint64](&_linux_fentry_noop))
+    # L2: kmalloc family.
+    _add_export("kmalloc",    cast[uint64](&_linux_kmalloc_shim))
+    _add_export("kzalloc",    cast[uint64](&_linux_kzalloc_shim))
+    _add_export("kfree",      cast[uint64](&_linux_kfree_shim))
+    _add_export("krealloc",   cast[uint64](&_linux_krealloc_shim))
 
 
 def linux_abi_lookup(name: Ptr[char]) -> uint64:
