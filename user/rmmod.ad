@@ -1,0 +1,75 @@
+# user/rmmod.ad
+#
+# Hamnix `rmmod NAME`. Mirrors busybox rmmod at minimal scope.
+#
+# L1 deviation: the kernel's L1 loader doesn't yet index modules by
+# name, so the slot id is what SYS_DELETE_MODULE actually wants. We
+# accept either a numeric slot ("rmmod 1") or a string that we
+# atoi-decode. Once L2 lands the /proc/modules name table, this is
+# trivial to grow into a real name-lookup.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def parse_uint(s: Ptr[uint8]) -> int32:
+    # Tiny decimal atoi. Returns -1 on the first non-digit byte; a
+    # negative result lets main() distinguish "bad input" from a
+    # legitimate slot 0 (which is the reserved-unused slot in the
+    # loader anyway).
+    n: int32 = 0
+    i: uint64 = 0
+    if s[0] == 0:
+        return -1
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int32](c - 48)
+        i = i + 1
+    return n
+
+
+def sys_delete_module(name: Ptr[char], flags: int32) -> int32:
+    # SYS_DELETE_MODULE = 176. Same spill-and-syscall pattern as
+    # insmod's sys_init_module wrapper — see that file for the
+    # convention. For L1 the kernel reads %rdi as a SLOT ID rather
+    # than a name pointer; we pass slot in rdi by repurposing the
+    # `name` arg as the encoded slot integer.
+    asm_volatile("""
+        movq -8(%rbp), %rdi
+        movq -16(%rbp), %rsi
+        movq $176, %rax
+        syscall
+    """)
+    # See insmod.ad's sys_init_module note: the implicit leave/ret
+    # preserves %rax, which carries the syscall return back.
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2, "rmmod: usage: rmmod SLOT\n")
+        return 1
+    slot: int32 = parse_uint(cast[Ptr[uint8]](argv[1]))
+    if slot < 0:
+        write_str(2, "rmmod: SLOT must be a non-negative integer\n")
+        return 1
+    # The kernel's L1 SYS_DELETE_MODULE treats its first arg as the
+    # slot id (see arch/x86/kernel/syscall.ad's dispatch). Pass slot
+    # via the `name` argument slot — the wrapper doesn't care what
+    # the byte pattern is.
+    rc: int32 = sys_delete_module(cast[Ptr[char]](cast[uint64](slot)), 0)
+    if rc < 0:
+        write_str(2, "rmmod: delete_module failed\n")
+        return 1
+    return 0

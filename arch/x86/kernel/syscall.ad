@@ -44,6 +44,7 @@ from fs.vfs import (
 )
 from fs.elf import elf_load_blob
 from mm.page_alloc import alloc_page
+from linux_abi.loader import kmod_linux_load, kmod_linux_unload
 
 extern def do_execve_finish(new_rip: uint64, new_rsp: uint64,
                             argc: uint64, argv: uint64)
@@ -85,6 +86,12 @@ SYS_CHDIR:       uint64 = 19                   # a0=path; returns 0 / -E2BIG
 SYS_GETCWD:      uint64 = 20                   # a0=buf, a1=count; returns bytes (incl NUL)
 SYS_UNLINK:      uint64 = 21                   # a0=path; returns 0 / -errno
 SYS_MKDIR:       uint64 = 22                   # a0=path; no-op stub (tmpfs is flat)
+
+# Linux-numbered syscalls (L-track, linux_abi/). We use the stock
+# Linux 6.12 x86_64 numbers so userspace tools built against Linux's
+# unistd_64.h can call them by literal number.
+SYS_INIT_MODULE:    uint64 = 175                # a0=image, a1=size, a2=params
+SYS_DELETE_MODULE:  uint64 = 176                # a0=name, a1=flags
 
 # M16.35: the previous user_rsp_save / kernel_rsp globals were
 # retired in favour of a per-task syscall stack. syscall_entry now
@@ -438,5 +445,23 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         code: int64 = task_exit_code(target)
         task_reap(target)
         return cast[uint64](code)
+    if nr == SYS_INIT_MODULE:
+        # Linux-ABI .ko loader (L1). a0=Ptr[uint8] image, a1=size,
+        # a2=Ptr[char] params (param string, NUL-terminated; can be
+        # NULL or empty). Returns module slot id (>= 1) on success
+        # or -errno on parse / OOM failure. The L1 loader ignores
+        # `params`; the L2 milestone parses MODULE_PARM_DESC entries
+        # and pushes the values into the module's .data section.
+        rc: int32 = kmod_linux_load(cast[Ptr[uint8]](a0), a1)
+        return cast[uint64](rc)
+    if nr == SYS_DELETE_MODULE:
+        # delete_module(name, flags). For L1 we ignore `name` (no
+        # /proc/modules name index yet) and treat a0 as the slot id
+        # returned by SYS_INIT_MODULE. Wrapped this way so userland
+        # rmmod can write `delete_module(name=<slot encoded>, 0)`
+        # without spinning up a full name->slot lookup. L2 grows the
+        # name index.
+        rc: int32 = kmod_linux_unload(cast[int32](a0))
+        return cast[uint64](rc)
     printk2("Hamnix: unknown syscall nr=%d a0=%x\n", nr, a0)
     return cast[uint64](-1)

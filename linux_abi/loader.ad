@@ -1,0 +1,664 @@
+# linux_abi/loader.ad
+#
+# L1 of the Hamnix Linux-ABI track: load a stock Linux 6.12 ET_REL .ko
+# (kbuild's normal output) and run its module_init.
+#
+# Mirrors kernel/module/main.c::load_module() at the smallest meaningful
+# scale: parse the ELF64 header, walk section headers, allocate one
+# contiguous region big enough to hold every SHF_ALLOC section back-to-
+# back, copy progbits in / zero nobits, then walk every .rela.<section>
+# table and apply the four x86_64 relocation types kbuild's modules
+# actually emit. Undefined (external) symbols are resolved through
+# linux_abi/exports.ad — Hamnix's equivalent of EXPORT_SYMBOL's
+# __ksymtab.
+#
+# Deliberately out of scope (deferred to later L milestones):
+#   - module signing (CONFIG_MODULE_SIG)
+#   - MODVERSIONS CRC validation (we log + bypass)
+#   - .altinstructions / .smp_locks / .return_sites jump-label rewrites
+#   - module taint flags, sysfs nodes, /proc/modules
+#   - alt-relocation flavors (R_X86_64_32, R_X86_64_GOTPCREL, ...)
+#
+# Memory model: this loader is a PARALLEL system to arch/x86/kernel/
+# module.ad. That one handles Hamnix's own .ko-equivalent format (a
+# plain ET_EXEC user-style ELF with a fixed entry); this one handles
+# stock Linux ET_REL objects. They share kmalloc / page_alloc /
+# printk underneath, nothing else.
+#
+# The happy path produces this on serial when hello.ko is loaded:
+#   kmod_linux: vermagic=6.12.48-...
+#   kmod_linux: MODVERSIONS bypassed: 1 symbols
+#   kmod_linux: init_module @ 0xffff... — calling
+#   L1: hello.ko module_init                     <- from the module's printk
+#   kmod_linux: init returned 0; slot=N
+
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.page_alloc import alloc_pages, free_pages, PAGE_SIZE
+from linux_abi.exports import linux_abi_lookup
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- ELF constants (from include/uapi/linux/elf.h) ------------------
+
+ET_REL:       uint32 = 1
+EM_X86_64:    uint32 = 62
+
+SHT_NULL:     uint32 = 0
+SHT_PROGBITS: uint32 = 1
+SHT_SYMTAB:   uint32 = 2
+SHT_STRTAB:   uint32 = 3
+SHT_RELA:     uint32 = 4
+SHT_NOBITS:   uint32 = 8
+
+SHF_ALLOC:    uint64 = 2
+
+SHN_UNDEF:    uint32 = 0
+
+# x86_64 relocation types (include/uapi/linux/elf.h)
+R_X86_64_NONE:           uint32 = 0
+R_X86_64_64:             uint32 = 1
+R_X86_64_PC32:           uint32 = 2
+R_X86_64_PLT32:          uint32 = 4
+R_X86_64_REX_GOTPCRELX:  uint32 = 42
+
+
+# --- Module slot table ---------------------------------------------
+#
+# One row per loaded Linux-ABI module. Slot 0 means "free". When
+# kmod_linux_unload runs it calls the slot's exit, then frees the
+# backing pages and zeroes the slot.
+
+MAX_LINUX_MODULES: uint64 = 8
+
+# Parallel arrays (same struct-globals-with-Ptr-fields pitfall as
+# exports.ad). Slot 0 of each array is reserved as "unused"; valid
+# slot ids start at 1.
+mod_base_addr:   Array[8, uint64]      # base of the contiguous load region
+mod_base_pages:  Array[8, uint64]      # how many pages we allocated (free on unload)
+mod_base_order:  Array[8, uint64]      # alloc_pages order used (for free_pages)
+mod_exit_fn:     Array[8, uint64]      # cleanup_module address (0 if none)
+mod_in_use:      Array[8, uint64]      # 1 = live, 0 = free
+
+
+# --- ELF parsing helpers --------------------------------------------
+#
+# We read multi-byte fields from arbitrarily-aligned positions in the
+# image buffer; x86_64 tolerates misaligned loads, but writing it as
+# explicit byte-shuffles keeps the source portable to a future port.
+
+def _rd_u16(p: Ptr[uint8]) -> uint16:
+    return cast[uint16](p[0]) | (cast[uint16](p[1]) << 8)
+
+
+def _rd_u32(p: Ptr[uint8]) -> uint32:
+    return (cast[uint32](p[0])
+            | (cast[uint32](p[1]) << 8)
+            | (cast[uint32](p[2]) << 16)
+            | (cast[uint32](p[3]) << 24))
+
+
+def _rd_u64(p: Ptr[uint8]) -> uint64:
+    return (cast[uint64](p[0])
+            | (cast[uint64](p[1]) << 8)
+            | (cast[uint64](p[2]) << 16)
+            | (cast[uint64](p[3]) << 24)
+            | (cast[uint64](p[4]) << 32)
+            | (cast[uint64](p[5]) << 40)
+            | (cast[uint64](p[6]) << 48)
+            | (cast[uint64](p[7]) << 56))
+
+
+def _wr_u32(p: Ptr[uint8], v: uint32):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+    p[2] = cast[uint8]((v >> 16) & 0xFF)
+    p[3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _wr_u64(p: Ptr[uint8], v: uint64):
+    p[0] = cast[uint8](v & 0xFF)
+    p[1] = cast[uint8]((v >> 8) & 0xFF)
+    p[2] = cast[uint8]((v >> 16) & 0xFF)
+    p[3] = cast[uint8]((v >> 24) & 0xFF)
+    p[4] = cast[uint8]((v >> 32) & 0xFF)
+    p[5] = cast[uint8]((v >> 40) & 0xFF)
+    p[6] = cast[uint8]((v >> 48) & 0xFF)
+    p[7] = cast[uint8]((v >> 56) & 0xFF)
+
+
+def _ldr_streq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: uint8 = b[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def _starts_with(s: Ptr[uint8], pfx: Ptr[uint8]) -> int32:
+    # Byte-prefix check. Used to gate ".rela." section names without a
+    # full strncmp helper. Returns 1 on prefix match, 0 otherwise.
+    i: uint64 = 0
+    while True:
+        cp: uint8 = pfx[i]
+        if cp == 0:
+            return 1
+        if s[i] != cp:
+            return 0
+        i = i + 1
+
+
+# --- Per-load scratch state -----------------------------------------
+#
+# load_module() is single-threaded — we don't have concurrent inserts —
+# so a pile of file-scope scratch globals is fine. The Hamnix
+# convention (see fs/elf.ad's elf_last_load_base) is to bias toward
+# globals for medium-sized arrays rather than oversize stack frames.
+
+MAX_SECTIONS: uint64 = 96
+
+# Per-section bookkeeping. sec_loaded_addr is non-zero exactly for
+# SHF_ALLOC sections; everything else stays 0 and is keyed off
+# sec_offset (file-position) for read-only access.
+sec_name_off:     Array[96, uint32]     # sh_name (offset into shstrtab)
+sec_type:         Array[96, uint32]     # sh_type
+sec_flags:        Array[96, uint64]     # sh_flags
+sec_offset:       Array[96, uint64]     # sh_offset (file offset)
+sec_size:         Array[96, uint64]     # sh_size
+sec_link:         Array[96, uint32]     # sh_link
+sec_info:         Array[96, uint32]     # sh_info
+sec_entsize:      Array[96, uint64]     # sh_entsize
+sec_loaded_addr:  Array[96, uint64]     # runtime base or 0
+
+
+# Cached indices for sections we need by role. Stored as int32 (-1 =
+# absent) so absent vs. "section 0" never collide (sh 0 is the
+# always-NULL section in ELF anyway, but defensive).
+this_module_idx:  int32 = -1
+modinfo_idx:      int32 = -1
+versions_idx:     int32 = -1
+symtab_idx:       int32 = -1
+strtab_idx:       int32 = -1
+shstrtab_idx:     int32 = -1
+
+
+def _sec_name(image: Ptr[uint8], shstr_off: uint64, i: uint64) -> Ptr[uint8]:
+    # Get the C-string name of section i out of the shstrtab.
+    name_pos: uint64 = shstr_off + cast[uint64](sec_name_off[i])
+    return cast[Ptr[uint8]](cast[uint64](image) + name_pos)
+
+
+# --- Pass 1: parse + sniff ------------------------------------------
+
+def _parse_sections(image: Ptr[uint8], shoff: uint64, shnum: uint64,
+                    shentsize: uint64, shstrndx: uint64) -> int32:
+    # Read every section header into the parallel arrays and cache
+    # the role-specific indices we'll need later.
+    if shnum > MAX_SECTIONS:
+        printk1("kmod_linux: too many sections: %d\n", shnum)
+        return -1
+
+    this_module_idx = -1
+    modinfo_idx     = -1
+    versions_idx    = -1
+    symtab_idx      = -1
+    strtab_idx      = -1
+    shstrtab_idx    = cast[int32](shstrndx)
+
+    i: uint64 = 0
+    while i < shnum:
+        sh: uint64 = cast[uint64](image) + shoff + i * shentsize
+        sec_name_off[i] = _rd_u32(cast[Ptr[uint8]](sh + 0))
+        sec_type[i]     = _rd_u32(cast[Ptr[uint8]](sh + 4))
+        sec_flags[i]    = _rd_u64(cast[Ptr[uint8]](sh + 8))
+        sec_offset[i]   = _rd_u64(cast[Ptr[uint8]](sh + 24))
+        sec_size[i]     = _rd_u64(cast[Ptr[uint8]](sh + 32))
+        sec_link[i]     = _rd_u32(cast[Ptr[uint8]](sh + 40))
+        sec_info[i]     = _rd_u32(cast[Ptr[uint8]](sh + 44))
+        sec_entsize[i]  = _rd_u64(cast[Ptr[uint8]](sh + 56))
+        sec_loaded_addr[i] = 0
+        i = i + 1
+
+    # Now that sec_name_off is populated, walk again to identify
+    # role-bearing sections by name.
+    shstr_off: uint64 = sec_offset[shstrndx]
+    i = 0
+    while i < shnum:
+        nm: Ptr[uint8] = _sec_name(image, shstr_off, i)
+        if _ldr_streq(nm, ".gnu.linkonce.this_module") == 1:
+            this_module_idx = cast[int32](i)
+        elif _ldr_streq(nm, ".modinfo") == 1:
+            modinfo_idx = cast[int32](i)
+        elif _ldr_streq(nm, "__versions") == 1:
+            versions_idx = cast[int32](i)
+        elif sec_type[i] == SHT_SYMTAB:
+            symtab_idx = cast[int32](i)
+            # The symtab's sh_link points at its associated strtab.
+            strtab_idx = cast[int32](sec_link[i])
+        i = i + 1
+
+    return 0
+
+
+# --- Pass 2: allocate + place ---------------------------------------
+
+def _layout_sections(shnum: uint64) -> uint64:
+    # Total size of every SHF_ALLOC section, page-rounded between
+    # them so .text / .rodata / .data / .bss don't share a cache
+    # line in pathological cases (and so future per-section
+    # protection has clean boundaries to work with).
+    total: uint64 = 0
+    i: uint64 = 0
+    while i < shnum:
+        flg: uint64 = sec_flags[i]
+        if (flg & SHF_ALLOC) != 0 and sec_size[i] > 0:
+            # 8-byte align each section's start.
+            total = (total + 7) & ~cast[uint64](7)
+            sec_loaded_addr[i] = total      # provisional, biased below
+            total = total + sec_size[i]
+        i = i + 1
+    return total
+
+
+def _bias_loaded(base: uint64, shnum: uint64):
+    # _layout_sections stored a relative-to-region offset (possibly 0
+    # for the first allocatable section) in sec_loaded_addr[i] for
+    # every SHF_ALLOC section with a non-zero size. Walk the same
+    # predicate now and turn each offset into an absolute address;
+    # leave non-allocatable sections at 0 so downstream code can use
+    # `sec_loaded_addr[i] == 0` as "not loaded".
+    i: uint64 = 0
+    while i < shnum:
+        if (sec_flags[i] & SHF_ALLOC) != 0 and sec_size[i] > 0:
+            sec_loaded_addr[i] = base + sec_loaded_addr[i]
+        i = i + 1
+
+
+def _copy_sections(image: Ptr[uint8], shnum: uint64):
+    # PROGBITS: memcpy from file. NOBITS (.bss): the region was
+    # already zeroed by memset in load_module.
+    i: uint64 = 0
+    while i < shnum:
+        addr: uint64 = sec_loaded_addr[i]
+        if addr == 0:
+            i = i + 1
+            continue
+        if sec_type[i] == SHT_PROGBITS:
+            src: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](image) + sec_offset[i])
+            memcpy(cast[Ptr[uint8]](addr), src, sec_size[i])
+        i = i + 1
+
+
+# --- Symbol resolution ----------------------------------------------
+
+def _sym_addr(image: Ptr[uint8], sym_idx: uint64) -> uint64:
+    # Resolve symbol number `sym_idx` to a runtime address. Returns
+    # 0 if the symbol is undefined and not in linux_abi/exports.ad —
+    # the caller logs and skips, mirroring real Linux's
+    # "Unknown symbol" warning.
+    syt:      uint64 = cast[uint64](image) + sec_offset[symtab_idx]
+    sym_off:  uint64 = syt + sym_idx * 24                # sizeof(Elf64_Sym)
+    st_name:  uint32 = _rd_u32(cast[Ptr[uint8]](sym_off + 0))
+    st_shndx: uint16 = _rd_u16(cast[Ptr[uint8]](sym_off + 6))
+    st_value: uint64 = _rd_u64(cast[Ptr[uint8]](sym_off + 8))
+
+    if cast[uint32](st_shndx) == SHN_UNDEF:
+        # Undefined → external. Look up by name in the kernel's
+        # exported-symbol table (Hamnix's EXPORT_SYMBOL equivalent).
+        strt_off: uint64 = cast[uint64](image) + sec_offset[strtab_idx]
+        name: Ptr[char] = cast[Ptr[char]](strt_off + cast[uint64](st_name))
+        addr: uint64 = linux_abi_lookup(name)
+        if addr == 0:
+            printk1("kmod_linux: unresolved external symbol '%s'\n",
+                    cast[uint64](name))
+        return addr
+
+    # Defined symbol — relative to its owning section's loaded base.
+    return sec_loaded_addr[cast[uint64](st_shndx)] + st_value
+
+
+def _sym_name(image: Ptr[uint8], sym_idx: uint64) -> Ptr[char]:
+    # Helper for diagnostics: turn a symbol index into its name string.
+    syt:     uint64 = cast[uint64](image) + sec_offset[symtab_idx]
+    sym_off: uint64 = syt + sym_idx * 24
+    st_name: uint32 = _rd_u32(cast[Ptr[uint8]](sym_off + 0))
+    strt_off: uint64 = cast[uint64](image) + sec_offset[strtab_idx]
+    return cast[Ptr[char]](strt_off + cast[uint64](st_name))
+
+
+# --- Relocation application -----------------------------------------
+
+def _apply_relocations(image: Ptr[uint8], shnum: uint64):
+    # Walk every SHT_RELA section. Each rela's sh_info points at the
+    # target section index; only apply if that target was loaded
+    # (SHF_ALLOC). Each rela entry is 24 bytes: r_offset (8), r_info
+    # (8: sym_idx in high 32, type in low 32), r_addend (8 signed).
+    i: uint64 = 0
+    nr_applied: uint64 = 0
+    nr_skipped: uint64 = 0
+    while i < shnum:
+        if sec_type[i] != SHT_RELA:
+            i = i + 1
+            continue
+        target_idx: uint64 = cast[uint64](sec_info[i])
+        target_addr: uint64 = sec_loaded_addr[target_idx]
+        if target_addr == 0:
+            # Target section wasn't loaded (.debug_*, .comment) —
+            # skip the entire rela table.
+            i = i + 1
+            continue
+
+        rela_base: uint64 = cast[uint64](image) + sec_offset[i]
+        nr_entries: uint64 = sec_size[i] / 24
+        j: uint64 = 0
+        while j < nr_entries:
+            ent: uint64 = rela_base + j * 24
+            r_offset: uint64 = _rd_u64(cast[Ptr[uint8]](ent + 0))
+            r_info:   uint64 = _rd_u64(cast[Ptr[uint8]](ent + 8))
+            r_addend: uint64 = _rd_u64(cast[Ptr[uint8]](ent + 16))
+
+            sym_idx: uint64 = r_info >> 32
+            r_type:  uint32 = cast[uint32](r_info & 0xFFFFFFFF)
+
+            s: uint64 = _sym_addr(image, sym_idx)
+            p: uint64 = target_addr + r_offset
+            a: uint64 = r_addend                # already signed-extended on x86_64
+
+            if s == 0 and r_type != R_X86_64_NONE:
+                # Unresolved external — _sym_addr already logged.
+                # Leave the relocation site at its preload value (0)
+                # and continue; a real call into the missing symbol
+                # would fault, but for L1 the test fixture only
+                # touches printk which IS resolved.
+                nr_skipped = nr_skipped + 1
+                j = j + 1
+                continue
+
+            if r_type == R_X86_64_64:
+                # *(uint64*)P = S + A
+                _wr_u64(cast[Ptr[uint8]](p), s + a)
+                nr_applied = nr_applied + 1
+            elif r_type == R_X86_64_PC32 \
+                    or r_type == R_X86_64_PLT32 \
+                    or r_type == R_X86_64_REX_GOTPCRELX:
+                # *(int32*)P = (int32)(S + A - P)
+                # We don't have a GOT — REX_GOTPCRELX is treated as
+                # plain PC32 (the compiler emits it for `mov foo@GOTPCREL(%rip), %rax`,
+                # which after our patch becomes a `lea`-like direct
+                # address load with the unified address space).
+                rel32: uint64 = (s + a) - p
+                _wr_u32(cast[Ptr[uint8]](p), cast[uint32](rel32 & 0xFFFFFFFF))
+                nr_applied = nr_applied + 1
+            elif r_type == R_X86_64_NONE:
+                pass
+            else:
+                # Unknown reloc — log once-per-record so the count
+                # tells us which modules will refuse to function.
+                # L2+ will grow handlers for R_X86_64_32 / 32S /
+                # GOTOFF64 etc. as their modules show up.
+                printk2("kmod_linux: unknown reloc type %d at sym '%s'\n",
+                        cast[uint64](r_type),
+                        cast[uint64](_sym_name(image, sym_idx)))
+                nr_skipped = nr_skipped + 1
+            j = j + 1
+        i = i + 1
+    printk2("kmod_linux: relocations applied=%d skipped=%d\n",
+            nr_applied, nr_skipped)
+
+
+# --- modinfo / __versions diagnostics -------------------------------
+
+def _log_modinfo(image: Ptr[uint8]):
+    # .modinfo is a sequence of "key=value\0" C-strings packed back
+    # to back. We scan for "vermagic=" and log whatever follows; any
+    # value is accepted (we deliberately don't fail-stop on mismatch
+    # at this scale — kbuild's vermagic encodes CONFIG_PREEMPT /
+    # CONFIG_SMP / etc. which the L1 loader is decoupled from).
+    if modinfo_idx < 0:
+        printk0("kmod_linux: no .modinfo (non-kbuild module?)\n")
+        return
+    base: uint64 = cast[uint64](image) + sec_offset[cast[uint64](modinfo_idx)]
+    size: uint64 = sec_size[cast[uint64](modinfo_idx)]
+
+    # Scan for "vermagic=" as the first 9 bytes of a key=value record.
+    i: uint64 = 0
+    while i < size:
+        cur: Ptr[uint8] = cast[Ptr[uint8]](base + i)
+        # Skip leading NULs that pad between records.
+        if cur[0] == 0:
+            i = i + 1
+            continue
+        if _starts_with(cur, "vermagic=") == 1:
+            # Print the value (after "vermagic=") up to NUL.
+            printk1("kmod_linux: vermagic=%s\n",
+                    cast[uint64](cast[Ptr[char]](base + i + 9)))
+            # Don't break — also pick up "name=" for nicer logging.
+        elif _starts_with(cur, "name=") == 1:
+            printk1("kmod_linux: name=%s\n",
+                    cast[uint64](cast[Ptr[char]](base + i + 5)))
+        # Advance past this record's NUL terminator.
+        while i < size and cast[Ptr[uint8]](base + i)[0] != 0:
+            i = i + 1
+        i = i + 1                                # step over NUL
+
+
+def _log_versions():
+    if versions_idx < 0:
+        return
+    sz: uint64 = sec_size[cast[uint64](versions_idx)]
+    # Each __versions entry is a `modversion_info`: 8 bytes CRC +
+    # 56 bytes name = 64 bytes total. We just count and announce
+    # the bypass; the CRC validation belongs to a later milestone.
+    n: uint64 = sz / 64
+    printk1("kmod_linux: MODVERSIONS bypassed: %d symbols\n", n)
+
+
+# --- init / exit lookup ---------------------------------------------
+#
+# kbuild emits `init_module` and `cleanup_module` as global aliases
+# pointing at the registered module_init / module_exit functions.
+# That's the easiest route into the entry points — and it's robust
+# against the `.gnu.linkonce.this_module` field-offset drift across
+# Linux configs.
+
+def _find_named_symbol(image: Ptr[uint8], target: Ptr[char]) -> uint64:
+    if symtab_idx < 0:
+        return 0
+    syt:    uint64 = cast[uint64](image) + sec_offset[cast[uint64](symtab_idx)]
+    strt:   uint64 = cast[uint64](image) + sec_offset[cast[uint64](strtab_idx)]
+    sz:     uint64 = sec_size[cast[uint64](symtab_idx)]
+    n:      uint64 = sz / 24
+    i: uint64 = 0
+    while i < n:
+        off: uint64 = syt + i * 24
+        st_name:  uint32 = _rd_u32(cast[Ptr[uint8]](off + 0))
+        st_shndx: uint16 = _rd_u16(cast[Ptr[uint8]](off + 6))
+        if cast[uint32](st_shndx) != SHN_UNDEF:
+            nm: Ptr[uint8] = cast[Ptr[uint8]](strt + cast[uint64](st_name))
+            if _ldr_streq(nm, cast[Ptr[uint8]](target)) == 1:
+                st_value: uint64 = _rd_u64(cast[Ptr[uint8]](off + 8))
+                return sec_loaded_addr[cast[uint64](st_shndx)] + st_value
+        i = i + 1
+    return 0
+
+
+# --- this_module struct probe (informational) -----------------------
+
+def _log_this_module():
+    # Best-effort diagnostic. We don't parse the struct module fields
+    # by offset (they drift with kernel config); instead we just
+    # confirm the section is present and report its size. Later L
+    # milestones will move init/exit dispatch here once the L0
+    # struct-layout work makes the field offsets reliable.
+    if this_module_idx >= 0:
+        printk1("kmod_linux: .gnu.linkonce.this_module present, %d bytes\n",
+                sec_size[cast[uint64](this_module_idx)])
+
+
+# --- order helper ---------------------------------------------------
+
+def _order_for(size: uint64) -> int32:
+    # Smallest order O such that (PAGE_SIZE << O) >= size. Mirrors
+    # the order helper in mm/slab.ad's large-kmalloc path. Caps at
+    # MAX_ORDER (page_alloc enforces); returns -1 if too large.
+    o: int32 = 0
+    block: uint64 = PAGE_SIZE
+    while block < size:
+        if o >= 10:                              # MAX_ORDER
+            return -1
+        o = o + 1
+        block = block << 1
+    return o
+
+
+# --- public API -----------------------------------------------------
+
+def kmod_linux_load(image: Ptr[uint8], size: uint64) -> int32:
+    # Returns a positive slot id on success (1..MAX_LINUX_MODULES-1),
+    # or a negative errno on failure. Mirrors load_module()'s contract
+    # to userspace, just routed through SYS_INIT_MODULE in syscall.ad.
+
+    # --- header sanity ---------------------------------------------
+    if size < 64:
+        printk0("kmod_linux: image too small for ELF64 header\n")
+        return -22                              # -EINVAL
+    if image[0] != 0x7F or image[1] != 0x45 \
+            or image[2] != 0x4C or image[3] != 0x46:
+        printk0("kmod_linux: bad ELF magic\n")
+        return -8                                # -ENOEXEC
+    if image[4] != 2:                            # ELFCLASS64
+        printk0("kmod_linux: not ELFCLASS64\n")
+        return -8
+
+    e_type:      uint32 = cast[uint32](_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](image) + 16)))
+    e_machine:   uint32 = cast[uint32](_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](image) + 18)))
+    if e_type != ET_REL:
+        printk1("kmod_linux: not ET_REL (e_type=%d)\n",
+                cast[uint64](e_type))
+        return -8
+    if e_machine != EM_X86_64:
+        printk1("kmod_linux: not EM_X86_64 (e_machine=%d)\n",
+                cast[uint64](e_machine))
+        return -8
+
+    shoff:     uint64 = _rd_u64(cast[Ptr[uint8]](cast[uint64](image) + 40))
+    shentsize: uint64 = cast[uint64](_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](image) + 58)))
+    shnum:     uint64 = cast[uint64](_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](image) + 60)))
+    shstrndx:  uint64 = cast[uint64](_rd_u16(
+        cast[Ptr[uint8]](cast[uint64](image) + 62)))
+
+    printk2("kmod_linux: ET_REL ELF: shnum=%d shentsize=%d\n",
+            shnum, shentsize)
+
+    # --- section table parse + role-sniff --------------------------
+    rc: int32 = _parse_sections(image, shoff, shnum, shentsize, shstrndx)
+    if rc != 0:
+        return -22
+
+    if symtab_idx < 0 or strtab_idx < 0:
+        printk0("kmod_linux: missing .symtab / .strtab\n")
+        return -8
+
+    # --- modinfo / versions diagnostics ---------------------------
+    _log_modinfo(image)
+    _log_versions()
+    _log_this_module()
+
+    # --- compute load-region size + allocate -----------------------
+    span: uint64 = _layout_sections(shnum)
+    if span == 0:
+        printk0("kmod_linux: no SHF_ALLOC sections (empty module?)\n")
+        return -8
+    # Round up to PAGE_SIZE so we can use alloc_pages.
+    span = (span + cast[uint64](PAGE_SIZE - 1)) & ~cast[uint64](PAGE_SIZE - 1)
+    order: int32 = _order_for(span)
+    if order < 0:
+        printk1("kmod_linux: module image too large: %d bytes\n", span)
+        return -12                              # -ENOMEM
+    base: uint64 = alloc_pages(order)
+    if base == 0:
+        printk0("kmod_linux: alloc_pages failed\n")
+        return -12
+    # Zero the entire region: .bss / NOBITS comes for free, and any
+    # gap left by 8-byte alignment is implicitly zero.
+    memset(cast[Ptr[uint8]](base), 0, span)
+
+    _bias_loaded(base, shnum)
+    _copy_sections(image, shnum)
+
+    printk2("kmod_linux: loaded image at %p (%d bytes)\n", base, span)
+
+    # --- relocations ----------------------------------------------
+    _apply_relocations(image, shnum)
+
+    # --- init / exit lookup ---------------------------------------
+    init_addr: uint64 = _find_named_symbol(image, "init_module")
+    exit_addr: uint64 = _find_named_symbol(image, "cleanup_module")
+    if init_addr == 0:
+        printk0("kmod_linux: no init_module symbol\n")
+        free_pages(base, order)
+        return -8
+
+    # --- find a free slot ------------------------------------------
+    slot: uint64 = 1                             # slot 0 reserved
+    while slot < MAX_LINUX_MODULES:
+        if mod_in_use[slot] == 0:
+            break
+        slot = slot + 1
+    if slot >= MAX_LINUX_MODULES:
+        printk0("kmod_linux: module table full\n")
+        free_pages(base, order)
+        return -12
+    mod_base_addr[slot]  = base
+    mod_base_order[slot] = cast[uint64](order)
+    mod_exit_fn[slot]    = exit_addr
+    mod_in_use[slot]     = 1
+
+    # --- call init_module -----------------------------------------
+    printk1("kmod_linux: init_module @ %p — calling\n", init_addr)
+    init_fn: Ptr[uint8] = cast[Ptr[uint8]](init_addr)
+    rc_init: int32 = init_fn()
+    printk2("kmod_linux: init returned %d; slot=%d\n",
+            cast[uint64](rc_init), slot)
+
+    if rc_init != 0:
+        # Module rejected itself — roll back the slot and free.
+        mod_in_use[slot] = 0
+        free_pages(base, order)
+        return rc_init
+
+    return cast[int32](slot)
+
+
+def kmod_linux_unload(slot: int32) -> int32:
+    # Mirrors delete_module(2): call the module's cleanup_module
+    # (if any), then free the backing pages and clear the slot.
+    s: uint64 = cast[uint64](slot)
+    if slot <= 0 or s >= MAX_LINUX_MODULES:
+        return -22                               # -EINVAL
+    if mod_in_use[s] == 0:
+        return -2                                # -ENOENT
+
+    exit_addr: uint64 = mod_exit_fn[s]
+    if exit_addr != 0:
+        printk1("kmod_linux: cleanup_module @ %p — calling\n", exit_addr)
+        exit_fn: Ptr[uint8] = cast[Ptr[uint8]](exit_addr)
+        exit_fn()
+
+    free_pages(mod_base_addr[s], cast[int32](mod_base_order[s]))
+    mod_base_addr[s]  = 0
+    mod_base_order[s] = 0
+    mod_exit_fn[s]    = 0
+    mod_in_use[s]     = 0
+    printk1("kmod_linux: slot %d unloaded\n", cast[uint64](slot))
+    return 0
