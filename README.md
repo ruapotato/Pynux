@@ -232,13 +232,25 @@ drivers (xhci_hcd, nvme, usbhid, e1000e). See
 | **L33** | Relocation walker diagnostics + library-only module proof: `.gnu.linkonce.this_module` relocs (when present) walk via the existing target-section dispatch — no special case needed | **Done** |
 | **L34** | `__crc32c_le` + 6 crypto-register shims — `crc32c_generic.ko` init runs, returns -EINVAL (placeholder CRC math) | **Done** |
 | **L35** | Real CRC32C (Castagnoli) implementation in `__crc32c_le` shim — table-driven, matches Linux's `lib/crc32c.c` | **Done** |
-| **L36** | **First stock Debian `.ko` to load cleanly on Hamnix: `crc32c_generic.ko` init returns 0.** Loader gains `R_X86_64_32` + `R_X86_64_32S` reloc support. 95 relocations applied, 0 skipped, 0 unresolved externals | **Done** |
-| L37..L39 | usbcore, xhci-pci, xhci-hcd, usbhid, nvme, efifb / simpledrm | Pending |
+| **L36** | First stock Debian `.ko` to load cleanly on Hamnix: `crc32c_generic.ko` init returns 0. Loader gains `R_X86_64_32` + `R_X86_64_32S` reloc support. 95 relocs applied, 0 skipped, 0 unresolved externals | **Done** |
+| **L37** | Two-module dependency chain: `crc32c_generic.ko` + `libcrc32c.ko` both insmod with init==0. `nm -u` cross-check identifies missing-symbol L38 targets | **Done** |
+| **L38** | `__stack_chk_fail` + `__stack_chk_guard` (gcc stack-protector runtime) + `crypto_destroy_tfm` + `crypto_shash_update`. Five-of-five UND coverage for libcrc32c.ko at load AND runtime | **Done** |
+| L39..L40 | usbcore, xhci-pci, xhci-hcd, usbhid, nvme, efifb / simpledrm — real-hardware drivers | Pending |
 | L38 | UEFI boot path (PE/COFF) | Scaffold |
 | L39 | ACPI MADT/MCFG parsing | Scaffold |
 | L40 | First boot on real ThinkPad hardware | Pending |
 
-## U-series: Linux userspace ABI (planned)
+## U-series: Linux userspace ABI
+
+| Milestone | Description | Status |
+|-----------|-------------|--------|
+| **U1** | Per-task `is_linux_userspace` flag in `TaskStruct`; `do_syscall` forks to `linux_u_syscall_dispatch` when set | **Done** |
+| **U2** | `fs/elf.ad` detects Linux-ABI ELF binaries via OSABI marker + PT_INTERP segment; helper to read the interpreter path | **Done** |
+| U3 | Linux-ELF loader: detect at exec time, build new task, flip flag, iretq through dynamic linker | Pending |
+| U4 | Real `libc.so.6` body bind-paths (printf/malloc/exit through actual Linux syscall numbers) | Pending |
+| U5 | Run unmodified `/bin/echo` from a Debian sysroot | Pending |
+
+Surface area below targets the actual end-game.
 
 The track that lands AFTER L-series completes. Goal: run
 unmodified Linux user binaries (Steam, Firefox, language

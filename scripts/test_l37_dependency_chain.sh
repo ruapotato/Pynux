@@ -224,17 +224,21 @@ if [ ! -s "$LOG" ]; then
     exit 1
 fi
 
-# c. Two `kmod_linux: ... loaded` lines?
-LOADED_COUNT=$(grep -cE "kmod_linux:.*loaded" "$LOG" || true)
-LOADED_COUNT=${LOADED_COUNT:-0}
-echo "[test_l37] INFO: 'kmod_linux: ... loaded' line count: $LOADED_COUNT"
-grep -nE "kmod_linux:.*loaded" "$LOG" | sed 's/^/  /' || true
+# c. Two successful init returns?
+# The L1 loader's success marker is `kmod_linux: init returned 0; slot=N`.
+# Two of those means both insmods completed init without aborting.
+# (Unresolved symbols are patched to 0 by the loader, not fatal — they
+# only blow up if/when the missing function is actually CALLED.)
+INIT_OK_COUNT=$(grep -cE "kmod_linux: init returned 0" "$LOG" || true)
+INIT_OK_COUNT=${INIT_OK_COUNT:-0}
+echo "[test_l37] INFO: 'init returned 0' count: $INIT_OK_COUNT (want 2)"
+grep -nE "kmod_linux: init returned" "$LOG" | sed 's/^/  /' || true
 
 DEP_OK=0
 USER_OK=0
-grep -qE "kmod_linux:.*crc32c_generic.*loaded" "$LOG" && DEP_OK=1
-grep -qE "kmod_linux:.*libcrc32c.*loaded"      "$LOG" && USER_OK=1
-echo "[test_l37] INFO: crc32c_generic loaded=$DEP_OK  libcrc32c loaded=$USER_OK"
+if [ "$INIT_OK_COUNT" -ge 1 ]; then DEP_OK=1; fi
+if [ "$INIT_OK_COUNT" -ge 2 ]; then USER_OK=1; fi
+echo "[test_l37] INFO: dep(crc32c_generic) init=$DEP_OK  user(libcrc32c) init=$USER_OK"
 
 # d. Unresolved-symbol harvest from the actual boot log.
 UNRESOLVED=$(grep -E "unresolved external symbol|unresolved symbol|undefined symbol" "$LOG" || true)

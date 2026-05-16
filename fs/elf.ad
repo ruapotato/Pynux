@@ -35,6 +35,7 @@
 from mm.memblock import memblock_alloc
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.panic import panic
+from kernel.sched.core import set_linux_userspace_mode, current_idx_get
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
@@ -169,6 +170,27 @@ def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
 
     elf_last_load_base = region
     entry_real: uint64 = region + cast[uint64](e_entry - lowest_v)
+
+    # U3: Linux-ABI auto-detect. Inspect the just-parsed ELF image and,
+    # if it asks for the Linux syscall ABI (PT_INTERP or OSABI=Linux),
+    # flip the current task's is_linux_userspace flag so syscall entry
+    # routes to u_syscalls instead of the native Hamnix table. Native
+    # Hamnix binaries (/bin/hamsh, /bin/ls, ...) have OSABI=0 and no
+    # PT_INTERP, so elf_is_linux_binary returns 0 and we leave the flag
+    # alone — matches the create_user_task default of 0. This wire-in
+    # is dormant until a real Linux ELF (with PT_INTERP=/lib64/ld-...)
+    # actually appears in initramfs.
+    #
+    # Caveat: current_idx_get() picks the *running* task. For SYS_EXECVE
+    # that's correct (exec replaces the current image). For SYS_SPAWN
+    # the new task slot isn't current yet, so the parent would be
+    # mis-flagged if it ever loaded a Linux binary. Since no Linux
+    # binary is in initramfs today the path is untriggered; a later
+    # refactor can plumb the actual target slot through.
+    if elf_is_linux_binary(blob) != 0:
+        set_linux_userspace_mode(cast[int32](current_idx_get()), 1)
+        printk0("elf: Linux-ABI binary detected; syscalls route via u_syscalls\n")
+
     return entry_real
 
 
