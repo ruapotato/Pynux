@@ -607,10 +607,42 @@ def kmod_linux_load(image: Ptr[uint8], size: uint64) -> int32:
     _apply_relocations(image, shnum)
 
     # --- init / exit lookup ---------------------------------------
+    # kbuild emits two parallel paths to the entry points:
+    #
+    #   (1) Old/simple modules expose `init_module` / `cleanup_module`
+    #       as global aliases pointing at the registered functions.
+    #       This is the easiest route — one symtab lookup.
+    #
+    #   (2) Most distro modules (anything using module_init()/
+    #       module_exit() macros — i.e. everything in lib/ and crypto/)
+    #       emit *only* the function pointers inside
+    #       `struct module __this_module` living at offset 0 of
+    #       `.gnu.linkonce.this_module`. Per L0's BTF dump (see
+    #       linux_abi/structs/module.ad), `module.init` is at offset 312
+    #       and `module.exit` is at offset 1200 in Linux 6.12.48.
+    #
+    # Try (1) first; if absent, fall back to (2). Either way we end
+    # up with a function pointer in {init,exit}_addr.
     init_addr: uint64 = _find_named_symbol(image, "init_module")
     exit_addr: uint64 = _find_named_symbol(image, "cleanup_module")
+    if init_addr == 0 or exit_addr == 0:
+        if this_module_idx >= 0:
+            tm_base: uint64 = sec_loaded_addr[cast[uint64](this_module_idx)]
+            if tm_base != 0:
+                if init_addr == 0:
+                    # module.init offset (see structs/module.ad: init=312)
+                    init_addr = _rd_u64(cast[Ptr[uint8]](tm_base + 312))
+                    if init_addr != 0:
+                        printk1("kmod_linux: init via struct module.init @ %p\n",
+                                init_addr)
+                if exit_addr == 0:
+                    # module.exit offset (see structs/module.ad: exit=1200)
+                    exit_addr = _rd_u64(cast[Ptr[uint8]](tm_base + 1200))
+                    if exit_addr != 0:
+                        printk1("kmod_linux: exit via struct module.exit @ %p\n",
+                                exit_addr)
     if init_addr == 0:
-        printk0("kmod_linux: no init_module symbol\n")
+        printk0("kmod_linux: no init_module symbol or struct module.init\n")
         free_pages(base, order)
         return -8
 
