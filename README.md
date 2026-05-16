@@ -170,9 +170,37 @@ drivers (xhci_hcd, nvme, usbhid, e1000e). See
 | Milestone | Description | Status |
 |-----------|-------------|--------|
 | **L0** | BTF parser + `scripts/gen_linux_abi.py` + initial generated structs (`module`, `list_head`, `kobject`, `kref`) | **In progress** |
-| **L1** | ET_REL `.ko` loader: ELF parse, relocations, vermagic + MODVERSIONS bypass, `module_init/exit` dispatch. `SYS_INIT_MODULE`/`SYS_DELETE_MODULE`. `/bin/insmod`, `/bin/rmmod` | **In progress** |
-| L2..L28 | (Linux subsystems incrementally exported under their stock names — see commit log for individual milestone descriptions as they land) | Pending |
+| **L1** | ET_REL `.ko` loader: ELF parse, relocations, vermagic + MODVERSIONS bypass, `module_init/exit` dispatch. `SYS_INIT_MODULE`/`SYS_DELETE_MODULE`. `/bin/insmod`, `/bin/rmmod` | **Done** |
+| **L2** | `kmalloc` / `kfree` / `krealloc` / `kzalloc` exports | **Done** |
+| **L3** | `kmem_cache_create` / `alloc` / `free` / `destroy` | **Done** |
+| **L4** | chrdev: `register_chrdev`, `cdev_init`, `cdev_add`, etc. | **Done** |
+| **L5** | procfs: `proc_create`, `seq_printf`, `seq_puts`, `proc_mkdir` | **Done** |
+| **L6** | Mutex + spinlock + completion (uniprocessor model) | **Done** |
+| **L7** | Wait queues: `__init_waitqueue_head`, `prepare_to_wait`, `__wake_up` | **Done** |
+| **L8** | kthread + workqueue: `kthread_create_on_node`, `__alloc_workqueue`, `INIT_WORK`-shape | **Done** |
+| **L9** | `timer_list`: `timer_setup`, `mod_timer`, `del_timer_sync` | **Done** |
+| **L10** | `hrtimer` + `ktime_get` ns clock | **Done** |
+| **L11** | IRQ: `request_irq`, `request_threaded_irq`, `free_irq` | **Done** |
+| **L12** | sysfs: `kobject_create_and_add`, `sysfs_create_file_ns` | **Done** |
+| **L13** | kprobe / kretprobe: register/unregister | **Done** |
+| **L14** | debugfs: `debugfs_create_dir` / `_file` / `_u32` | **Done** |
+| **L15** | crypto: `crypto_alloc_shash`, `crypto_shash_tfm_digest` | **Done** |
+| **L16** | random + `_copy_to_user` / `_copy_from_user` | **Done** |
+| **L17** | atomic ops + `__queue_delayed_work` + kfifo | **Done** |
+| **L18** | `init_uts_ns` + `smp_processor_id` | **Done** |
+| **L19** | `list_head` re-exports under Linux names | **Done** |
+| **L20** | `register_die_notifier` | **Done** |
+| **L21** | PCI core: `__pci_register_driver`, config-space accessors, BAR map | **Done** |
+| **L22** | DMA API: `dma_alloc_coherent`, `dma_map_single` | **Done** |
+| **L23** | virtio core: `register_virtio_driver`, `virtqueue_add_sgs` | **Done** |
+| **L24** | Block layer: `blk_alloc_disk`, `add_disk`, `blk_mq_alloc_tag_set` | **Done** |
+| **L25** | netdev: `alloc_etherdev_mqs`, `register_netdev`, skb alloc/free | **Done** |
+| **L26** | netfilter: `nf_register_net_hook`, `nf_unregister_net_hook` | **Done** |
+| **L27** | Filesystem registration: `register_filesystem`, `mount_nodev` | **Done** |
+| **L28** | Kernel sockets: `sock_create_kern`, `kernel_bind` | **Done** |
 | L29 | M1..M15 .ko regression passes against Hamnix | Pending |
+| L30..L37 | Stock distro modules (crc32c, xhci_hcd, nvme, usbhid, efifb) | Pending |
+| L38..L39 | UEFI boot + ACPI MADT/MCFG | Pending |
 | L40 | First boot on real ThinkPad hardware | Pending |
 
 ## U-series: Linux userspace ABI (planned)
