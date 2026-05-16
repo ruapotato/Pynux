@@ -133,6 +133,14 @@ def ext4_is_mounted() -> int32:
 # allocation per call.
 ext4_blk_buf: Array[1024, uint8]
 
+# Separate scratch for the extent-tree walk. _ext4_logical_to_physical
+# is called by ext4_read_file just BEFORE that function reads the
+# physical data block into ext4_blk_buf — so reusing the same buffer
+# for index-node reads would race with the data read on the same
+# iteration. Keep a dedicated 1 KiB page here. (4 KiB block sizes
+# would need this bumped along with ext4_blk_buf — same constraint.)
+ext4_ext_scratch: Array[1024, uint8]
+
 
 def _ext4_read_block(block_nr: uint64, buf: Ptr[uint8]) -> int32:
     # Read filesystem block `block_nr` into `buf`. Always reads
@@ -218,25 +226,11 @@ EXT4_EXTENT_MAGIC:    uint16 = 0xF30A
 
 
 def ext4_inode_first_extent_block(buf: Ptr[uint8]) -> uint64:
-    # Returns the FIRST extent's physical start block, or 0 on a
-    # depth-> 0 (index) tree or a malformed header. For HELLO.TXT
-    # and the root directory inode in our test image, there's
-    # exactly one inline leaf extent — this is all we need.
-    eh: uint64 = cast[uint64](buf) + INODE_I_BLOCK_OFFSET
-    magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
-    if magic != EXT4_EXTENT_MAGIC:
-        return 0
-    depth: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 6))
-    if depth != 0:
-        # Indirect (index node). M16.54+ walks these; not today.
-        return 0
-    entries: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 2))
-    if entries == 0:
-        return 0
-    # First leaf extent starts at +12 from the header.
-    ee: uint64 = eh + 12
-    lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 8))
-    return cast[uint64](lo)
+    # Returns the physical block holding logical block 0 of the file.
+    # For directories this is the dir's first data block; for files
+    # the start of the data. Walks index nodes transparently, so a
+    # depth > 0 directory or a sparse-front file resolves correctly.
+    return _ext4_logical_to_physical(buf, 0)
 
 
 # --- directory walk -----------------------------------------------
@@ -304,24 +298,68 @@ def ext4_dir_lookup(dir_inode_buf: Ptr[uint8],
 
 def _ext4_logical_to_physical(inode_buf: Ptr[uint8],
                               logical_blk: uint64) -> uint64:
+    # Walk the extent tree from the inode's i_block root to the leaf
+    # that owns `logical_blk`. The root header lives at inode+0x28;
+    # for depth-> 0 we follow index records into a child block,
+    # repointing eh at the child's header and looping. Linux's
+    # fs/ext4/extents.c::ext4_ext_find_extent does the same.
+    #
+    # Index-record layout (12 bytes, same size as leaf extents):
+    #     0x00  u32 ei_block     lowest logical block this child covers
+    #     0x04  u32 ei_leaf_lo   physical block of the child node
+    #     0x08  u16 ei_leaf_hi   high 16 bits (48-bit phys total)
+    #     0x0A  u16 ei_unused
     eh: uint64 = cast[uint64](inode_buf) + INODE_I_BLOCK_OFFSET
-    magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
-    if magic != EXT4_EXTENT_MAGIC:
-        return 0
-    depth: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 6))
-    if depth != 0:
-        return 0
-    entries: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 2))
-    i: uint16 = 0
-    while i < entries:
-        ee: uint64 = eh + 12 + cast[uint64](i) * 12
-        ee_block: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 0))
-        ee_len:   uint16 = _ext4_read_u16(cast[Ptr[uint8]](ee + 4))
-        ee_start_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 8))
-        eb: uint64 = cast[uint64](ee_block)
-        if logical_blk >= eb and logical_blk < eb + cast[uint64](ee_len):
-            return cast[uint64](ee_start_lo) + (logical_blk - eb)
-        i = i + 1
+    # 5 levels is comfortably more than ext4 ever produces in practice
+    # — even 16 TB filesystems top out around 3-4. The bound is here
+    # so a malformed header pointing into a cycle doesn't loop forever.
+    safety: int32 = 5
+    while safety > 0:
+        safety = safety - 1
+        magic: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 0))
+        if magic != EXT4_EXTENT_MAGIC:
+            return 0
+        entries: uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 2))
+        depth:   uint16 = _ext4_read_u16(cast[Ptr[uint8]](eh + 6))
+        if depth == 0:
+            # Leaf: find the extent covering logical_blk.
+            i: uint16 = 0
+            while i < entries:
+                ee: uint64 = eh + 12 + cast[uint64](i) * 12
+                ee_block:    uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 0))
+                ee_len:      uint16 = _ext4_read_u16(cast[Ptr[uint8]](ee + 4))
+                ee_start_hi: uint16 = _ext4_read_u16(cast[Ptr[uint8]](ee + 6))
+                ee_start_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ee + 8))
+                eb: uint64 = cast[uint64](ee_block)
+                if logical_blk >= eb and logical_blk < eb + cast[uint64](ee_len):
+                    phys_base: uint64 = (cast[uint64](ee_start_hi) << 32) \
+                                      | cast[uint64](ee_start_lo)
+                    return phys_base + (logical_blk - eb)
+                i = i + 1
+            return 0
+        # Index node: pick the RIGHTMOST entry whose ei_block <=
+        # logical_blk. Entries are sorted ascending by ei_block, so a
+        # simple linear scan with a "best so far" cursor is correct.
+        chosen: int32 = -1
+        j: uint16 = 0
+        while j < entries:
+            ei: uint64 = eh + 12 + cast[uint64](j) * 12
+            ei_block: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ei + 0))
+            if cast[uint64](ei_block) <= logical_blk:
+                chosen = cast[int32](j)
+            else:
+                break
+            j = j + 1
+        if chosen < 0:
+            return 0
+        ei: uint64 = eh + 12 + cast[uint64](chosen) * 12
+        ei_leaf_lo: uint32 = _ext4_read_u32(cast[Ptr[uint8]](ei + 4))
+        ei_leaf_hi: uint16 = _ext4_read_u16(cast[Ptr[uint8]](ei + 8))
+        child_blk: uint64 = (cast[uint64](ei_leaf_hi) << 32) \
+                          | cast[uint64](ei_leaf_lo)
+        if _ext4_read_block(child_blk, &ext4_ext_scratch[0]) != 0:
+            return 0
+        eh = cast[uint64](&ext4_ext_scratch[0])
     return 0
 
 

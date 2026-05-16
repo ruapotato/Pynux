@@ -49,9 +49,11 @@ set +e
     sleep 1
     printf '/cat /ext/SUB/NESTED.TXT\n'
     sleep 1
+    printf '/cat /ext/BIG.TXT\n'
+    sleep 1
     printf 'exit\n'
     sleep 1
-) | timeout 18s qemu-system-x86_64 \
+) | timeout 22s qemu-system-x86_64 \
     -kernel "$ELF" \
     -drive file=build/ext4.img,if=virtio,format=raw \
     -smp 2 \
@@ -75,7 +77,8 @@ for needle in \
     "dirent inode=12 name='HELLO.TXT'" \
     "EXT4_MARKER hello from /ext/HELLO.TXT" \
     "NESTED.TXT" \
-    "EXT4_NESTED_MARKER /ext/SUB/NESTED.TXT"
+    "EXT4_NESTED_MARKER /ext/SUB/NESTED.TXT" \
+    "DEPTH1_MARKER ext4 index extents work"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_ext4] OK: '$needle'"

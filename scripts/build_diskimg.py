@@ -269,21 +269,28 @@ def build_ext4_image(out_path: Path) -> bytes:
          str(out_path)],
         check=True, capture_output=True,
     )
-    # Plant /HELLO.TXT and /SUB/NESTED.TXT via debugfs. The mkdir
-    # / cd / write -f sequence is sent as one command stream so
-    # debugfs preserves working-directory state between commands.
+    # Plant /HELLO.TXT, /SUB/NESTED.TXT, and /BIG.TXT via debugfs.
+    # The mkdir / cd / write -f sequence is sent as one command
+    # stream so debugfs preserves working-directory state between
+    # commands. BIG.TXT is the source for the depth-1 surgery below.
     hello_body = (
         b"EXT4_MARKER hello from /ext/HELLO.TXT - ext4 driver works\n"
     )
     nested_body = (
         b"EXT4_NESTED_MARKER /ext/SUB/NESTED.TXT - subdir walk works\n"
     )
+    big_body = (
+        b"DEPTH1_MARKER ext4 index extents work - read via depth=1 tree\n"
+    )
     tmp_hello  = out_path.with_suffix(".hello.tmp")
     tmp_nested = out_path.with_suffix(".nested.tmp")
+    tmp_big    = out_path.with_suffix(".big.tmp")
     tmp_hello.write_bytes(hello_body)
     tmp_nested.write_bytes(nested_body)
+    tmp_big.write_bytes(big_body)
     cmd_stream = (
         f"write {tmp_hello} HELLO.TXT\n"
+        f"write {tmp_big} BIG.TXT\n"
         f"mkdir SUB\n"
         f"cd SUB\n"
         f"write {tmp_nested} NESTED.TXT\n"
@@ -294,10 +301,138 @@ def build_ext4_image(out_path: Path) -> bytes:
             input=cmd_stream, text=True,
             check=True, capture_output=True,
         )
+        # Surgery: rewrite BIG.TXT's extent tree from inline depth=0
+        # to indirect depth=1, exercising the index-walk path on read.
+        _fragment_to_depth1(out_path, "BIG.TXT")
     finally:
         tmp_hello.unlink(missing_ok=True)
         tmp_nested.unlink(missing_ok=True)
+        tmp_big.unlink(missing_ok=True)
     return out_path.read_bytes()
+
+
+def _fragment_to_depth1(image_path: Path, filename: str) -> None:
+    """Post-process an ext4 image so `filename` (in the root dir) has a
+    depth=1 extent tree instead of an inline depth=0 leaf.
+
+    debugfs writes are always optimally contiguous, so a single
+    small file gets one inline extent — useful to verify the
+    common case, but it doesn't exercise the index walk. We
+    surgically rewrite the inode after planting:
+
+      old layout (depth=0, inline)
+        eh{magic, entries=1, max=4, depth=0}
+        ee{ee_block=0, ee_len=1, ee_start_lo=DATA_BLK}
+
+      new layout (depth=1)
+        eh{magic, entries=1, max=4, depth=1}
+        ei{ei_block=0, ei_leaf_lo=LEAF_BLK}
+
+      LEAF_BLK contents (planted by us)
+        eh{magic, entries=1, max=N, depth=0}
+        ee{ee_block=0, ee_len=1, ee_start_lo=DATA_BLK}
+
+    LEAF_BLK is taken from the top of the image (1 KiB blocks in
+    a 1 MiB image leaves the trailing blocks unused after a fresh
+    mkfs + small writes). We don't bother updating the block
+    bitmap — our kernel doesn't validate it on read.
+    """
+    img = bytearray(image_path.read_bytes())
+    # Parse just the fields we need from the SB at byte 1024.
+    sb = img[1024:1024 + 1024]
+    s_log_block_size  = struct.unpack_from("<I", sb, 0x18)[0]
+    s_inodes_per_grp  = struct.unpack_from("<I", sb, 0x28)[0]
+    s_first_data_blk  = struct.unpack_from("<I", sb, 0x14)[0]
+    s_inode_size      = struct.unpack_from("<H", sb, 0x58)[0] or 128
+    s_desc_size       = struct.unpack_from("<H", sb, 0xFE)[0] or 32
+    block_size        = 1024 << s_log_block_size
+    gdt_block         = s_first_data_blk + 1
+    # Group 0 descriptor at the start of the GDT block.
+    gd_off = gdt_block * block_size
+    inode_table_blk = struct.unpack_from("<I", img, gd_off + 8)[0]
+
+    # Find BIG.TXT's inode number by walking the root dir's first
+    # data block. Root is inum 2; its i_block holds one inline extent
+    # in the freshly-built image.
+    root_inode_off = inode_table_blk * block_size + (2 - 1) * s_inode_size
+    root_iblock_off = root_inode_off + 0x28
+    # Read root's first extent (depth must be 0 for a fresh small dir).
+    eh_magic, entries, _, depth, _ = struct.unpack_from(
+        "<HHHHI", img, root_iblock_off)
+    assert eh_magic == 0xF30A and depth == 0
+    ee_off = root_iblock_off + 12
+    _, _, _, root_data_blk = struct.unpack_from("<IHHI", img, ee_off)
+    # Walk dir entries to find BIG.TXT.
+    name_bytes = filename.encode("ascii")
+    pos = 0
+    target_inum = None
+    while pos + 8 <= block_size:
+        e_off = root_data_blk * block_size + pos
+        inum, rec_len = struct.unpack_from("<IH", img, e_off)
+        if rec_len == 0:
+            break
+        if inum != 0:
+            name_len = img[e_off + 6]
+            if img[e_off + 8: e_off + 8 + name_len] == name_bytes:
+                target_inum = inum
+                break
+        pos += rec_len
+    assert target_inum is not None, f"{filename} not found in root dir"
+
+    # Read BIG.TXT's inode, current extent points at data_blk.
+    big_inode_off = inode_table_blk * block_size \
+                    + (target_inum - 1) * s_inode_size
+    big_iblock_off = big_inode_off + 0x28
+    eh_magic, entries, _, depth, _ = struct.unpack_from(
+        "<HHHHI", img, big_iblock_off)
+    assert eh_magic == 0xF30A and depth == 0 and entries == 1, \
+        f"BIG.TXT extent tree unexpected: depth={depth} entries={entries}"
+    _, _, ee_start_hi, ee_start_lo = struct.unpack_from(
+        "<IHHI", img, big_iblock_off + 12)
+    data_blk = (ee_start_hi << 32) | ee_start_lo
+
+    # Pick a leaf block from the tail end of the image — well past
+    # anything mkfs or our small writes have touched. Block (total - 4)
+    # leaves a few sentinels at the very end alone.
+    total_blocks = len(img) // block_size
+    leaf_blk = total_blocks - 4
+    assert leaf_blk > data_blk + 16
+
+    # Write the synthetic leaf block: one header + one extent record
+    # pointing back at the original data block. Pad the rest with 0
+    # — eh_max can claim a high entry count, ext4 readers don't care
+    # as long as eh_entries is honored.
+    leaf_off = leaf_blk * block_size
+    img[leaf_off: leaf_off + block_size] = b"\x00" * block_size
+    struct.pack_into("<HHHHI", img, leaf_off,
+                     0xF30A,     # eh_magic
+                     1,          # eh_entries
+                     (block_size - 12) // 12,  # eh_max
+                     0,          # eh_depth (leaf)
+                     0)          # eh_generation
+    struct.pack_into("<IHHI", img, leaf_off + 12,
+                     0,          # ee_block (logical)
+                     1,          # ee_len
+                     0,          # ee_start_hi
+                     data_blk)   # ee_start_lo
+
+    # Rewrite BIG.TXT's inline i_block to be a depth=1 header + one
+    # index record pointing at leaf_blk.
+    iblk_bytes = bytearray(60)
+    struct.pack_into("<HHHHI", iblk_bytes, 0,
+                     0xF30A,     # eh_magic
+                     1,          # eh_entries
+                     4,          # eh_max (inline cap)
+                     1,          # eh_depth (1 = one level of index)
+                     0)          # eh_generation
+    struct.pack_into("<IIHH", iblk_bytes, 12,
+                     0,          # ei_block
+                     leaf_blk,   # ei_leaf_lo
+                     0,          # ei_leaf_hi
+                     0)          # ei_unused
+    img[big_iblock_off: big_iblock_off + 60] = iblk_bytes
+
+    image_path.write_bytes(bytes(img))
 
 
 if __name__ == "__main__":
@@ -330,6 +465,7 @@ if __name__ == "__main__":
         build_ext4_image(ext4_raw)
         print(f"Wrote {ext4_raw} (raw ext4 bytes, ~1 MiB)")
         print(f"  /ext/HELLO.TXT (planted via debugfs)")
+        print(f"  /ext/BIG.TXT   (depth=1 extent tree — exercises index walk)")
     except SystemExit as e:
         print(f"WARNING: ext4 image not generated ({e}); skipping")
     # Always emit the placeholder blob so the kernel's references
