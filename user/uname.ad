@@ -1,0 +1,14 @@
+# user/uname.ad
+#
+# Hamnix `uname`: writes a fixed "<sysname> <machine> <release>\n"
+# line. No flags (-a / -r / -m) yet — the kernel doesn't expose a
+# utsname-like struct, so there's nothing variable to query. Hard-
+# coded string keeps the binary self-contained while still giving
+# scripts something to grep for.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+def main() -> int32:
+    sys_write(1, "Hamnix x86_64 0.1\n", 18)
+    return 0

@@ -24,6 +24,7 @@ from kernel.sched.core import (
     task_state, task_pid_at, task_name0_at, task_table_size,
 )
 from arch.x86.kernel.time import get_jiffies
+from mm.page_alloc import page_alloc_total, page_alloc_free_count
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -140,6 +141,56 @@ def render_tasks(buf: Ptr[uint8]) -> uint64:
     return pos
 
 
+def render_meminfo(buf: Ptr[uint8]) -> uint64:
+    # GNU `free` and friends parse this — three lines is the minimum
+    # shape they tolerate. Page size is 4 KiB so pages*4 = kB directly,
+    # which keeps us out of 64-bit division by 1024 and matches what
+    # Linux's si_meminfo() ultimately reports through the same units.
+    total_kb: uint64 = page_alloc_total() * 4
+    free_kb:  uint64 = page_alloc_free_count() * 4
+    # No reclaimable cache layer yet, so MemAvailable == MemFree (this
+    # is what the kernel reports too before slab accounting is wired).
+    avail_kb: uint64 = free_kb
+    pos: uint64 = 0
+    pos = _buf_put_str(buf, pos, "MemTotal:        ")
+    pos = _buf_put_dec(buf, pos, total_kb)
+    pos = _buf_put_str(buf, pos, " kB\n")
+    pos = _buf_put_str(buf, pos, "MemFree:         ")
+    pos = _buf_put_dec(buf, pos, free_kb)
+    pos = _buf_put_str(buf, pos, " kB\n")
+    pos = _buf_put_str(buf, pos, "MemAvailable:    ")
+    pos = _buf_put_dec(buf, pos, avail_kb)
+    pos = _buf_put_str(buf, pos, " kB\n")
+    return pos
+
+
+def render_cpuinfo(buf: Ptr[uint8]) -> uint64:
+    # Static for now: SMP enumeration through CPUID/MADT lands later.
+    # The tab between key and ':' is what /usr/bin/lscpu et al expect;
+    # Linux's arch/x86/kernel/cpu/proc.c emits the exact same shape.
+    pos: uint64 = 0
+    pos = _buf_put_str(buf, pos, "processor\t: 0\n")
+    pos = _buf_put_str(buf, pos, "vendor_id\t: Hamnix\n")
+    pos = _buf_put_str(buf, pos, "cpu family\t: 6\n")
+    pos = _buf_put_str(buf, pos, "model name\t: x86_64 generic\n")
+    pos = _buf_put_str(buf, pos, "cpu MHz\t\t: 1000\n")
+    return pos
+
+
+def render_mounts(buf: Ptr[uint8]) -> uint64:
+    # No mount table yet (M16.x defers a real struct mnt_namespace), so
+    # we emit the conventional layout the rest of M16 has wired up by
+    # convention. /etc/mtab consumers tolerate the static view because
+    # the kernel never unmounts these — they're root-pinned for boot.
+    pos: uint64 = 0
+    pos = _buf_put_str(buf, pos, "ramfs / ramfs rw 0 0\n")
+    pos = _buf_put_str(buf, pos, "procfs /proc procfs rw 0 0\n")
+    pos = _buf_put_str(buf, pos, "tmpfs /tmp tmpfs rw 0 0\n")
+    pos = _buf_put_str(buf, pos, "fat /mnt fat ro 0 0\n")
+    pos = _buf_put_str(buf, pos, "ext4 /ext ext4 rw 0 0\n")
+    return pos
+
+
 def proc_render(path: Ptr[char], buf: Ptr[uint8]) -> int64:
     # Dispatch on path. Returns bytes written, or -1 if the path
     # isn't a known /proc entry. Caller has already established
@@ -150,6 +201,12 @@ def proc_render(path: Ptr[char], buf: Ptr[uint8]) -> int64:
         return cast[int64](render_uptime(buf))
     if _path_eq(path, "/proc/tasks") != 0:
         return cast[int64](render_tasks(buf))
+    if _path_eq(path, "/proc/meminfo") != 0:
+        return cast[int64](render_meminfo(buf))
+    if _path_eq(path, "/proc/cpuinfo") != 0:
+        return cast[int64](render_cpuinfo(buf))
+    if _path_eq(path, "/proc/mounts") != 0:
+        return cast[int64](render_mounts(buf))
     return -1
 
 

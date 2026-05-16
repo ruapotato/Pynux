@@ -146,6 +146,27 @@ def tmpfs_data(slot: int32) -> Ptr[uint8]:
     return cast[Ptr[uint8]](tmpfs_table[cast[uint64](slot)].data)
 
 
+def tmpfs_unlink(name: Ptr[char]) -> int32:
+    # Mark the named entry free. We deliberately DO NOT kfree the
+    # backing buffer — tmpfs_open_for_write reuses it on the next
+    # create into the same slot ("if data == 0 then kmalloc" path),
+    # which keeps the slab churn down and matches the lazy-alloc
+    # shape of the create path. Real Linux tmpfs frees the inode's
+    # pages here; we'll wire that up when slab grows a free path
+    # we trust. Returns 0 on success, -ENOENT (-2) on miss.
+    slot: int32 = tmpfs_lookup(name)
+    if slot < 0:
+        return -2
+    su: uint64 = cast[uint64](slot)
+    tmpfs_table[su].used = 0
+    tmpfs_table[su].size = 0
+    # Wipe the first byte of the name so a half-matched stale key
+    # can't accidentally compare equal in tmpfs_lookup before the
+    # slot gets reused.
+    tmpfs_table[su].name[0] = 0
+    return 0
+
+
 def tmpfs_write(slot: int32, src: Ptr[uint8], pos: uint64,
                 count: uint64) -> uint64:
     # Write up to `count` bytes from `src` to entry `slot` starting at

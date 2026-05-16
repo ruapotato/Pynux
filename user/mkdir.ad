@@ -1,0 +1,41 @@
+# user/mkdir.ad
+#
+# Hamnix `mkdir`: stub binary that calls sys_mkdir for each path in
+# argv[1..]. At this milestone tmpfs is a flat namespace, so
+# SYS_MKDIR is a kernel-side no-op that always returns success —
+# this binary mostly exists so `mkdir foo` in hamsh doesn't error
+# out before real directory support lands. A real mkdir(2) — with
+# inode/dentry allocation, mode bits, EEXIST, ENOSPC — comes when
+# a backing FS grows a directory-create path (M16.66+).
+
+extern def sys_mkdir(path: Ptr[char]) -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2, "mkdir: missing operand\n")
+        return 1
+    failed: int32 = 0
+    i: int32 = 1
+    while i < argc:
+        path: Ptr[char] = cast[Ptr[char]](argv[cast[uint64](i)])
+        rc: int32 = sys_mkdir(path)
+        if rc != 0:
+            write_str(2, "mkdir: cannot create directory ")
+            write_str(2, cast[Ptr[uint8]](path))
+            write_str(2, "\n")
+            failed = 1
+        i = i + 1
+    return failed

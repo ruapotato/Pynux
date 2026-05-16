@@ -51,3 +51,15 @@ build_adder_user pwd                  # M16.47: print working dir
 build_adder_user head                 # M16.57: first N lines
 build_adder_user wc                   # M16.57: line/word/byte count
 build_adder_user grep                 # M16.57: substring line filter
+build_adder_user seq                  # M16.64: 1..N or M..N output
+build_adder_user uname                # M16.64: system identification
+build_adder_user true                 # M16.64: exit 0
+build_adder_user false                # M16.64: exit 1
+build_adder_user yes                  # M16.64: repeat-until-SIGINT
+build_adder_user sleep                # M16.64: jiffies-based delay
+build_adder_user sort                 # M16.64: insertion sort of stdin
+build_adder_user tee                  # M16.64: fan stdin to stdout + file
+build_adder_user rev                  # M16.64: per-line reverse
+build_adder_user rm                   # M16.65: tmpfs unlink
+build_adder_user touch                # M16.65: create-empty / truncate
+build_adder_user mkdir                # M16.65: no-op stub (flat tmpfs)

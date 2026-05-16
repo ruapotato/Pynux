@@ -1,0 +1,130 @@
+# user/sort.ad
+#
+# Hamnix `sort`: reads stdin (cap ~8 KiB), splits on newlines,
+# insertion-sorts the lines lexicographically (byte-wise), writes
+# the result. Insertion sort is fine for our scale — initramfs
+# inputs are small and the worst case (a few hundred short lines)
+# is still well under a tick. Lines longer than 256 bytes are
+# truncated to keep the per-line buffer flat.
+
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+INPUT_CAP: uint64 = 8192
+LINE_CAP:  uint64 = 256
+LINES_MAX: uint64 = 256
+
+
+# Globals so the buffers don't blow the kernel-side user stack.
+in_buf:    Array[8192, uint8]
+# Pack lines into a single 2D-shaped flat array: line i occupies
+# [i*LINE_CAP .. i*LINE_CAP + len[i]]. Avoids a real 2D type which
+# the M16 backend doesn't carry yet.
+lines_buf: Array[65536, uint8]      # LINES_MAX * LINE_CAP
+lens:      Array[256, uint64]
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def line_cmp(a_idx: uint64, b_idx: uint64) -> int32:
+    # Byte-wise compare of two stored lines. Returns -1/0/1 with
+    # the shorter line being smaller on a common prefix tie.
+    la: uint64 = lens[a_idx]
+    lb: uint64 = lens[b_idx]
+    ab: uint64 = a_idx * 256
+    bb: uint64 = b_idx * 256
+    n: uint64 = la
+    if lb < n:
+        n = lb
+    i: uint64 = 0
+    while i < n:
+        ca: uint8 = lines_buf[ab + i]
+        cb: uint8 = lines_buf[bb + i]
+        if ca < cb:
+            return -1
+        if ca > cb:
+            return 1
+        i = i + 1
+    if la < lb:
+        return -1
+    if la > lb:
+        return 1
+    return 0
+
+
+def swap_lines(a: uint64, b: uint64):
+    # Swap the per-line byte spans and lengths in place. Cheap
+    # enough since LINE_CAP is only 256 bytes per swap.
+    ta: uint64 = lens[a]
+    lens[a] = lens[b]
+    lens[b] = ta
+    ab: uint64 = a * 256
+    bb: uint64 = b * 256
+    i: uint64 = 0
+    while i < 256:
+        tb: uint8 = lines_buf[ab + i]
+        lines_buf[ab + i] = lines_buf[bb + i]
+        lines_buf[bb + i] = tb
+        i = i + 1
+
+
+def main() -> int32:
+    # 1. Slurp stdin into in_buf.
+    total: uint64 = 0
+    while total < INPUT_CAP:
+        n: int64 = sys_read(0, cast[Ptr[uint8]](
+            cast[uint64](&in_buf[0]) + total),
+            INPUT_CAP - total)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+
+    # 2. Split on '\n' into the lines table. Lines longer than
+    #    LINE_CAP get clipped at the boundary.
+    line_ct: uint64 = 0
+    cur_len: uint64 = 0
+    i: uint64 = 0
+    while i < total and line_ct < LINES_MAX:
+        c: uint8 = in_buf[i]
+        if c == 10:
+            lens[line_ct] = cur_len
+            line_ct = line_ct + 1
+            cur_len = 0
+        else:
+            if cur_len < LINE_CAP:
+                lines_buf[line_ct * 256 + cur_len] = c
+                cur_len = cur_len + 1
+        i = i + 1
+    # Trailing partial line without a newline still counts.
+    if cur_len > 0 and line_ct < LINES_MAX:
+        lens[line_ct] = cur_len
+        line_ct = line_ct + 1
+
+    # 3. Insertion sort. n^2/2 comparisons; fine at <= 256 lines.
+    k: uint64 = 1
+    while k < line_ct:
+        j: uint64 = k
+        while j > 0 and line_cmp(j - 1, j) > 0:
+            swap_lines(j - 1, j)
+            j = j - 1
+        k = k + 1
+
+    # 4. Emit. Always write a trailing newline per line, even if
+    #    the input's last line lacked one — matches coreutils sort.
+    p: uint64 = 0
+    while p < line_ct:
+        sys_write(1, cast[Ptr[uint8]](
+            cast[uint64](&lines_buf[0]) + p * 256), lens[p])
+        sys_write(1, "\n", 1)
+        p = p + 1
+    return 0

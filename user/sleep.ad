@@ -1,0 +1,53 @@
+# user/sleep.ad
+#
+# Hamnix `sleep N`: busy-waits N seconds against the 100Hz jiffies
+# counter. There's no nanosleep yet, so we spin in user mode reading
+# sys_get_jiffies — the scheduler still preempts us on the timer
+# tick, so other tasks make forward progress.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_get_jiffies() -> uint64
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def parse_int(s: Ptr[uint8]) -> int64:
+    n: int64 = 0
+    i: uint64 = 0
+    if s[0] == 0:
+        return -1
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int64](c - 48)
+        i = i + 1
+    return n
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2, "sleep: usage: sleep SECONDS\n")
+        return 1
+    secs: int64 = parse_int(cast[Ptr[uint8]](argv[1]))
+    if secs < 0:
+        write_str(2, "sleep: bad SECONDS\n")
+        return 1
+    # 100Hz tick → ticks = seconds * 100. Capture start once and
+    # compare deltas so the loop is robust against jiffies overflow
+    # within the run window.
+    start: uint64 = sys_get_jiffies()
+    target: uint64 = cast[uint64](secs) * 100
+    while sys_get_jiffies() - start < target:
+        # Spin. The kernel timer preempts us every 10ms.
+        pass
+    return 0

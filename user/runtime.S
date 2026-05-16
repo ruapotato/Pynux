@@ -275,3 +275,28 @@ sys_getcwd:
     syscall
     ret
     .size sys_getcwd, .-sys_getcwd
+
+
+    /* --- sys_unlink(path) -> int32 -----------------------------------
+     * Remove a name from the filesystem. tmpfs frees the slot;
+     * other backings return -EROFS until their write paths land. */
+    .globl sys_unlink
+    .type sys_unlink, @function
+sys_unlink:
+    movq    $21, %rax               /* SYS_UNLINK */
+    syscall
+    ret
+    .size sys_unlink, .-sys_unlink
+
+
+    /* --- sys_mkdir(path) -> int32 ------------------------------------
+     * No-op stub at this scale (tmpfs is flat). Returns 0 so
+     * userland `mkdir foo` doesn't error out before the real
+     * directory machinery exists. */
+    .globl sys_mkdir
+    .type sys_mkdir, @function
+sys_mkdir:
+    movq    $22, %rax               /* SYS_MKDIR */
+    syscall
+    ret
+    .size sys_mkdir, .-sys_mkdir

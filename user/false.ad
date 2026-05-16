@@ -1,0 +1,7 @@
+# user/false.ad
+#
+# `false`: failure exit, no output. The exit code (1) flows out
+# through _start's main()->sys_exit forwarding in user/runtime.S.
+
+def main() -> int32:
+    return 1

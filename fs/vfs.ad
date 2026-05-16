@@ -39,7 +39,7 @@ from fs.cpio import (
 from fs.procfs import is_proc_path, proc_render
 from fs.tmpfs import (
     is_tmpfs_path, tmpfs_lookup, tmpfs_open_for_write,
-    tmpfs_size, tmpfs_data, tmpfs_write,
+    tmpfs_size, tmpfs_data, tmpfs_write, tmpfs_unlink,
 )
 from fs.pipe import (
     pipe_alloc, pipe_read, pipe_write,
@@ -52,6 +52,7 @@ from fs.fat import (
 from fs.ext4 import (
     is_ext_path, strip_ext_prefix, ext4_open, ext4_close,
     ext4_open_size, ext4_open_inum, ext4_read_file, ext4_listdir,
+    ext4_open_create_or_trunc, ext4_write_open_file,
 )
 from mm.slab import kmalloc, kfree
 
@@ -162,25 +163,58 @@ def vfs_open(name: Ptr[char]) -> int32:
 
 
 def vfs_open_write(name: Ptr[char]) -> int32:
-    # Open-or-create for write. Only tmpfs paths are writable at this
-    # scale (cpio is read-only baked-in; procfs is read-only by
-    # design). Truncates the file on open — matches Linux O_CREAT |
-    # O_WRONLY | O_TRUNC semantics, which is what `> file` shell
-    # redirection wants.
-    if is_tmpfs_path(name) == 0:
+    # Open-or-create for write with O_CREAT | O_WRONLY | O_TRUNC
+    # semantics, which is what `> file` shell redirection wants.
+    # Writable backends:
+    #   - tmpfs (in-RAM /tmp/*)
+    #   - ext4 root (/ext/*) since M16.64 — single-block files only
+    # cpio (initramfs) is read-only baked-in; procfs is read-only by
+    # design; FAT writes aren't wired.
+    if is_tmpfs_path(name) != 0:
+        slot: int32 = tmpfs_open_for_write(name)
+        if slot < 0:
+            return ENOSPC
+        task: Ptr[TaskStruct] = current_task()
+        fd: int32 = _alloc_fd(task)
+        if fd < 0:
+            return EMFILE
+        fdu: uint64 = cast[uint64](fd)
+        task[0].fd_idx[fdu] = FD_TMPFS_MARK
+        task[0].fd_pos[fdu] = 0
+        task[0].fd_buf[fdu] = cast[uint64](slot)
+        return fd
+    if is_ext_path(name) != 0:
+        # M16.64 scope: root dir only. strip_ext_prefix gives us the
+        # bare leaf name. A subdir-bearing path (e.g. /ext/sub/foo)
+        # falls through to create_or_trunc which scans root only and
+        # refuses; that's a graceful -EROFS for now.
+        eslot: int32 = ext4_open_create_or_trunc(strip_ext_prefix(name))
+        if eslot < 0:
+            return ENOSPC
+        task: Ptr[TaskStruct] = current_task()
+        fd: int32 = _alloc_fd(task)
+        if fd < 0:
+            ext4_close(eslot)
+            return EMFILE
+        fdu: uint64 = cast[uint64](fd)
+        task[0].fd_idx[fdu] = FD_EXT4_MARK
+        task[0].fd_pos[fdu] = 0
+        task[0].fd_buf[fdu] = cast[uint64](eslot)
+        return fd
+    return EROFS
+
+
+def vfs_unlink(name: Ptr[char]) -> int32:
+    # Mirrors fs/namei.c::do_unlinkat() at the smallest meaningful
+    # scope: route by path prefix to the backing FS. Only tmpfs is
+    # truly writable, so /tmp/* delegates and everything else falls
+    # back to -EROFS. ext4 wiring lands in M16.65+ alongside the
+    # rest of the write path.
+    if is_tmpfs_path(name) != 0:
+        return tmpfs_unlink(name)
+    if is_ext_path(name) != 0:
         return EROFS
-    slot: int32 = tmpfs_open_for_write(name)
-    if slot < 0:
-        return ENOSPC
-    task: Ptr[TaskStruct] = current_task()
-    fd: int32 = _alloc_fd(task)
-    if fd < 0:
-        return EMFILE
-    fdu: uint64 = cast[uint64](fd)
-    task[0].fd_idx[fdu] = FD_TMPFS_MARK
-    task[0].fd_pos[fdu] = 0
-    task[0].fd_buf[fdu] = cast[uint64](slot)
-    return fd
+    return EROFS
 
 
 def _path_eq_const(name: Ptr[char], expected: Ptr[uint8],
@@ -584,7 +618,17 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # FAT cache flushes, journal).
         return cast[int64](EROFS)
     if file_idx == FD_EXT4_MARK:
-        return cast[int64](EROFS)
+        # M16.64: ext4 write path. Single-block scope — caps at
+        # ext4_block_size bytes per file. Larger writes return the
+        # short count (caller's outer loop will see we stopped
+        # before count and either give up or retry — they retry,
+        # since we return 0 once we've hit the cap).
+        eslot: int32 = cast[int32](task[0].fd_buf[fdu])
+        pos:   uint64 = task[0].fd_pos[fdu]
+        n: int64 = ext4_write_open_file(eslot, buf, pos, count)
+        if n > 0:
+            task[0].fd_pos[fdu] = pos + cast[uint64](n)
+        return n
     if file_idx == FD_PIPE_MARK_W:
         # Blocking write: drain as much as the ring will accept,
         # yielding when full until a reader makes room. EPIPE if

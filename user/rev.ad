@@ -1,0 +1,52 @@
+# user/rev.ad
+#
+# Hamnix `rev`: reads stdin line by line and emits each line with
+# its bytes in reverse order. Newlines mark line boundaries and are
+# preserved (not reversed into the previous line). Lines longer
+# than LINE_BUF get clipped — matches the grep.ad convention.
+
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+
+LINE_BUF: uint64 = 1024
+
+# Global so it doesn't blow the kernel-side stack allocation.
+line: Array[1024, uint8]
+rev_buf: Array[1024, uint8]
+
+
+def flush_line(n: uint64):
+    # Materialise the reversed copy into rev_buf and emit it in
+    # one syscall. Per-byte sys_write would dominate runtime.
+    i: uint64 = 0
+    while i < n:
+        rev_buf[i] = line[n - 1 - i]
+        i = i + 1
+    sys_write(1, &rev_buf[0], n)
+    sys_write(1, "\n", 1)
+
+
+def main() -> int32:
+    chunk: Array[256, uint8]
+    pos: uint64 = 0
+    while True:
+        n: int64 = sys_read(0, &chunk[0], 256)
+        if n <= 0:
+            break
+        i: uint64 = 0
+        while i < cast[uint64](n):
+            c: uint8 = chunk[i]
+            if c == 10:
+                flush_line(pos)
+                pos = 0
+            else:
+                if pos + 1 < LINE_BUF:
+                    line[pos] = c
+                    pos = pos + 1
+            i = i + 1
+    # Trailing line without a final newline still gets reversed +
+    # emitted (with the synthetic '\n' from flush_line).
+    if pos > 0:
+        flush_line(pos)
+    return 0

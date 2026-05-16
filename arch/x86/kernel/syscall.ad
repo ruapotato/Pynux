@@ -38,6 +38,7 @@ from kernel.sched.core import (
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_write,
     vfs_close, vfs_lseek, vfs_dup, vfs_dup2, vfs_listdir,
+    vfs_unlink,
     resolve_path,
     initramfs_data_ptr, initramfs_data_size,
 )
@@ -82,6 +83,8 @@ SYS_DUP2:        uint64 = 17                   # a0=oldfd, a1=newfd; returns new
 SYS_LISTDIR:     uint64 = 18                   # a0=path, a1=buf, a2=count; returns bytes
 SYS_CHDIR:       uint64 = 19                   # a0=path; returns 0 / -E2BIG
 SYS_GETCWD:      uint64 = 20                   # a0=buf, a1=count; returns bytes (incl NUL)
+SYS_UNLINK:      uint64 = 21                   # a0=path; returns 0 / -errno
+SYS_MKDIR:       uint64 = 22                   # a0=path; no-op stub (tmpfs is flat)
 
 # M16.35: the previous user_rsp_save / kernel_rsp globals were
 # retired in favour of a per-task syscall stack. syscall_entry now
@@ -403,6 +406,21 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
                 return i
         dst[i] = 0
         return i + 1
+    if nr == SYS_UNLINK:
+        # Resolve to absolute first so vfs_unlink's prefix routing
+        # sees the canonical form (matches SYS_OPEN's behaviour).
+        abs_path: Array[256, uint8]
+        rc: int32 = resolve_path(cast[Ptr[char]](a0), &abs_path[0], 256)
+        if rc != 0:
+            return cast[uint64](rc)
+        rc = vfs_unlink(cast[Ptr[char]](&abs_path[0]))
+        return cast[uint64](rc)
+    if nr == SYS_MKDIR:
+        # Stub: tmpfs is a flat namespace right now, so we just say
+        # "ok" and let the create-on-open path do the real work.
+        # Real fs/namei.c::do_mkdirat() lands when a backing FS
+        # actually has a directory inode to allocate.
+        return 0
     if nr == SYS_WAITPID:
         # Block until the named child enters STATE_EXITED, then
         # return its exit_code AND reap the slot. Without the reap

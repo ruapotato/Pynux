@@ -68,9 +68,15 @@ set +e
     # = 55 lines.
     printf '/ls /ext | /wc\n'
     sleep 2
+    # M16.64: ext4 write through shell `>` redirect. /echo writes
+    # "WRITE_VIA_SHELL\n" into a new ext4 file; /cat reads it back.
+    printf '/echo WRITE_VIA_SHELL > /ext/USERMADE.TXT\n'
+    sleep 2
+    printf '/cat /ext/USERMADE.TXT\n'
+    sleep 2
     printf 'exit\n'
     sleep 1
-) | timeout 30s qemu-system-x86_64 \
+) | timeout 40s qemu-system-x86_64 \
     -kernel "$ELF" \
     -drive file=build/ext4.img,if=virtio,format=raw \
     -smp 2 \
@@ -98,7 +104,8 @@ for needle in \
     "DEPTH1_MARKER ext4 index extents work" \
     "ext4: bitmap smoke PASS" \
     "ext4: create smoke PASS" \
-    "CREATE_OK ext4 file-create round-trip works"
+    "CREATE_OK ext4 file-create round-trip works" \
+    "WRITE_VIA_SHELL"
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_ext4] OK: '$needle'"
@@ -134,12 +141,14 @@ if grep -F -q "/cat /ext/FILE49.TXT" "$LOG"; then
     fi
 fi
 
-# /ls /ext | /wc — root dir has 57 entries (., .., lost+found,
-# HELLO.TXT, BIG.TXT, SUB, FILE00..FILE49, SMOKE.TXT). SMOKE.TXT
-# was created by ext4_create_smoke_test at kernel init; the count
-# verifies that BOTH the multi-block listdir works (a single-block
-# walker would stop ~30) AND that the M16.63 dirent insert is
-# visible through the same listdir path. /wc emits "lines words bytes".
+# /ls /ext | /wc — root dir has 57 entries before the shell write
+# (., .., lost+found, HELLO.TXT, BIG.TXT, SUB, FILE00..FILE49,
+# SMOKE.TXT). SMOKE.TXT was created by ext4_create_smoke_test at
+# kernel init; the count verifies that BOTH the multi-block listdir
+# works (a single-block walker would stop ~30) AND that the M16.63
+# dirent insert is visible through the same listdir path. The shell-
+# created USERMADE.TXT comes LATER in the session so it doesn't
+# affect this count.
 if echo "$cleaned" | grep -E -q "(^| )57 57 "; then
     echo "[test_ext4] OK: /ls /ext listed all 57 entries (multi-block + create)"
 else

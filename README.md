@@ -125,10 +125,6 @@ The end-game is a fully Hamnix-authored kernel.
 | M16.32 | Loadable kernel modules — insmod-equivalent; `mod/kmod_hello.S` loaded at runtime, calls back via API function-pointer table | **Done** |
 | M16.33 | `x86_64-adder-user` compiler target — userland programs written in Hamnix; `user/hello.py` runs as a real CPL-3 ELF | **Done** |
 
-The microcontroller OS the project originally shipped (ARM Cortex-M,
-QEMU mps2-an385, RP2040, STM32F4) still compiles via the original ARM
-Thumb-2 backend. It is intentionally kept working but is no longer the
-focus of new work.
 
 ## How it works
 

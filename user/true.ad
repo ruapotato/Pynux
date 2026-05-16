@@ -1,0 +1,7 @@
+# user/true.ad
+#
+# `true`: success exit, no output. Pairs with `false` for shell
+# control-flow primitives once hamsh grows `&&` / `||`.
+
+def main() -> int32:
+    return 0
