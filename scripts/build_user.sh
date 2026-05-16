@@ -78,3 +78,4 @@ build_adder_user date                 # M16.67: uptime-as-clock until RTC
 build_adder_user more                 # M16.67: 24-line pager over stdin
 build_adder_user find                 # M16.67: recursive listdir walk
 build_adder_user diff                 # M16.67: byte-compare two files
+build_adder_user motd  # M16.68: print /etc/motd

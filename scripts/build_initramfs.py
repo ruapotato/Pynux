@@ -112,6 +112,20 @@ def build_archive() -> bytes:
             print(f"  embedded {name} ({len(data)} bytes from "
                   f"build/user/{elf.name})")
 
+    # Baseline /etc files: anything in etc/ gets embedded as /etc/<name>
+    # so userland (motd, hostname, future login/init scripts) can read
+    # config from a Linux-conventional path without baking strings into
+    # binaries. Edit etc/* and re-run this script to refresh.
+    etc_dir = here / "etc"
+    if etc_dir.is_dir():
+        for ef in sorted(etc_dir.iterdir()):
+            if ef.is_file():
+                data = ef.read_bytes()
+                name = "/etc/" + ef.name
+                blob += cpio_entry(name, data)
+                print(f"  embedded {name} ({len(data)} bytes from "
+                      f"etc/{ef.name})")
+
     # Kernel modules: anything in build/mod/ gets embedded as /<stem>
     # so module_load() can fetch by path. Convention is to start the
     # binary names with "kmod_" so the cpio entries read /kmod_X.

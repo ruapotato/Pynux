@@ -1,0 +1,7 @@
+Welcome to Hamnix.
+
+This is a from-scratch x86_64 OS written in Adder. The kernel,
+filesystem drivers (ext4 + FAT32), block layer, and userland
+binaries are all hand-written. No third-party code.
+
+Try: /uname /ls /cat /proc/cpuinfo /find / /head /etc/motd
