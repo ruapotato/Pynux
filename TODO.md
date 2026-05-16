@@ -5,22 +5,7 @@ are fair game for any contributor — human or AI agent.
 
 ## Language
 
-- **`do-while` loop** — Python lacks it, but it's the right shape for
-  "execute body at least once, then test." A reasonable surface
-  syntax:
-
-  ```python
-  do:
-      body
-  while condition
-  ```
-
-  Implementation touches `compiler/lexer.py` (add `do` keyword),
-  `compiler/parser.py` (`parse_do_while`), `compiler/ast_nodes.py`
-  (`DoWhile` node), and `compiler/codegen_x86.py` (lower to a
-  `top: body; cmp; jne top` pair).
-  See [Adder compiler quirks](memory/feedback_compiler_quirks.md)
-  for known compiler footguns that may interact.
+- ~~**`do-while` loop** — shipped in commit `c563762`.~~
 
 ## Compiler
 
