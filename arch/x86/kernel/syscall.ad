@@ -35,6 +35,7 @@ from kernel.sched.core import (
     signal_post, signal_check_and_handle,
     get_cwd_buf, set_task_cwd, current_idx_get,
     set_linux_userspace_mode,
+    task_vfork_done, set_task_vfork_done,
 )
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_write,
@@ -317,9 +318,12 @@ def _build_user_argv_linux(ustack_top: uint64, argv_user: uint64,
         env_addrs[i] = str_sp
         i = i + 1
 
-    # 2. 16 bytes of AT_RANDOM material. Zero is fine for now — Hamnix
-    #    has no entropy source yet and musl uses these only for stack-
-    #    protector canary seeding, which is best-effort.
+    # 2. 16 bytes of AT_RANDOM material. Hamnix has no entropy source
+    #    yet so we leave the bytes zero. glibc seeds its stack-protector
+    #    canary from these (resulting in a zero canary), which is a
+    #    weakness, not a correctness issue — every saved canary on the
+    #    stack and every live TCB canary compare 0==0. A non-zero
+    #    canary would only be needed once a real RNG lands.
     str_sp = str_sp - 16
     cast[Ptr[uint64]](str_sp)[0]     = 0
     cast[Ptr[uint64]](str_sp + 8)[0] = 0
@@ -488,9 +492,166 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
                                    &argc_out, &argv_out)
     printk2("execve: jumping to %p with stack %p\n",
             entry, new_rsp)
+    # U26: if this task is a vfork-style child still sharing its
+    # parent's user image, signal the parent that we've replaced the
+    # image and it's safe to resume. The parent is spinning on
+    # task_vfork_done in do_clone; setting this here is the last
+    # moment before SYSRETQ swaps to the new user RIP/RSP. A regular
+    # (non-forked) execve still sets this — harmless, nobody's polling.
+    set_task_vfork_done(cast[int32](current_idx_get()), 1)
     do_execve_finish(entry, new_rsp, argc_out, argv_out)
     # Not reached.
     return 0
+
+
+def do_clone(flags: uint64, child_stack: uint64,
+             ptid: uint64, ctid: uint64, tls: uint64) -> int64:
+    # U26: vfork-style fork. Allocate a child task slot that shares the
+    # parent's user image (no fresh ELF load — child inherits the
+    # parent's address space exactly). The child's first iretq lands at
+    # the parent's saved user RIP (the instruction immediately after
+    # the SYSCALL that invoked us) with rax=0, so glibc's fork()
+    # wrapper sees "I am the child". The parent gets back the child's
+    # pid as the normal syscall return value.
+    #
+    # `flags` carries the standard Linux clone bits — for plain fork()
+    # this is SIGCHLD (0x11) and we honour none of the CLONE_* sharing
+    # bits at this milestone (no CLONE_VM/CLONE_FS/CLONE_FILES splits;
+    # the child gets its own cloned task_struct + an effectively shared
+    # user address space because both PML4s point at the same lower-
+    # level page tables). child_stack / ptid / ctid / tls are accepted
+    # for ABI compatibility with future CLONE_THREAD work but ignored
+    # here. The next milestone (U27) lights up real thread creation by
+    # honouring CLONE_VM | CLONE_THREAD and respecting child_stack.
+    #
+    # Blocking-parent semantics (vfork-equivalent). Until we have real
+    # copy-on-write page tables, parent and child literally share the
+    # same user stack page. If both run concurrently, the child's glibc
+    # post-fork() bookkeeping (canary check, _IO locks, ___run_postfork_
+    # handlers stack frames) pushes return addresses, locals, and a
+    # tcbhead_t robust-list write into the SAME memory that the parent's
+    # fork() return path expects to find unmodified — wild jumps to TLS
+    # data (e.g. 0xb6550) and abort() loops result. POSIX vfork solves
+    # this by blocking the parent until the child execve's or _exit's;
+    # we do the same here. do_execve sets task.vfork_done = 1 on its way
+    # out of the kernel, and task_exit_current implicitly wakes us by
+    # leaving STATE_RUNNING. Yields run with IRQs enabled briefly so the
+    # scheduler can swap to the child; otherwise the parent would loop
+    # forever with the child never getting a CPU slice.
+    parent: Ptr[TaskStruct] = current_task()
+    kstack_top: uint64 = parent[0].kstack_top
+    # syscall_64.S parks (user_rsp - 8) at kstack_top-8 (the user's
+    # original RSP minus the bytes pushq %r12 consumed), r11/RFLAGS at
+    # -16, and rcx/user_RIP at -24. We undo the r12 push so the
+    # child resumes at the parent's natural user RSP.
+    parent_user_rsp: uint64 = cast[Ptr[uint64]](kstack_top - 8)[0] + 8
+    parent_user_rip: uint64 = cast[Ptr[uint64]](kstack_top - 24)[0]
+    # Give the child its OWN user stack page, page-aligned, with the
+    # parent's stack content copied byte-for-byte so the child sees the
+    # same locals/canary/return chain as the parent did. Without this
+    # the two tasks would share the same stack page: glibc's child-side
+    # post-fork cleanup walks FILE._lock pointers and zeros them, and
+    # any FILE whose _lock happens to live on the stack (or any glibc
+    # global referencing a stack-relative pointer set up at __libc_init
+    # time) corrupts the parent's stack frame, blowing the canary check
+    # when the parent's fork() wrapper unwinds.
+    parent_ustack_top: uint64 = (parent_user_rsp + 4095) & ~cast[uint64](4095)
+    parent_ustack_base: uint64 = parent_ustack_top - 4096
+    child_ustack_base: uint64 = alloc_page()
+    if child_ustack_base == 0:
+        return cast[int64](-11)               # -EAGAIN
+    memcpy(cast[Ptr[uint8]](child_ustack_base),
+           cast[Ptr[uint8]](parent_ustack_base), 4096)
+    # Child's RSP lands at the same OFFSET into its private page that
+    # the parent has into hers — so the relative arrangement of saved
+    # rbp/rbx, the canary at rsp+8, the call return chain above, etc.,
+    # are all valid from the child's PoV too. Linux's COW fork has the
+    # exact same semantics; we're doing it eagerly because we lack the
+    # MMU plumbing for real COW.
+    rsp_offset: uint64 = parent_user_rsp - parent_ustack_base
+    child_user_rsp: uint64 = child_ustack_base + rsp_offset
+    # create_user_task_argv with a non-zero user_rsp skips the fresh
+    # ustack allocation and plants the supplied RSP straight into the
+    # iret frame — exactly what we want here, our child_user_rsp goes
+    # straight into the iret frame. argc / argv go into the iret rdi /
+    # rsi slots; glibc's fork() wrapper doesn't read those after
+    # syscall return so 0/0 is fine.
+    slot: int32 = create_user_task_argv(parent_user_rip,
+                                        0x5f5f666f726b5f5f,        # "__fork__"
+                                        child_user_rsp, 0, 0)
+    if slot < 0:
+        return cast[int64](-11)               # -EAGAIN
+    # Make the child's first read of the wake flag explicit. It's also
+    # zeroed by bss/_find_free_slot reuse, but defensive setting here
+    # keeps the contract obvious.
+    set_task_vfork_done(slot, 0)
+    # Mirror the parent's Linux-ABI mode onto the child so the child's
+    # first syscall (likely _exit / execve) routes through u_syscalls.
+    if parent[0].is_linux_userspace != 0:
+        set_linux_userspace_mode(slot, 1)
+    # Copy parent's fd table into the child. The fresh slot already
+    # has stdin/stdout/stderr pre-opened by _init_fd_table; overwrite
+    # those plus walk the rest of the table so opened files / pipes /
+    # FAT entries propagate. dup_fd_to_child bumps refcounts on
+    # FD_PIPE_MARK_* entries so closing the parent's end doesn't
+    # punch the channel out from under the child.
+    i: uint64 = 0
+    while i < 16:
+        dup_fd_to_child(slot, i, parent, i)
+        i = i + 1
+    # cwd inheritance: _inherit_cwd_from_parent was already called
+    # inside create_user_task_argv (it reads current_idx's cwd). Make
+    # it explicit here too so future refactors of that helper don't
+    # silently break fork(). set_task_cwd is idempotent.
+    set_task_cwd(cast[uint64](slot), get_cwd_buf(current_idx_get()))
+    child_pid: uint64 = task_pid_at(slot)
+    # Block until the child has either exited or replaced its user
+    # image via execve. Even with the private ustack copy above, glibc's
+    # post-fork bookkeeping mutates the SHARED Linux-side address space
+    # (heap, FILE list, _dl_load_lock) and ought not to overlap with
+    # the parent's continued execution at this milestone. This matches
+    # POSIX vfork semantics, which we approximate until we have real
+    # COW page tables. yield_to_others sti+hlt+cli's so the scheduler
+    # actually picks up the new task even though we entered with IF=0.
+    while task_vfork_done(slot) == 0 and \
+          task_state(slot) != STATE_EXITED:
+        yield_to_others()
+    return cast[int64](child_pid)
+
+
+def do_wait4(pid: uint64, wstatus_ptr: uint64,
+             options: uint64, rusage: uint64) -> int64:
+    # U26: Linux-shape waitpid. Mirrors the SYS_WAITPID body in
+    # do_syscall() but writes the result into *wstatus_ptr using the
+    # Linux wait-status encoding (low byte = signal that killed the
+    # process, byte 1 = exit code for WIFEXITED; we don't have signal
+    # exits yet so we always set byte 0 to 0 and exit_code << 8).
+    # `options` / `rusage` are accepted for ABI compatibility but
+    # ignored — WNOHANG (1) would change the polling shape but no U26
+    # caller uses it.
+    target: int32 = task_lookup_by_pid(pid)
+    if target < 0:
+        return cast[int64](-10)               # -ECHILD
+    # do-while: we want to check state at least once even if the child
+    # already exited before the parent reached wait4 (the common case
+    # for short-lived children like our test fixture's _exit(42)).
+    do:
+        if task_state(target) == STATE_EXITED:
+            break
+        yield_to_others()
+        target = task_lookup_by_pid(pid)
+        if target < 0:
+            return cast[int64](-10)
+    while 1
+    code: int64 = task_exit_code(target)
+    # Linux W* macros: WIFEXITED iff low byte == 0; WEXITSTATUS = byte 1.
+    # Encode the exit code into bits 15:8 so userspace's
+    # WEXITSTATUS(wstatus) == (wstatus >> 8) & 0xff returns our value.
+    if wstatus_ptr != 0:
+        cast[Ptr[int32]](wstatus_ptr)[0] = cast[int32]((code & 0xFF) << 8)
+    reaped_pid: uint64 = task_pid_at(target)
+    task_reap(target)
+    return cast[int64](reaped_pid)
 
 
 def syscall_init():

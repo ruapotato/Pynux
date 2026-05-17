@@ -87,6 +87,15 @@ class TaskStruct:
     # offset 0, and the per-task fd table still lives where vfs.ad
     # expects it.
     is_linux_userspace: int32         # offset 672
+    # U26: vfork-style fork wake flag. do_clone sets this to 0 on the
+    # newly-created child; the child clears the parent's blocking yield
+    # by transitioning to either STATE_EXITED or by writing 1 here from
+    # do_execve (signalling "child has replaced its user image and the
+    # parent is no longer sharing the address space"). Parent's do_clone
+    # spins yielding until this is non-zero OR the child has exited.
+    # Without this, the parent races the child on the SHARED user stack
+    # — both running glibc fork() return paths whose locals collide.
+    vfork_done: int32                 # offset 676
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -523,6 +532,21 @@ def task_is_linux_userspace(slot: int32) -> int32:
     # as a debug aid. The hot-path syscall dispatch reads the field
     # off current_task() directly to avoid the slot lookup.
     return task_table[cast[uint64](slot)].is_linux_userspace
+
+
+def task_vfork_done(slot: int32) -> int32:
+    # U26: read the vfork_done flag on the given slot. Used by do_clone
+    # in its blocking-parent yield loop to detect "child has replaced
+    # its user image" so the parent can resume without waiting for the
+    # exec'd binary to also exit.
+    return task_table[cast[uint64](slot)].vfork_done
+
+
+def set_task_vfork_done(slot: int32, v: int32):
+    # U26: set the vfork_done flag. do_execve calls this on the current
+    # task right before the SYSRETQ into the new image — that's the
+    # latest moment we can wake a blocked vfork parent without races.
+    task_table[cast[uint64](slot)].vfork_done = v
 
 
 def task_name0_at(slot: int32) -> uint64:

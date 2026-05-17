@@ -821,19 +821,39 @@ def _u_unimpl_nanosleep(a0: uint64, a1: uint64, a2: uint64,
     return ELINUX_NOSYS
 
 
-def _u_unimpl_clone(a0: uint64, a1: uint64, a2: uint64,
-                    a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+def _u_clone(a0: uint64, a1: uint64, a2: uint64,
+             a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # long clone(unsigned long flags, void *child_stack,
+    #            int *ptid, int *ctid, unsigned long tls)
+    #
+    # U26: forward to the kernel's shared do_clone helper. We honour
+    # none of the CLONE_* sharing bits yet — every clone() at this
+    # milestone behaves like a vfork-style fork(): brand-new task
+    # slot, shared user address space (PML4s cloned but lower-level
+    # mappings shared), child resumes at the parent's saved syscall
+    # return RIP with rax=0 so glibc's fork() sees the conventional
+    # "I'm the child" return value. child_stack / ptid / ctid / tls
+    # are passed through for ABI compatibility and ignored until U27
+    # (real pthread_create via CLONE_VM | CLONE_THREAD).
+    return do_clone(a0, a1, a2, a3, a4)
 
 
-def _u_unimpl_fork(a0: uint64, a1: uint64, a2: uint64,
-                   a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+def _u_fork(a0: uint64, a1: uint64, a2: uint64,
+            a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # pid_t fork(void). Identical to clone(SIGCHLD, NULL, NULL, NULL, 0)
+    # — the canonical Linux mapping. 0x11 == SIGCHLD.
+    return do_clone(cast[uint64](0x11), 0, 0, 0, 0)
 
 
-def _u_unimpl_vfork(a0: uint64, a1: uint64, a2: uint64,
-                    a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+def _u_vfork(a0: uint64, a1: uint64, a2: uint64,
+             a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # pid_t vfork(void). On real Linux vfork suspends the parent until
+    # the child execve's or _exit's. Hamnix's "fork" is already
+    # vfork-style at this milestone (shared address space until exec),
+    # so vfork and fork are the same call here. CLONE_VM | CLONE_VFORK
+    # | SIGCHLD would be the faithful flag set; we don't need to
+    # distinguish them in do_clone yet.
+    return do_clone(cast[uint64](0x4111), 0, 0, 0, 0)
 
 
 def _u_execve(a0: uint64, a1: uint64, a2: uint64,
@@ -851,9 +871,17 @@ def _u_execve(a0: uint64, a1: uint64, a2: uint64,
     return do_execve(a0, a1, a2)
 
 
-def _u_unimpl_wait4(a0: uint64, a1: uint64, a2: uint64,
-                    a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+def _u_wait4(a0: uint64, a1: uint64, a2: uint64,
+             a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # pid_t wait4(pid_t pid, int *wstatus, int options,
+    #             struct rusage *rusage)
+    #
+    # U26: forward to the kernel's shared do_wait4 helper, which mirrors
+    # the existing SYS_WAITPID body but writes the Linux-shape wait
+    # status (exit code in bits 15:8) into *wstatus_ptr. glibc's
+    # waitpid() is the thin wrapper waitpid(pid, st, opt) ->
+    # wait4(pid, st, opt, NULL) — same path.
+    return do_wait4(a0, a1, a2, a3)
 
 
 # =====================================================================
@@ -1554,17 +1582,17 @@ def linux_u_syscall_dispatch(nr: uint64,
     if nr == SYS_getpid:
         return _u_getpid(a0, a1, a2, a3, a4, a5)
     if nr == SYS_clone:
-        return _u_unimpl_clone(a0, a1, a2, a3, a4, a5)
+        return _u_clone(a0, a1, a2, a3, a4, a5)
     if nr == SYS_fork:
-        return _u_unimpl_fork(a0, a1, a2, a3, a4, a5)
+        return _u_fork(a0, a1, a2, a3, a4, a5)
     if nr == SYS_vfork:
-        return _u_unimpl_vfork(a0, a1, a2, a3, a4, a5)
+        return _u_vfork(a0, a1, a2, a3, a4, a5)
     if nr == SYS_execve:
         return _u_execve(a0, a1, a2, a3, a4, a5)
     if nr == SYS_exit:
         return _u_exit(a0, a1, a2, a3, a4, a5)
     if nr == SYS_wait4:
-        return _u_unimpl_wait4(a0, a1, a2, a3, a4, a5)
+        return _u_wait4(a0, a1, a2, a3, a4, a5)
     if nr == SYS_kill:
         return _u_kill(a0, a1, a2, a3, a4, a5)
     if nr == SYS_uname:
