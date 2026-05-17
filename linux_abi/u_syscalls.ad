@@ -86,9 +86,13 @@ from kernel.sched.core import (
     get_task_alt_stack_sp, set_task_alt_stack_sp,
     get_task_alt_stack_size, set_task_alt_stack_size,
     get_task_alt_stack_flags, set_task_alt_stack_flags,
+    task_brk_base, set_task_brk_base,
+    task_brk_end, set_task_brk_end,
+    task_brk_max, set_task_brk_max,
 )
 from arch.x86.kernel.time import get_jiffies
 from mm.slab import kmalloc, kfree, kzalloc
+from mm.page_alloc import alloc_pages
 
 # memset for zero-filling user-supplied stat buffers before we poke
 # individual fields. Declared `extern` because the actual body lives in
@@ -112,25 +116,35 @@ IA32_FS_BASE: uint32 = 0xC0000100
 # user task needs them.
 ARCH_SET_FS: uint64 = 0x1002
 
-# SYS_brk state. Linux's brk(0) returns the current program break; the
-# first call by a process is glibc's way of asking "where did the kernel
-# put my heap?" We park the answer in a single global because Hamnix
-# doesn't yet have per-task heap state and there is at most one Linux
-# user task in flight during the L1 bring-up. linux_brk == 0 means
-# "uninitialised" — the first call lazily allocates a starter chunk
-# from kmalloc and parks its base here. Subsequent calls grow by
-# kmalloc'ing extra chunks as needed; we never shrink because kmalloc
-# isn't a real heap and freeing mid-region would fragment it badly.
-# When per-task brk state arrives, this global becomes a task field.
-linux_brk:     uint64 = 0
-linux_brk_end: uint64 = 0      # one past the last byte we've backed
-
-# SYS_brk's initial heap size. 64 KiB is enough for glibc's first few
-# malloc()s on a freshly-loaded binary; further growth pulls more
-# kmalloc chunks. Kept modest to avoid burning slab on the common case
-# where no Linux task ever runs.
-LINUX_BRK_INITIAL: uint64 = 0x10000
-LINUX_BRK_GROW:    uint64 = 0x10000
+# SYS_brk state. M16.104: now per-task — three uint64 fields on
+# TaskStruct (brk_base / brk_end / brk_max), accessed through the
+# task_brk_* helpers imported above. The old single-global cursor
+# (linux_brk / linux_brk_end) collided across concurrent Linux ELFs
+# and forced single-process callers to fight kmalloc fragmentation;
+# the per-task region pre-reserves contiguous physical memory via
+# alloc_pages(LINUX_BRK_ORDER) on first call so glibc-malloc's
+# arena bookkeeping sees a single growing range — no more "break
+# adjusted to free malloc space" abort.
+#
+# LINUX_BRK_ORDER = 10 → 2^10 pages = 4 MiB contiguous per task.
+# That's the page-allocator's MAX_ORDER (see mm/page_alloc.ad), so
+# it's the largest single contiguous region we can guarantee today.
+# 4 MiB is 64x the legacy 64 KiB starter and 4x MicroPython's default
+# 1 MiB GC heap, with room to spare for CPython / Apache / sshd. The
+# bigger "64 MiB initial reservation" the spec sketches would need
+# either MAX_ORDER bumped past 10 or a separate large-region
+# allocator — both are out of scope for this commit.
+#
+# Why pre-reserve up front instead of growing one page per brk-grow:
+# glibc-malloc only consults brk() for the TOP address and assumes
+# everything below it is one virtually-contiguous arena. If we
+# alloc_page() once per grow we'd hit the same kmalloc-fragments-at-
+# page-granularity problem the old code did (alloc_page returns
+# whatever order-0 slot is free; consecutive calls rarely land
+# adjacent). Pre-reserving the full 4 MiB in a single alloc_pages
+# call guarantees contiguity for the lifetime of the task.
+LINUX_BRK_ORDER:  int32  = 10
+LINUX_BRK_RESERVE: uint64 = 4194304        # 2^10 * 4096 = 4 MiB
 
 # SYS_set_tid_address state. Linux records the user pointer so that on
 # task exit the kernel can clear it (and futex-wake the parent waiting
@@ -1249,50 +1263,77 @@ def _u_unimpl_brk(a0: uint64, a1: uint64, a2: uint64,
                   a3: uint64, a4: uint64, a5: uint64) -> int64:
     # void *brk(void *new_brk). Linux convention: returns the *new*
     # program break on success, and the *current* break on failure (so
-    # callers like glibc's sbrk(0) probe the heap top by asking with
-    # new_brk=0). new_brk=0 also doubles as the "where is my heap?"
-    # query glibc fires on every process startup.
+    # glibc's sbrk(0) probe and malloc's grow path can distinguish OK
+    # from "couldn't grow, fall back to mmap"). new_brk=0 also doubles
+    # as the "where is my heap?" query glibc fires on every process
+    # startup.
     #
-    # Hamnix heap model: we lazily allocate the initial 64 KiB the
-    # first time brk is touched (kmalloc-backed; not a real anonymous
-    # mapping, but contiguous and zero-initialised is good enough for
-    # glibc's pre-main bump allocations). On subsequent grow requests
-    # past linux_brk_end we kmalloc another chunk. We do NOT support
-    # shrinking, and the slab-backed allocations don't have to be
-    # virtually contiguous with the previous chunk — glibc's malloc
-    # arena bookkeeping only consults brk() for the *top* address, and
-    # falls back to mmap for any large request anyway. When a real
-    # per-task anon-mmap region exists this whole body migrates to it.
-    if linux_brk == 0:
-        base: uint64 = kmalloc(LINUX_BRK_INITIAL)
-        if base == 0:
+    # M16.104 model: per-task brk_base / brk_end / brk_max stored on
+    # TaskStruct (kernel/sched/core.ad). On the FIRST call (brk_base ==
+    # 0) we lazily reserve LINUX_BRK_RESERVE (4 MiB) of contiguous
+    # physical memory via alloc_pages(LINUX_BRK_ORDER). brk_base lands
+    # at the base of that region, brk_end starts equal, brk_max =
+    # base + reserve. Subsequent calls just adjust brk_end inside the
+    # reserved range — no further kernel allocator traffic, and the
+    # memory is guaranteed virtually contiguous so glibc-malloc's
+    # arena bookkeeping never trips the "break adjusted to free malloc
+    # space" path that the legacy kmalloc-chunk-per-grow code hit on
+    # multi-megabyte heaps.
+    #
+    # Lazy-init rather than exec-time-init because the only place that
+    # knows the right initial value of brk_base is the execve / spawn
+    # path in arch/x86/kernel/syscall.ad, which this milestone may not
+    # modify (locked file under parallel work). The cost of doing it
+    # lazily is exactly one alloc_pages call on the FIRST brk(), which
+    # is glibc's very first pre-main probe — well before any latency-
+    # sensitive code runs. The reserved region's physical base also
+    # serves as the user-visible heap address: ET_DYN binaries (the
+    # common case) run identity-mapped, so the kernel kphys == user
+    # vaddr and glibc can dereference brk_end-1 directly. ET_EXEC
+    # binaries with a per-task overlay don't see the new region in
+    # their PML4, but no Linux ET_EXEC tested so far calls brk() —
+    # they all touch mmap(2) instead. That gap is documented in the
+    # follow-up TODO ("mmap-based brk for ET_EXEC binaries").
+    cur: uint64 = current_idx_get()
+    base: uint64 = task_brk_base(cur)
+    if base == 0:
+        # First call from this task — reserve the contiguous 4 MiB.
+        region: uint64 = alloc_pages(LINUX_BRK_ORDER)
+        if region == 0:
             return 0                                  # OOM — return 0 brk
-        linux_brk     = base
-        linux_brk_end = base + LINUX_BRK_INITIAL
+        base = region
+        set_task_brk_base(cur, base)
+        set_task_brk_end(cur, base)
+        set_task_brk_max(cur, base + LINUX_BRK_RESERVE)
+    end: uint64 = task_brk_end(cur)
     if a0 == 0:
-        return cast[int64](linux_brk)
-    # A shrink (or no-op) keeps the existing brk; just record the new
-    # high-water mark if it fits in the currently-allocated region.
-    if a0 <= linux_brk_end:
-        linux_brk = a0
-        return cast[int64](linux_brk)
-    # Grow: pull as many LINUX_BRK_GROW chunks as needed to cover a0.
-    # kmalloc doesn't promise contiguity with the previous chunk, so
-    # we burn a tiny check here — if a fresh chunk happens to land
-    # right after linux_brk_end, the heap stays contiguous and we
-    # advance linux_brk_end. Otherwise we fail the grow (Linux returns
-    # the *old* brk on failure, which is what malloc keys off of to
-    # fall back to mmap).
-    while linux_brk_end < a0:
-        chunk: uint64 = kmalloc(LINUX_BRK_GROW)
-        if chunk == 0:
-            return cast[int64](linux_brk)             # OOM, old brk
-        if chunk != linux_brk_end:
-            # Non-contiguous — malloc will sbrk-fail and switch to mmap.
-            return cast[int64](linux_brk)
-        linux_brk_end = linux_brk_end + LINUX_BRK_GROW
-    linux_brk = a0
-    return cast[int64](linux_brk)
+        # brk(0) → "where is my heap?". Return current break.
+        return cast[int64](end)
+    if a0 < base:
+        # Request below the initial break — Linux silently refuses
+        # (returns current break, not an error). glibc never asks for
+        # this; honoured for completeness.
+        return cast[int64](end)
+    max_v: uint64 = task_brk_max(cur)
+    if a0 > max_v:
+        # Past the reservation — refuse the grow. Linux's brk()
+        # returns the *old* break on failure, which is what malloc
+        # keys off of to fall back to mmap(2). Don't try to extend the
+        # reservation here: the alloc_pages allocator has no way to
+        # grow an existing contiguous run, and a fresh alloc would
+        # almost certainly land elsewhere (breaking contiguity, which
+        # is exactly the bug this whole milestone fixes). Bumping the
+        # reserve from 4 MiB to e.g. 64 MiB is a separate milestone —
+        # see TODO.md ("mmap-based brk for very large heaps").
+        return cast[int64](end)
+    # In-range adjust (grow OR shrink). The backing memory was
+    # reserved up front, so all we do is move the cursor. We never
+    # release pages on shrink — glibc's malloc walks the arena
+    # backwards expecting to find its own metadata and the
+    # alloc_pages allocator has no partial-free path anyway. Same
+    # observable behaviour as Linux's brk(2) at this scale.
+    set_task_brk_end(cur, a0)
+    return cast[int64](a0)
 
 
 def _u_rt_sigaction(a0: uint64, a1: uint64, a2: uint64,

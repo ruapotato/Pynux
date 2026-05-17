@@ -72,22 +72,21 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 5
-    # u_python -X heapsize=64k -c "print('hello from hamnix')"
+    # u_python -c "print('hello from hamnix')"
     # hamsh's tokenizer supports double quotes (see user/hamsh.ad:240);
     # we use that to keep the print() expression as a single argv slot.
     #
-    # `-X heapsize=64k` shrinks MicroPython's GC arena from the default
-    # 1 MiB down to 64 KiB. The default forces glibc-malloc's main_arena
-    # onto Hamnix's brk() path, which can only grow contiguously when
-    # the underlying kmalloc returns adjacent chunks -- for million-byte
-    # requests that doesn't happen, malloc prints "break adjusted to
-    # free malloc space" + falls back to mmap, and somewhere in the
-    # arena bookkeeping a glibc assert fires (exit 134 = SIGABRT). With
-    # a 64 KiB heap the whole arena fits in a single kmalloc chunk and
-    # the interpreter runs cleanly. The same surface is exercised
-    # (brk + mmap + futex + clock_gettime + getrandom + read + write);
-    # the smaller heap just avoids the malloc-arena-grow corner case.
-    printf "u_python -X heapsize=64k -c \"print('hello from hamnix')\"\n"
+    # M16.104 dropped the `-X heapsize=64k` workaround. The legacy
+    # brk path kmalloc'd one chunk at a time and only succeeded when
+    # consecutive chunks happened to land adjacent -- for the default
+    # 1 MiB MicroPython GC arena that almost never happened, malloc
+    # printed "break adjusted to free malloc space" + aborted inside
+    # glibc-malloc's arena bookkeeping (exit 134 = SIGABRT). The new
+    # path reserves 4 MiB of CONTIGUOUS physical memory per task via
+    # alloc_pages(MAX_ORDER) on the first brk() call and just adjusts
+    # a per-task cursor inside it for subsequent calls -- guaranteed
+    # virtually contiguous, no kmalloc fragmentation, no abort.
+    printf "u_python -c \"print('hello from hamnix')\"\n"
     sleep 30
     printf 'exit\n'
     sleep 1
