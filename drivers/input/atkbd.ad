@@ -1,12 +1,23 @@
 # drivers/input/atkbd.py
 #
-# PS/2 AT keyboard driver scaffold. Mirrors drivers/input/keyboard/atkbd.c
-# in Linux at the smallest still-recognizable scale: poll the i8042
-# data/status ports, translate Set 1 scancodes to ASCII, and feed a
-# software FIFO that vfs_read can later drain. No IRQ wiring yet —
-# atkbd_poll() is intended to be called from the timer ISR (the same
-# place uart_drain_hw_to_fifo() runs), but the wiring is done by
-# init/main.ad, not here.
+# PS/2 AT keyboard driver. Mirrors drivers/input/keyboard/atkbd.c in
+# Linux at the smallest still-recognizable scale: poll the i8042
+# data/status ports, translate Set 1 scancodes to ASCII (or VT220/
+# xterm escape sequences for special keys), and feed a software FIFO
+# that vfs_read can later drain.
+#
+# M16.100 polish on top of the M16.75 scaffold:
+#   - Extended scancodes (0xE0 prefix) -> ANSI/VT220 escapes for
+#     arrows, Home/End, Insert/Delete, F1..F12, right Ctrl, right Alt.
+#   - Modifier-state tracking (Shift/Ctrl/Alt + CapsLock/NumLock).
+#   - Shift+letter / Caps+letter producing uppercase via XOR.
+#   - Shift+symbol producing US-104 shifted symbols (`1`->`!`, etc.).
+#   - Ctrl+letter producing the canonical 0x01..0x1A control bytes
+#     (Ctrl+C -> 0x03 keeps the M16.42 SIGINT path working — the
+#     byte still reaches the FIFO so /dev/cons readers see it).
+#
+# Still polled (drained from the timer tick in arch/x86/kernel/time.ad);
+# real IRQ 1 wiring is a separate milestone.
 #
 # Linux mapping:
 #   atkbd_interrupt() -> atkbd_poll()      (no IRQ context yet; polled)
@@ -33,20 +44,45 @@ KBD_STATUS_PORT: int32 = 0x64      # read status, write commands
 KBD_STATUS_OBF: int32 = 0x01
 
 # Set 1 high-bit flag — scancode | 0x80 is the break (key-up) event
-# for that scancode. We ignore key-ups entirely for the first cut.
+# for that scancode. For modifier keys we DO care about the break
+# (Shift release clears MOD_SHIFT); for normal keys we still skip
+# pushing on break (matches stock keyboard semantics — held-down
+# repeats come from the BIOS auto-repeat).
 SC1_BREAK_MASK: int32 = 0x80
+
+# Extended-scancode prefix. When 0xE0 arrives on its own, set
+# in_e0_prefix; the *next* byte selects from a parallel "extended"
+# decode table (arrows, F-keys, right-side modifiers, etc.).
+SC1_E0_PREFIX: int32 = 0xE0
+
+# --- Modifier state bitmask -------------------------------------------
+#
+# Layout intentionally matches the rough Linux input-event SHIFT/CTRL/
+# ALT bits enough that future readers don't have to context-switch.
+# CapsLock/NumLock are toggle bits — toggled on every make, ignored on
+# break (so a long press doesn't toggle twice).
+
+MOD_SHIFT: uint32 = 0x01
+MOD_CTRL:  uint32 = 0x02
+MOD_ALT:   uint32 = 0x04
+MOD_CAPS:  uint32 = 0x10
+MOD_NUM:   uint32 = 0x20
+
+kbd_state:      uint32 = 0
+in_e0_prefix:   int32  = 0
 
 
 # --- Scancode -> ASCII translation table -------------------------------
 #
 # Set 1 layout, qwerty US. Index is the make code (0x00..0x7F).
-# Entries that aren't covered stay 0; atkbd_poll() treats 0 as "skip,
-# don't push". Modifiers (shift/ctrl/alt) and the extended-prefix
-# 0xE0 sequences (arrow keys, etc.) are deliberately out of scope —
-# they need state we don't have yet.
+# Entries that aren't covered stay 0; atkbd_process_byte() treats 0
+# as "skip, don't push". Modifier scancodes (Shift/Ctrl/Alt/Caps/Num)
+# are handled explicitly in atkbd_process_byte BEFORE the table
+# lookup so they don't show up here as zero entries.
 
 SC1_TABLE_SIZE: uint64 = 128
-sc1_to_ascii: Array[128, uint8]
+sc1_to_ascii:   Array[128, uint8]
+sc1_to_shifted: Array[128, uint8]
 
 
 def atkbd_build_table():
@@ -94,10 +130,54 @@ def atkbd_build_table():
     sc1_to_ascii[0x31] = 110       # 'n'
     sc1_to_ascii[0x32] = 109       # 'm'
 
+    # Symbol keys (unshifted side). The shifted side is in
+    # sc1_to_shifted; both tables are indexed by the same scancode.
+    sc1_to_ascii[0x0C] = 45        # '-'
+    sc1_to_ascii[0x0D] = 61        # '='
+    sc1_to_ascii[0x1A] = 91        # '['
+    sc1_to_ascii[0x1B] = 93        # ']'
+    sc1_to_ascii[0x2B] = 92        # '\\'
+    sc1_to_ascii[0x27] = 59        # ';'
+    sc1_to_ascii[0x28] = 39        # '\''
+    sc1_to_ascii[0x29] = 96        # '`'
+    sc1_to_ascii[0x33] = 44        # ','
+    sc1_to_ascii[0x34] = 46        # '.'
+    sc1_to_ascii[0x35] = 47        # '/'
+
     # Whitespace and editing keys.
     sc1_to_ascii[0x39] = 32        # space
     sc1_to_ascii[0x1C] = 10        # Enter -> '\n' (LF, matches UART RX)
     sc1_to_ascii[0x0E] = 8         # Backspace -> 0x08 (BS)
+    sc1_to_ascii[0x0F] = 9         # Tab -> '\t'
+    sc1_to_ascii[0x01] = 27        # Esc -> 0x1B
+
+    # --- Shifted side of the US-104 layout ------------------------------
+    # Letters fall through to the case-flip in atkbd_apply_case() so
+    # they're absent here; only the symbol/number row entries differ
+    # between shifted and unshifted.
+
+    sc1_to_shifted[0x02] = 33      # '!'
+    sc1_to_shifted[0x03] = 64      # '@'
+    sc1_to_shifted[0x04] = 35      # '#'
+    sc1_to_shifted[0x05] = 36      # '$'
+    sc1_to_shifted[0x06] = 37      # '%'
+    sc1_to_shifted[0x07] = 94      # '^'
+    sc1_to_shifted[0x08] = 38      # '&'
+    sc1_to_shifted[0x09] = 42      # '*'
+    sc1_to_shifted[0x0A] = 40      # '('
+    sc1_to_shifted[0x0B] = 41      # ')'
+
+    sc1_to_shifted[0x0C] = 95      # '_'
+    sc1_to_shifted[0x0D] = 43      # '+'
+    sc1_to_shifted[0x1A] = 123     # '{'
+    sc1_to_shifted[0x1B] = 125     # '}'
+    sc1_to_shifted[0x2B] = 124     # '|'
+    sc1_to_shifted[0x27] = 58      # ':'
+    sc1_to_shifted[0x28] = 34      # '"'
+    sc1_to_shifted[0x29] = 126     # '~'
+    sc1_to_shifted[0x33] = 60      # '<'
+    sc1_to_shifted[0x34] = 62      # '>'
+    sc1_to_shifted[0x35] = 63      # '?'
 
 
 def sc1_translate(scancode: int32) -> int32:
@@ -112,12 +192,25 @@ def sc1_translate(scancode: int32) -> int32:
     return cast[int32](sc1_to_ascii[scancode])
 
 
+def sc1_translate_shifted(scancode: int32) -> int32:
+    # Returns the shifted ASCII byte for a Set 1 make code, or 0 if
+    # there's no distinct shifted form (which means "fall back to the
+    # unshifted form, possibly after case-flip for letters").
+    if scancode < 0:
+        return 0
+    if cast[uint64](scancode) >= SC1_TABLE_SIZE:
+        return 0
+    return cast[int32](sc1_to_shifted[scancode])
+
+
 # --- Software RX FIFO --------------------------------------------------
 #
 # Same ring-buffer shape as drivers/tty/serial/early_8250.ad's
 # uart_rx_fifo: head/tail indices, push drops on full, pop returns -1
 # on empty. 128 bytes is plenty for a human typing between timer
-# ticks (10 ms by default) — even 250 wpm tops out at ~20 cps.
+# ticks (10 ms by default) — even 250 wpm tops out at ~20 cps. The
+# extended-scancode paths can push up to 5 bytes per key (e.g. F12 is
+# `ESC [ 2 4 ~`), so the FIFO comfortably absorbs many keys-worth.
 
 KBD_FIFO_SIZE: uint64 = 128
 
@@ -155,29 +248,477 @@ def kbd_rx_has() -> int32:
     return 1
 
 
+# --- Special-key escape-sequence emitters -----------------------------
+#
+# VT220 / xterm convention. All sequences start with ESC (0x1B). The
+# strings are short enough that inlining the byte-by-byte push is
+# clearer than building a buffer + memcpy. Each helper pushes all
+# bytes or none-after-the-first if the FIFO fills mid-way (caller
+# can't tell; partial-escape is fine — the worst case is a wedged
+# escape sequence that a terminal will time out on, which is exactly
+# what a real serial console does too).
+
+def _push_esc_bracket(final: uint8):
+    # CSI form: ESC [ <final>.  Used for arrows + Home + End.
+    kbd_rx_push(27)                # ESC
+    kbd_rx_push(91)                # '['
+    kbd_rx_push(final)
+
+
+def _push_esc_o(final: uint8):
+    # SS3 form: ESC O <final>.  Used for F1..F4 (VT220-style).
+    kbd_rx_push(27)                # ESC
+    kbd_rx_push(79)                # 'O'
+    kbd_rx_push(final)
+
+
+def _push_esc_bracket_tilde(digits_a: uint8, digits_b: uint8):
+    # Numeric VT220 form: ESC [ <digits> ~.  Used for Insert/Delete
+    # (single digit) and F5..F12 (two digits). Pass 0 for digits_b
+    # when only one digit is needed; the helper skips it.
+    kbd_rx_push(27)                # ESC
+    kbd_rx_push(91)                # '['
+    kbd_rx_push(digits_a)
+    if digits_b != 0:
+        kbd_rx_push(digits_b)
+    kbd_rx_push(126)               # '~'
+
+
+def sc1_extended_emit(scancode: int32) -> int32:
+    # Push the VT220/xterm sequence for an extended scancode (the
+    # byte that followed 0xE0). Returns 1 if anything was pushed,
+    # 0 if the scancode is unknown (so the caller can fall back to a
+    # diagnostic). Modifier scancodes (right Ctrl 0x1D, right Alt
+    # 0x38) are handled BEFORE this function in atkbd_process_byte —
+    # they don't reach here.
+    if scancode == 0x48:
+        # Arrow Up
+        _push_esc_bracket(65)      # 'A'
+        return 1
+    if scancode == 0x50:
+        # Arrow Down
+        _push_esc_bracket(66)      # 'B'
+        return 1
+    if scancode == 0x4D:
+        # Arrow Right
+        _push_esc_bracket(67)      # 'C'
+        return 1
+    if scancode == 0x4B:
+        # Arrow Left
+        _push_esc_bracket(68)      # 'D'
+        return 1
+    if scancode == 0x47:
+        # Home
+        _push_esc_bracket(72)      # 'H'
+        return 1
+    if scancode == 0x4F:
+        # End
+        _push_esc_bracket(70)      # 'F'
+        return 1
+    if scancode == 0x52:
+        # Insert -> ESC [ 2 ~
+        _push_esc_bracket_tilde(50, 0)
+        return 1
+    if scancode == 0x53:
+        # Delete -> ESC [ 3 ~
+        _push_esc_bracket_tilde(51, 0)
+        return 1
+    if scancode == 0x49:
+        # PageUp -> ESC [ 5 ~
+        _push_esc_bracket_tilde(53, 0)
+        return 1
+    if scancode == 0x51:
+        # PageDown -> ESC [ 6 ~
+        _push_esc_bracket_tilde(54, 0)
+        return 1
+    if scancode == 0x1C:
+        # Keypad Enter — same as Enter (LF), no escape sequence.
+        kbd_rx_push(10)
+        return 1
+    if scancode == 0x35:
+        # Keypad '/' — same as '/'.
+        kbd_rx_push(47)
+        return 1
+    return 0
+
+
+def sc1_fkey_emit(scancode: int32) -> int32:
+    # F1..F12 are NOT extended-prefixed in Set 1 (the make codes are
+    # plain 0x3B..0x44, 0x57, 0x58). We funnel them through their own
+    # helper so the main translator's switch stays compact.
+    if scancode == 0x3B:
+        # F1 -> ESC O P
+        _push_esc_o(80)
+        return 1
+    if scancode == 0x3C:
+        # F2 -> ESC O Q
+        _push_esc_o(81)
+        return 1
+    if scancode == 0x3D:
+        # F3 -> ESC O R
+        _push_esc_o(82)
+        return 1
+    if scancode == 0x3E:
+        # F4 -> ESC O S
+        _push_esc_o(83)
+        return 1
+    if scancode == 0x3F:
+        # F5 -> ESC [ 1 5 ~
+        _push_esc_bracket_tilde(49, 53)
+        return 1
+    if scancode == 0x40:
+        # F6 -> ESC [ 1 7 ~
+        _push_esc_bracket_tilde(49, 55)
+        return 1
+    if scancode == 0x41:
+        # F7 -> ESC [ 1 8 ~
+        _push_esc_bracket_tilde(49, 56)
+        return 1
+    if scancode == 0x42:
+        # F8 -> ESC [ 1 9 ~
+        _push_esc_bracket_tilde(49, 57)
+        return 1
+    if scancode == 0x43:
+        # F9 -> ESC [ 2 0 ~
+        _push_esc_bracket_tilde(50, 48)
+        return 1
+    if scancode == 0x44:
+        # F10 -> ESC [ 2 1 ~
+        _push_esc_bracket_tilde(50, 49)
+        return 1
+    if scancode == 0x57:
+        # F11 -> ESC [ 2 3 ~
+        _push_esc_bracket_tilde(50, 51)
+        return 1
+    if scancode == 0x58:
+        # F12 -> ESC [ 2 4 ~
+        _push_esc_bracket_tilde(50, 52)
+        return 1
+    return 0
+
+
+# --- Modifier + case transforms ---------------------------------------
+
+def atkbd_apply_case(ch: int32) -> int32:
+    # Letters: Shift XOR CapsLock -> uppercase, else lowercase. (Both
+    # set means lowercase, matching every PC keyboard since 1985.)
+    if ch < 97:
+        return ch                  # not a lowercase letter
+    if ch > 122:
+        return ch
+    shift_on: int32 = 0
+    caps_on:  int32 = 0
+    if (kbd_state & MOD_SHIFT) != 0:
+        shift_on = 1
+    if (kbd_state & MOD_CAPS) != 0:
+        caps_on = 1
+    # XOR: 0^0=0 (lowercase), 1^0=1 (uppercase), 0^1=1 (uppercase),
+    # 1^1=0 (lowercase — both pressed).
+    if (shift_on ^ caps_on) != 0:
+        return ch - 32             # 'a'-'A' == 32
+    return ch
+
+
+def atkbd_apply_ctrl(ch: int32) -> int32:
+    # Ctrl+letter -> 0x01..0x1A. Convention: 'a'..'z' -> 1..26.
+    # Ctrl+C therefore = 0x03 (canonical SIGINT byte that hamsh's
+    # line discipline picks up). 'A'..'Z' (already-uppercase from a
+    # held Shift) get the same treatment so Ctrl+Shift+C still maps
+    # to 0x03 rather than the obscure 0x43 - 0x40 = 3 path; we just
+    # use bit-and 0x1F which folds both ranges.
+    if ch < 64:
+        return ch                  # not in the letter range at all
+    if ch > 122:
+        return ch
+    # Letters only: A-Z (65..90) or a-z (97..122). Anything in between
+    # (the symbol gap 91..96) is not Ctrl-able by convention; pass
+    # through.
+    if ch > 90:
+        if ch < 97:
+            return ch
+    return ch & 0x1F
+
+
 # --- Polled read path --------------------------------------------------
 #
-# atkbd_poll() is the equivalent of one IRQ1 take in Linux's atkbd_interrupt
-# fast path: read every byte the controller currently has buffered,
-# translate make codes, drop break codes. We drain in a loop because
-# QEMU (and real hardware under typing) will frequently have multiple
-# bytes pending between calls — leaving them queued delays input
-# arbitrarily.
+# atkbd_process_byte() is the core translator — split out from
+# atkbd_poll() so it's directly callable from atkbd_self_test() with
+# synthetic scancode bytes (no I/O port reads). atkbd_poll() does
+# nothing more than "while OBF: process one byte".
+
+def atkbd_process_byte(raw: int32):
+    sc: int32 = raw & 0xFF
+
+    # --- 1. 0xE0 prefix gate. -------------------------------------
+    # The prefix arrives on its own; the NEXT byte is the real
+    # scancode, looked up in the extended path. We set a sticky
+    # flag and return without emitting anything.
+    if sc == SC1_E0_PREFIX:
+        in_e0_prefix = 1
+        return
+
+    is_break: int32 = 0
+    if (sc & SC1_BREAK_MASK) != 0:
+        is_break = 1
+        sc = sc & 0x7F             # strip break bit for table lookup
+
+    # --- 2. Extended path. ----------------------------------------
+    if in_e0_prefix != 0:
+        # Right Ctrl (0xE0 0x1D / 0xE0 0x9D).
+        if sc == 0x1D:
+            if is_break != 0:
+                kbd_state = kbd_state & (~MOD_CTRL)
+            else:
+                kbd_state = kbd_state | MOD_CTRL
+            in_e0_prefix = 0
+            return
+        # Right Alt / AltGr (0xE0 0x38 / 0xE0 0xB8).
+        if sc == 0x38:
+            if is_break != 0:
+                kbd_state = kbd_state & (~MOD_ALT)
+            else:
+                kbd_state = kbd_state | MOD_ALT
+            in_e0_prefix = 0
+            return
+        # Everything else: ignore the break, decode the make.
+        if is_break == 0:
+            sc1_extended_emit(sc)
+        in_e0_prefix = 0
+        return
+
+    # --- 3. Plain modifier keys. ----------------------------------
+    # Left/Right Shift (0x2A, 0x36).
+    if sc == 0x2A:
+        if is_break != 0:
+            kbd_state = kbd_state & (~MOD_SHIFT)
+        else:
+            kbd_state = kbd_state | MOD_SHIFT
+        return
+    if sc == 0x36:
+        if is_break != 0:
+            kbd_state = kbd_state & (~MOD_SHIFT)
+        else:
+            kbd_state = kbd_state | MOD_SHIFT
+        return
+    # Left Ctrl (0x1D — the un-prefixed form).
+    if sc == 0x1D:
+        if is_break != 0:
+            kbd_state = kbd_state & (~MOD_CTRL)
+        else:
+            kbd_state = kbd_state | MOD_CTRL
+        return
+    # Left Alt (0x38).
+    if sc == 0x38:
+        if is_break != 0:
+            kbd_state = kbd_state & (~MOD_ALT)
+        else:
+            kbd_state = kbd_state | MOD_ALT
+        return
+    # CapsLock (0x3A) — toggle on make only, ignore the break so a
+    # long hold doesn't toggle twice.
+    if sc == 0x3A:
+        if is_break == 0:
+            kbd_state = kbd_state ^ MOD_CAPS
+        return
+    # NumLock (0x45) — same toggle-on-make semantics.
+    if sc == 0x45:
+        if is_break == 0:
+            kbd_state = kbd_state ^ MOD_NUM
+        return
+
+    # --- 4. Break codes for non-modifiers: drop. ------------------
+    if is_break != 0:
+        return
+
+    # --- 5. F-keys (un-prefixed in Set 1). ------------------------
+    if sc >= 0x3B:
+        if sc1_fkey_emit(sc) != 0:
+            return
+
+    # --- 6. Plain ASCII via the translation table. ----------------
+    ascii: int32 = sc1_translate(sc)
+    if ascii == 0:
+        return
+
+    # Shift transforms symbols / number row via the shifted table.
+    # If no entry, fall through (letters route via case-flip below).
+    if (kbd_state & MOD_SHIFT) != 0:
+        sh: int32 = sc1_translate_shifted(sc)
+        if sh != 0:
+            ascii = sh
+
+    # Letter case from Shift XOR CapsLock.
+    ascii = atkbd_apply_case(ascii)
+
+    # Ctrl+letter -> control code. Applied LAST so it overrides any
+    # case transform. Keep the byte going to the FIFO so userspace
+    # readline / SIGINT discipline still sees it (M16.42 invariant).
+    if (kbd_state & MOD_CTRL) != 0:
+        ascii = atkbd_apply_ctrl(ascii)
+
+    kbd_rx_push(cast[uint8](ascii & 0xFF))
+
 
 def atkbd_poll():
     # Status bit 0 must be set before each read; reading 0x60 with OBF
-    # clear returns stale or undefined data on real hardware.
+    # clear returns stale or undefined data on real hardware. We drain
+    # in a loop because QEMU (and real hardware under typing) will
+    # frequently have multiple bytes pending between calls — leaving
+    # them queued delays input arbitrarily.
     while (inb(KBD_STATUS_PORT) & KBD_STATUS_OBF) != 0:
-        sc: int32 = inb(KBD_DATA_PORT) & 0xFF
-        # Break code: high bit set means the key was released. Set 1
-        # encodes break as make | 0x80, so we just mask it off and
-        # skip pushing — we don't track key state yet.
-        if (sc & SC1_BREAK_MASK) != 0:
-            continue
-        ascii: int32 = sc1_translate(sc)
-        if ascii == 0:
-            continue
-        kbd_rx_push(cast[uint8](ascii))
+        raw: int32 = inb(KBD_DATA_PORT) & 0xFF
+        atkbd_process_byte(raw)
+
+
+# --- Boot-time self test ----------------------------------------------
+#
+# Drives atkbd_process_byte() with synthetic scancode sequences and
+# asserts the FIFO contents. Catches regressions in the modifier-
+# state machine and the extended-prefix decoder without needing
+# QEMU's `-monitor sendkey` infrastructure (which is awkward in
+# non-interactive scripts).
+#
+# Important: the self-test consumes whatever was in the FIFO before
+# it ran, then restores the FIFO head/tail to empty before returning.
+# Real keystrokes that race the self-test (highly unlikely during
+# boot but possible) are dropped — better than corrupting the post-
+# init state.
+
+selftest_pass: int32 = 0
+selftest_fail: int32 = 0
+
+
+def _selftest_reset():
+    kbd_head = 0
+    kbd_tail = 0
+    kbd_state = 0
+    in_e0_prefix = 0
+
+
+def _selftest_expect_byte(expected: int32, label: Ptr[uint8]):
+    got: int32 = kbd_rx_pop()
+    if got == expected:
+        selftest_pass = selftest_pass + 1
+    else:
+        selftest_fail = selftest_fail + 1
+        printk1("atkbd: self-test FAIL: expected/got mismatch (got=%d)\n",
+                cast[uint64](got))
+
+
+def atkbd_self_test():
+    selftest_pass = 0
+    selftest_fail = 0
+
+    # Case 1: lowercase 'a'. Scancode 0x1E, no modifiers.
+    _selftest_reset()
+    atkbd_process_byte(0x1E)
+    _selftest_expect_byte(97, cast[Ptr[uint8]](0))      # 'a'
+
+    # Case 2: Shift held, 'a' -> 'A'. Shift make, 'a' make, Shift break.
+    _selftest_reset()
+    atkbd_process_byte(0x2A)       # LShift make
+    atkbd_process_byte(0x1E)       # 'a' make -> should be 'A'
+    atkbd_process_byte(0xAA)       # LShift break
+    _selftest_expect_byte(65, cast[Ptr[uint8]](0))      # 'A'
+
+    # Case 3: CapsLock then 'a' -> 'A', then 'a' again (caps still
+    # on) -> still 'A'. Caps break must NOT toggle.
+    _selftest_reset()
+    atkbd_process_byte(0x3A)       # Caps make -> caps on
+    atkbd_process_byte(0xBA)       # Caps break -> NO change
+    atkbd_process_byte(0x1E)       # 'a' -> 'A'
+    _selftest_expect_byte(65, cast[Ptr[uint8]](0))
+    atkbd_process_byte(0x1E)       # 'a' -> 'A' (caps still latched)
+    _selftest_expect_byte(65, cast[Ptr[uint8]](0))
+
+    # Case 4: Shift+Caps+'a' -> 'a' (XOR cancels).
+    _selftest_reset()
+    atkbd_process_byte(0x3A)       # Caps on
+    atkbd_process_byte(0xBA)       # Caps break
+    atkbd_process_byte(0x2A)       # Shift make
+    atkbd_process_byte(0x1E)       # 'a' -> 'a' (xor cancel)
+    _selftest_expect_byte(97, cast[Ptr[uint8]](0))
+
+    # Case 5: Shift+'1' -> '!'.
+    _selftest_reset()
+    atkbd_process_byte(0x2A)       # Shift make
+    atkbd_process_byte(0x02)       # '1' -> '!'
+    _selftest_expect_byte(33, cast[Ptr[uint8]](0))      # '!'
+
+    # Case 6: Ctrl+'c' -> 0x03 (SIGINT byte).
+    _selftest_reset()
+    atkbd_process_byte(0x1D)       # Ctrl make
+    atkbd_process_byte(0x2E)       # 'c'
+    _selftest_expect_byte(0x03, cast[Ptr[uint8]](0))
+
+    # Case 7: Ctrl+Shift+'d' -> 0x04 (Shift doesn't suppress Ctrl-fold).
+    _selftest_reset()
+    atkbd_process_byte(0x1D)       # Ctrl
+    atkbd_process_byte(0x2A)       # Shift
+    atkbd_process_byte(0x20)       # 'd'
+    _selftest_expect_byte(0x04, cast[Ptr[uint8]](0))
+
+    # Case 8: Arrow Up -> ESC [ A (3 bytes).
+    _selftest_reset()
+    atkbd_process_byte(0xE0)       # extended prefix
+    atkbd_process_byte(0x48)       # up arrow
+    _selftest_expect_byte(27, cast[Ptr[uint8]](0))      # ESC
+    _selftest_expect_byte(91, cast[Ptr[uint8]](0))      # '['
+    _selftest_expect_byte(65, cast[Ptr[uint8]](0))      # 'A'
+
+    # Case 9: Delete key -> ESC [ 3 ~ (4 bytes).
+    _selftest_reset()
+    atkbd_process_byte(0xE0)       # extended prefix
+    atkbd_process_byte(0x53)       # delete
+    _selftest_expect_byte(27, cast[Ptr[uint8]](0))      # ESC
+    _selftest_expect_byte(91, cast[Ptr[uint8]](0))      # '['
+    _selftest_expect_byte(51, cast[Ptr[uint8]](0))      # '3'
+    _selftest_expect_byte(126, cast[Ptr[uint8]](0))     # '~'
+
+    # Case 10: F1 -> ESC O P.
+    _selftest_reset()
+    atkbd_process_byte(0x3B)
+    _selftest_expect_byte(27, cast[Ptr[uint8]](0))
+    _selftest_expect_byte(79, cast[Ptr[uint8]](0))      # 'O'
+    _selftest_expect_byte(80, cast[Ptr[uint8]](0))      # 'P'
+
+    # Case 11: F5 -> ESC [ 1 5 ~.
+    _selftest_reset()
+    atkbd_process_byte(0x3F)
+    _selftest_expect_byte(27, cast[Ptr[uint8]](0))
+    _selftest_expect_byte(91, cast[Ptr[uint8]](0))
+    _selftest_expect_byte(49, cast[Ptr[uint8]](0))      # '1'
+    _selftest_expect_byte(53, cast[Ptr[uint8]](0))      # '5'
+    _selftest_expect_byte(126, cast[Ptr[uint8]](0))
+
+    # Case 12: extended-form right Ctrl + 'c' -> 0x03.
+    # 0xE0 0x1D (right Ctrl make), 'c' make, 0xE0 0x9D (right Ctrl break).
+    _selftest_reset()
+    atkbd_process_byte(0xE0)
+    atkbd_process_byte(0x1D)       # right Ctrl make
+    atkbd_process_byte(0x2E)       # 'c' -> 0x03
+    _selftest_expect_byte(0x03, cast[Ptr[uint8]](0))
+    atkbd_process_byte(0xE0)
+    atkbd_process_byte(0x9D)       # right Ctrl break — must clear MOD_CTRL
+    atkbd_process_byte(0x2E)       # 'c' -> 'c' (Ctrl released)
+    _selftest_expect_byte(99, cast[Ptr[uint8]](0))
+
+    # Drain anything left over (shouldn't be any, but defensive).
+    while kbd_rx_pop() >= 0:
+        pass
+
+    # Reset modifier state so a stray "Shift make, kernel boots,
+    # Shift break never seen" doesn't leave MOD_SHIFT latched into
+    # the user's first prompt.
+    kbd_state = 0
+    in_e0_prefix = 0
+
+    if selftest_fail == 0:
+        printk1("atkbd: self-test PASS (%d cases)\n",
+                cast[uint64](selftest_pass))
+    else:
+        printk1("atkbd: self-test FAIL (%d failures)\n",
+                cast[uint64](selftest_fail))
 
 
 # --- Init --------------------------------------------------------------
@@ -188,6 +729,13 @@ def atkbd_init() -> int32:
     # would need a feature the language doesn't have yet. Cost is one
     # function call at boot.
     atkbd_build_table()
+
+    # Run the boot-time translator self-test BEFORE we drain the
+    # hardware controller. The self-test only touches the software
+    # FIFO + state machine, never the I/O ports, so it's safe to do
+    # this in any order; doing it first means a translator regression
+    # is reported even on systems where the i8042 itself is wedged.
+    atkbd_self_test()
 
     # Drain anything the BIOS/firmware left in the controller output
     # buffer. If we don't, the first real keystroke arrives behind a
@@ -204,5 +752,5 @@ def atkbd_init() -> int32:
 
     if drained > 0:
         printk1("atkbd: drained %d stale bytes\n", cast[uint64](drained))
-    printk0("atkbd: ready\n")
+    printk0("atkbd: ready (Set 1 + ext + modifiers)\n")
     return 0

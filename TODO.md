@@ -184,6 +184,37 @@ are fair game for any contributor — human or AI agent.
   Real controllers carve multiple namespaces; need IDENTIFY active
   namespace list (CNS=0x02) + a per-NS state struct.
 
+## Input
+
+- ~~PS/2 keyboard polish — shipped in M16.100. Extended scancodes
+  (arrows, F1..F12, Home/End/Ins/Del/PgUp/PgDn), modifier-state
+  tracking (Shift/Ctrl/Alt + CapsLock/NumLock), Shift+letter and
+  Caps+letter via XOR fold, Shift+symbol via parallel `sc1_to_shifted`
+  table, Ctrl+letter -> 0x01..0x1A (preserves the M16.42 SIGINT path).
+  Boot-time `atkbd_self_test()` checks 25 expectations across 12
+  scenarios. See `scripts/test_atkbd_ext.sh`.~~
+- IRQ 1 wiring for PS/2 keyboard — today `atkbd_poll()` is drained
+  every timer tick (100 Hz = 10 ms latency). A real IRQ 1 handler
+  via the IOAPIC would zero-latency the keystroke and free the
+  timer ISR from doing keyboard work. Blocks on IOAPIC PCI-style
+  routing for the legacy 8042 line (vector 0x21 today is masked).
+- USB HID keyboard — `usbcore` + `xhci_hcd` + `usbhid` from the
+  L-track. Same FIFO sink (`kbd_rx_push`); separate driver that
+  parses USB HID report descriptors and synthesises the same
+  ASCII / escape-sequence bytes. Required for laptops post-2018
+  that ship with no PS/2 port. Large effort — own milestone.
+- International keyboard layouts (Dvorak, AZERTY, German QWERTZ,
+  UK, etc.) — today `sc1_to_ascii` + `sc1_to_shifted` are hard-
+  coded US-104. A `kbd_set_layout(name)` entry point plus a
+  registry of named layouts would suffice; layouts live as data
+  tables compiled in (no runtime loader needed).
+- Dead-key / compose / IME — `Compose-' a` -> 'á', etc. Not
+  needed for English-only install; standard X11-shape compose
+  tables plus a 2-byte pending-deadkey state in `kbd_state`
+  would cover the European-Latin set.
+- PS/2 mouse (the other channel on the 8042). Same controller,
+  different port; needed once `hamwd` window-server lands.
+
 ## Toolchain & install
 
 - Real-hardware boot (ThinkPad). FAT32 read + EXT4 r/w done;
