@@ -62,6 +62,10 @@ from linux_abi.u_syscalls import linux_u_syscall_dispatch
 # identifiers must start with a letter or underscore (the literal
 # directory name `9` is not a valid Python-style module-path component).
 from sys.src.port9.port.error import _u_errstr
+# Phase C / M16.98: rfork body lives in sys/src/9/port/sysproc.ad —
+# mirrors 9front's /sys/src/9/port/sysproc.c. Imported through the
+# port9 directory alias for the same identifier reason as error.ad.
+from sys.src.port9.port.sysproc import do_rfork
 
 extern def do_execve_finish(new_rip: uint64, new_rsp: uint64,
                             argc: uint64, argv: uint64)
@@ -1104,7 +1108,13 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
     # to be rebuilt when Phase C lands the bodies for rfork / bind /
     # mount / create / stat / fstat / remove / fd2path.
     if nr == SYS_RFORK:
-        return cast[uint64](-38)               # -ENOSYS
+        # Phase C / M16.98: Plan 9-shape process / namespace primitive.
+        # a0 = flags (RF* bit field). a5 = user-side %rbp captured by
+        # the runtime.S::sys_rfork wrapper — do_rfork patches the
+        # child's initial-stack image so the child's first user-mode
+        # instruction has a valid frame pointer. SYS_CLONE (3) stays
+        # for the Linux ABI; both work concurrently.
+        return cast[uint64](do_rfork(cast[int32](a0), a5))
     if nr == SYS_BIND:
         return cast[uint64](-38)               # -ENOSYS
     if nr == SYS_MOUNT:

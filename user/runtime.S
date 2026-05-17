@@ -319,3 +319,27 @@ sys_errstr:
     syscall
     ret
     .size sys_errstr, .-sys_errstr
+
+
+    /* --- sys_rfork(flags) -> int32 ----------------------------------
+     * Phase C / M16.98: Plan 9-shape process / namespace primitive.
+     * SysV passes `flags` in %rdi (also the syscall a0 slot). do_rfork
+     * additionally needs the parent's user-side %rbp so it can patch
+     * the child's initial __switch_to stack image — without that the
+     * child's first RBP-relative local read after rfork() goes to the
+     * parent's stack page. We stash %rbp into %r9 (syscall a5) before
+     * the SYSCALL instruction; syscall_64.S forwards a5 verbatim to
+     * do_syscall, which hands it to do_rfork as its second arg.
+     *
+     * Behaviour mirrors 9front's rfork(2):
+     *   * RFPROC set:    returns child pid in parent, 0 in child.
+     *   * RFPROC clear:  mutates current task in place; returns 0.
+     *   * On error:      returns -EAGAIN / -ENOSYS (negative int32). */
+    .globl sys_rfork
+    .type sys_rfork, @function
+sys_rfork:
+    movq    %rbp, %r9               /* a5 = parent user %rbp */
+    movq    $256, %rax              /* SYS_RFORK */
+    syscall
+    ret
+    .size sys_rfork, .-sys_rfork

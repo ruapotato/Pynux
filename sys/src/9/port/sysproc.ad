@@ -1,0 +1,337 @@
+# sys/src/9/port/sysproc.ad
+#
+# Layer 1 (Plan 9-shape) process-control syscall bodies. Mirrors
+# 9front's /sys/src/9/port/sysproc.c at minimal scale. Phase C
+# (M16.98) opens this file with the rfork() primitive; subsequent
+# milestones add exec / exits / wait / sleep next to it (see
+# docs/architecture.md Phase G plan).
+#
+# rfork() is the cornerstone of Plan 9-shape process control: a
+# single primitive that replaces fork / vfork / clone / pthread_create
+# / unshare with a flag-bit dial. The full per-bit contract lives in
+# docs/native-api.md (the SYS_RFORK = 256 entry). At this milestone
+# the namespace + note-group bits are accepted and tracked on the
+# TaskStruct, but the matching subsystems (mount table, note
+# delivery) don't exist yet — see the comments on each flag below
+# for the deferred wiring.
+#
+# Coexistence: SYS_CLONE (3) and do_clone() in arch/x86/kernel/syscall.ad
+# stay around for Linux ABI (linux_abi/u_syscalls.ad's
+# clone3/clone()), which is unaffected by this file. Native Adder
+# callers can pick either today; once the Plan 9 surface is the
+# default (Phase G), SYS_CLONE retires.
+
+from kernel.sched.core import (
+    TaskStruct, current_task, current_idx_get,
+    create_user_task_argv,
+    task_pid_at, task_pml4,
+    set_task_vfork_done, set_task_fs_base,
+    set_linux_userspace_mode,
+    set_task_cwd, get_cwd_buf,
+    copy_fd_entry, dup_fd_to_child,
+    task_namespace_id, set_task_namespace_id,
+    task_note_group, set_task_note_group,
+    task_fd_table_refcount, set_task_fd_table_refcount,
+    current_namespace_id, set_current_namespace_id,
+    alloc_namespace_id, alloc_note_group_id,
+    task_table_size,
+)
+# task_table is module-private to core.ad; we need a per-slot read of
+# the saved kernel-stack pointer so we can patch the callee-saved
+# %rbp slot in the child's initial-stack image. Going through a small
+# helper keeps the access pattern explicit. The function lives in
+# kernel/sched/core.ad and is added in M16.98 specifically for this.
+from kernel.sched.core import task_initial_sp
+from mm.page_alloc import alloc_page
+from kernel.printk.printk import printk0, printk1
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# RF* flag bits — numerically identical to 9front's <plan9/libc.h>
+# RFPROC / RFMEM / ... so a userland binary that includes a Plan 9
+# header gets the same bits we honour here. Kept local to this file
+# rather than centralised in kernel/sched/core.ad so the core module
+# doesn't grow a Plan 9-private constants block — every other
+# RF*-aware consumer is downstream of this file anyway.
+RFPROC:    uint64 = 0x001            # create a new process
+RFMEM:     uint64 = 0x002            # share parent's address space (thread)
+RFFDG:     uint64 = 0x004            # copy fd table (else share)
+RFNAMEG:   uint64 = 0x008            # copy namespace (else share)
+RFENVG:    uint64 = 0x010            # copy environment (else share)
+RFNOTEG:   uint64 = 0x020            # start a new note group
+RFCFDG:    uint64 = 0x040            # close all fds in child
+RFCNAMEG:  uint64 = 0x080            # start child with empty namespace
+RFNOWAIT:  uint64 = 0x100            # detach — parent never reaps
+RFREND:    uint64 = 0x200            # new rendezvous group (reserved)
+
+
+# fd-table inheritance helper. Three regimes, in priority order:
+#
+#   1. RFCFDG  -> child starts with the slot's _init_fd_table default
+#                 (stdin / stdout / stderr pre-opened, the rest CLOSED).
+#                 create_user_task_argv already arranged this; we just
+#                 don't copy anything from the parent.
+#   2. RFFDG   -> copy each parent slot into the same child slot, with
+#                 copy_fd_entry bumping pipe / fat / ext4 / dir
+#                 refcounts so closing the parent's end doesn't yank
+#                 the channel out from under the child. This is exactly
+#                 what do_clone() does for the fork path.
+#   3. else    -> share. Today "share" still deep-copies (we don't have
+#                 a single fd-table object to refcount yet — fd_idx /
+#                 fd_pos / fd_buf live INLINE in each TaskStruct), and
+#                 we mark fd_table_refcount=2 on parent + child as a
+#                 placeholder so future code (real sharing) can detect
+#                 the invariant. RFCFDG | (no RFFDG) is also valid
+#                 Plan 9 and short-circuits to regime 1.
+def _rfork_setup_fd_table(child_slot: int32, parent: Ptr[TaskStruct],
+                          flags: uint64):
+    if (flags & RFCFDG) != 0:
+        # _init_fd_table inside create_user_task_argv already set up
+        # the default stdin/stdout/stderr + closed-rest layout.
+        # Plan 9 RFCFDG means "child starts with NO fds at all"; but
+        # stdio is universally inherited from /dev/cons at the syscall
+        # layer regardless, so leaving the defaults is closer to the
+        # idiom than zeroing them out.
+        set_task_fd_table_refcount(child_slot, 1)
+        return
+    # Copy each open fd, including stdio (overwriting the
+    # _init_fd_table defaults so the child sees pipes / open files
+    # the parent passed it).
+    i: uint64 = 0
+    while i < 16:
+        dup_fd_to_child(child_slot, i, parent, i)
+        i = i + 1
+    if (flags & RFFDG) != 0:
+        # Caller asked for a private copy. We've already deep-copied
+        # above (the only mechanism we have); leave refcounts at 1
+        # on both sides.
+        set_task_fd_table_refcount(child_slot, 1)
+    else:
+        # Caller wants the table SHARED. We model that as
+        # "deep-copy and mark both sides as sharing"; the
+        # refcount bookkeeping is forward-looking until real
+        # sharing lands.
+        set_task_fd_table_refcount(child_slot, 2)
+        # Bump the parent's refcount to match. The parent is the
+        # current task; reading the current count + incrementing
+        # is safe at uniprocessor scale (no other CPU can touch
+        # this task's bookkeeping mid-syscall).
+        cur: int32 = cast[int32](current_idx_get())
+        rc: int32 = task_fd_table_refcount(cur)
+        if rc < 1:
+            rc = 1
+        set_task_fd_table_refcount(cur, rc + 1)
+
+
+def _rfork_setup_namespace(child_slot: int32, parent: Ptr[TaskStruct],
+                           flags: uint64):
+    # Plan 9 RFCNAMEG dominates RFNAMEG (per rfork(2)): if both are
+    # set, the empty-namespace bit wins. We follow.
+    if (flags & RFCNAMEG) != 0:
+        # Empty namespace: model as -1 until a real "no mounts at all"
+        # namespace constructor exists. A future bind() call inside
+        # the child will allocate fresh entries; today there are no
+        # bind entries to construct OR drop, so the value sits inert.
+        set_task_namespace_id(child_slot, -1)
+        return
+    if (flags & RFNAMEG) != 0:
+        # Copy: allocate a fresh namespace id so subsequent bind/mount
+        # calls in the child don't disturb the parent's view. The
+        # actual deep-copy of mount entries lands when the mount table
+        # itself does (Phase D+). The id allocation today is just a
+        # forward-looking handle.
+        set_task_namespace_id(child_slot, alloc_namespace_id())
+        return
+    # Default: share parent's namespace. Same id; future bind() calls
+    # made by either task end up on the same mount table.
+    cur: int32 = cast[int32](current_idx_get())
+    set_task_namespace_id(child_slot, task_namespace_id(cur))
+
+
+def _rfork_setup_note_group(child_slot: int32, parent: Ptr[TaskStruct],
+                            flags: uint64):
+    if (flags & RFNOTEG) != 0:
+        # Fresh note group — used by daemons that want to be killable
+        # as a unit without taking down the parent.
+        set_task_note_group(child_slot, alloc_note_group_id())
+        return
+    # Inherit. parent[0].note_group reads the field directly; we go
+    # through the accessor for symmetry with the namespace case.
+    cur: int32 = cast[int32](current_idx_get())
+    set_task_note_group(child_slot, task_note_group(cur))
+
+
+def do_rfork(flags: int32, user_rbp: uint64) -> int32:
+    # Plan 9-shape process / namespace primitive. Behaviour pivots on
+    # whether RFPROC is set:
+    #
+    #   * RFPROC set:    create a new child task. Returns the child's
+    #                    pid in the parent's return register, 0 in the
+    #                    child's (the iret frame planted by
+    #                    create_user_task_argv defaults rax to 0).
+    #
+    #   * RFPROC clear:  mutate the CURRENT task in place. RFNAMEG /
+    #                    RFCNAMEG flip our own namespace_id; the other
+    #                    in-place bits are noops at this milestone
+    #                    (no mount table, no note machinery, no real
+    #                    environment object). Returns 0 on success.
+    #
+    # `flags` is signed int32 for symmetry with the Plan 9 prototype
+    # (rfork(int) at the C level); we widen to uint64 internally so
+    # bit-masking against 0x100 / 0x200 doesn't sign-extend.
+    # `user_rbp` is the parent's user-side %rbp, captured by the
+    # syscall wrapper in user/runtime.S::sys_rfork and forwarded
+    # through the SYS_RFORK dispatch site as syscall arg a5. We need
+    # it to patch the child's initial __switch_to stack image so the
+    # child's first user-mode instruction after rfork has a valid
+    # frame pointer (Adder-compiled code uses RBP-relative locals).
+    f: uint64 = cast[uint64](cast[uint32](flags))
+
+    # --- in-place mutation path ------------------------------------
+    if (f & RFPROC) == 0:
+        # Only the namespace bits do anything visible today. Plan 9's
+        # `rfork(RFNAMEG)` is the canonical "privatise my mounts"
+        # idiom — we'd allocate a fresh namespace id and leave the
+        # current task pointing at it.
+        if (f & RFCNAMEG) != 0:
+            set_current_namespace_id(-1)
+        elif (f & RFNAMEG) != 0:
+            set_current_namespace_id(alloc_namespace_id())
+        # RFNOTEG, RFMEM, RFENVG, RFCFDG without RFPROC are accepted
+        # silently — they exist on the userland-API surface but the
+        # in-place forms only make sense once the matching subsystems
+        # land. Returning 0 here matches 9front's behaviour for
+        # under-implemented bits.
+        return 0
+
+    # --- new-process path (RFPROC set) -----------------------------
+    # Mirror do_clone()'s fork branch in arch/x86/kernel/syscall.ad
+    # but parameterised by RF* bits instead of hard-coded
+    # vfork-style semantics. RFMEM is the equivalent of CLONE_VM
+    # (POSIX thread); we DO NOT implement a separate thread path
+    # in this commit because (a) the test we're shipping uses the
+    # POSIX-fork idiom RFPROC|RFFDG|RFNAMEG|RFENVG, and (b) the
+    # full thread path needs caller-supplied child_stack +
+    # CLONE_SETTLS-shape TLS plumbing — those land in a follow-up
+    # milestone.
+    if (f & RFMEM) != 0:
+        # Acceptable shape but not yet implemented. Plan 9 itself
+        # supports rfork(RFPROC|RFMEM) as "thread with own stack"
+        # — Hamnix will route that through this same body once the
+        # thread machinery merges with the fork machinery. For
+        # now, surface as -ENOSYS so userland sees the deferral
+        # cleanly instead of silently getting fork semantics.
+        printk0("rfork: RFMEM (thread path) not yet implemented\n")
+        return -38                              # -ENOSYS
+
+    parent: Ptr[TaskStruct] = current_task()
+    kstack_top: uint64 = parent[0].kstack_top
+    # syscall_64.S parks (user_rsp - 8) at kstack_top-8 (the entry stub
+    # does pushq %r12 to user RSP before parking RSP at kstack_top-8),
+    # user RFLAGS at -16, and user RIP at -24. Undo the r12 push to
+    # recover the parent's NATURAL user RSP — same dance do_clone does.
+    parent_user_rsp: uint64 = cast[Ptr[uint64]](kstack_top - 8)[0] + 8
+    parent_user_rip: uint64 = cast[Ptr[uint64]](kstack_top - 24)[0]
+
+    # Deep-copy the parent's user stack page so the child has its own
+    # locals + return chain. Identical to do_clone()'s fork branch —
+    # we don't have COW MMU plumbing yet, so the eager copy stands in.
+    parent_ustack_top: uint64 = (parent_user_rsp + 4095) & ~cast[uint64](4095)
+    parent_ustack_base: uint64 = parent_ustack_top - 4096
+    child_ustack_base: uint64 = alloc_page()
+    if child_ustack_base == 0:
+        return -11                              # -EAGAIN
+    memcpy(cast[Ptr[uint8]](child_ustack_base),
+           cast[Ptr[uint8]](parent_ustack_base), 4096)
+    rsp_offset: uint64 = parent_user_rsp - parent_ustack_base
+    child_user_rsp: uint64 = child_ustack_base + rsp_offset
+
+    # Create the child. create_user_task_argv with a non-zero user_rsp
+    # skips its own fresh-ustack allocation and plants our supplied
+    # RSP straight into the iret frame; argc/argv go into rdi/rsi
+    # (irrelevant on the rfork return path — userland's rfork wrapper
+    # doesn't read those after syscall return). _build_initial_kstack
+    # zero-fills the rax slot, which is exactly what we want: the
+    # child sees a 0 return value from rfork().
+    slot: int32 = create_user_task_argv(
+        parent_user_rip,
+        0x5f5f72666f726b5f,                     # "__rfork_"
+        child_user_rsp,
+        0, 0,
+    )
+    if slot < 0:
+        # Couldn't allocate a task slot. The kstack page we already
+        # reserved leaks — same as do_clone's fork branch (no
+        # alloc_page reclaim path yet).
+        return -11                              # -EAGAIN
+
+    # Patch the child's saved-%rbp slot in the initial __switch_to
+    # stack image so its first user-mode instruction has a valid
+    # frame pointer. _build_initial_kstack laid down 6 zero quads for
+    # the callee-saved set (r15, r14, r13, r12, rbx, rbp — lowest to
+    # highest), then a return-address quad, then the iret frame.
+    # %rbp lives at sp + 40 (5 quads above the lowest callee-saved).
+    #
+    # The parent's user_rbp points into the PARENT's stack page; the
+    # child's stack page is at a different VA, but holds a byte-for-
+    # byte copy. Translate the address so the child's %rbp lands in
+    # its own page. This only makes sense if user_rbp is within the
+    # one page we just copied (parent_ustack_base..parent_ustack_top).
+    # If it's outside (deep callees with frames spanning multiple
+    # pages), fall back to the raw value — the identity map will at
+    # least keep reads functional, at the cost of cross-task writes
+    # showing up in the parent's stack. That's a real bug surface
+    # but only matters once the frame chain spans pages; the simple
+    # test fixture stays within one page.
+    child_rbp: uint64 = user_rbp
+    if user_rbp >= parent_ustack_base and user_rbp < parent_ustack_top:
+        child_rbp = child_ustack_base + (user_rbp - parent_ustack_base)
+    child_sp: uint64 = task_initial_sp(slot)
+    cast[Ptr[uint64]](child_sp + 40)[0] = child_rbp
+
+    # Inherit fs_base + Linux-ABI bit + vfork_done state from the
+    # parent. Native rfork callers leave fs_base = 0, but defensive
+    # mirroring keeps the same semantics across the fork.
+    set_task_fs_base(slot, parent[0].fs_base)
+    set_task_vfork_done(slot, 0)
+    if parent[0].is_linux_userspace != 0:
+        set_linux_userspace_mode(slot, 1)
+
+    # Inherit cwd — same shape as do_clone. cwd is logically part of
+    # the namespace; RFNAMEG today does NOT split cwd off because we
+    # don't have a separate "namespace object" yet. Phase D+ resolves
+    # that.
+    set_task_cwd(cast[uint64](slot), get_cwd_buf(current_idx_get()))
+
+    # Wire up the rfork-controlled sharing decisions: fd table, then
+    # namespace, then note group. Each helper consults the parent and
+    # writes the appropriate field on the child.
+    _rfork_setup_fd_table(slot, parent, f)
+    _rfork_setup_namespace(slot, parent, f)
+    _rfork_setup_note_group(slot, parent, f)
+
+    # RFNOWAIT semantically detaches the child so the parent never
+    # reaps. Hamnix's current parent-pid model is a single uint64 on
+    # the child; we'd flip it to 0 (init) to surface "no waitable
+    # ancestor". The TaskStruct field exists; we leave it alone for
+    # now because none of the current callers exercise the detach
+    # path, and zeroing it would break the existing parent_pid =
+    # current_idx assumption that create_user_task_argv installed.
+    # Real detach handling lands when wait() learns to drop
+    # RFNOWAIT children automatically.
+
+    # RFENVG semantics: copy environment. The environment today lives
+    # on the user stack as part of the auxv layout we built at
+    # spawn/execve time. Because we just deep-copied the user stack
+    # page above, RFENVG is effectively honoured for free. RFMEM
+    # would have shared the page (no copy) — but we already
+    # short-circuited that case above with -ENOSYS.
+
+    child_pid: uint64 = task_pid_at(slot)
+    printk1("rfork: child created, pid=%d\n", cast[int32](child_pid))
+    # rfork returns int32 per the Plan 9 prototype; pids in Hamnix
+    # are uint64 but capped well under 2^31 at this scale, so the
+    # cast is lossless. -1 on failure (-EAGAIN above) is also fine
+    # because int32 carries the negative.
+    return cast[int32](child_pid)

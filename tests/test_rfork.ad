@@ -1,0 +1,109 @@
+# tests/test_rfork.ad
+#
+# Phase C / M16.98 regression: prove that SYS_RFORK (256) creates a
+# Plan 9-shape child task with the POSIX-fork flag combo
+# (RFPROC | RFFDG | RFNAMEG | RFENVG). Returns the child pid in the
+# parent and 0 in the child; both lines print to stdout so the host
+# test harness can grep the serial log for them.
+#
+# Contract:
+#   1. sys_rfork(RFPROC|RFFDG|RFNAMEG|RFENVG) returns:
+#        > 0  in the parent (the child's pid)
+#        = 0  in the child
+#        < 0  on error (-EAGAIN / -ENOSYS)
+#   2. The child prints "[rfork] hello from child\n" and exits(0).
+#   3. The parent prints "[rfork] child=<pid>\n", waits via
+#      sys_waitpid, then prints "[rfork] PASS\n".
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       tests/test_rfork.ad -o build/user/test_rfork.elf
+#
+# Run via scripts/test_rfork.sh.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_rfork(flags: int32) -> int32
+extern def sys_waitpid(pid: uint64) -> int64
+extern def sys_exit(code: uint64)
+
+# Plan 9 POSIX-fork combo: new process + copy fd table + copy namespace
+# + copy environment. Matches docs/native-api.md's "POSIX fork" idiom.
+RFPROC:   int32 = 0x001
+RFFDG:    int32 = 0x004
+RFNAMEG:  int32 = 0x008
+RFENVG:   int32 = 0x010
+
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    n: uint64 = strlen(s)
+    sys_write(fd, s, n)
+
+
+def write_dec(fd: int32, value: uint64):
+    # Reverse-fill digits then emit. Mirrors the procfs pid renderer.
+    if value == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(fd, &out[0], i)
+
+
+def main() -> int32:
+    write_str(1, "[rfork] start\n")
+
+    flags: int32 = RFPROC | RFFDG | RFNAMEG | RFENVG
+    rc: int32 = sys_rfork(flags)
+
+    if rc < 0:
+        # Negative return = error. The errstr is set by the kernel
+        # (-EAGAIN if no free task slot, -ENOSYS for unsupported
+        # flag combos like RFMEM today).
+        write_str(1, "[rfork] FAIL: sys_rfork returned negative\n")
+        return 1
+
+    if rc == 0:
+        # Child branch. Plan 9 contract: rfork returns 0 in the
+        # child. We MUST exit explicitly here — falling off main
+        # would also exit (the _start wrapper calls sys_exit on
+        # main's return), but being explicit makes the serial log
+        # easier to read for a future debugger.
+        write_str(1, "[rfork] hello from child\n")
+        sys_exit(0)
+        # Not reached.
+        return 0
+
+    # Parent branch. rc is the child pid; print it and wait.
+    write_str(1, "[rfork] child=")
+    write_dec(1, cast[uint64](rc))
+    write_str(1, "\n")
+
+    # waitpid blocks until the named child enters STATE_EXITED, then
+    # reaps the slot. We don't inspect the exit code beyond "did it
+    # come back without error"; the child's stdout banner is the
+    # real signal that the fork worked end-to-end.
+    status: int64 = sys_waitpid(cast[uint64](rc))
+    if status < 0:
+        write_str(1, "[rfork] FAIL: waitpid returned -errno\n")
+        return 2
+
+    write_str(1, "[rfork] PASS\n")
+    return 0

@@ -31,15 +31,30 @@ are fair game for any contributor — human or AI agent.
 - **Phase C** — Land real bodies for the Plan 9 primitives next to
   the existing Linux-shape calls. Order proposed by
   `docs/architecture.md`:
-  - `rfork` (256) — PENDING. A previous agent (rate-limited mid-
-    flight) left a scaffold at `sys/src/9/port/sysproc.ad` (337
-    lines, untracked); the file is not yet imported anywhere and
-    `SYS_RFORK` (256) still returns -ENOSYS in
-    `arch/x86/kernel/syscall.ad`. Next agent: wire it up properly,
-    add the matching `TaskStruct` fields (`fd_table_refcount`,
-    `namespace_id`, `note_group`), and land `tests/test_rfork.ad`
-    + `scripts/test_rfork.sh` (also untracked scaffolds in the
-    tree).
+  - ~~`rfork` (256) — shipped in M16.98. Body lives in
+    `sys/src/9/port/sysproc.ad`; `TaskStruct` carries the three
+    new sharing-state fields (`fd_table_refcount`, `namespace_id`,
+    `note_group`) with accessors + monotonic id allocators in
+    `kernel/sched/core.ad`. `user/runtime.S::sys_rfork` stashes the
+    parent's user `%rbp` into syscall arg a5 so `do_rfork` can
+    patch the child's initial-stack image. POSIX-fork combo
+    (`RFPROC | RFFDG | RFNAMEG | RFENVG`) verified end-to-end by
+    `scripts/test_rfork.sh`.~~ Follow-ups still pending:
+      * `RFMEM` (thread path) returns -ENOSYS today. The full
+        thread route needs caller-supplied `child_stack` plus
+        CLONE_SETTLS-shape TLS plumbing — mirror the do_clone
+        thread branch into `do_rfork` once a Plan 9 `pthread`-
+        equivalent caller exists.
+      * Namespace machinery body — `alloc_namespace_id` hands back
+        a fresh int32 but no actual mount-table deep-copy happens
+        because Hamnix has no mount table yet. Lands with the
+        `bind` / `mount` bodies below.
+      * Note delivery — `note_group` is tracked but the
+        `notify(2)` / `noted(2)` syscalls don't exist. Adding them
+        unlocks Plan 9's "killable group" idiom for daemons.
+      * Detach (`RFNOWAIT`) — accepted but does not yet sever the
+        child's parent_pid; lands when `wait4` learns to drop
+        RFNOWAIT children automatically.
   - `bind` (257) + `mount` (258) + `unmount` (259) — namespace
     primitives. Need the channel/`chan` skeleton in
     `sys/src/9/port/chan.ad` (new) first.
