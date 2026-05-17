@@ -1,0 +1,389 @@
+# linux_abi/api_l67.ad
+#
+# L67: ships five more Debian 6.12 modules. One is a pure ride-along
+# (zero new exports — every UND symbol already covered by L<=66 plus
+# the new L67 surface); the other four need 17 new exports across
+# four small groups.
+#
+#   * xt_string.ko        — netfilter `--string` match (matches an
+#                              skb payload against a textsearch needle;
+#                              the classic `iptables -m string`). 7
+#                              UND, 3 new (textsearch_prepare,
+#                              textsearch_destroy, skb_find_text).
+#   * xt_LED.ko           — netfilter `-j LED` target (blinks a kernel
+#                              LED-class device when a rule matches —
+#                              useful for "physical light when traffic
+#                              hits the firewall"). 25 UND, 3 new
+#                              (led_trigger_register,
+#                              led_trigger_unregister, led_trigger_
+#                              event). The L62 led_trigger_register_
+#                              simple / unregister_simple / blink_
+#                              oneshot trio is the "simple" wrapper API
+#                              consumed by usb-common; xt_LED uses the
+#                              underlying core API, which is genuinely
+#                              new at L67.
+#   * nft_chain_nat.ko    — nftables NAT chain type (the `chain {
+#                              type nat ... }` glue that lets nft rules
+#                              live in a NAT chain). 13 UND, 7 new
+#                              (nft_register_chain_type, nft_unregister_
+#                              chain_type, nft_do_chain, nf_nat_inet_
+#                              register_fn, nf_nat_inet_unregister_fn,
+#                              nf_nat_ipv6_register_fn, nf_nat_ipv6_
+#                              unregister_fn).
+#   * nft_masq.ko         — nftables masquerade expression (the `masq`
+#                              statement; nftables' SNAT-to-egress-
+#                              interface-address). 16 UND, 4 new
+#                              (nf_nat_masquerade_inet_register_
+#                              notifiers, nf_nat_masquerade_inet_
+#                              unregister_notifiers, nf_nat_masquerade_
+#                              ipv4, nf_nat_masquerade_ipv6).
+#   * xt_MASQUERADE.ko    — netfilter `-j MASQUERADE` target (the
+#                              iptables sibling of nft_masq). 12 UND,
+#                              0 missing — the four new nf_nat_
+#                              masquerade_* symbols ship with nft_masq
+#                              above, every other UND is already in
+#                              the L<=66 xt_register_targets / nf_ct_
+#                              netns_get / pr_debug / fentry / return
+#                              thunk surface.
+#
+# Module count in tests/linux-modules/ after L67: 53 + 5 = 58.
+#
+# UND analysis (`nm -u`, missing-after-L66):
+#   xt_string.ko        3 missing
+#   xt_LED.ko           3 missing
+#   nft_chain_nat.ko    7 missing
+#   nft_masq.ko         4 missing
+#   xt_MASQUERADE.ko    0 missing
+#   union              17 unique
+#
+# 17 new exports across 4 groups:
+#
+#   1.  Textsearch + skb scanning (textsearch_prepare,
+#         textsearch_destroy, skb_find_text)
+#   2.  LED-trigger core API (led_trigger_register,
+#         led_trigger_unregister, led_trigger_event)
+#   3.  nftables chain-type registry + dispatcher (nft_register_chain_
+#         type, nft_unregister_chain_type, nft_do_chain)
+#   4.  nf_nat per-family register hooks
+#         (nf_nat_inet_register_fn, nf_nat_inet_unregister_fn,
+#          nf_nat_ipv6_register_fn, nf_nat_ipv6_unregister_fn,
+#          nf_nat_masquerade_inet_register_notifiers,
+#          nf_nat_masquerade_inet_unregister_notifiers,
+#          nf_nat_masquerade_ipv4, nf_nat_masquerade_ipv6)
+#
+# Stub philosophy mirrors L51..L66: every shim is init-cold for our
+# env (no userspace nftables ruleset, no LED-class devices, no live
+# NAT chain, no payload-scanning rule). Each returns success / 0 /
+# NULL / void so init_module stays on the happy path. The
+# masquerade_ipv4 / masquerade_ipv6 entries return NF_ACCEPT (1)
+# because they're packet-path verdicts that only ever get called
+# from inside a hook chain that we never traverse at insmod.
+#
+# Naming notes:
+#   * Adder reserves `bytes`, `match`, `case`, `file`, `field`, `type`
+#     -> renamed to `nbytes` / `mt` / `cse` / `fp` / `fld` / `kind`.
+#   * The "_l_" prefix marks the Hamnix-side shim.
+
+from linux_abi.exports import _add_export
+from mm.slab import kmalloc, kzalloc
+
+
+# =====================================================================
+# Group 1: Textsearch + skb scanning (xt_string)
+# =====================================================================
+#
+# Linux:
+#   struct ts_config *textsearch_prepare(const char *algo, const void *pattern,
+#                                          unsigned int patlen, gfp_t gfp_mask,
+#                                          int flags);
+#   void              textsearch_destroy(struct ts_config *conf);
+#   unsigned int      skb_find_text(struct sk_buff *skb, unsigned int from,
+#                                     unsigned int to, struct ts_config *conf);
+#
+# textsearch_prepare:
+#   Compiles a textsearch needle (algo == "bm" / "kmp" / "fsm") into a
+#   ts_config the caller can hand to skb_find_text. xt_string's
+#   checkentry calls it once per rule at userspace `iptables -m string`
+#   load time. With no userspace iptables in Hamnix the call site is
+#   never reached at insmod; the relocation still needs the address.
+#   Returning a non-NULL "looks-valid" pointer would let a hypothetical
+#   later call into skb_find_text proceed without dereferencing
+#   garbage. We allocate a 32-byte zero-init buffer (enough to satisfy
+#   any subsequent ts_config field read) and return its address.
+#
+# textsearch_destroy:
+#   Pairs with prepare; frees the ts_config. With no live config in
+#   our env we accept any pointer and kfree it (NULL-safe).
+#
+# skb_find_text:
+#   Scans skb->data[from..to] for the prepared needle; returns the
+#   offset of the first match or UINT_MAX (0xffffffff) for "not
+#   found". With no live packets in QEMU, "not found" is the right
+#   answer for any caller that wires this up.
+
+def _l_textsearch_prepare(algo: uint64, pattern: uint64, patlen: uint32,
+                            gfp_mask: uint64, flags: int32) -> uint64:
+    # 32-byte zero-init scratch — large enough for any ts_config
+    # field offset xt_string's match path would read on a hot call.
+    # init-cold for our env (no userspace iptables) so the bytes are
+    # never inspected; just need a non-NULL "success" answer.
+    return kzalloc(32)
+
+
+def _l_textsearch_destroy(conf: uint64):
+    # NULL-safe; pairs with textsearch_prepare. Never reached at
+    # insmod (rule teardown requires userspace iptables interaction).
+    if conf == 0:
+        return
+    # Forward to the Linux-side kfree shim equivalent — direct call
+    # to mm.slab kfree would bypass the printk/NULL guard, so we
+    # just leak the 32 bytes (init-cold, single rule's worth).
+    return
+
+
+def _l_skb_find_text(skb: uint64, fr: uint32, to: uint32,
+                       conf: uint64) -> uint32:
+    # UINT_MAX == "not found"; the right answer when no live
+    # netfilter rule is actually scanning a packet. xt_string's
+    # match arm treats UINT_MAX as "no hit; rule does not match".
+    return 0xffffffff
+
+
+# =====================================================================
+# Group 2: LED-trigger core API (xt_LED)
+# =====================================================================
+#
+# Linux:
+#   int  led_trigger_register(struct led_trigger *trig);
+#   void led_trigger_unregister(struct led_trigger *trig);
+#   void led_trigger_event(struct led_trigger *trig,
+#                            enum led_brightness brightness);
+#
+# led_trigger_register / _unregister:
+#   xt_LED's checkentry calls led_trigger_register to expose a new
+#   trigger name like "netfilter-mytrig" so userspace can bind it to
+#   a /sys/class/leds/.../trigger sysfs node. With no LED-class
+#   devices in Hamnix QEMU, the trigger has nothing to drive — register
+#   trivially succeeds; unregister is void.
+#
+#   NB: the *simple* variants (led_trigger_register_simple,
+#   led_trigger_unregister_simple, led_trigger_blink_oneshot) already
+#   ship at L62 as part of the usb-common surface; xt_LED uses the
+#   underlying full-struct API which is genuinely new at L67.
+#
+# led_trigger_event:
+#   Fires a brightness change on all LEDs bound to the trigger.
+#   xt_LED's target callback invokes it whenever a packet matches.
+#   With no LED-class devices the event has no consumers; pure no-op.
+
+def _l_led_trigger_register(trig: uint64) -> int32:
+    # 0 == "trigger registered ok". With no LED-class devices in
+    # Hamnix the trigger name never gets surfaced to userspace, but
+    # the relocation needs a "success" arm for init_module.
+    return 0
+
+
+def _l_led_trigger_unregister(trig: uint64):
+    # cleanup_module never runs in our env; no-op.
+    return
+
+
+def _l_led_trigger_event(trig: uint64, brightness: uint32):
+    # No LED-class devices bound; the trigger has no listeners and
+    # the event is a pure no-op. Real Linux walks led_cdev list under
+    # trig->leddev_list_lock and updates each LED's brightness.
+    return
+
+
+# =====================================================================
+# Group 3: nftables chain-type registry + dispatcher (nft_chain_nat)
+# =====================================================================
+#
+# Linux:
+#   int  nft_register_chain_type(const struct nft_chain_type *ctype);
+#   void nft_unregister_chain_type(const struct nft_chain_type *ctype);
+#   unsigned int nft_do_chain(struct nft_pktinfo *pkt, void *priv);
+#
+# nft_register_chain_type / _unregister:
+#   nft_chain_nat's init_module installs a "nat" chain type into the
+#   nft_tables core's per-family chain_types[] array. With no nft_
+#   tables core in Hamnix yet (deferred until a later L milestone),
+#   the registration is a stub that records nothing; return 0 ==
+#   "installed ok" so init_module proceeds. unregister is void.
+#
+# nft_do_chain:
+#   The expression-evaluation dispatcher. Walks a chain's rule list
+#   and dispatches each expr's ->eval callback against the packet.
+#   xt_MASQUERADE / nft_chain_nat / nft_masq all wire it as the
+#   chain's per-hook nf_hookfn body. Never reached at insmod in our
+#   env (no live hook chain). NF_ACCEPT == 1 == "let the packet
+#   continue through the rest of the pipeline" is the safe answer
+#   if it ever does fire.
+
+def _l_nft_register_chain_type(ctype: uint64) -> int32:
+    # 0 == "registered ok". The real Linux body acquires nf_tables_
+    # mutex and slots ctype into chain_types[family][hooknum]; we
+    # have no core to slot it into, so the stub is a pure success
+    # return that keeps nft_chain_nat's init_module on the happy
+    # path.
+    return 0
+
+
+def _l_nft_unregister_chain_type(ctype: uint64):
+    # cleanup_module never runs in our env; no-op.
+    return
+
+
+def _l_nft_do_chain(pkt: uint64, priv: uint64) -> uint32:
+    # NF_ACCEPT == 1. Never reached at insmod (no live hook
+    # traversal); relocation-only.
+    return 1
+
+
+# =====================================================================
+# Group 4: nf_nat per-family register hooks + masquerade
+# =====================================================================
+#
+# Linux:
+#   int  nf_nat_inet_register_fn(struct net *net,
+#                                  const struct nf_hook_ops *ops);
+#   void nf_nat_inet_unregister_fn(struct net *net,
+#                                    const struct nf_hook_ops *ops);
+#   int  nf_nat_ipv6_register_fn(struct net *net,
+#                                  const struct nf_hook_ops *ops);
+#   void nf_nat_ipv6_unregister_fn(struct net *net,
+#                                    const struct nf_hook_ops *ops);
+#   int  nf_nat_masquerade_inet_register_notifiers(void);
+#   void nf_nat_masquerade_inet_unregister_notifiers(void);
+#   unsigned int nf_nat_masquerade_ipv4(struct sk_buff *skb,
+#                                         unsigned int hooknum,
+#                                         const struct nf_nat_range2 *range,
+#                                         const struct net_device *out);
+#   unsigned int nf_nat_masquerade_ipv6(struct sk_buff *skb,
+#                                         const struct nf_nat_range2 *range,
+#                                         const struct net_device *out);
+#
+# nf_nat_inet_register_fn / _unregister_fn:
+#   Per-net register/unregister of the IPv4+IPv6 (the "inet" combo)
+#   NAT hook. nft_chain_nat calls them at chain-type install time so
+#   each new pernet namespace gets its NAT chain wired. With no
+#   pernet namespace logic in Hamnix (one boot-time net), the call
+#   reduces to "remember nothing"; return 0 == success.
+#
+# nf_nat_ipv6_register_fn / _unregister_fn:
+#   IPv6-only variant; same shape. nft_chain_nat picks one of the
+#   three (ipv4/ipv6/inet) at register time based on the family of
+#   the chain being created.
+#
+# nf_nat_masquerade_inet_register_notifiers / _unregister_notifiers:
+#   Registers (per netns + global) inetaddr / inet6addr notifiers
+#   that flush conntrack entries when an interface's address changes
+#   (the entries' "from-address" became stale). With no live
+#   conntrack table or netdev address changes in our env, registration
+#   has nothing to wire up; return 0 == "registered ok".
+#
+# nf_nat_masquerade_ipv4 / nf_nat_masquerade_ipv6:
+#   The packet-path verdicts. Pick a new source IP from `out`'s
+#   primary address and rewrite skb's source IP to match (the
+#   "masquerade" effect). NF_ACCEPT == 1 == "I changed nothing
+#   useful; let the rest of the pipeline continue" is the right
+#   answer in our env (no real NAT setup) and matches the L66
+#   nf_nat_redirect_ipv4 / _ipv6 convention.
+
+def _l_nf_nat_inet_register_fn(net: uint64, ops: uint64) -> int32:
+    # 0 == "registered ok". No pernet hook table to thread; the
+    # caller's error arm bails on negative returns so 0 keeps
+    # nft_chain_nat's init_module on the happy path.
+    return 0
+
+
+def _l_nf_nat_inet_unregister_fn(net: uint64, ops: uint64):
+    # cleanup never runs in our env; no-op.
+    return
+
+
+def _l_nf_nat_ipv6_register_fn(net: uint64, ops: uint64) -> int32:
+    # Same story as the inet variant.
+    return 0
+
+
+def _l_nf_nat_ipv6_unregister_fn(net: uint64, ops: uint64):
+    return
+
+
+def _l_nf_nat_masquerade_inet_register_notifiers() -> int32:
+    # 0 == "notifiers registered". No inetaddr/inet6addr chain to
+    # listen on in Hamnix (the notifier_chain register stubs at L60
+    # already accept and ignore registrations); return success.
+    return 0
+
+
+def _l_nf_nat_masquerade_inet_unregister_notifiers():
+    return
+
+
+def _l_nf_nat_masquerade_ipv4(skb: uint64, hooknum: uint32,
+                                range_arg: uint64, out: uint64) -> uint32:
+    # NF_ACCEPT == 1. Same convention as L66's nf_nat_redirect_ipv4
+    # — never reached at insmod, relocation-only.
+    return 1
+
+
+def _l_nf_nat_masquerade_ipv6(skb: uint64, range_arg: uint64,
+                                out: uint64) -> uint32:
+    # NF_ACCEPT == 1.
+    return 1
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_l67():
+    # Called from linux_abi_exports_init() after the L66 batch.
+    # Adds 17 new exports for the xt_string / xt_LED / nft_chain_nat
+    # / nft_masq / xt_MASQUERADE batch. xt_MASQUERADE.ko needs no new
+    # exports beyond the four nf_nat_masquerade_* symbols already
+    # shipped here for nft_masq.
+
+    # ---- Group 1: Textsearch + skb scanning ----
+    _add_export("textsearch_prepare",
+                cast[uint64](&_l_textsearch_prepare))
+    _add_export("textsearch_destroy",
+                cast[uint64](&_l_textsearch_destroy))
+    _add_export("skb_find_text",
+                cast[uint64](&_l_skb_find_text))
+
+    # ---- Group 2: LED-trigger core API ----
+    _add_export("led_trigger_register",
+                cast[uint64](&_l_led_trigger_register))
+    _add_export("led_trigger_unregister",
+                cast[uint64](&_l_led_trigger_unregister))
+    _add_export("led_trigger_event",
+                cast[uint64](&_l_led_trigger_event))
+
+    # ---- Group 3: nftables chain-type registry + dispatcher ----
+    _add_export("nft_register_chain_type",
+                cast[uint64](&_l_nft_register_chain_type))
+    _add_export("nft_unregister_chain_type",
+                cast[uint64](&_l_nft_unregister_chain_type))
+    _add_export("nft_do_chain",
+                cast[uint64](&_l_nft_do_chain))
+
+    # ---- Group 4: nf_nat per-family register hooks + masquerade ----
+    _add_export("nf_nat_inet_register_fn",
+                cast[uint64](&_l_nf_nat_inet_register_fn))
+    _add_export("nf_nat_inet_unregister_fn",
+                cast[uint64](&_l_nf_nat_inet_unregister_fn))
+    _add_export("nf_nat_ipv6_register_fn",
+                cast[uint64](&_l_nf_nat_ipv6_register_fn))
+    _add_export("nf_nat_ipv6_unregister_fn",
+                cast[uint64](&_l_nf_nat_ipv6_unregister_fn))
+    _add_export("nf_nat_masquerade_inet_register_notifiers",
+                cast[uint64](&_l_nf_nat_masquerade_inet_register_notifiers))
+    _add_export("nf_nat_masquerade_inet_unregister_notifiers",
+                cast[uint64](&_l_nf_nat_masquerade_inet_unregister_notifiers))
+    _add_export("nf_nat_masquerade_ipv4",
+                cast[uint64](&_l_nf_nat_masquerade_ipv4))
+    _add_export("nf_nat_masquerade_ipv6",
+                cast[uint64](&_l_nf_nat_masquerade_ipv6))
