@@ -77,6 +77,7 @@ from kernel.block.blk import blk_read_sectors, blk_write_sectors, find_blockdev
 from drivers.block.brd import brd_init
 from drivers.block.virtio_blk import virtio_blk_init
 from drivers.ata.ahci import ahci_smoke_test
+from drivers.nvme.nvme import nvme_smoke_test
 from fs.fat import fat_init
 from fs.ext4 import (
     ext4_init, ext4_read_inode, ext4_inode_mode, ext4_inode_size_lo,
@@ -710,6 +711,7 @@ def start_kernel():
     net_smoke_test()
     block_smoke_test()
     ahci_smoke_test()
+    nvme_smoke_test()
 
     setup_per_cpu_areas()
     printk1("Hamnix: smp_processor_id() = %d\n", get_cpu_id())

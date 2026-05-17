@@ -87,9 +87,21 @@ are fair game for any contributor — human or AI agent.
 - AHCI hot-plug / COMRESET / port reset retry — real ThinkPads
   flap SATA on resume; the driver needs to re-init a port that
   drops link.
-- NVMe driver — sibling effort to AHCI for the modern install base.
-  PCI class=0x01, subclass=0x08, prog_if=0x02; admin queue + I/O
-  submission queue + completion queue dance.
+- ~~NVMe driver — shipped in M16.92. PCI class-match (0x01/0x08/0x02),
+  64-bit BAR0 map, controller reset + admin SQ/CQ + CC.EN dance,
+  IDENTIFY controller + namespace, CREATE-IO-CQ/SQ, I/O READ of LBA 0
+  with MBR signature check. Polled completion via CQ phase bit.~~
+- NVMe write path (opcode 0x01) — symmetrical to the M16.92 read path;
+  PRP1 = source buffer, CDW10/11 = LBA, CDW12 = NLB-1. Should reuse
+  the existing I/O queue + `_io_submit_and_wait` plumbing.
+- NVMe multi-queue (one SQ per CPU) — today every I/O serialises on
+  qid=1. Per-CPU SQs unlock the scalability the protocol was
+  designed for.
+- NVMe MSI-X IRQ wiring — replace the busy-poll on CQ phase with an
+  actual interrupt handler. Blocks on real IOAPIC + MSI-X bring-up.
+- NVMe multi-namespace support — current driver hard-codes NSID=1.
+  Real controllers carve multiple namespaces; need IDENTIFY active
+  namespace list (CNS=0x02) + a per-NS state struct.
 
 ## Toolchain & install
 

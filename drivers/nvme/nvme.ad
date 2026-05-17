@@ -1,0 +1,694 @@
+# drivers/nvme/nvme.ad
+#
+# Bare-metal NVMe (NVM Express) driver. NVMe is the modern PCIe-attached
+# storage protocol that displaced AHCI on essentially every new
+# desktop/laptop/server SSD shipped since ~2014. AHCI (drivers/ata/ahci.ad)
+# still covers SATA, but NVMe is what's actually in a 2026 ThinkPad or
+# 1U server.
+#
+# Scope of this driver (one milestone, polled, no IRQs):
+#
+#   1. Walk the PCI bus for class=0x01, subclass=0x08, prog_if=0x02 —
+#      the NVMe class triple.
+#   2. Map BAR0 (a MEM BAR covering controller registers + the doorbell
+#      array at +0x1000).
+#   3. Run the controller reset / init dance:
+#         - clear CC.EN, wait CSTS.RDY=0
+#         - point ASQ/ACQ at kmalloc'd 4 KiB pages
+#         - write AQA (admin queue depths = 63)
+#         - set CC (MPS=0 → 4 KiB pages, IOSQES=6, IOCQES=4,
+#           CSS=0 NVM command set, EN=1)
+#         - wait CSTS.RDY=1
+#   4. Submit admin commands via a 64-byte SQ entry → tail doorbell →
+#      poll CQ phase bit → head doorbell. The five commands we send:
+#         - IDENTIFY controller (opc 0x06, CNS=1)  → model + serial
+#         - IDENTIFY namespace 1 (opc 0x06, CNS=0) → LBA count
+#         - CREATE I/O CQ (opc 0x05) qid=1
+#         - CREATE I/O SQ (opc 0x01) qid=1
+#         - I/O READ (opc 0x02) of LBA 0 on namespace 1
+#   5. Decode 16 bytes of LBA 0; check MBR signature 0x55/0xAA at
+#      bytes 510..511 and log "[nvme] MBR signature OK" on a match.
+#
+# Why polled? Same constraint as virtio-net / ahci: the kernel brings
+# up the LAPIC for the timer tick but has no IOAPIC routing for PCI
+# INTx, and MSI/MSI-X wiring is its own milestone. We busy-poll the
+# completion queue's phase bit instead — every CQ entry's bit 0 of
+# DW3 flips between 0 and 1 each pass through the queue, and we know
+# we own a completion when the phase doesn't match the expected
+# previous value.
+#
+# References:
+#   - NVMe base spec rev 1.4 (chapter 3 admin cmds, chapter 6 I/O cmds)
+#   - Linux drivers/nvme/host/pci.c
+#   - drivers/ata/ahci.ad (the closest sibling in-tree)
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.pci.pci import (
+    pci_config_read_dword, pci_config_write_dword,
+    pci_bdf_bus, pci_bdf_dev, pci_bdf_fn, pci_pack_bdf,
+    pci_read_bar, PCI_BDF_NONE,
+    PCI_COMMAND_OFFSET, PCI_COMMAND_MEM, PCI_COMMAND_MASTER,
+)
+from mm.page_alloc import alloc_pages
+from mm.slab import kmalloc
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- PCI matching --------------------------------------------------
+#
+# NVMe controllers report a standard mass-storage class / non-volatile-
+# memory subclass / NVMe prog_if triple regardless of vendor. We match
+# on the class so the driver works against QEMU's emulated NVMe
+# (1b36:0010), Samsung 970/980, WD Black SN850, Intel 760p, etc.
+NVME_CLASS:    uint32 = 0x01
+NVME_SUBCLASS: uint32 = 0x08
+NVME_PROGIF:   uint32 = 0x02
+
+
+# --- Controller register offsets (BAR0 + N) -----------------------
+#
+# Only the registers we actually touch. Full layout is in NVMe base
+# spec §3.1 (table 24). The doorbell array starts at 0x1000 and is
+# stride-dependent on CAP.DSTRD — for the qemu nvme device and all
+# common controllers DSTRD=0 → 4-byte stride.
+NVME_CAP:     uint64 = 0x00     # 64-bit Controller Capabilities
+NVME_VS:      uint64 = 0x08     # 32-bit Version
+NVME_CC:      uint64 = 0x14     # 32-bit Controller Configuration
+NVME_CSTS:    uint64 = 0x1C     # 32-bit Controller Status
+NVME_AQA:     uint64 = 0x24     # 32-bit Admin Queue Attributes
+NVME_ASQ:     uint64 = 0x28     # 64-bit Admin Submission Queue Base
+NVME_ACQ:     uint64 = 0x30     # 64-bit Admin Completion Queue Base
+NVME_DOORBELL_BASE: uint64 = 0x1000
+
+# CC (Controller Configuration) bit fields we set.
+#   EN     bit  0  — controller enable
+#   CSS    bits 4..6 — command set select (0 = NVM)
+#   MPS    bits 7..10 — memory page size, encoded as 2^(12+MPS).
+#                       MPS=0 → 4 KiB host pages. Required to match
+#                       the host's PRP entry alignment.
+#   AMS    bits 11..13 — arbitration (0 = round-robin)
+#   SHN    bits 14..15 — shutdown notification (0 = no shutdown)
+#   IOSQES bits 16..19 — I/O SQ entry size, encoded as 2^N.
+#                        N=6 → 64-byte SQ entries (the spec mandate).
+#   IOCQES bits 20..23 — I/O CQ entry size, 2^N. N=4 → 16-byte CQ
+#                        entries (also spec-mandated).
+NVME_CC_EN:     uint32 = 0x1
+NVME_CC_CSS_NVM: uint32 = 0x0          # NVM command set (default)
+NVME_CC_MPS_4K:  uint32 = 0x0          # 4 KiB page size
+NVME_CC_AMS_RR:  uint32 = 0x0          # round-robin arbitration
+NVME_CC_IOSQES_6: uint32 = 0x60000     # (6 << 16) — 64B SQ entry
+NVME_CC_IOCQES_4: uint32 = 0x400000    # (4 << 20) — 16B CQ entry
+
+# CSTS (Controller Status) bit fields.
+NVME_CSTS_RDY:  uint32 = 0x1           # bit 0 — controller ready
+NVME_CSTS_CFS:  uint32 = 0x2           # bit 1 — fatal error
+
+
+# --- Queue geometry -------------------------------------------------
+#
+# NVMe SQ entries are 64 bytes, CQ entries are 16 bytes. We size both
+# admin and I/O queues to 64 entries, which fits 4 KiB SQ and 1 KiB CQ
+# allocations comfortably within one page each.
+NVME_QUEUE_DEPTH: uint32 = 64
+NVME_SQ_ENTRY_BYTES: uint64 = 64
+NVME_CQ_ENTRY_BYTES: uint64 = 16
+
+# Admin queue identifier — always 0. The first I/O queue we create
+# is qid=1.
+NVME_ADMIN_QID: uint32 = 0
+NVME_IO_QID:    uint32 = 1
+
+
+# --- Admin and I/O command opcodes (NVMe §5 / §6.x) ----------------
+NVME_ADMIN_DELETE_SQ:   uint8 = 0x00
+NVME_ADMIN_CREATE_SQ:   uint8 = 0x01
+NVME_ADMIN_DELETE_CQ:   uint8 = 0x04
+NVME_ADMIN_CREATE_CQ:   uint8 = 0x05
+NVME_ADMIN_IDENTIFY:    uint8 = 0x06
+
+NVME_IO_FLUSH:          uint8 = 0x00
+NVME_IO_WRITE:          uint8 = 0x01
+NVME_IO_READ:           uint8 = 0x02
+
+# IDENTIFY CNS values (CDW10[7..0]).
+NVME_CNS_NAMESPACE:     uint32 = 0x00
+NVME_CNS_CONTROLLER:    uint32 = 0x01
+
+
+# --- Driver state --------------------------------------------------
+#
+# Single-controller, single-IO-queue scope. Multi-queue + multi-NS is
+# a follow-up.
+
+class NvmeState:
+    bar0:           uint64       # MMIO base
+    doorbell_stride: uint32      # bytes between doorbells (4 << CAP.DSTRD)
+
+    asq:            uint64       # Admin SQ ring (4 KiB page)
+    acq:            uint64       # Admin CQ ring (4 KiB page)
+    asq_tail:       uint32       # next slot to write
+    acq_head:       uint32       # next slot to read
+    acq_phase:      uint32       # current expected phase bit (0/1)
+    admin_cid:      uint32       # monotonic command id
+
+    iosq:           uint64       # I/O SQ ring
+    iocq:           uint64       # I/O CQ ring
+    iosq_tail:      uint32
+    iocq_head:      uint32
+    iocq_phase:     uint32
+    io_cid:         uint32
+
+    nsze:           uint64       # namespace 1 size (LBA count)
+
+    # 40-byte controller model string + NUL.
+    model:          Array[41, uint8]
+    # 20-byte controller serial number + NUL.
+    serial:         Array[21, uint8]
+
+
+nvme: NvmeState
+
+
+# --- MMIO helpers --------------------------------------------------
+
+def _nvme_mmio_r32(addr: uint64) -> uint32:
+    return cast[Ptr[uint32]](addr)[0]
+
+
+def _nvme_mmio_w32(addr: uint64, value: uint32):
+    cast[Ptr[uint32]](addr)[0] = value
+
+
+def _nvme_mmio_r64(addr: uint64) -> uint64:
+    return cast[Ptr[uint64]](addr)[0]
+
+
+def _nvme_mmio_w64(addr: uint64, value: uint64):
+    cast[Ptr[uint64]](addr)[0] = value
+
+
+# --- PCI plumbing --------------------------------------------------
+#
+# We open-code the class-match scan rather than depending on a shared
+# helper. drivers/pci/pci.ad's pci_find is vendor:device only; AHCI
+# similarly carries its own _nvme_pci_find_class. Keeping it local makes
+# the driver entirely self-contained at the PCI layer.
+
+def _nvme_pci_find_class(class_code: uint32, subclass: uint32,
+                    prog_if: uint32) -> uint32:
+    bus: uint32 = 0
+    dev: uint32 = 0
+    while dev < 32:
+        ident: uint32 = pci_config_read_dword(bus, dev, 0, 0x00)
+        v: uint32 = ident & 0xFFFF
+        if v != 0xFFFF:
+            cls: uint32 = pci_config_read_dword(bus, dev, 0, 0x08)
+            this_class:    uint32 = (cls >> 24) & 0xFF
+            this_subclass: uint32 = (cls >> 16) & 0xFF
+            this_progif:   uint32 = (cls >>  8) & 0xFF
+            if this_class == class_code \
+               and this_subclass == subclass \
+               and this_progif == prog_if:
+                return pci_pack_bdf(bus, dev, 0)
+        dev = dev + 1
+    return PCI_BDF_NONE
+
+
+def _nvme_pci_enable_mem_and_master(bdf: uint32):
+    # NVMe BAR0 is a MEM BAR, plus the controller needs to DMA into
+    # host memory (PRP entries / completion queue writes) — both
+    # require Memory Space Enable + Bus Master.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    cmd: uint32 = pci_config_read_dword(bus, dev, fn,
+                                        PCI_COMMAND_OFFSET) & 0xFFFF
+    cmd = cmd | PCI_COMMAND_MEM | PCI_COMMAND_MASTER
+    upper: uint32 = pci_config_read_dword(bus, dev, fn,
+                                          PCI_COMMAND_OFFSET) & 0xFFFF0000
+    pci_config_write_dword(bus, dev, fn, PCI_COMMAND_OFFSET,
+                           upper | cmd)
+
+
+def _pci_read_bar0_64(bdf: uint32) -> uint64:
+    # NVMe BAR0 is a 64-bit MEM BAR (type bits in [1..3] = 0b10).
+    # The address spans BAR0 (low 32) and BAR1 (high 32).
+    low: uint32  = pci_read_bar(bdf, 0)
+    high: uint32 = pci_read_bar(bdf, 1)
+    # Mask the type/prefetch bits out of the low half.
+    base: uint64 = cast[uint64](low & 0xFFFFFFF0) \
+                 | (cast[uint64](high) << 32)
+    return base
+
+
+# --- Controller reset / enable -------------------------------------
+
+def _wait_csts_rdy(bar0: uint64, expected: uint32) -> int32:
+    # Poll CSTS.RDY until it matches `expected` (1 to come up, 0 for
+    # shutdown). NVMe spec gives CAP.TO (timeout) in 500 ms ticks;
+    # we ignore the exact value and just busy-spin a few million
+    # times — plenty on QEMU TCG.
+    spin: uint64 = 0
+    while spin < 10000000:
+        csts: uint32 = _nvme_mmio_r32(bar0 + NVME_CSTS)
+        if (csts & NVME_CSTS_CFS) != 0:
+            printk1("[nvme] CSTS.CFS set (csts=%x)\n",
+                    cast[uint64](csts))
+            return -1
+        if (csts & NVME_CSTS_RDY) == expected:
+            return 0
+        spin = spin + 1
+    printk2("[nvme] CSTS.RDY timeout (want=%d got=%x)\n",
+            cast[uint64](expected),
+            cast[uint64](_nvme_mmio_r32(bar0 + NVME_CSTS)))
+    return -1
+
+
+# --- Doorbell address arithmetic -----------------------------------
+#
+# Per spec §3.1.10:
+#   SQyTDBL = BAR0 + 0x1000 + (2 * qid)     * stride
+#   CQyHDBL = BAR0 + 0x1000 + (2 * qid + 1) * stride
+# where stride = 4 << CAP.DSTRD. For DSTRD=0 (qemu, every modern
+# controller) the stride is 4 bytes.
+
+def _sq_doorbell(qid: uint32) -> uint64:
+    return nvme.bar0 + NVME_DOORBELL_BASE \
+         + cast[uint64](2 * qid) * cast[uint64](nvme.doorbell_stride)
+
+
+def _cq_doorbell(qid: uint32) -> uint64:
+    return nvme.bar0 + NVME_DOORBELL_BASE \
+         + cast[uint64](2 * qid + 1) * cast[uint64](nvme.doorbell_stride)
+
+
+# --- Admin / I/O command primitives --------------------------------
+#
+# SQ entry is 64 bytes:
+#   DW0:   [opcode:7..0 | fuse:8..9 | rsvd:10..13 | PSDT:14..15
+#           | CID:16..31]
+#   DW1:   NSID
+#   DW2/3: rsvd
+#   DW4/5: MPTR (metadata)
+#   DW6/7: PRP1 low/high
+#   DW8/9: PRP2 low/high
+#   DW10..15: command-specific (CDW10..CDW15)
+#
+# We zero the slot, then plant opcode + cid in DW0, nsid in DW1, the
+# PRP pointers, and CDW10..15.
+
+def _build_sq_entry(slot_addr: uint64, opcode: uint8, cid: uint32,
+                    nsid: uint32, prp1: uint64, prp2: uint64,
+                    cdw10: uint32, cdw11: uint32, cdw12: uint32,
+                    cdw13: uint32, cdw14: uint32, cdw15: uint32):
+    memset(cast[Ptr[uint8]](slot_addr), 0, 64)
+    p: Ptr[uint32] = cast[Ptr[uint32]](slot_addr)
+    # DW0 = opcode (low 8) | (cid << 16). FUSE/PSDT both 0 for
+    # everything we issue.
+    p[0] = cast[uint32](opcode) | (cid << 16)
+    p[1] = nsid
+    # DW6/7 = PRP1 low/high.
+    p[6] = cast[uint32](prp1 & 0xFFFFFFFF)
+    p[7] = cast[uint32](prp1 >> 32)
+    # DW8/9 = PRP2 low/high.
+    p[8]  = cast[uint32](prp2 & 0xFFFFFFFF)
+    p[9]  = cast[uint32](prp2 >> 32)
+    # CDW10..15.
+    p[10] = cdw10
+    p[11] = cdw11
+    p[12] = cdw12
+    p[13] = cdw13
+    p[14] = cdw14
+    p[15] = cdw15
+
+
+def _poll_completion(cq_base: uint64, head_p: Ptr[uint32],
+                     phase_p: Ptr[uint32], cq_doorbell: uint64,
+                     depth: uint32) -> uint32:
+    # Walk to the current CQ slot and busy-spin until its phase bit
+    # flips. CQ entry layout (16 bytes / 4 DWORDs):
+    #   DW0: command-specific (e.g. CREATE-CQ returns 0)
+    #   DW1: reserved
+    #   DW2: [SQ head ptr:0..15 | SQ id:16..31]
+    #   DW3: [CID:0..15 | phase:16 | status:17..31]
+    # The phase bit (bit 16 of DW3) toggles every wrap. We start
+    # expecting phase=1 (queue is zero-filled, phase 0 means
+    # "unwritten"), and flip our expectation each wrap.
+    head: uint32 = head_p[0]
+    expected_phase: uint32 = phase_p[0]
+    slot_addr: uint64 = cq_base \
+                      + cast[uint64](head) * NVME_CQ_ENTRY_BYTES
+    spin: uint64 = 0
+    while spin < 50000000:
+        e: Ptr[uint32] = cast[Ptr[uint32]](slot_addr)
+        dw3: uint32 = e[3]
+        cur_phase: uint32 = (dw3 >> 16) & 0x1
+        if cur_phase == expected_phase:
+            # Extract status field (bits 17..31 of DW3) — bit 17..30
+            # is status code, bit 31 is "Do Not Retry". A status code
+            # of 0 means success. We pack the full top 15 bits and
+            # let the caller log non-zero as failure.
+            status: uint32 = (dw3 >> 17) & 0x7FFF
+            # Advance head + phase bookkeeping.
+            new_head: uint32 = head + 1
+            new_phase: uint32 = expected_phase
+            if new_head >= depth:
+                new_head = 0
+                new_phase = 1 - expected_phase
+            head_p[0] = new_head
+            phase_p[0] = new_phase
+            # Ring the CQ head doorbell so the controller can re-use
+            # the slot.
+            _nvme_mmio_w32(cq_doorbell, new_head)
+            return status
+        spin = spin + 1
+    printk0("[nvme] completion timeout\n")
+    return 0xFFFF
+
+
+def _admin_submit_and_wait(opcode: uint8, nsid: uint32,
+                           prp1: uint64, prp2: uint64,
+                           cdw10: uint32, cdw11: uint32,
+                           cdw12: uint32, cdw13: uint32,
+                           cdw14: uint32, cdw15: uint32) -> uint32:
+    # Build the SQ entry at the current admin tail, bump the tail
+    # doorbell, then poll the admin CQ.
+    cid: uint32 = nvme.admin_cid
+    nvme.admin_cid = cid + 1
+    slot_addr: uint64 = nvme.asq \
+                      + cast[uint64](nvme.asq_tail) \
+                      * NVME_SQ_ENTRY_BYTES
+    _build_sq_entry(slot_addr, opcode, cid, nsid, prp1, prp2,
+                    cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
+    new_tail: uint32 = nvme.asq_tail + 1
+    if new_tail >= NVME_QUEUE_DEPTH:
+        new_tail = 0
+    nvme.asq_tail = new_tail
+    _nvme_mmio_w32(_sq_doorbell(NVME_ADMIN_QID), new_tail)
+    return _poll_completion(nvme.acq,
+                            &nvme.acq_head, &nvme.acq_phase,
+                            _cq_doorbell(NVME_ADMIN_QID),
+                            NVME_QUEUE_DEPTH)
+
+
+def _io_submit_and_wait(opcode: uint8, nsid: uint32,
+                        prp1: uint64, prp2: uint64,
+                        cdw10: uint32, cdw11: uint32,
+                        cdw12: uint32, cdw13: uint32,
+                        cdw14: uint32, cdw15: uint32) -> uint32:
+    cid: uint32 = nvme.io_cid
+    nvme.io_cid = cid + 1
+    slot_addr: uint64 = nvme.iosq \
+                      + cast[uint64](nvme.iosq_tail) \
+                      * NVME_SQ_ENTRY_BYTES
+    _build_sq_entry(slot_addr, opcode, cid, nsid, prp1, prp2,
+                    cdw10, cdw11, cdw12, cdw13, cdw14, cdw15)
+    new_tail: uint32 = nvme.iosq_tail + 1
+    if new_tail >= NVME_QUEUE_DEPTH:
+        new_tail = 0
+    nvme.iosq_tail = new_tail
+    _nvme_mmio_w32(_sq_doorbell(NVME_IO_QID), new_tail)
+    return _poll_completion(nvme.iocq,
+                            &nvme.iocq_head, &nvme.iocq_phase,
+                            _cq_doorbell(NVME_IO_QID),
+                            NVME_QUEUE_DEPTH)
+
+
+# --- IDENTIFY decoding ---------------------------------------------
+
+def _copy_trimmed(src: Ptr[uint8], dst: Ptr[uint8], n: uint64):
+    # Copy n bytes from src to dst, NUL-terminate at dst[n], then
+    # right-trim trailing 0x20 (space — NVMe pads model + serial).
+    i: uint64 = 0
+    while i < n:
+        dst[i] = src[i]
+        i = i + 1
+    dst[n] = 0
+    j: int32 = cast[int32](n) - 1
+    while j >= 0:
+        if dst[j] != 0x20:
+            j = -1
+        else:
+            dst[j] = 0
+            j = j - 1
+
+
+def _nvme_identify_controller(buf: uint64) -> int32:
+    # IDENTIFY with CNS=1 returns 4 KiB of controller-wide data:
+    #   bytes  0..1     VID
+    #   bytes  2..3     SSVID
+    #   bytes  4..23    SN  (20 ASCII bytes, space-padded)
+    #   bytes 24..63    MN  (40 ASCII bytes, space-padded)
+    memset(cast[Ptr[uint8]](buf), 0, 4096)
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_IDENTIFY, 0, buf, 0,
+        NVME_CNS_CONTROLLER, 0, 0, 0, 0, 0)
+    if status != 0:
+        printk1("[nvme] IDENTIFY controller failed (status=%x)\n",
+                cast[uint64](status))
+        return -1
+
+    sn_src: Ptr[uint8] = cast[Ptr[uint8]](buf + 4)
+    _copy_trimmed(sn_src, &nvme.serial[0], 20)
+    mn_src: Ptr[uint8] = cast[Ptr[uint8]](buf + 24)
+    _copy_trimmed(mn_src, &nvme.model[0], 40)
+
+    printk1("[nvme] model=%s\n",  cast[uint64](&nvme.model[0]))
+    printk1("[nvme] serial=%s\n", cast[uint64](&nvme.serial[0]))
+    return 0
+
+
+def _nvme_identify_namespace(buf: uint64, nsid: uint32) -> int32:
+    # IDENTIFY with CNS=0 + NSID returns 4 KiB of namespace data.
+    # NSZE (Namespace Size) is bytes 0..7 — total LBA count.
+    memset(cast[Ptr[uint8]](buf), 0, 4096)
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_IDENTIFY, nsid, buf, 0,
+        NVME_CNS_NAMESPACE, 0, 0, 0, 0, 0)
+    if status != 0:
+        printk1("[nvme] IDENTIFY namespace failed (status=%x)\n",
+                cast[uint64](status))
+        return -1
+
+    nsze: uint64 = cast[Ptr[uint64]](buf)[0]
+    nvme.nsze = nsze
+    printk1("[nvme] LBAs=%d\n", nsze)
+    return 0
+
+
+# --- I/O queue creation --------------------------------------------
+#
+# CREATE I/O CQ (opcode 0x05):
+#   PRP1   = CQ base address (must be page-aligned)
+#   CDW10  = [qsize-1:16..31 | qid:0..15]
+#   CDW11  = [IV:16..31 | IEN:1 | PC:0]
+#     PC=1 means physically contiguous (we always are).
+#     IEN=0 (no interrupts; we poll).
+#     IV ignored when IEN=0.
+#
+# CREATE I/O SQ (opcode 0x01):
+#   PRP1   = SQ base
+#   CDW10  = [qsize-1:16..31 | qid:0..15]
+#   CDW11  = [CQID:16..31 | QPRIO:1..2 | PC:0]
+
+def _nvme_create_iocq() -> int32:
+    qsize_m1: uint32 = NVME_QUEUE_DEPTH - 1
+    cdw10: uint32 = (qsize_m1 << 16) | NVME_IO_QID
+    # PC=1 (bit 0), IEN=0 (bit 1).
+    cdw11: uint32 = 0x1
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_CREATE_CQ, 0, nvme.iocq, 0,
+        cdw10, cdw11, 0, 0, 0, 0)
+    if status != 0:
+        printk1("[nvme] CREATE-IO-CQ failed (status=%x)\n",
+                cast[uint64](status))
+        return -1
+    return 0
+
+
+def _nvme_create_iosq() -> int32:
+    qsize_m1: uint32 = NVME_QUEUE_DEPTH - 1
+    cdw10: uint32 = (qsize_m1 << 16) | NVME_IO_QID
+    # PC=1 (bit 0); CQID in upper 16. QPRIO=0 (medium).
+    cdw11: uint32 = 0x1 | (NVME_IO_QID << 16)
+    status: uint32 = _admin_submit_and_wait(
+        NVME_ADMIN_CREATE_SQ, 0, nvme.iosq, 0,
+        cdw10, cdw11, 0, 0, 0, 0)
+    if status != 0:
+        printk1("[nvme] CREATE-IO-SQ failed (status=%x)\n",
+                cast[uint64](status))
+        return -1
+    return 0
+
+
+# --- I/O READ ------------------------------------------------------
+#
+# Opcode 0x02 (NVME_IO_READ):
+#   PRP1   = destination buffer (page-aligned)
+#   CDW10  = LBA low 32
+#   CDW11  = LBA high 32
+#   CDW12  = [NLB-1:0..15 | rsvd:16..29 | PRINFO:30..31]
+#            NLB is 0-based (NLB=0 → 1 block).
+
+def _nvme_read_lba(lba: uint64, nblocks: uint16, dst: uint64) -> int32:
+    cdw10: uint32 = cast[uint32](lba & 0xFFFFFFFF)
+    cdw11: uint32 = cast[uint32](lba >> 32)
+    cdw12: uint32 = cast[uint32](nblocks - 1) & 0xFFFF
+    status: uint32 = _io_submit_and_wait(
+        NVME_IO_READ, NVME_IO_QID, dst, 0,
+        cdw10, cdw11, cdw12, 0, 0, 0)
+    if status != 0:
+        printk1("[nvme] I/O READ failed (status=%x)\n",
+                cast[uint64](status))
+        return -1
+    return 0
+
+
+# --- Public entry point -------------------------------------------
+
+def nvme_smoke_test() -> int32:
+    # Probe, init, identify, read LBA 0. Returns 0 on success, -1 on
+    # any failure. As with ahci, a failure here is non-fatal — the
+    # kernel keeps booting either way; we just don't have an NVMe
+    # block device.
+    bdf: uint32 = _nvme_pci_find_class(NVME_CLASS, NVME_SUBCLASS,
+                                  NVME_PROGIF)
+    if bdf == PCI_BDF_NONE:
+        printk0("[nvme] no controller found\n")
+        return -1
+    printk1("[nvme] controller found bdf=%x\n", cast[uint64](bdf))
+
+    _nvme_pci_enable_mem_and_master(bdf)
+
+    bar0: uint64 = _pci_read_bar0_64(bdf)
+    if bar0 == 0:
+        printk0("[nvme] BAR0 is unmapped\n")
+        return -1
+    nvme.bar0 = bar0
+    printk1("[nvme] bar0=%p\n", bar0)
+
+    # Decode CAP.DSTRD (bits 32..35 of the 64-bit CAP register) to
+    # know the doorbell stride. DSTRD=0 → 4 byte stride; DSTRD=1 →
+    # 8 byte; etc. Almost every controller is DSTRD=0.
+    cap: uint64 = _nvme_mmio_r64(bar0 + NVME_CAP)
+    dstrd: uint32 = cast[uint32]((cap >> 32) & 0xF)
+    nvme.doorbell_stride = cast[uint32](4) << dstrd
+    printk2("[nvme] CAP_lo=%x DSTRD=%d\n",
+            cast[uint64](cast[uint32](cap & 0xFFFFFFFF)),
+            cast[uint64](dstrd))
+
+    vs: uint32 = _nvme_mmio_r32(bar0 + NVME_VS)
+    printk1("[nvme] version=%x\n", cast[uint64](vs))
+
+    # ----- Disable controller (CC.EN = 0) and wait CSTS.RDY = 0 -----
+    cc: uint32 = _nvme_mmio_r32(bar0 + NVME_CC)
+    if (cc & NVME_CC_EN) != 0:
+        _nvme_mmio_w32(bar0 + NVME_CC, cc & ~NVME_CC_EN)
+        if _wait_csts_rdy(bar0, 0) != 0:
+            printk0("[nvme] disable timeout\n")
+            return -1
+
+    # ----- Allocate admin SQ + CQ (one page each — 64 entries) -----
+    asq: uint64 = alloc_pages(0)
+    acq: uint64 = alloc_pages(0)
+    if asq == 0 or acq == 0:
+        printk0("[nvme] admin queue allocation failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](asq), 0, 4096)
+    memset(cast[Ptr[uint8]](acq), 0, 4096)
+    nvme.asq = asq
+    nvme.acq = acq
+    nvme.asq_tail = 0
+    nvme.acq_head = 0
+    # CQ entries start with phase 0 (zero-fill); the controller flips
+    # them to 1 on the first lap. So our "expected phase" begins as 1.
+    nvme.acq_phase = 1
+    nvme.admin_cid = 0
+
+    # ----- AQA + ASQ + ACQ registers ------------------------------
+    # AQA layout: [ACQS-1:16..27 | ASQS-1:0..11] (depth-1 in each).
+    aqa: uint32 = ((NVME_QUEUE_DEPTH - 1) << 16) \
+                | (NVME_QUEUE_DEPTH - 1)
+    _nvme_mmio_w32(bar0 + NVME_AQA, aqa)
+    _nvme_mmio_w64(bar0 + NVME_ASQ, asq)
+    _nvme_mmio_w64(bar0 + NVME_ACQ, acq)
+
+    # ----- Set CC and enable -------------------------------------
+    new_cc: uint32 = NVME_CC_EN \
+                   | NVME_CC_IOSQES_6 \
+                   | NVME_CC_IOCQES_4
+    # CSS=0, MPS=0, AMS=0, SHN=0 all default to zero — nothing to OR.
+    _nvme_mmio_w32(bar0 + NVME_CC, new_cc)
+
+    if _wait_csts_rdy(bar0, NVME_CSTS_RDY) != 0:
+        printk0("[nvme] enable timeout\n")
+        return -1
+    printk0("[nvme] controller ready\n")
+
+    # ----- IDENTIFY controller + namespace -----------------------
+    id_buf: uint64 = kmalloc(4096)
+    if id_buf == 0:
+        printk0("[nvme] kmalloc(4096) for IDENTIFY failed\n")
+        return -1
+    if _nvme_identify_controller(id_buf) != 0:
+        return -1
+    if _nvme_identify_namespace(id_buf, 1) != 0:
+        return -1
+
+    # ----- Allocate I/O queues + create on the controller --------
+    iocq: uint64 = alloc_pages(0)
+    iosq: uint64 = alloc_pages(0)
+    if iocq == 0 or iosq == 0:
+        printk0("[nvme] I/O queue allocation failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](iocq), 0, 4096)
+    memset(cast[Ptr[uint8]](iosq), 0, 4096)
+    nvme.iocq = iocq
+    nvme.iosq = iosq
+    nvme.iosq_tail = 0
+    nvme.iocq_head = 0
+    nvme.iocq_phase = 1
+    nvme.io_cid = 0
+
+    # Order matters: CQ first (the SQ binds to its CQID).
+    if _nvme_create_iocq() != 0:
+        return -1
+    if _nvme_create_iosq() != 0:
+        return -1
+    printk0("[nvme] I/O queues online\n")
+
+    # ----- Read LBA 0 -------------------------------------------
+    mbr_buf: uint64 = alloc_pages(0)
+    if mbr_buf == 0:
+        printk0("[nvme] alloc_pages(0) for MBR failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](mbr_buf), 0, 4096)
+    if _nvme_read_lba(0, 1, mbr_buf) != 0:
+        return -1
+
+    # Log first 16 bytes of LBA 0 as hex — same shape as the AHCI
+    # driver so output is comparable side-by-side.
+    printk0("[nvme] LBA0[0..16]=")
+    k: uint64 = 0
+    while k < 16:
+        b: uint64 = cast[uint64](cast[Ptr[uint8]](mbr_buf + k)[0])
+        hi: uint64 = (b >> 4) & 0xF
+        lo: uint64 = b & 0xF
+        printk1("%x", hi)
+        printk1("%x", lo)
+        if k < 15:
+            printk0(" ")
+        k = k + 1
+    printk0("\n")
+
+    # MBR signature check — bytes 510/511 must be 0x55 0xAA.
+    sig_lo: uint8 = cast[Ptr[uint8]](mbr_buf + 510)[0]
+    sig_hi: uint8 = cast[Ptr[uint8]](mbr_buf + 511)[0]
+    if sig_lo == 0x55 and sig_hi == 0xAA:
+        printk0("[nvme] MBR signature OK\n")
+    else:
+        printk2("[nvme] MBR signature MISMATCH (got %x %x)\n",
+                cast[uint64](sig_lo), cast[uint64](sig_hi))
+
+    return 0
