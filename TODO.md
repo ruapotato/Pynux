@@ -36,14 +36,27 @@ are fair game for any contributor — human or AI agent.
   driver is polled from the kernel init smoke test; without
   IOAPIC routing of PCI INTx we can't take a real interrupt
   yet, so `virtio_net_poll()` is the only RX path.
-- Fill in `eth_rx()` body — currently it just logs + drops.
-  Needs the EthHdr cast, proto byte-swap, and L3 dispatch
-  (`arp_rx` / `ip_rx`).
-- ARP responder + cache — reply to who-has queries for our IP
-  so SLIRP-side userspace tools can talk to us.
+- ~~Fill in `eth_rx()` body — shipped in M16.90. Header length
+  check, ethertype byte-swap, dispatch to `arp_rx`/`ip_rx`,
+  drop with diagnostic on unknown type.~~
+- ~~ARP responder + cache — shipped in M16.90. RX path learns
+  (sender_ip, sender_mac) on both REQUEST and REPLY into an
+  8-entry cache; responder builds a reply frame when the target
+  protocol address matches our configured IP.~~
+- ARP TX via virtio-net — `arp_send_reply()` currently hands the
+  frame to `eth_tx()`, which is still a logging stub. Wire a
+  real `virtio_net_tx(buf, len)` so peers actually see the
+  reply on the wire. Needed before tap-mode validation of the
+  responder side.
+- IPv4 datagram path beyond the `eth_rx -> ip_rx` stub — header
+  + checksum validation, our-address match, dispatch by
+  `.protocol` (ICMP/UDP/TCP).
 - ICMP echo (ping reply) — first proof of two-way IP traffic.
+  Depends on the ARP TX path so peers can resolve us first.
 - DHCP client — replaces the hard-coded 10.0.2.15 in the ARP
   probe. Unblocks `apt update` reaching real package mirrors.
+- TCP three-way handshake — SYN/SYN-ACK/ACK and a minimal
+  receive window. End-state requirement for `apt` over HTTP.
 
 ## Userspace / U-track
 

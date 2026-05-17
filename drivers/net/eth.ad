@@ -18,6 +18,8 @@
 # once a real driver actually moves bytes.
 
 from kernel.printk.printk import printk0, printk1
+from drivers.net.arp import arp_rx
+from drivers.net.ip import ip_rx
 
 
 # EtherType values (host order; on the wire these are big-endian and
@@ -25,6 +27,9 @@ from kernel.printk.printk import printk0, printk1
 ETH_P_IP:   uint16 = 0x0800
 ETH_P_ARP:  uint16 = 0x0806
 ETH_P_IPV6: uint16 = 0x86DD
+
+# Minimum Ethernet II frame size (dst[6] + src[6] + ethertype[2]).
+ETH_HDR_LEN: uint64 = 14
 
 
 # Standard Ethernet II header. 14 bytes on the wire. No 802.1Q tag
@@ -50,23 +55,61 @@ nd_rx_drop: uint64 = 0
 nd_tx_pkts: uint64 = 0
 
 
+def eth_set_mac(mac6: Ptr[uint8]):
+    # Push our MAC down to the eth layer so ARP can answer requests
+    # without needing to import the NIC driver's per-device state.
+    # The NIC driver calls this once during init, after it has read
+    # the MAC from device config space.
+    i: uint64 = 0
+    while i < 6:
+        nd_mac[i] = mac6[i]
+        i = i + 1
+
+
+def eth_get_mac() -> Ptr[uint8]:
+    # Accessor for upper layers (ARP) that need to embed our MAC
+    # as the sender hardware address.
+    return cast[Ptr[uint8]](&nd_mac[0])
+
+
 def eth_rx(frame: Ptr[uint8], length: uint64):
-    # Scaffold stub. A real implementation would:
-    #   1. Validate length >= 14 (header) and <= MTU + 14.
-    #   2. Cast frame to Ptr[EthHdr], byte-swap .proto.
-    #   3. Switch on the host-order proto and tail-call the L3 handler.
-    #   4. On unknown proto, bump nd_rx_drop and return.
-    # For now: log + discard.
+    # Frame demux. virtio_net (or any other NIC driver) hands us a
+    # raw Ethernet frame: 14-byte header followed by the L3 payload.
+    # We validate the header length, byte-swap the ethertype (it is
+    # big-endian on the wire — x86 is little-endian), and dispatch
+    # to the appropriate L3 handler.
     nd_rx_pkts = nd_rx_pkts + 1
+    if length < ETH_HDR_LEN:
+        nd_rx_drop = nd_rx_drop + 1
+        printk1("[eth] runt frame: %d bytes\n", length)
+        return
+    # Ethertype lives at offset 12..13 on the wire, big-endian.
+    hi: uint16 = cast[uint16](frame[12])
+    lo: uint16 = cast[uint16](frame[13])
+    ethertype: uint16 = (hi << 8) | lo
+    if ethertype == ETH_P_ARP:
+        # Hand the full frame; arp_rx() skips the 14-byte ethernet header.
+        arp_rx(frame, length)
+        return
+    if ethertype == ETH_P_IP:
+        # IPv4 — skip the ethernet header before handing up.
+        ip_payload: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](frame) + ETH_HDR_LEN)
+        ip_rx(ip_payload, length - ETH_HDR_LEN)
+        return
+    # Unknown ethertype — drop with diagnostic. Common surprises here:
+    # 0x86DD (IPv6 — no NDP yet), 0x8100 (VLAN tag — no Q-tag stripping).
     nd_rx_drop = nd_rx_drop + 1
-    printk1("eth_rx: %d bytes\n", length)
+    printk1("[eth] unknown ethertype=%x\n", cast[uint64](ethertype))
 
 
 def eth_tx(frame: Ptr[uint8], length: uint64) -> int32:
     # Placeholder transmit path. The NIC driver will replace the body
     # with a ring-doorbell sequence; for now we just count the call.
+    # ARP uses this to "send" a reply — the actual wire transmission
+    # arrives once a `virtio_net_tx()` shim lands (see TODO.md).
     nd_tx_pkts = nd_tx_pkts + 1
-    printk1("eth_tx: %d bytes (no driver)\n", length)
+    printk1("[eth] tx %d bytes (no driver bound)\n", length)
     return 0
 
 

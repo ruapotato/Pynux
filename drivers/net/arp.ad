@@ -9,10 +9,12 @@
 # so the constant factor on lookup is irrelevant). On overflow we
 # overwrite slot 0 — a fully fledged LRU lands with the L37+ work.
 
-from kernel.printk.printk import printk0, printk1
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.net.eth import eth_tx, eth_get_mac
 
 
-# ARP operation codes (network order on the wire, host order here).
+# ARP operation codes (host order; on the wire they appear byte-swapped
+# because the wire is big-endian. arp_rx() byte-swaps when parsing).
 ARP_OP_REQUEST: uint16 = 1
 ARP_OP_REPLY:   uint16 = 2
 
@@ -20,6 +22,13 @@ ARP_OP_REPLY:   uint16 = 2
 # we resolve; ARP-for-IPv6 doesn't exist (NDP replaces it).
 ARP_HW_ETHER:   uint16 = 1
 ARP_PROTO_IPV4: uint16 = 0x0800
+
+# Layer offsets / sizes. ARP_L2_HDR_LEN is local to this file (eth.ad
+# owns the canonical ETH_HDR_LEN; we keep our own to avoid an import
+# round-trip on the parse path).
+ARP_L2_HDR_LEN: uint64 = 14
+ARP_PKT_LEN:    uint64 = 28
+ARP_FRAME_LEN:  uint64 = 42         # 14 ethernet + 28 ARP
 
 
 # 28-byte ARP packet (Ethernet + IPv4 form). Fixed layout — ARP for
@@ -48,72 +57,310 @@ class ArpPkt:
 #                     the wire — keeps comparison cheap on the RX path).
 #   arp_mac[i]      : 6-byte MAC.
 
-ARP_CACHE_SIZE: uint64 = 16
+ARP_CACHE_SIZE: uint64 = 8
 
-arp_valid: Array[16, uint8]
-arp_ip:    Array[16, uint32]
-arp_mac:   Array[16, Array[6, uint8]]
+arp_valid: Array[8, uint8]
+arp_ip:    Array[8, uint32]
+arp_mac:   Array[8, Array[6, uint8]]
 
 # Round-robin replacement cursor for cache overflow. Bumped on every
 # insert; the L37+ work will replace this with an actual LRU.
 arp_next_evict: uint64 = 0
 
 
-def arp_lookup(ip: uint32) -> int32:
-    # Returns slot index 0..ARP_CACHE_SIZE-1 if the IP is cached, else -1.
+# Our own IPv4 address, stored in **network byte order** (big-endian as
+# laid out on the wire). All cache entries also store IPs in network
+# byte order, so the comparison `tpa == arp_our_ip` is a direct
+# memcmp-style compare with no byte-swap on the hot path. Bytes:
+# arp_our_ip[0]=high byte (e.g. 10), arp_our_ip[3]=low byte (e.g. 15
+# for 10.0.2.15).
+arp_our_ip: Array[4, uint8]
+arp_our_ip_set: uint8 = 0
+
+
+# TX buffer for outbound ARP replies. Big enough for one 42-byte frame
+# plus padding up to 60 bytes (minimum Ethernet payload). The
+# responder fills this in place — there's at most one reply in flight
+# because eth_tx() returns synchronously.
+arp_tx_buf: Array[64, uint8]
+
+
+def arp_set_our_ip(ip_be: Ptr[uint8]):
+    # Caller passes the 4-byte IPv4 address in network byte order
+    # (high byte first). For 10.0.2.15 the bytes are {10, 0, 2, 15}.
+    i: uint64 = 0
+    while i < 4:
+        arp_our_ip[i] = ip_be[i]
+        i = i + 1
+    arp_our_ip_set = 1
+
+
+def arp_lookup(ip_be: Ptr[uint8]) -> Ptr[uint8]:
+    # Look up the MAC for `ip_be` (4-byte IPv4, network byte order).
+    # Returns a pointer into the cache's MAC slot on a hit, or 0
+    # (NULL) on a miss. Linear scan over 8 entries — cache miss
+    # already costs a packet send, so the constant factor is fine.
+    w0: uint32 = cast[uint32](ip_be[0]) << 24
+    w1: uint32 = cast[uint32](ip_be[1]) << 16
+    w2: uint32 = cast[uint32](ip_be[2]) << 8
+    w3: uint32 = cast[uint32](ip_be[3])
+    want: uint32 = w0 | w1 | w2 | w3
     i: uint64 = 0
     while i < ARP_CACHE_SIZE:
         if arp_valid[i] != 0:
-            if arp_ip[i] == ip:
-                return cast[int32](i)
+            if arp_ip[i] == want:
+                return cast[Ptr[uint8]](&arp_mac[i][0])
         i = i + 1
-    return -1
+    return cast[Ptr[uint8]](0)
 
 
-def _arp_insert(ip: uint32, mac: Ptr[uint8]) -> int32:
-    # Find a free slot; if none, evict round-robin. Returns slot index.
+def _arp_pack_ip(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> uint32:
+    # Pack 4 IP bytes (network byte order) into a uint32 with the
+    # high byte first so we can store/compare without further
+    # endian conversion.
+    v0: uint32 = cast[uint32](b0) << 24
+    v1: uint32 = cast[uint32](b1) << 16
+    v2: uint32 = cast[uint32](b2) << 8
+    v3: uint32 = cast[uint32](b3)
+    return v0 | v1 | v2 | v3
+
+
+def _arp_print_ip(ip32: uint32):
+    # Dotted-quad printer for a packed network-order IP.
+    a: uint64 = cast[uint64]((ip32 >> 24) & 0xFF)
+    b: uint64 = cast[uint64]((ip32 >> 16) & 0xFF)
+    c: uint64 = cast[uint64]((ip32 >>  8) & 0xFF)
+    d: uint64 = cast[uint64](ip32 & 0xFF)
+    printk1("%d", a)
+    printk0(".")
+    printk1("%d", b)
+    printk0(".")
+    printk1("%d", c)
+    printk0(".")
+    printk1("%d", d)
+
+
+def _arp_print_mac(mac: Ptr[uint8]):
+    # "xx:xx:xx:xx:xx:xx" — one byte per printk so the one-arg path
+    # is enough. Pads leading zeros explicitly.
     i: uint64 = 0
+    while i < 6:
+        v: uint64 = cast[uint64](mac[i])
+        hi: uint64 = (v >> 4) & 0xF
+        lo: uint64 = v & 0xF
+        printk1("%x", hi)
+        printk1("%x", lo)
+        if i < 5:
+            printk0(":")
+        i = i + 1
+
+
+def _arp_insert(ip_packed: uint32, mac: Ptr[uint8]):
+    # Insert/refresh the (ip -> mac) binding. If `ip_packed` is already
+    # present, overwrite the MAC in place (the peer may have moved).
+    # Otherwise grab the first empty slot, or evict round-robin if full.
+    i: uint64 = 0
+    while i < ARP_CACHE_SIZE:
+        if arp_valid[i] != 0:
+            if arp_ip[i] == ip_packed:
+                j: uint64 = 0
+                while j < 6:
+                    arp_mac[i][j] = mac[j]
+                    j = j + 1
+                return
+        i = i + 1
+    # Not present — find an empty slot.
+    i = 0
     while i < ARP_CACHE_SIZE:
         if arp_valid[i] == 0:
             arp_valid[i] = 1
-            arp_ip[i] = ip
+            arp_ip[i] = ip_packed
             j: uint64 = 0
             while j < 6:
                 arp_mac[i][j] = mac[j]
                 j = j + 1
-            return cast[int32](i)
+            return
         i = i + 1
     # Cache full — round-robin evict.
     slot: uint64 = arp_next_evict
     if slot >= ARP_CACHE_SIZE:
         slot = 0
     arp_next_evict = slot + 1
-    arp_ip[slot] = ip
+    arp_ip[slot] = ip_packed
     arp_valid[slot] = 1
     j: uint64 = 0
     while j < 6:
         arp_mac[slot][j] = mac[j]
         j = j + 1
-    return cast[int32](slot)
 
 
-def arp_rx(pkt: Ptr[uint8], length: uint64):
-    # Scaffold: on ARP REPLY, learn the (spa, sha) binding. ARP REQUEST
-    # learning ("gratuitous ARP" optimisation) is left for L37+.
-    if length < 28:
-        printk0("arp_rx: runt\n")
+def _arp_ip_matches_ours(b0: uint8, b1: uint8,
+                         b2: uint8, b3: uint8) -> int32:
+    # Compare a 4-byte target IP against our configured address.
+    # Returns 1 on match, 0 otherwise (including the "not set" case
+    # where we obviously don't own any address yet).
+    if arp_our_ip_set == 0:
+        return 0
+    if arp_our_ip[0] != b0:
+        return 0
+    if arp_our_ip[1] != b1:
+        return 0
+    if arp_our_ip[2] != b2:
+        return 0
+    if arp_our_ip[3] != b3:
+        return 0
+    return 1
+
+
+def arp_send_reply(target_mac: Ptr[uint8],
+                   target_ip_b0: uint8, target_ip_b1: uint8,
+                   target_ip_b2: uint8, target_ip_b3: uint8) -> int32:
+    # Build a 42-byte ARP reply directly into arp_tx_buf and hand it
+    # to the ethernet layer. Layout (offsets are within the frame):
+    #
+    #   0   dst MAC = target_mac (the requester)
+    #   6   src MAC = our MAC    (from eth_get_mac)
+    #  12   ethertype = 0x0806   (ARP, big-endian on wire)
+    #  14   htype     = 0x0001   (Ethernet)
+    #  16   ptype     = 0x0800   (IPv4)
+    #  18   hlen=6, plen=4
+    #  20   opcode    = 0x0002   (reply)
+    #  22   sha       = our MAC
+    #  28   spa       = our IP (network order)
+    #  32   tha       = target_mac
+    #  38   tpa       = target_ip
+    #
+    # eth_tx() is still a logging stub until a real virtio_net_tx()
+    # surface lands — see TODO.md. The frame is built correctly
+    # regardless, so wiring through a real TX is a one-line change.
+    # We import eth_get_mac lazily by re-importing to avoid a circular
+    # import cycle (eth.ad imports arp_rx from here).
+    our_mac: Ptr[uint8] = _arp_get_our_mac()
+    if our_mac == cast[Ptr[uint8]](0):
+        return -1
+    # Zero the whole buffer (cheap: 64 bytes) — this also pads up to
+    # the 60-byte Ethernet minimum without any extra work.
+    i: uint64 = 0
+    while i < 64:
+        arp_tx_buf[i] = 0
+        i = i + 1
+    # Ethernet header.
+    j: uint64 = 0
+    while j < 6:
+        arp_tx_buf[j] = target_mac[j]
+        arp_tx_buf[6 + j] = our_mac[j]
+        j = j + 1
+    arp_tx_buf[12] = 0x08
+    arp_tx_buf[13] = 0x06
+    # ARP body @ offset 14.
+    arp_tx_buf[14] = 0x00       # htype hi
+    arp_tx_buf[15] = 0x01       # htype lo  (Ethernet)
+    arp_tx_buf[16] = 0x08       # ptype hi
+    arp_tx_buf[17] = 0x00       # ptype lo  (IPv4)
+    arp_tx_buf[18] = 6          # hlen
+    arp_tx_buf[19] = 4          # plen
+    arp_tx_buf[20] = 0x00       # opcode hi
+    arp_tx_buf[21] = 0x02       # opcode lo (reply)
+    # sha = our MAC
+    j = 0
+    while j < 6:
+        arp_tx_buf[22 + j] = our_mac[j]
+        j = j + 1
+    # spa = our IP
+    arp_tx_buf[28] = arp_our_ip[0]
+    arp_tx_buf[29] = arp_our_ip[1]
+    arp_tx_buf[30] = arp_our_ip[2]
+    arp_tx_buf[31] = arp_our_ip[3]
+    # tha = target_mac
+    j = 0
+    while j < 6:
+        arp_tx_buf[32 + j] = target_mac[j]
+        j = j + 1
+    # tpa = target_ip
+    arp_tx_buf[38] = target_ip_b0
+    arp_tx_buf[39] = target_ip_b1
+    arp_tx_buf[40] = target_ip_b2
+    arp_tx_buf[41] = target_ip_b3
+    printk0("[arp] reply built for ")
+    _arp_print_ip(_arp_pack_ip(target_ip_b0, target_ip_b1,
+                               target_ip_b2, target_ip_b3))
+    printk0("\n")
+    return eth_tx(cast[Ptr[uint8]](&arp_tx_buf[0]), 60)
+
+
+def _arp_get_our_mac() -> Ptr[uint8]:
+    # Tiny shim so the import dependency lives in one place. eth_get_mac
+    # returns a pointer into eth.ad's nd_mac global, which is filled in
+    # by the NIC driver during init.
+    return eth_get_mac()
+
+
+def arp_rx(frame: Ptr[uint8], length: uint64):
+    # ARP receive. `frame` points at the **full Ethernet frame** (i.e.
+    # the 14-byte L2 header followed by the 28-byte ARP body). We
+    # validate sizes, sanity-check the fixed-field values (htype=1,
+    # ptype=0x0800, hlen=6, plen=4) and then act on the opcode:
+    #
+    #   REQUEST (1): if the target protocol address matches us, send
+    #                a reply AND learn the (sender_ip, sender_mac)
+    #                binding — saves a follow-up gratuitous request.
+    #   REPLY   (2): just learn the binding.
+    #
+    # All on-wire multi-byte fields are big-endian; we compare against
+    # byte values directly rather than building a swapped uint16 so
+    # the parser stays endian-agnostic at the source level.
+    if length < ARP_FRAME_LEN:
+        printk1("[arp] runt frame: %d bytes\n", length)
         return
-    p: Ptr[ArpPkt] = cast[Ptr[ArpPkt]](pkt)
-    # op is big-endian on the wire; comparing against the swapped
-    # constant value avoids a runtime byte-swap. ARP_OP_REPLY = 2
-    # -> 0x0200 on the wire.
-    op_wire: uint16 = p[0].op
-    if op_wire != 0x0200:
+    # Skip the 14-byte ethernet header.
+    p: uint64 = cast[uint64](frame) + ARP_L2_HDR_LEN
+    a: Ptr[uint8] = cast[Ptr[uint8]](p)
+    # htype must be 0x0001 (Ethernet).
+    if a[0] != 0x00:
         return
-    # Update / insert the sender's binding.
-    sha_ptr: Ptr[uint8] = cast[Ptr[uint8]](&p[0].sha[0])
-    slot: int32 = _arp_insert(p[0].spa, sha_ptr)
-    printk1("arp_rx: learned IP at slot %d\n", cast[uint64](slot))
+    if a[1] != 0x01:
+        return
+    # ptype must be 0x0800 (IPv4).
+    if a[2] != 0x08:
+        return
+    if a[3] != 0x00:
+        return
+    if a[4] != 6:                # hlen
+        return
+    if a[5] != 4:                # plen
+        return
+    # opcode (a[6..7]) — wire is big-endian so a[6]=0, a[7]=op.
+    if a[6] != 0x00:
+        return
+    op: uint8 = a[7]
+    if op != 1:
+        if op != 2:
+            return
+    # sender_mac = a[8..13], sender_ip = a[14..17],
+    # target_mac = a[18..23], target_ip = a[24..27].
+    sender_mac: Ptr[uint8] = cast[Ptr[uint8]](p + 8)
+    s_b0: uint8 = a[14]
+    s_b1: uint8 = a[15]
+    s_b2: uint8 = a[16]
+    s_b3: uint8 = a[17]
+    t_b0: uint8 = a[24]
+    t_b1: uint8 = a[25]
+    t_b2: uint8 = a[26]
+    t_b3: uint8 = a[27]
+    sender_ip_packed: uint32 = _arp_pack_ip(s_b0, s_b1, s_b2, s_b3)
+    # Always learn the sender (regardless of opcode). This is the
+    # "free" cache fill that ARP gives us — the peer just told us
+    # both its IP and MAC by speaking to us.
+    _arp_insert(sender_ip_packed, sender_mac)
+    printk0("[arp] cached: ")
+    _arp_print_ip(sender_ip_packed)
+    printk0(" -> ")
+    _arp_print_mac(sender_mac)
+    printk0("\n")
+    if op == 1:
+        # Request: reply iff the target protocol address is ours.
+        if _arp_ip_matches_ours(t_b0, t_b1, t_b2, t_b3) == 1:
+            arp_send_reply(sender_mac, s_b0, s_b1, s_b2, s_b3)
 
 
 def arp_init():
@@ -123,4 +370,5 @@ def arp_init():
         arp_ip[i] = 0
         i = i + 1
     arp_next_evict = 0
-    printk0("arp: cache initialized (16 entries)\n")
+    arp_our_ip_set = 0
+    printk0("arp: cache initialized (8 entries)\n")
