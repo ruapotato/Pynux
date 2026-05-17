@@ -75,9 +75,32 @@ it has to honour.
       * Detach (`RFNOWAIT`) — accepted but does not yet sever the
         child's parent_pid; lands when `wait4` learns to drop
         RFNOWAIT children automatically.
-  - `bind` (257) + `mount` (258) + `unmount` (259) — namespace
-    primitives. Need the channel/`chan` skeleton in
-    `sys/src/9/port/chan.ad` (new) first. Still -ENOSYS.
+  - ~~`bind` (257) + `mount` (258) + `unmount` (259) — shipped in
+    M16.107. Channel + 32-entry mount-table skeleton lands in
+    `sys/src/9/port/chan.ad` (new); syscall bodies in
+    `sys/src/9/port/syschan.ad` (new). `fs/vfs.ad::resolve_path`
+    grows a one-call `chan_resolve_prefix` hook that rewrites the
+    longest-prefix mount entry before the existing cpio / tmpfs /
+    ext4 routing — so `bind("/sysroot", "/etc", MREPL)` makes
+    `open("/sysroot/motd")` resolve to the cpio-backed `/etc/motd`.
+    `mount(srvfd, -1, "/dev/win", MREPL, "")` records a SRV-kind
+    chan; the actual 9P traffic over `srvfd` is Phase D's hamwd
+    job. `unmount(NULL, old)` removes every binding at `old`;
+    `unmount(new, old)` removes the specific edge. End-to-end
+    fixture `tests/test_p9mount.ad`. See `scripts/test_p9mount.sh`.~~
+    Follow-ups:
+      * Union mounts (`MBEFORE` / `MAFTER`) — flag is recorded by
+        the entry but `chan_resolve_prefix` picks longest-prefix
+        only; no union walk. Phase D follow-up alongside hamwd.
+      * Per-namespace mount-table deep-copy on `rfork(RFNAMEG)` —
+        today the rfork helper just allocates a fresh
+        `namespace_id`; the mount table is still shared via
+        `_entry_visible`'s "shared OR private match" rule rather
+        than copied. Real deep-copy lands when union semantics
+        need it.
+      * Real 9P `chan_attach` — `chan.ad::chan_attach` stores the
+        srvfd but doesn't speak `Tversion`/`Tattach` over it. Phase
+        D's hamwd grows the wire side.
   - ~~`create` (260) — shipped in M16.101. Body in
     `sys/src/9/port/sysfile.ad::do_create`. Delegates to
     `vfs_open_write` for the regular-file path. DMDIR returns -1
@@ -237,12 +260,52 @@ it has to honour.
     on each delivery; HTTP responses bigger than the receive window
     will lose data. Track gaps explicitly and reorder before
     handing up.
-  - HTTP/1.1 client — the consumer that justifies TCP. Minimum:
-    GET / Host / Connection: close request builder + response parser
-    that strips the status line and headers and returns a
-    Content-Length-bounded body. Builds on `tcp_connect`.
+  - ~~HTTP/1.1 client — shipped in M16.106 (`drivers/net/http.ad`).
+    Single `http_get(url, out_buf, out_max, status_out)` entry point
+    builds `GET <path> HTTP/1.1\r\nHost: <host>\r\nUser-Agent:
+    Hamnix-kernel/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n`,
+    drains the response through TCP, parses status line + headers
+    (case-insensitive Content-Length), returns body bytes into the
+    caller's buffer. Smoke test fetches `http://example.com/` and
+    confirms status=200 + `<!doctype html>` in the body. See
+    `scripts/test_net_http.sh`. Closes the full
+    `DHCP -> ARP -> IP -> UDP -> DNS -> TCP -> HTTP` chain.~~
   - Socket(2) API — Plan 9 `/net/tcp/clone` shape lands in Phase F.
     Today TCP is callable only from in-kernel code paths.
+- HTTP/1.1 follow-ups:
+  - Chunked transfer encoding (`Transfer-Encoding: chunked`) — the
+    M16.106 client reads body bytes verbatim, so a chunked response
+    leaks the hex-length frames into the buffer. Cloudflare-fronted
+    `example.com` exposes this — body starts `210\r\n<!doctype...`.
+    Real fix: detect the header, then in the body loop strip each
+    `<hexlen>\r\n` prefix + the trailing `\r\n` per chunk until the
+    `0\r\n\r\n` terminator.
+  - HTTPS / TLS — separate large effort. Needs at minimum a TLS 1.2
+    client with the ECDHE-RSA-AES128-GCM cipher suite, X.509 chain
+    validation against a baked-in CA bundle, and a record-layer
+    splitter that sits between `http_get` and `tcp_send`/`tcp_recv`.
+    Until then, `https://` URLs return -1 with `[http] HTTPS not
+    supported`.
+  - 3xx redirect handling — `http_get` surfaces the status code
+    through `status_out` so the caller can re-issue against the
+    `Location:` header value; a higher-level `http_get_follow()`
+    wrapper that resolves the header + caps redirect depth would
+    let `apt update` follow mirror redirects automatically.
+  - HTTP keep-alive (`Connection: keep-alive`) — today every GET
+    opens a fresh TCP slot, runs the full SYN/SYN-ACK/ACK
+    handshake, fires the request, drains, and tears down. apt
+    fetches dozens of small files per repo; keep-alive (single TCP
+    conn, multiple GETs back-to-back) would cut handshake overhead
+    significantly.
+  - Header parser that handles header continuation lines (folded
+    headers per RFC 9112 §5.2) — uncommon in practice but the
+    spec allows it.
+  - Header block spanning multiple `tcp_recv` chunks — today the
+    parser punts ("headers > 4 KiB scratch") if the `\r\n\r\n`
+    boundary doesn't fall inside the first segment. Apt-shape
+    servers always fit headers in well under 4 KiB so this hasn't
+    fired in practice, but a real fix accumulates header bytes
+    across reads.
 - ~~Native Intel e1000e Gigabit NIC driver — shipped in M16.103.
   PCI vendor 0x8086 + class 0x02/0x00/0x00 match with a device-ID
   whitelist (82574L 0x10D3, 82583V 0x150C, 82573L 0x10F5, 82579LM

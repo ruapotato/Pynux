@@ -22,6 +22,17 @@ If you're running an agent against this repo:
 - When you find a real bug (compiler codegen, kernel race, ABI gap),
   fix the bug — don't paper over with retry logic or a
   backwards-compat shim.
+- **Do NOT edit `README.md`'s Status table.** Picking the next free
+  `M16.X` row number when multiple agents run in parallel causes
+  thrashing — we've burned commits on rename dances and merge
+  conflicts that solved nothing. Instead: in your final report,
+  tell the orchestrator (human or parent agent) the one-line
+  milestone description you'd put in the table. They batch-edit
+  the README after a wave of commits lands. Same for the snapshot
+  paragraph above the Status table.
+- TODO.md is fine to edit — its structure tolerates concurrent
+  additions and cross-references. Strike completed items, add
+  follow-ups.
 
 ## Open work
 
