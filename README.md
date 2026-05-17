@@ -26,7 +26,7 @@ tracks share the same compiler and language:
    finish. **The userspace `/init` and a kernel module (`/kmod_hello`)
    are loaded from a real cpio-format initramfs via an ELF loader
    that walks PT_LOAD segments.** Userland binaries can be written
-   in Hamnix (`user/hello.py` → `python3 -m compiler.adder compile
+   in Adder (`user/hello.ad` → `python3 -m compiler.adder compile
    --target=x86_64-adder-user ...`) and `SYS_EXECVE` replaces a
    running user image with a new ELF from the initramfs. Source
    tree mirrors Linux's layout
@@ -50,26 +50,35 @@ tracks share the same compiler and language:
    subsystems land.
 
 The end-game is a fully Hamnix-authored kernel that **also loads
-stock Linux kernel modules and userspace binaries**. As of commit
-`95535a1`:
+stock Linux kernel modules and userspace binaries** — shipped as
+a real installable **server OS** that can run Debian-packaged
+services (`apt install python3`, `apache2`, `openssh-server`,
+`postgresql`). Graphics is **console-only** (VGA text + EFI GOP
+text-mode framebuffer); X11 / Wayland / Steam / Firefox / any
+GUI app are explicitly **out of scope**. Snapshot:
 
-- Stock Debian `crc32c_generic.ko` loads cleanly on Hamnix —
-  95 relocations applied, 0 unresolved externals, `init_module`
-  returns 0, real CRC32C-Castagnoli math running on the live path
-  through the Linux-ABI shims (`linux_abi/api_crypto.ad`).
-- L1..L36 of the Linux kernel ABI track are shipped (.ko loader,
-  vermagic + MODVERSIONS bypass, six relocation types, ~200 Linux
-  kernel symbols exported under their stock names).
-- U-series (Linux userspace ABI) scaffolding in place:
-  `linux_abi/u_syscalls.ad` (Linux x86_64 syscall number map),
-  `linux_abi/u_ldso.ad` (dynamic-linker scaffold),
-  `linux_abi/u_libc.ad` (mini libc.so.6 — strlen/strcmp/memcpy/...
-  with real bodies, printf/malloc/exit wired through Hamnix
-  syscalls).
+- 24 stock Debian `.ko` modules load cleanly on Hamnix —
+  crc32c_generic, crc16, crc7, crc-itu-t, lib80211, raid6_pq,
+  xor, nf_log_syslog, nfnetlink, crc32_generic, md4, rmd160,
+  blake2b_generic, ghash-generic, xxhash_generic, crypto_null,
+  des_generic, chacha_generic, poly1305_generic, curve25519-
+  generic, chacha20poly1305, nf_defrag_ipv4, plus the L67/L68
+  xt_* + nft_* netfilter family.
+- L1..L68 of the Linux kernel ABI track are shipped (.ko loader,
+  vermagic + MODVERSIONS bypass, six relocation types, ~1300
+  Linux kernel symbols exported under their stock names).
+- U-series (Linux userspace ABI) running real toolchain-built
+  binaries — musl-static, glibc-static-pie, C++ static-pie with
+  iostream + STL + exceptions, fork+waitpid, musl pthreads with
+  real 16-slot futex queue + per-task TLS via MSR_FS_BASE.
 - hamsh has if/then/else/fi + while/do/done + ;/&&/|| + $? +
   $VAR + double-quoted strings + PATH walker + comments — enough
   to write real boot scripts.
 - ~60 GNU-style userland binaries in /bin/.
+- Bootable hybrid BIOS+UEFI ISO via grub-mkrescue (commit
+  `b8e1d45`); VGA text-mode console verified on QEMU under BIOS
+  (EFI GOP framebuffer is the next gap for UEFI graphical
+  output).
 - 30/30 integration tests pass.
 
 ## Status
@@ -124,7 +133,7 @@ stock Linux kernel modules and userspace binaries**. As of commit
 | M16.10 | memset / memcpy / memmove + kzalloc — `rep stosb`/`rep movsb` (mirrors `arch/x86/lib/{memset,memcpy}_64.S`) | **Done** |
 | M16.11 | panic / BUG / WARN_ON + pr_emerg/err/warn/info/debug log levels (mirrors `kernel/panic.c` + `KERN_*`) | **Done** |
 | M16.12 | list_head intrusive doubly-linked list — `INIT_LIST_HEAD`, `list_add`, `list_del`, list poison (mirrors `include/linux/list.h`) | **Done** |
-| M16.13 | Multiboot mmap parsing — `arch/x86/kernel/e820.py` walks firmware memory map, drives `memblock_set_region` | **Done** |
+| M16.13 | Multiboot mmap parsing — `arch/x86/kernel/e820.ad` walks firmware memory map, drives `memblock_set_region` | **Done** |
 | M16.14 | `Percpu[T]` first-class language feature — codegen emits literal `%gs:offset`, master template in `.data..percpu` | **Done** |
 | M16.15 | alloc_pages(order) + kmalloc > 2 KiB — per-order free lists, page-backed large allocations | **Done** |
 | M16.16 | `container_of(ptr, Type, field)` compile-time builtin — collapses manual offset arithmetic at list walks | **Done** |
@@ -138,13 +147,13 @@ stock Linux kernel modules and userspace binaries**. As of commit
 | M16.24 | AP bootstrap — INIT-SIPI-SIPI; trampoline at 0x8000 real→32-bit→long mode; AP bumps `cpus_online` | **Done** |
 | M16.25 | LAPIC timer PIT-anchored calibration — exact HZ=100 instead of hand-picked count | **Done** |
 | M16.26 | Per-task fd tables + `SYS_WRITE` + `SYS_LSEEK` — stdout/stderr pre-opened; lseek repositions | **Done** |
-| M16.27 | Real cpio "newc" initramfs — `scripts/build_initramfs.py` generates the blob; `fs/cpio.py` parses at boot | **Done** |
+| M16.27 | Real cpio "newc" initramfs — `scripts/build_initramfs.py` generates the blob; `fs/cpio.ad` parses at boot | **Done** |
 | M16.28 | Per-task page tables — each user task owns its own PML4 (clone of BSP's); CR3 switched on context switch | **Done** |
 | M16.29 | PCI bus scan + netfilter chain — enumerates QEMU's i440FX/PIIX3/stdvga/E1000; indirect-call hook dispatch | **Done** |
 | M16.30 | ELF loader — `/init` loaded from cpio initramfs, PT_LOAD segments copied + zero-padded, enter_user_mode jumps in | **Done** |
 | M16.31 | `SYS_EXECVE` — userspace exec() via direct SYSRETQ to new RIP/RSP with new ELF; pid preserved across image replace | **Done** |
 | M16.32 | Loadable kernel modules — insmod-equivalent; `mod/kmod_hello.S` loaded at runtime, calls back via API function-pointer table | **Done** |
-| M16.33 | `x86_64-adder-user` compiler target — userland programs written in Hamnix; `user/hello.py` runs as a real CPL-3 ELF | **Done** |
+| M16.33 | `x86_64-adder-user` compiler target — userland programs written in Adder; `user/hello.ad` runs as a real CPL-3 ELF | **Done** |
 | M16.34 | UART RX + `sys_read` on stdin — line-buffered serial input drives interactive userland | **Done** |
 | M16.35 | `hamsh` shell + `SYS_EXECVE(path, argv)` + `SYS_SPAWN` + `SYS_WAITPID` — interactive command runner with builtins | **Done** |
 | M16.36 | `/proc/{version,uptime,tasks}` + `ps` — dynamic procfs snapshots rendered on open | **Done** |
@@ -286,33 +295,45 @@ drivers (xhci_hcd, nvme, usbhid, e1000e). See
 
 Surface area below targets the actual end-game.
 
-The track that lands AFTER L-series completes. Goal: run
-unmodified Linux user binaries (Steam, Firefox, language
-runtimes, graphical apps) on top of Hamnix-the-kernel. Implies:
+Goal: run unmodified Linux server binaries on top of Hamnix
+— a useful **server OS** that can be installed on real
+hardware, boot from disk, and host services. Targets:
+Python 3, Apache/nginx, OpenSSH, PostgreSQL, the Debian
+package manager itself. **Graphics is console-only (VGA text
++ EFI GOP text-mode framebuffer); X11 / Wayland / Steam /
+Firefox / any GUI app are explicitly out of scope.** Implies:
 
 - Linux x86_64 syscall ABI under the stock numbers (read=0,
   write=1, …, openat=257, futex=202, etc.). Hamnix's own
   syscalls move to a high-number range (1000+) to avoid
   collision.
 - `/lib/ld-linux-x86-64.so.2` dynamic linker — either Hamnix-
-  authored or wrapping Debian's.
-- Glibc / musl compatibility — the layers between
-  syscalls and what apps actually call.
+  authored or wrapping Debian's. Required for apt-installed
+  dynamic binaries (everything in Debian).
+- Glibc / musl compatibility — the layers between syscalls
+  and what apps actually call.
 - `/proc` and `/sys` layouts that satisfy glibc's runtime
   setup + udev-style device introspection.
 - Threading primitives — `futex(2)`, `clone(CLONE_THREAD)`,
   TLS via `arch_prctl(ARCH_SET_FS)`.
 - Mmap layout that matches what loaders assume.
+- TCP/IP networking — apt fetches over HTTP(S); a server OS
+  must accept inbound connections (ssh, web).
 
 ## End game
 
-A shippable distribution where:
+A shippable **server distribution** where:
 - Bootloader + kernel + init + shell + coreutils are all
   Hamnix-authored (the trust-critical surface).
-- L-series enables loading the NVIDIA driver + closed-source
-  kernel modules.
-- U-series enables installing software from Debian's
-  repositories (`apt install firefox`, `apt install steam`).
+- L-series enables loading the kernel modules needed for
+  real hardware that we don't want to rewrite — AHCI, NVMe,
+  e1000e / r8169, xhci-hcd / usbhid, ext4 (interim), TLS-
+  capable crypto. Anything we _can_ write in Adder, we do.
+- U-series enables installing services from Debian's
+  repositories — `apt install python3`, `apt install
+  apache2`, `apt install openssh-server`, `apt install
+  postgresql`. The bar is "useful server OS", not "Linux
+  desktop".
 - The long-tail userspace comes from Debian, the
   security-critical core from Hamnix.
 
@@ -324,7 +345,7 @@ L-series order: L0/L1 (loader + structs) → L2..L28
 ## How it works
 
 ```
-Hamnix source (.py with static types, def/while/if, structs)
+Adder source (.ad with static types, def/while/if, structs)
    │
    ▼
 compiler/  (CPython-hosted; hamnix.py CLI dispatches by --target)
@@ -360,9 +381,9 @@ Requirements: `gcc`, `make`, `qemu-system-x86_64`, `flex`, `bison`,
 ./scripts/run_x86_bare.sh
 ```
 
-Compiles `init/main.py` (plus the imports it pulls in:
-`arch/x86/`, `mm/memblock.py`, `kernel/sched/core.py`,
-`kernel/printk/printk.py`, `drivers/tty/serial/early_8250.py`),
+Compiles `init/main.ad` (plus the imports it pulls in:
+`arch/x86/`, `mm/memblock.ad`, `kernel/sched/core.ad`,
+`kernel/printk/printk.ad`, `drivers/tty/serial/early_8250.ad`),
 assembles + links into `build/hamnix-vmlinux.elf`, and boots it under
 QEMU. Serial output shows the boot banner, memblock smoke test,
 per-CPU id, PIT timer ticks, then two kernel threads alternating
@@ -385,7 +406,7 @@ module loaded, ran, and produced the expected output.
 
 ## Writing a kernel module in Hamnix
 
-`kernel-modules/hello/hello.py`:
+`kernel-modules/hello/hello.ad`:
 
 ```python
 extern def _printk(fmt: str) -> int32
@@ -406,7 +427,7 @@ system (`obj-m := hello.o`) does the rest including modpost (vermagic,
 glue, link).
 
 For an example of real hardware access in Hamnix, see
-`kernel-modules/m2-console/m2_console.py` — it declares the kernel's
+`kernel-modules/m2-console/m2_console.ad` — it declares the kernel's
 `struct console` field-by-field in Hamnix, populates the fields in
 `init_module`, and registers itself as a console. The driver's write
 function polls the UART's Line Status Register via the `inb` intrinsic
@@ -432,47 +453,47 @@ arch/x86/
   kernel/vmlinux.lds    linker script (elf32-i386 wrapper, 64-bit code)
   kernel/boot_info_asm.S mb_magic / mb_info accessors
   kernel/idt_asm.S      per-vector trap stubs + common_trap
-  kernel/idt.py         gate descriptor packing, idt_init
-  kernel/traps.py       do_trap dispatch + hex printing
+  kernel/idt.ad         gate descriptor packing, idt_init
+  kernel/traps.ad       do_trap dispatch + hex printing
   kernel/irq_asm.S      per-IRQ stubs + common_irq (iretq path)
-  kernel/irq.py         do_irq vector dispatch
-  kernel/i8259.py       8259 PIC remap + mask/unmask + EOI
-  kernel/time.py        PIT @ 100 Hz, jiffies, timer_interrupt -> schedule
-  kernel/e820.py        multiboot mmap walk -> memblock_set_region
-  kernel/setup_percpu.py + .S  Percpu[T] template memcpy + %gs base
+  kernel/irq.ad         do_irq vector dispatch
+  kernel/i8259.ad       8259 PIC remap + mask/unmask + EOI
+  kernel/time.ad        PIT @ 100 Hz, jiffies, timer_interrupt -> schedule
+  kernel/e820.ad        multiboot mmap walk -> memblock_set_region
+  kernel/setup_percpu.ad + .S  Percpu[T] template memcpy + %gs base
   kernel/sched_asm.S    __switch_to_asm, kthread_bootstrap, enter_first_task
-  kernel/syscall.py + .S STAR/LSTAR/FMASK MSRs, syscall_entry, do_syscall
+  kernel/syscall.ad + .S STAR/LSTAR/FMASK MSRs, syscall_entry, do_syscall
                         (SYS_PUTC/EXIT/GET_JIFFIES/CLONE/GETPID/
                          OPEN/READ/CLOSE)
   kernel/tss_asm.S      TSS + RSP0 — IRQs while in CPL 3
-  kernel/apic.py        Local APIC enable + LVT timer + PIT calibration
+  kernel/apic.ad        Local APIC enable + LVT timer + PIT calibration
                         + INIT/SIPI IPI helpers
-  kernel/smp.py + smp_asm.S   AP bring-up via INIT-SIPI-SIPI;
+  kernel/smp.ad + smp_asm.S   AP bring-up via INIT-SIPI-SIPI;
                               ap_main_hamnix; CR3 / load_cr3 helpers
   realmode/trampoline.S real-mode→long-mode AP trampoline (placed
                         at physical 0x8000 by linker VMA trick)
   lib/string_64.S       memset / memcpy / memmove via rep stos/movs
-  mm/init.py            mem_init() arch-side bring-up
-mm/memblock.py          early bump allocator (~ mm/memblock.c)
-mm/page_alloc.py        order-N page allocator + buddy merge-on-free
-mm/slab.py              SLUB-style slab caches + kmalloc / kzalloc / kfree
+  mm/init.ad            mem_init() arch-side bring-up
+mm/memblock.ad          early bump allocator (~ mm/memblock.c)
+mm/page_alloc.ad        order-N page allocator + buddy merge-on-free
+mm/slab.ad              SLUB-style slab caches + kmalloc / kzalloc / kfree
                         large kmalloc routes to alloc_pages
-kernel/sched/core.py    task_struct, kthread_create, create_user_task,
+kernel/sched/core.ad    task_struct, kthread_create, create_user_task,
                         preemptive schedule, multi-task lifecycle
-kernel/printk/printk.py printk0/1/2 + pr_emerg/err/warn/info/debug
-kernel/panic.py         panic / BUG / WARN_ON
-kernel/list.py          list_head intrusive doubly-linked list
-fs/cpio.py              parser for embedded newc cpio archive
+kernel/printk/printk.ad printk0/1/2 + pr_emerg/err/warn/info/debug
+kernel/panic.ad         panic / BUG / WARN_ON
+kernel/list.ad          list_head intrusive doubly-linked list
+fs/cpio.ad              parser for embedded newc cpio archive
 fs/initramfs_blob.S     generated cpio bytes (scripts/build_initramfs.py)
-fs/vfs.py               vfs_open / read / write / close / lseek
+fs/vfs.ad               vfs_open / read / write / close / lseek
                         + per-task fd table (lives in task_struct)
-drivers/tty/serial/early_8250.py  polled 16550A UART
-drivers/video/console/vga_text.py text-mode VGA console at 0xB8000
-drivers/pci/pci.py      PCI config space access (port 0xCF8/0xCFC)
+drivers/tty/serial/early_8250.ad  polled 16550A UART
+drivers/video/console/vga_text.ad text-mode VGA console at 0xB8000
+drivers/pci/pci.ad      PCI config space access (port 0xCF8/0xCFC)
                         + bus scan
-drivers/net/netfilter.py netfilter hook chain + indirect dispatch
+drivers/net/netfilter.ad netfilter hook chain + indirect dispatch
 scripts/build_initramfs.py  regenerates fs/initramfs_blob.S
-init/main.py            start_kernel()
+init/main.ad            start_kernel()
 
 kernel-modules/  Hamnix source for each module milestone
   hello/         M1   hello-world
@@ -517,7 +538,7 @@ kernel-modules/  Hamnix source for each module milestone
   m15-kfifo/     M15.2 kfifo circular buffer
 
 scripts/         x86 dev-loop infrastructure
-  run_x86_bare.sh        Compile init/main.py → hamnix-vmlinux.elf → QEMU -kernel
+  run_x86_bare.sh        Compile init/main.ad → hamnix-vmlinux.elf → QEMU -kernel
   build_x86_kernel.sh    Fetch + build mitigations-off Linux for QEMU
   x86_kernel_config.sh   Kernel config knobs
   make_initramfs.sh      Build static busybox + cpio initramfs

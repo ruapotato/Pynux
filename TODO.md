@@ -42,3 +42,13 @@ are fair game for any contributor — human or AI agent.
 
 - Real-hardware boot (ThinkPad). FAT32 read + EXT4 r/w done;
   UEFI handover outstanding.
+- EFI GOP graphical console. Under UEFI boot, GRUB-EFI doesn't
+  program legacy VGA text mode, so `drivers/video/console/vga_text.ad`
+  (writes to 0xB8000) is dark on the monitor — UEFI users see only
+  the serial console. The multiboot1 framebuffer tag (type 8) is
+  available at kernel entry in `%ebx`; parse it for `(base, width,
+  height, bpp, pitch)` and add a sibling driver (e.g.
+  `drivers/video/console/fb_text.ad`) that renders 8x16 bitmap-font
+  glyphs into the linear framebuffer. Hook the new `fb_putc` into
+  the same `early_putc` fan-out point. BIOS path is unaffected
+  (CGA text framebuffer still works).

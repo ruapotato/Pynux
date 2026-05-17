@@ -649,6 +649,13 @@ def task_pml4(slot: int32) -> uint64:
     return task_table[cast[uint64](slot)].cr3
 
 
+def task_kstack_top(slot: int32) -> uint64:
+    # U39 diag accessor — exposes the freshly-built iret frame top so
+    # SYS_SPAWN can sanity-check the planted RIP/RSP without poking
+    # task_table directly.
+    return task_table[cast[uint64](slot)].kstack_top
+
+
 def task_lookup_by_pid(pid: uint64) -> int32:
     # Linear scan — NTASKS is 4 so this is cheap; switches to a
     # hashed pidmap when the runqueue grows. Returns -1 on miss.

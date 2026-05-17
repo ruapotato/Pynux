@@ -23,7 +23,6 @@ from drivers.tty.serial.early_8250 import (
     early_putc, early_getc_polled, uart_rx_pop,
 )
 from drivers.input.atkbd import kbd_rx_pop
-from drivers.video.console.vga_text import vga_putc
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.sched.core import (
     TaskStruct, current_task,
@@ -972,12 +971,14 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # M16.77: mirror every byte to BOTH the UART and the VGA text
         # console. The UART feeds `-nographic` QEMU; the VGA console
         # is what a real-hardware user sees on the monitor. Same byte
-        # stream on both. vga_putc handles its own scroll + cursor.
+        # stream on both. early_putc() already fans out to vga_putc()
+        # internally, so a single call here drives both surfaces —
+        # calling vga_putc() a second time would double every glyph
+        # on the framebuffer.
         i: uint64 = 0
         while i < count:
             ch: int32 = cast[int32](buf[i])
             early_putc(ch)
-            vga_putc(ch)
             i = i + 1
         return cast[int64](count)
     if file_idx == FD_STDIN_MARK:
