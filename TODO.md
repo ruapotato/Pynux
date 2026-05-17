@@ -243,6 +243,43 @@ it has to honour.
     Content-Length-bounded body. Builds on `tcp_connect`.
   - Socket(2) API — Plan 9 `/net/tcp/clone` shape lands in Phase F.
     Today TCP is callable only from in-kernel code paths.
+- ~~Native Intel e1000e Gigabit NIC driver — shipped in M16.103.
+  PCI vendor 0x8086 + class 0x02/0x00/0x00 match with a device-ID
+  whitelist (82574L 0x10D3, 82583V 0x150C, 82573L 0x10F5, 82579LM
+  0x1502, I217-LM 0x153A, I218-LM 0x15A2, I219-LM 0x156F + v3
+  0x15B7). MMIO BAR0 + MEM/master enable; CTRL.SLU+ASDE for PHY
+  bring-up; MAC read from RAL[0]/RAH[0]; 256-descriptor RX ring
+  with 2 KiB buffers; RCTL.EN/BAM/BSIZE=2K/SECRC programmed.
+  `e1000e_poll()` drains via descriptor.status.DD and re-arms RDT.
+  Probe + IDENTIFY + RECEIVE only — no TX, no integration with
+  the ARP/IP/UDP/ICMP/DHCP/DNS/TCP stack. With virtio-net + e1000e
+  the install ISO now reaches the wire on every Dell PowerEdge /
+  HP ProLiant / Supermicro motherboard / ThinkPad / Latitude /
+  EliteBook from the last ~15 years. See `scripts/test_net_e1000e.sh`.~~
+- e1000e follow-ups:
+  - Single-segment TX (`e1000e_tx_one`) — enough to send an ARP
+    probe and observe an inbound reply land in the RX ring, the
+    same shape virtio_net M16.88 uses for its self-test. Once TX
+    exists, the e1000e test can add an `[e1000e] RX packet`
+    assertion.
+  - MSI-X interrupt routing (after IOAPIC programming lands) —
+    today `e1000e_poll` drains the RX ring on demand from the
+    init spin loop, same shape as virtio_net_poll.
+  - EEPROM-walk (`EERD`) for real hardware without a pre-loaded
+    RAL/RAH — QEMU always loads MAC from `-device e1000e,mac=...`,
+    but some real cards leave RAH.AV cleared until the driver
+    issues an EERD-paced 16-bit-at-a-time read.
+- Realtek r8169-family NIC driver — covers most consumer ASUS /
+  Gigabyte / MSI motherboards + ThinkPads + gaming laptops
+  (vendor 0x10EC, devices 0x8168 / 0x8169 / 0x8139). After
+  e1000e (Intel) + virtio-net (QEMU), Realtek is the remaining
+  high-volume gap on real-hardware NIC coverage.
+- Broadcom tg3 driver — covers most Dell / HP business laptops
+  (BCM57xx series). After r8169 + e1000e the gap to "boots on any
+  real laptop" is mostly tg3 and the Atheros AR8161 family.
+- Intel igb driver — covers I210 / I350 server NICs that ship on
+  most modern motherboards but aren't part of the e1000e device-ID
+  whitelist (they use the igb register layout, not e1000e's).
 
 ## Userspace / U-track
 

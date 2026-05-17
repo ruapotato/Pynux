@@ -22,6 +22,14 @@
 
 from kernel.printk.printk import printk0, printk1, printk2
 
+# Cross-import the e1000e probe so it lands in the link graph and
+# `pci_scan()` can drive it. The Adder compiler handles cycles via
+# its hoist-all-decls-to-one-namespace lowering — `drivers/net/eth.ad`
+# already does the same trick with `drivers/net/virtio_net.ad`. We
+# only need the two entry points here; the rest of the driver lives
+# entirely under `drivers/net/e1000e.ad`.
+from drivers.net.e1000e import e1000e_init, e1000e_poll
+
 PCI_CONFIG_ADDR: uint64 = 0xCF8
 PCI_CONFIG_DATA: uint64 = 0xCFC
 
@@ -200,3 +208,23 @@ def pci_scan():
 
     printk1("PCI: scan complete, %d devices found\n",
             cast[uint64](nr_found))
+
+    # Opportunistic probe for the native Intel e1000e Gigabit NIC.
+    # virtio-net (M16.88) covers QEMU's `-device virtio-net`; e1000e
+    # (M16.103) covers QEMU's `-device e1000e` AND real-hardware
+    # Intel PCH NICs from ~2009 onwards. Both are polled — IOAPIC
+    # programming is still outstanding, so neither has a real IRQ
+    # handler yet. A miss (no matching device on the bus) returns
+    # -1 and is silent except for the "[e1000e] no controller found"
+    # log; the kernel keeps booting either way.
+    if e1000e_init() == 0:
+        # Drain whatever the device has spontaneously delivered. On
+        # QEMU SLIRP this is usually nothing (SLIRP doesn't broadcast
+        # unsolicited frames), but the call costs ~one PCI MMIO
+        # read against an empty ring on the miss path. We loop a
+        # short busy-wait to give QEMU SLIRP time to inject any
+        # link-up triggered traffic.
+        spin: uint64 = 0
+        while spin < 1000000:
+            e1000e_poll()
+            spin = spin + 1

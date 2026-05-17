@@ -1,0 +1,500 @@
+# drivers/net/e1000e.ad
+#
+# Bare-metal e1000e (Intel Gigabit Ethernet) PCI driver — second
+# real NIC after the M16.88 virtio-net path. Scope is intentionally
+# narrower than virtio_net's: PROBE + IDENTIFY + RECEIVE only. No
+# TX. No integration with the ARP/DHCP/ICMP/DNS stack — virtio-net
+# stays the bring-up NIC for those tests. This commit proves the
+# controller initialises, the MAC is readable, the PHY/link comes
+# up, and the RX descriptor ring is wired correctly enough that
+# any frame the device decides to deliver flows through eth_rx().
+#
+# Why e1000e and not e1000 (the older 8254x family virtio_net's
+# `-device e1000` would land at)? Two reasons:
+#
+#   1. e1000e is the modern variant — every PCH-on-die NIC since
+#      Nehalem (~2009) is some flavour of 82574L / I217 / I218 /
+#      I219. Real Dell PowerEdge / HP ProLiant / Supermicro
+#      motherboards ship with one. Adding it doubles real-hardware
+#      NIC coverage from "QEMU only" to "QEMU + most x86 servers
+#      and laptops of the last 15 years" with one driver.
+#
+#   2. QEMU's `-device e1000e` emulates the 82574L (0x10D3) exactly
+#      — same register layout as the real silicon. Whatever we
+#      write here boots unchanged on real hardware that exposes
+#      the same device-id family.
+#
+# Why a polling helper and not a real IRQ handler? Same reason
+# virtio_net + AHCI + NVMe poll: the kernel brings up the LAPIC for
+# the timer tick but does NOT yet program the IOAPIC, so PCI INTx
+# lines have nowhere to land. MSI / MSI-X would work but adds
+# complexity ruled out of this milestone. `e1000e_poll()` drains
+# the RX descriptor ring on demand; the kernel calls it from the
+# init smoke-test path after the device is brought up.
+#
+# Register layout we touch (all relative to BAR0, MMIO):
+#
+#     0x00000  CTRL     Device Control                   (RW)
+#     0x00008  STATUS   Device Status                    (RO)
+#     0x00100  RCTL     Receive Control                  (RW)
+#     0x02800  RDBAL    RX Descriptor Base Address Low   (RW)
+#     0x02804  RDBAH    RX Descriptor Base Address High  (RW)
+#     0x02808  RDLEN    RX Descriptor Ring Length        (RW)
+#     0x02810  RDH      RX Descriptor Head               (RW)
+#     0x02818  RDT      RX Descriptor Tail               (RW)
+#     0x05400  RAL[0]   Receive Address Low  (MAC[0..3]) (RW)
+#     0x05404  RAH[0]   Receive Address High (MAC[4..5]) (RW)
+#
+# Receive descriptor layout (legacy, 16 bytes):
+#     [ u64 buffer_addr | u16 length | u16 csum | u8 status | u8 err
+#       | u16 vlan ]
+# We only care about `status.DD` (bit 0 — Descriptor Done) and
+# `length` on the way back; the device fills both when it places
+# an inbound frame into the buffer pointed at by `buffer_addr`.
+#
+# Intel 82574L datasheet section 8.2 (Device Control) + section
+# 10.3 (Receive Descriptor Ring) is the canonical reference; the
+# Linux driver under drivers/net/ethernet/intel/e1000e/ is a much
+# larger superset (EEE / ASF / PHY-init / link-state interrupts /
+# offloads) that we deliberately don't reach for here.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.pci.pci import (
+    pci_config_read_dword, pci_config_write_dword,
+    pci_bdf_bus, pci_bdf_dev, pci_bdf_fn, pci_pack_bdf,
+    pci_read_bar, PCI_BDF_NONE,
+    PCI_COMMAND_OFFSET, PCI_COMMAND_MEM, PCI_COMMAND_MASTER,
+)
+from mm.page_alloc import alloc_pages
+from mm.slab import kmalloc
+from drivers.net.eth import eth_rx
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- PCI matching --------------------------------------------------
+#
+# All e1000e variants share Intel's vendor ID 0x8086 and the
+# Ethernet-controller class triple (0x02 / 0x00 / 0x00). The device
+# ID varies by silicon generation; we match a short whitelist of the
+# IDs we know carry an e1000e-compatible register window. QEMU's
+# `-device e1000e` lands at 0x10D3 (82574L), so that's the only ID
+# this test fixture exercises; the rest are accepted so the same
+# driver picks up real hardware too.
+E1000E_VENDOR_INTEL: uint32 = 0x8086
+
+E1000E_CLASS:    uint32 = 0x02
+E1000E_SUBCLASS: uint32 = 0x00
+E1000E_PROGIF:   uint32 = 0x00
+
+# Known e1000e-compatible device IDs. Keep ordered by generation;
+# 0x10D3 first because that's the QEMU emulation target.
+E1000E_DEV_82574L:   uint32 = 0x10D3      # 82574L (QEMU `-device e1000e`)
+E1000E_DEV_82583V:   uint32 = 0x150C      # 82583V (low-end variant)
+E1000E_DEV_82573L:   uint32 = 0x10F5      # 82573L
+E1000E_DEV_82579LM:  uint32 = 0x1502      # 82579LM (Ibex Peak PCH)
+E1000E_DEV_I217_LM:  uint32 = 0x153A      # I217-LM (Lynx Point PCH)
+E1000E_DEV_I218_LM:  uint32 = 0x15A2      # I218-LM (Wildcat Point PCH)
+E1000E_DEV_I219_LM:  uint32 = 0x156F      # I219-LM (Sunrise Point PCH)
+E1000E_DEV_I219_V3:  uint32 = 0x15B7      # I219-LM v3 (Skylake)
+
+
+# --- Register offsets (relative to BAR0 MMIO base) -----------------
+
+E1000_CTRL:    uint64 = 0x00000
+E1000_STATUS:  uint64 = 0x00008
+E1000_RCTL:    uint64 = 0x00100
+E1000_RDBAL:   uint64 = 0x02800
+E1000_RDBAH:   uint64 = 0x02804
+E1000_RDLEN:   uint64 = 0x02808
+E1000_RDH:     uint64 = 0x02810
+E1000_RDT:     uint64 = 0x02818
+E1000_RAL0:    uint64 = 0x05400
+E1000_RAH0:    uint64 = 0x05404
+
+# CTRL (Device Control) bits we set.
+E1000_CTRL_SLU:      uint32 = 0x00000040    # Set Link Up
+E1000_CTRL_ASDE:     uint32 = 0x00000020    # Auto-Speed Detection Enable
+
+# STATUS bits we read.
+E1000_STATUS_LU:     uint32 = 0x00000002    # Link Up
+
+# RCTL (Receive Control) bits we set.
+E1000_RCTL_EN:       uint32 = 0x00000002    # Receiver Enable
+E1000_RCTL_BAM:      uint32 = 0x00008000    # Broadcast Accept Mode
+E1000_RCTL_BSIZE_2K: uint32 = 0x00000000    # BSIZE = 00 → 2048 bytes
+E1000_RCTL_SECRC:    uint32 = 0x04000000    # Strip Ethernet CRC
+
+# RAH (Receive Address High) — bit 31 is "Address Valid" once the
+# device has loaded the EEPROM MAC into RAL0/RAH0.
+E1000_RAH_AV:        uint32 = 0x80000000
+
+
+# --- Descriptor ring layout ----------------------------------------
+#
+# We use a fixed 256-descriptor ring × 16 bytes/descriptor = 4096
+# bytes, which fits in a single 4 KiB page and satisfies the spec's
+# 128-byte alignment requirement for RDBAL. Each descriptor points at
+# a 2 KiB receive buffer (matches RCTL.BSIZE=00).
+NR_RX_DESCS:       uint64 = 256
+RX_DESC_BYTES:     uint64 = 16
+RX_RING_BYTES:     uint64 = 4096          # 256 * 16
+
+E1000E_RX_BUF_BYTES: uint64 = 2048
+
+# Receive descriptor status bits.
+E1000_RXD_STAT_DD: uint8 = 0x01           # Descriptor Done
+E1000_RXD_STAT_EOP: uint8 = 0x02          # End of Packet
+
+
+# --- Driver state --------------------------------------------------
+
+class E1000e:
+    bdf:          uint32
+    device_id:    uint32
+    pad0:         uint32
+    bar0:         uint64                  # MMIO base
+    rx_ring:      uint64                  # base of the 4 KiB descriptor ring
+    # Per-descriptor receive-buffer base. We keep these in a parallel
+    # array (rather than walking the descriptor's buffer_addr) so the
+    # poll loop never has to trust DMA-mutated fields for the buffer
+    # pointer it re-arms.
+    rx_buf_addrs: Array[256, uint64]
+    rx_tail:      uint16                  # last RDT we wrote
+    pad1:         uint16
+    pad2:         uint32
+    mac:          Array[6, uint8]
+    rx_packets:   uint64
+
+
+e1000e_state: E1000e
+
+
+# --- MMIO helpers --------------------------------------------------
+
+def _e1000e_mmio_r32(addr: uint64) -> uint32:
+    return cast[Ptr[uint32]](addr)[0]
+
+
+def _e1000e_mmio_w32(addr: uint64, value: uint32):
+    cast[Ptr[uint32]](addr)[0] = value
+
+
+# --- Class+vendor+id PCI scan --------------------------------------
+#
+# Walk bus 0 looking for a device whose vendor is Intel, whose
+# class triple matches Ethernet-controller, AND whose device id
+# appears in our whitelist. Returns the packed BDF on a hit, or
+# PCI_BDF_NONE if no e1000e is attached.
+
+def _e1000e_match_devid(device: uint32) -> int32:
+    if device == E1000E_DEV_82574L:
+        return 1
+    if device == E1000E_DEV_82583V:
+        return 1
+    if device == E1000E_DEV_82573L:
+        return 1
+    if device == E1000E_DEV_82579LM:
+        return 1
+    if device == E1000E_DEV_I217_LM:
+        return 1
+    if device == E1000E_DEV_I218_LM:
+        return 1
+    if device == E1000E_DEV_I219_LM:
+        return 1
+    if device == E1000E_DEV_I219_V3:
+        return 1
+    return 0
+
+
+def _e1000e_pci_find() -> uint32:
+    bus: uint32 = 0
+    dev: uint32 = 0
+    while dev < 32:
+        ident: uint32 = pci_config_read_dword(bus, dev, 0, 0x00)
+        v: uint32 = ident & 0xFFFF
+        if v == E1000E_VENDOR_INTEL:
+            device: uint32 = (ident >> 16) & 0xFFFF
+            if _e1000e_match_devid(device) == 1:
+                cls: uint32 = pci_config_read_dword(bus, dev, 0, 0x08)
+                this_class:    uint32 = (cls >> 24) & 0xFF
+                this_subclass: uint32 = (cls >> 16) & 0xFF
+                # prog_if (cls >> 8) is 0 for e1000e; we don't bother
+                # cross-checking that byte — Intel only ships
+                # Ethernet controllers under 0x02/0x00.
+                if this_class == E1000E_CLASS \
+                   and this_subclass == E1000E_SUBCLASS:
+                    e1000e_state.device_id = device
+                    return pci_pack_bdf(bus, dev, 0)
+        dev = dev + 1
+    return PCI_BDF_NONE
+
+
+def _e1000e_pci_enable(bdf: uint32):
+    # e1000e BAR0 is MMIO; the controller DMAs into host memory for
+    # descriptor writeback + packet payload. Both require
+    # Memory Space Enable + Bus Master Enable. IO Space Enable is
+    # irrelevant — the legacy IOADDR/IODATA BAR (BAR2) isn't wired up
+    # by this driver.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    cmd: uint32 = pci_config_read_dword(bus, dev, fn,
+                                        PCI_COMMAND_OFFSET) & 0xFFFF
+    cmd = cmd | PCI_COMMAND_MEM | PCI_COMMAND_MASTER
+    upper: uint32 = pci_config_read_dword(bus, dev, fn,
+                                          PCI_COMMAND_OFFSET) & 0xFFFF0000
+    pci_config_write_dword(bus, dev, fn, PCI_COMMAND_OFFSET,
+                           upper | cmd)
+
+
+# --- MAC read ------------------------------------------------------
+#
+# The e1000e firmware loads the EEPROM MAC into RAL[0]/RAH[0] at
+# reset; we can just read it back. (A real driver would also walk
+# EERD on a controller where RAL[0] is empty, e.g. test cards
+# without a programmed EEPROM. QEMU's emulated 82574L always
+# preloads RAL/RAH from the `-device e1000e,mac=...` argument, so
+# the EEPROM dance isn't needed here.)
+
+def _e1000e_read_mac(bar0: uint64, mac: Ptr[uint8]):
+    ral: uint32 = _e1000e_mmio_r32(bar0 + E1000_RAL0)
+    rah: uint32 = _e1000e_mmio_r32(bar0 + E1000_RAH0)
+    mac[0] = cast[uint8](ral        & 0xFF)
+    mac[1] = cast[uint8]((ral >>  8) & 0xFF)
+    mac[2] = cast[uint8]((ral >> 16) & 0xFF)
+    mac[3] = cast[uint8]((ral >> 24) & 0xFF)
+    mac[4] = cast[uint8]( rah        & 0xFF)
+    mac[5] = cast[uint8]((rah >>  8) & 0xFF)
+
+
+def _e1000e_print_mac(mac: Ptr[uint8]):
+    # Same pattern as virtio_net's _print_mac: one printk per nibble
+    # because printk's format only takes a single arg per call. Pad
+    # the leading nibble so all bytes render as two hex digits.
+    printk0("[e1000e] mac=")
+    i: uint64 = 0
+    while i < 6:
+        b: uint64 = cast[uint64](mac[i])
+        hi: uint64 = (b >> 4) & 0xF
+        lo: uint64 = b & 0xF
+        printk1("%x", hi)
+        printk1("%x", lo)
+        if i < 5:
+            printk0(":")
+        i = i + 1
+    printk0("\n")
+
+
+# --- Descriptor ring setup -----------------------------------------
+#
+# Allocate a 4 KiB page for the descriptor ring (256 × 16 bytes —
+# exactly one page, naturally 4096-byte aligned). For each
+# descriptor, allocate a 2 KiB receive buffer and plant its address
+# at descriptor[i].buffer_addr. Wire the ring base into
+# RDBAL/RDBAH, length into RDLEN, and set the head/tail pair so the
+# device has all 256 descriptors available.
+
+def _e1000e_desc_set(ring: uint64, idx: uint64, buf_addr: uint64):
+    # Zero-out the per-descriptor 16-byte slot and plant only the
+    # buffer address. status/err/length stay zero — the device
+    # writes them when it deposits a frame.
+    d: uint64 = ring + idx * RX_DESC_BYTES
+    cast[Ptr[uint64]](d +  0)[0] = buf_addr
+    cast[Ptr[uint64]](d +  8)[0] = 0
+
+
+def _e1000e_setup_rx(state: Ptr[E1000e]) -> int32:
+    # 4 KiB page for the ring. alloc_pages(0) returns a 4 KiB
+    # page-aligned physical address; identity-map below 4 GiB makes
+    # this also a valid virtual pointer.
+    ring: uint64 = alloc_pages(0)
+    if ring == 0:
+        printk0("[e1000e] alloc_pages(0) for RX ring failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](ring), 0, cast[uint64](RX_RING_BYTES))
+    state[0].rx_ring = ring
+
+    # Per-descriptor buffers. kmalloc returns a kernel-virt address
+    # that is also a valid DMA address (identity map, no IOMMU yet).
+    i: uint64 = 0
+    while i < NR_RX_DESCS:
+        buf: uint64 = kmalloc(E1000E_RX_BUF_BYTES)
+        if buf == 0:
+            printk0("[e1000e] kmalloc for RX buf failed\n")
+            return -1
+        memset(cast[Ptr[uint8]](buf), 0, E1000E_RX_BUF_BYTES)
+        state[0].rx_buf_addrs[i] = buf
+        _e1000e_desc_set(ring, i, buf)
+        i = i + 1
+
+    bar0: uint64 = state[0].bar0
+
+    # Plant the ring base. RDBAL gets the low 32 bits, RDBAH the high.
+    _e1000e_mmio_w32(bar0 + E1000_RDBAL,
+                     cast[uint32](ring & 0xFFFFFFFF))
+    _e1000e_mmio_w32(bar0 + E1000_RDBAH,
+                     cast[uint32](ring >> 32))
+    # Length is in BYTES, must be a multiple of 128.
+    _e1000e_mmio_w32(bar0 + E1000_RDLEN,
+                     cast[uint32](RX_RING_BYTES))
+    # Head = 0; Tail = NR_RX_DESCS - 1 so the device sees every
+    # descriptor as available.
+    _e1000e_mmio_w32(bar0 + E1000_RDH, 0)
+    _e1000e_mmio_w32(bar0 + E1000_RDT,
+                     cast[uint32](NR_RX_DESCS - 1))
+    state[0].rx_tail = cast[uint16]((NR_RX_DESCS - 1) & 0xFFFF)
+
+    # Enable the receiver: EN + BAM (accept broadcasts) + BSIZE=2K.
+    # We deliberately leave UPE (unicast promiscuous) and MPE
+    # (multicast promiscuous) off — RAL[0] already filters incoming
+    # unicasts to our MAC, which is what we want.
+    rctl: uint32 = E1000_RCTL_EN | E1000_RCTL_BAM \
+                 | E1000_RCTL_BSIZE_2K | E1000_RCTL_SECRC
+    _e1000e_mmio_w32(bar0 + E1000_RCTL, rctl)
+    return 0
+
+
+# --- Public entry point --------------------------------------------
+
+def e1000e_init() -> int32:
+    # Probe, init, log MAC + link state. Returns 0 on success, -1
+    # on miss / failure. Caller treats failure as "no e1000e
+    # attached" — virtio-net stays the bring-up NIC for the existing
+    # net tests.
+    e1000e_state.bdf = PCI_BDF_NONE
+    e1000e_state.bar0 = 0
+    e1000e_state.rx_packets = 0
+
+    bdf: uint32 = _e1000e_pci_find()
+    if bdf == PCI_BDF_NONE:
+        printk0("[e1000e] no controller found\n")
+        return -1
+    e1000e_state.bdf = bdf
+    printk2("[e1000e] controller found bdf=%x device=%x\n",
+            cast[uint64](bdf), cast[uint64](e1000e_state.device_id))
+
+    _e1000e_pci_enable(bdf)
+
+    # BAR0 = MMIO, 32-bit. The 82574L's BAR0 is a 32-bit MEM BAR
+    # (type bits in [1..3] = 0b000), so we don't need to read BAR1
+    # for the high half. Mask the type/prefetch bits out.
+    bar0_raw: uint32 = pci_read_bar(bdf, 0)
+    if (bar0_raw & 1) != 0:
+        printk0("[e1000e] BAR0 is IO-space (unexpected)\n")
+        return -1
+    bar0: uint64 = cast[uint64](bar0_raw & 0xFFFFFFF0)
+    e1000e_state.bar0 = bar0
+    printk1("[e1000e] bar0=%p\n", bar0)
+
+    # PHY / link init. Set SLU (Set Link Up) + ASDE (Auto-Speed
+    # Detection Enable). On QEMU's emulated 82574L the link is
+    # already up after reset — both bits are no-ops. On real
+    # hardware SLU triggers the PHY's auto-negotiation handshake;
+    # ASDE feeds the resulting speed back into the MAC's SPEED
+    # field so the device doesn't sit in a stale 10/100 mode.
+    ctrl: uint32 = _e1000e_mmio_r32(bar0 + E1000_CTRL)
+    ctrl = ctrl | E1000_CTRL_SLU | E1000_CTRL_ASDE
+    _e1000e_mmio_w32(bar0 + E1000_CTRL, ctrl)
+
+    # Read MAC from RAL[0]/RAH[0]. Verify RAH.AV first — if zero,
+    # the firmware never loaded an EEPROM image and we'd be reading
+    # garbage. (QEMU always sets AV; real hardware on a freshly
+    # blanked card may not.)
+    rah: uint32 = _e1000e_mmio_r32(bar0 + E1000_RAH0)
+    if (rah & E1000_RAH_AV) == 0:
+        printk0("[e1000e] RAH0.AV clear — no MAC loaded from EEPROM\n")
+        # Continue anyway; the test fixture's `-device e1000e,mac=...`
+        # always populates RAL/RAH on QEMU. Real hardware without a
+        # programmed EEPROM would need the EERD-walk path which is
+        # explicit follow-up work.
+    _e1000e_read_mac(bar0, &e1000e_state.mac[0])
+    _e1000e_print_mac(&e1000e_state.mac[0])
+
+    # Log link state. The STATUS register's LU bit is set within
+    # ~1 ms of SLU on QEMU; on real hardware it can take 200 ms
+    # for the PHY to complete autoneg. We don't block — we just
+    # report whatever STATUS says now, and the caller can re-read
+    # later if it needs a definitive state.
+    status: uint32 = _e1000e_mmio_r32(bar0 + E1000_STATUS)
+    if (status & E1000_STATUS_LU) != 0:
+        printk0("[e1000e] link up\n")
+    else:
+        printk1("[e1000e] link down (status=%x)\n", cast[uint64](status))
+
+    # RX ring setup. Failure here is "driver init failed" — log and
+    # bail out so the caller knows the device isn't usable.
+    if _e1000e_setup_rx(&e1000e_state) != 0:
+        printk0("[e1000e] RX setup failed\n")
+        return -1
+    printk1("[e1000e] RX ring ready (%d descriptors)\n",
+            cast[uint64](NR_RX_DESCS))
+
+    printk0("[e1000e] init done\n")
+    return 0
+
+
+# --- RX polling ----------------------------------------------------
+#
+# Walk descriptors starting at (rx_tail + 1) % NR_RX_DESCS — that's
+# the next slot the device will fill, since the device walks
+# RDH→RDT. For each descriptor whose status.DD bit is set, hand the
+# frame up to eth_rx, then clear the status byte and re-arm the
+# descriptor (re-plant the buffer address, zero the writeback half)
+# so the device can use it again. After draining, advance RDT to
+# the last descriptor we processed so the device sees the same set
+# of available slots it had before.
+
+def _e1000e_rx_handle_one(idx: uint64):
+    ring: uint64 = e1000e_state.rx_ring
+    d: uint64 = ring + idx * RX_DESC_BYTES
+    # Re-load length + status from the descriptor (volatile-ish — DMA
+    # mutated this slot since we last touched it).
+    length: uint64 = cast[uint64](cast[Ptr[uint16]](d + 8)[0])
+    buf: uint64 = e1000e_state.rx_buf_addrs[idx]
+    e1000e_state.rx_packets = e1000e_state.rx_packets + 1
+    printk1("[e1000e] RX packet: len=%d\n", length)
+    eth_rx(cast[Ptr[uint8]](buf), length)
+    # Re-arm: zero the writeback half (length / status / err / vlan)
+    # so the next DD-set is observable, and re-plant buffer_addr in
+    # case some future driver bug clobbered it.
+    cast[Ptr[uint64]](d + 0)[0] = buf
+    cast[Ptr[uint64]](d + 8)[0] = 0
+
+
+def e1000e_poll():
+    # No device → no work.
+    if e1000e_state.bar0 == 0:
+        return
+    bar0: uint64 = e1000e_state.bar0
+    ring: uint64 = e1000e_state.rx_ring
+    qsize: uint64 = NR_RX_DESCS
+
+    # Drain. We walk from (rx_tail + 1) forward, checking each
+    # descriptor's status byte for DD. Stop at the first not-done
+    # slot (device hasn't filled it yet). Bound the loop at qsize
+    # iterations as a safety net against a wedged status field.
+    next_idx: uint64 = (cast[uint64](e1000e_state.rx_tail) + 1) % qsize
+    processed: uint64 = 0
+    last_done: int32 = -1
+    while processed < qsize:
+        d: uint64 = ring + next_idx * RX_DESC_BYTES
+        status: uint8 = cast[Ptr[uint8]](d + 12)[0]
+        if (status & E1000_RXD_STAT_DD) == 0:
+            processed = qsize        # break
+        else:
+            _e1000e_rx_handle_one(next_idx)
+            last_done = cast[int32](next_idx & 0xFFFFFFFF)
+            next_idx = (next_idx + 1) % qsize
+            processed = processed + 1
+    # Advance RDT to the last-processed descriptor so the device
+    # picks the refilled slots back up. If we drained nothing,
+    # leave RDT alone.
+    if last_done >= 0:
+        e1000e_state.rx_tail = cast[uint16](cast[uint64](last_done) & 0xFFFF)
+        _e1000e_mmio_w32(bar0 + E1000_RDT,
+                         cast[uint32](cast[uint64](last_done) & 0xFFFFFFFF))
+
+
+def e1000e_rx_packets() -> uint64:
+    return e1000e_state.rx_packets
