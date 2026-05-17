@@ -42,6 +42,7 @@
 # vaddr; gaps are part of the same allocation.
 
 from mm.memblock import memblock_alloc
+from mm.page_alloc import alloc_page
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.panic import panic
 # Note: elf_load_blob no longer flips is_linux_userspace itself —
@@ -50,6 +51,8 @@ from kernel.panic import panic
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+extern def load_cr3(value: uint64)
+extern def get_bsp_cr3() -> uint64
 
 
 PT_LOAD:    uint32 = 1
@@ -71,9 +74,37 @@ ELFOSABI_LINUX: uint8 = 3
 # for the SYS_SPAWN / SYS_EXECVE caller to fish out when building
 # the Linux process init-stack (auxv needs AT_PHDR / AT_PHNUM /
 # AT_ENTRY).
+#
+# Semantics of elf_last_load_base: it's the USER-side base address of
+# the loaded image — the value AT_PHDR / AT_ENTRY are anchored to.
+#   * ET_DYN (PIE): set to `region` because the binary runs at the
+#     identity-mapped kernel virt addr that equals the physical region
+#     pointer. AT_PHDR = region + e_phoff is a real user-readable vaddr.
+#   * ET_EXEC (U30+): set to `lowest_v`, the binary's link-time base
+#     (e.g. 0x400000 for busybox). The user mapping installed by
+#     elf_install_user_mapping translates [lowest_v, highest_v) to the
+#     physical region we just kmalloc'd, so AT_PHDR = lowest_v + e_phoff
+#     points at the loaded program headers inside the user's address
+#     space.
 elf_last_load_base: uint64 = 0
 elf_last_phoff:     uint64 = 0
 elf_last_phnum:     uint32 = 0
+
+# U30: per-task user-virtual-address mapping. ET_EXEC binaries (like the
+# Debian busybox-static) bake absolute addresses into .got / .text and
+# expect to be loaded at their link-time vaddr (typically 0x400000+).
+# When _load_elf64 detects ET_EXEC (e_type == 2) it stashes the user
+# vaddr range and the backing physical region here; the SYS_SPAWN /
+# SYS_EXECVE caller then invokes elf_install_user_mapping(pml4) on the
+# target task's per-task PML4 to overlay a fine-grained 4 KiB mapping
+# of [lowest_v, highest_v) onto the cloned identity map. ET_DYN binaries
+# leave elf_last_needs_user_map at 0 and continue to run at the
+# identity-mapped `region` address.
+elf_last_needs_user_map: int32  = 0
+elf_last_user_vlow:      uint64 = 0
+elf_last_user_vhigh:     uint64 = 0
+elf_last_user_phys_base: uint64 = 0
+ELF_ET_EXEC: uint16 = 2
 
 # Set by elf_load_blob to 1 when the just-loaded image is a Linux-ABI
 # binary (OSABI=Linux or PT_INTERP present). Consumed by SYS_SPAWN /
@@ -146,6 +177,11 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     if blob_size < 64:
         printk0("elf64: blob too small for ELF64 header\n")
         return 0
+    # e_type at offset 16 (uint16). 2 = ET_EXEC (absolute addresses
+    # baked in; needs the per-task user mapping installed below).
+    # 3 = ET_DYN (PIE / shared object); runs at the rebased `region`.
+    e_type: uint32 = _read_u16(cast[Ptr[uint8]](
+        cast[uint64](blob) + 16))
     e_entry: uint64 = _read_u64(cast[Ptr[uint8]](
         cast[uint64](blob) + 24))
     e_phoff: uint64 = _read_u64(cast[Ptr[uint8]](
@@ -225,10 +261,33 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     # _start handles its own relocations via _dl_relocate_static_pie
     # using AT_PHDR / AT_PHNUM / AT_BASE from auxv (populated by the
     # SYS_EXECVE / SYS_SPAWN caller).
-    elf_last_load_base = region
     elf_last_phoff     = e_phoff
     elf_last_phnum     = e_phnum
-    return region + (e_entry - lowest_v)
+
+    # U30: ET_EXEC binaries (e_type == 2) ship with absolute addresses
+    # baked into .text / .got. They expect to run at their link-time
+    # vaddr (lowest_v). Stash the user vaddr range + physical backing
+    # so the caller (SYS_SPAWN / SYS_EXECVE) can install a per-task
+    # mapping AFTER it knows the target task's PML4. For ET_DYN (PIE)
+    # we keep the legacy rebase-to-region behaviour — the binary is
+    # position-independent and runs fine at the identity-mapped region
+    # address.
+    if e_type == cast[uint32](ELF_ET_EXEC):
+        elf_last_needs_user_map = 1
+        elf_last_user_vlow      = lowest_v
+        elf_last_user_vhigh     = lowest_v + span
+        elf_last_user_phys_base = region
+        elf_last_load_base      = lowest_v
+        printk2("elf64: ET_EXEC user-map: [0x%x, 0x%x)\n",
+                lowest_v, lowest_v + span)
+        return e_entry
+    else:
+        elf_last_needs_user_map = 0
+        elf_last_user_vlow      = 0
+        elf_last_user_vhigh     = 0
+        elf_last_user_phys_base = 0
+        elf_last_load_base      = region
+        return region + (e_entry - lowest_v)
 
 
 def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
@@ -443,3 +502,222 @@ def elf_get_interp_path(image: Ptr[uint8], buf: Ptr[uint8],
     # NUL in p_filesz, but truncation could chop it off.
     buf[n] = 0
     return 1
+
+
+# -- U30: per-task user-vaddr mapping installer ---------------------------
+#
+# ET_EXEC binaries link at a fixed virtual address (Debian's busybox-static
+# at 0x400000) and bake absolute addresses into .text / .got. To run them
+# we have to physically place them somewhere (the memblock_alloc'd `region`
+# in _load_elf64) AND make the user-mode virtual address space see those
+# pages at the binary's link-time vaddrs.
+#
+# The BSP page tables built in arch/x86/boot/header.S identity-map the
+# low 4 GiB via 1 GiB pages at the PDPT level (PS=1, US=1). Each task
+# clones the BSP's PML4 page at create_user_task_argv time (see
+# kernel/sched/core.ad), so every task starts with the same identity map
+# AND the same shared PDPT page underneath it. To overlay a finer-
+# grained mapping for just the user range we have to clone the relevant
+# upper-level tables before mutating them — otherwise a write here would
+# corrupt every other task's view of low memory.
+#
+# Strategy (mirrors Linux's vmap_pte_range / __pte_alloc walk, scaled
+# down to "no error returns, no locking"):
+#
+#   1. Clone PML4[0] (covers [0, 512 GiB)) into a fresh PDPT page. Copy
+#      every entry over so unmodified-portions stay identity.
+#   2. For each 1 GiB chunk that overlaps [vlow, vhigh): clone its PDPT
+#      entry into a fresh PD page initialised with 512 PS=1 entries that
+#      reproduce the original 1 GiB identity map at 2 MiB granularity.
+#      Then drop PS=1 on the entry and point it at the new PD.
+#   3. For each 2 MiB chunk that overlaps [vlow, vhigh): clone its PD
+#      entry into a fresh PT page initialised with 512 4 KiB entries
+#      reproducing the original 2 MiB identity map. Then drop PS=1 on
+#      the PD entry and point it at the new PT.
+#   4. For each 4 KiB page inside [vlow, vhigh): overwrite the PT entry
+#      to map the user vaddr to phys_base + (vaddr - vlow).
+#
+# Limits:
+#   - Only one 1 GiB chunk is supported (vhigh must fit inside the same
+#     GiB as vlow). Real-world ET_EXEC binaries we care about (busybox,
+#     coreutils-static) span ~2 MiB at 0x400000 — well inside the first
+#     GiB. Wider ranges return -1.
+#   - We DO leak the cloned PDPT/PD/PT pages on a subsequent install
+#     (e.g. repeated execve into ET_EXEC binaries on the same task).
+#     Each install allocates fresh tables; the previous tree is dropped
+#     on the floor. mm has no reclaim path for page-table pages yet;
+#     fix lands when mm_struct teardown does.
+
+PT_FLAG_P:  uint64 = 0x1          # Present
+PT_FLAG_RW: uint64 = 0x2          # Read/Write
+PT_FLAG_US: uint64 = 0x4          # User/Supervisor (1 = CPL=3 may access)
+PT_FLAG_PS: uint64 = 0x80         # Page-Size (1 = terminal at this level)
+PT_ADDR_MASK: uint64 = 0x000FFFFFFFFFF000   # bits [51:12]: phys base
+
+PAGE_SIZE_4K: uint64 = 0x1000
+PAGE_SIZE_2M: uint64 = 0x200000
+PAGE_SIZE_1G: uint64 = 0x40000000
+
+
+def _zero_page(addr: uint64):
+    memset(cast[Ptr[uint8]](addr), 0, 4096)
+
+
+def _build_identity_pd(pd_phys: uint64, gib_base: uint64):
+    # Populate `pd_phys` with 512 PS=1 entries that identity-map the
+    # 1 GiB chunk starting at gib_base via 2 MiB pages. Equivalent to
+    # the boot-time 1 GiB PDPT entry with PS=1, just expressed at one
+    # finer granularity so individual 2 MiB chunks can be overridden.
+    pd: Ptr[uint64] = cast[Ptr[uint64]](pd_phys)
+    i: uint64 = 0
+    while i < 512:
+        addr: uint64 = gib_base + i * PAGE_SIZE_2M
+        pd[i] = addr | PT_FLAG_PS | PT_FLAG_US | PT_FLAG_RW | PT_FLAG_P
+        i = i + 1
+
+
+def _build_identity_pt(pt_phys: uint64, mib2_base: uint64):
+    # Populate `pt_phys` with 512 4 KiB entries that identity-map the
+    # 2 MiB chunk starting at mib2_base. Used when we need to crack a
+    # PS=1 PD entry into 4 KiB-granular entries so we can override a
+    # subset for user mappings.
+    pt: Ptr[uint64] = cast[Ptr[uint64]](pt_phys)
+    i: uint64 = 0
+    while i < 512:
+        addr: uint64 = mib2_base + i * PAGE_SIZE_4K
+        pt[i] = addr | PT_FLAG_US | PT_FLAG_RW | PT_FLAG_P
+        i = i + 1
+
+
+def elf_install_user_mapping(pml4_phys: uint64, vlow: uint64,
+                             vhigh: uint64, phys_base: uint64) -> int32:
+    # Overlay [vlow, vhigh) -> [phys_base, phys_base + (vhigh - vlow))
+    # in the supplied PML4. Both pml4_phys and phys_base are physical
+    # addresses (identity-mapped through the BSP page tables, so we
+    # can dereference them directly from kernel code).
+    #
+    # Returns 0 on success, -1 on:
+    #   - range spans more than one 1 GiB PDPT entry
+    #   - OOM from alloc_page() (no rollback — caller treats this as
+    #     a fatal "task can't run")
+    #
+    # Caller is responsible for the TLB consistency story:
+    #   - SYS_SPAWN target child hasn't been scheduled yet, so its CR3
+    #     never sat in the CPU's TLB — no flush needed.
+    #   - SYS_EXECVE target IS the current task whose CR3 is live;
+    #     caller should reload CR3 with the same value (full TLB
+    #     flush of non-global entries) after this returns.
+    if vlow >= vhigh:
+        return 0
+    if (vlow & (PAGE_SIZE_4K - 1)) != 0:
+        printk0("elf_install_user_mapping: vlow not 4 KiB-aligned\n")
+        return -1
+    if (vhigh & (PAGE_SIZE_4K - 1)) != 0:
+        printk0("elf_install_user_mapping: vhigh not 4 KiB-aligned\n")
+        return -1
+
+    # Confine to one PML4 entry + one PDPT entry. The 1 GiB chunk
+    # containing vlow must also contain vhigh - 1.
+    pml4_idx_lo: uint64 = (vlow >> 39) & 0x1FF
+    pml4_idx_hi: uint64 = ((vhigh - 1) >> 39) & 0x1FF
+    pdpt_idx_lo: uint64 = (vlow >> 30) & 0x1FF
+    pdpt_idx_hi: uint64 = ((vhigh - 1) >> 30) & 0x1FF
+    if pml4_idx_lo != pml4_idx_hi:
+        printk0("elf_install_user_mapping: range crosses PML4 entry\n")
+        return -1
+    if pdpt_idx_lo != pdpt_idx_hi:
+        printk0("elf_install_user_mapping: range crosses 1 GiB boundary\n")
+        return -1
+
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys)
+    bsp_pml4: Ptr[uint64] = cast[Ptr[uint64]](get_bsp_cr3())
+
+    # --- Step 1: ensure PML4[pml4_idx_lo] points at a per-task PDPT.
+    # The cloned PML4 entry currently shares its target PDPT with the
+    # BSP (memcpy at task-creation time copied the 8-byte entry, but
+    # the PDPT page itself is still the boot-time one). Detect that
+    # by comparing the PML4 entry against BSP's; if they match, clone
+    # the PDPT into a fresh page and update the PML4 entry.
+    pml4_entry: uint64 = pml4[pml4_idx_lo]
+    if pml4_entry == bsp_pml4[pml4_idx_lo]:
+        new_pdpt: uint64 = alloc_page()
+        if new_pdpt == 0:
+            return -1
+        # Copy the existing 4 KiB PDPT verbatim — preserves all
+        # mappings outside the user range.
+        old_pdpt_phys: uint64 = pml4_entry & PT_ADDR_MASK
+        memcpy(cast[Ptr[uint8]](new_pdpt),
+               cast[Ptr[uint8]](old_pdpt_phys), 4096)
+        # Preserve the original flag bits (P/RW/US, etc.) and just
+        # swap in the new physical base.
+        pml4[pml4_idx_lo] = new_pdpt \
+            | (pml4_entry & ~PT_ADDR_MASK)
+        pml4_entry = pml4[pml4_idx_lo]
+
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](pml4_entry & PT_ADDR_MASK)
+
+    # --- Step 2: ensure PDPT[pdpt_idx_lo] is a non-PS pointer to a PD.
+    # Boot-time PDPT entries are PS=1 1 GiB identity pages. Crack the
+    # one covering our user range into a 512-entry PD initialised with
+    # PS=1 2 MiB identity entries (same coverage, finer granularity).
+    pdpt_entry: uint64 = pdpt[pdpt_idx_lo]
+    if (pdpt_entry & PT_FLAG_PS) != 0:
+        new_pd: uint64 = alloc_page()
+        if new_pd == 0:
+            return -1
+        gib_base: uint64 = pdpt_idx_lo * PAGE_SIZE_1G
+        _build_identity_pd(new_pd, gib_base)
+        pdpt[pdpt_idx_lo] = new_pd \
+            | PT_FLAG_US | PT_FLAG_RW | PT_FLAG_P
+        pdpt_entry = pdpt[pdpt_idx_lo]
+
+    pd: Ptr[uint64] = cast[Ptr[uint64]](pdpt_entry & PT_ADDR_MASK)
+
+    # --- Step 3 + 4: walk every 4 KiB page in [vlow, vhigh). For each
+    # one, ensure the covering PD entry is a non-PS pointer to a PT
+    # (cracking the 2 MiB PS=1 entry on first touch), then plant the
+    # user mapping into the PT slot.
+    vaddr: uint64 = vlow
+    do:
+        pd_idx: uint64 = (vaddr >> 21) & 0x1FF
+        pd_entry: uint64 = pd[pd_idx]
+        if (pd_entry & PT_FLAG_PS) != 0 or (pd_entry & PT_FLAG_P) == 0:
+            # Crack into a PT initialised with identity 4 KiB entries
+            # covering this 2 MiB chunk. If the old entry was not
+            # present at all we still seed with identity so kernel
+            # reads inside the chunk keep working.
+            new_pt: uint64 = alloc_page()
+            if new_pt == 0:
+                return -1
+            mib2_base: uint64 = (vaddr >> 21) << 21
+            _build_identity_pt(new_pt, mib2_base)
+            pd[pd_idx] = new_pt \
+                | PT_FLAG_US | PT_FLAG_RW | PT_FLAG_P
+            pd_entry = pd[pd_idx]
+        pt: Ptr[uint64] = cast[Ptr[uint64]](pd_entry & PT_ADDR_MASK)
+        pt_idx: uint64 = (vaddr >> 12) & 0x1FF
+        target_phys: uint64 = phys_base + (vaddr - vlow)
+        pt[pt_idx] = target_phys \
+            | PT_FLAG_US | PT_FLAG_RW | PT_FLAG_P
+        vaddr = vaddr + PAGE_SIZE_4K
+    while vaddr < vhigh
+    return 0
+
+
+def elf_apply_last_user_mapping(pml4_phys: uint64) -> int32:
+    # Convenience wrapper used by SYS_SPAWN / SYS_EXECVE: install the
+    # user mapping recorded by the most recent _load_elf64 call. No-op
+    # (returns 0) if the last image was ET_DYN — those run at the
+    # identity-mapped region pointer and don't need the overlay.
+    if elf_last_needs_user_map == 0:
+        return 0
+    return elf_install_user_mapping(pml4_phys,
+                                    elf_last_user_vlow,
+                                    elf_last_user_vhigh,
+                                    elf_last_user_phys_base)
+
+
+def elf_last_needs_user_map_get() -> int32:
+    # Accessor for the caller — saves a direct module-global read at
+    # the call site without exporting elf_last_needs_user_map itself.
+    return elf_last_needs_user_map

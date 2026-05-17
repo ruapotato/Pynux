@@ -38,6 +38,7 @@ from kernel.sched.core import (
     set_linux_userspace_mode,
     task_vfork_done, set_task_vfork_done,
     set_task_fs_base, set_task_clear_child_tid,
+    task_pml4,
 )
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_write,
@@ -49,6 +50,7 @@ from fs.vfs import (
 from fs.elf import (
     elf_load_blob, elf_last_was_linux,
     elf_last_load_base, elf_last_phoff, elf_last_phnum,
+    elf_apply_last_user_mapping,
 )
 from mm.page_alloc import alloc_page
 from linux_abi.loader import kmod_linux_load, kmod_linux_unload
@@ -65,6 +67,7 @@ extern def enter_user_mode(entry: uint64, stack: uint64)
 extern def user_demo_entry()
 extern def local_irq_disable()
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def load_cr3(value: uint64)
 
 IA32_STAR:  uint32 = 0xC0000081
 IA32_LSTAR: uint32 = 0xC0000082
@@ -471,6 +474,19 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     if is_linux != 0:
         set_linux_userspace_mode(
             cast[int32](current_idx_get()), 1)
+    # U30: ET_EXEC binaries (busybox-static, etc.) need their
+    # link-time vaddr range mapped to the physical region we just
+    # copied them into. ET_DYN (PIE) leaves this a no-op. We install
+    # into the CURRENT task's PML4 because execve replaces this task's
+    # image in place. Force a TLB flush afterwards by reloading the
+    # same CR3 — the BSP identity map for [0x400000, 0x600000) is
+    # still cached as a 1 GiB entry and would shadow the new finer
+    # mapping otherwise.
+    cur_pml4: uint64 = task_pml4(cast[int32](current_idx_get()))
+    if elf_apply_last_user_mapping(cur_pml4) < 0:
+        printk0("execve: user-mapping install failed\n")
+        return cast[int64](-12)            # -ENOMEM
+    load_cr3(cur_pml4)
     # Fresh user stack for the new program. The previous user
     # stack page is leaked for now (no per-task ustack tracking
     # in this code path); proper teardown comes with mm_struct.
@@ -908,6 +924,15 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         )
         if slot < 0:
             return cast[uint64](-1)
+        # U30: install the ET_EXEC user-vaddr mapping into the child's
+        # PML4 (cloned from BSP inside create_user_task_argv). The
+        # child hasn't been scheduled yet, so its CR3 has never been
+        # loaded — no explicit TLB flush needed; the load_cr3 in
+        # schedule() will do it when the child first runs. ET_DYN
+        # binaries make this a 0-return no-op.
+        if elf_apply_last_user_mapping(task_pml4(slot)) < 0:
+            printk0("spawn: user-mapping install failed\n")
+            return cast[uint64](-12)           # -ENOMEM
         # U5: SYS_SPAWN runs in the parent's context. If the loaded
         # image is a Linux-ABI ELF, flip is_linux_userspace on the
         # *child* slot (not current) so the new task's syscalls route

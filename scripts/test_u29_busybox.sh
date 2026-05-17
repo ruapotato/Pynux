@@ -45,6 +45,13 @@ bash scripts/build_user.sh
 bash scripts/build_modules.sh
 
 echo "[test_u29_busybox] (2/4) Swap /init + embed u_busybox"
+# U30: also stage the same blob as /bin/busybox. Busybox's main()
+# dispatches to applets based on the basename of argv[0] — with argv[0]
+# = "u_busybox" it prints "applet not found" and exits. Invoking it as
+# "busybox" makes busybox_main print its banner, which is what this
+# test greps for. The /bin/u_busybox copy stays around for callers that
+# want to address it by the U-track name.
+cp tests/u-binary/u_busybox tests/u-binary/busybox
 INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py
 
 echo "[test_u29_busybox] (3/4) Rebuild kernel image"
@@ -53,14 +60,14 @@ python3 -m compiler.adder compile \
     init/main.ad \
     -o "$ELF"
 
-echo "[test_u29_busybox] (4/4) Boot QEMU + run u_busybox"
+echo "[test_u29_busybox] (4/4) Boot QEMU + run busybox"
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+trap 'rm -f "$LOG" tests/u-binary/busybox; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
 (
     sleep 3
-    printf 'u_busybox\n'
+    printf 'busybox\n'
     sleep 6
     printf 'exit\n'
     sleep 1
