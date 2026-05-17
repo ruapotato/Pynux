@@ -42,36 +42,43 @@ binary compatibility with stock Linux 6.12 — both kernel modules
 static-PIE) load and run against Hamnix's reimplementations of the
 Linux ABI.
 
-> **Historical note:** earlier revisions of Hamnix (then called
-> "Pynux") targeted ARM Cortex-M3. The MCU codebase was removed in
-> commit `288adad` (2026-05-16) when the project pivoted to x86_64
-> Linux compatibility. Some sections below still describe the older
-> ARM model — they're being rewritten as Hamnix evolves.
+> **Historical note:** an earlier prototype (then called "Pynux")
+> targeted ARM Cortex-M3 microcontrollers. That codebase was removed
+> in commit `288adad` (2026-05-16) when the project pivoted to
+> x86_64 + Linux compatibility, and **microcontroller targets are no
+> longer supported**. Adder compiles to x86_64 only; the ARM backend
+> and the legacy MCU OS are gone. References to either in older
+> docs are bugs — file an issue or send a PR.
 
 ## Project Structure
 
 ```
-hamnix/
-├── compiler/           # Compiler implementation (Python)
-│   ├── lexer.py       # Tokenizer
-│   ├── parser.py      # Recursive descent parser
-│   ├── ast_nodes.py   # AST node definitions
-│   ├── type_checker.py# Type analysis
-│   └── codegen_arm.py # ARM assembly generator
-├── kernel/            # OS kernel (Hamnix source)
-│   ├── process.py     # Process management, signals, IPC
-│   ├── devfs.py       # Device filesystem
-│   ├── ramfs.py       # RAM filesystem
-│   └── timer.py       # Timer subsystem
-├── lib/               # Standard library (Hamnix source)
-│   ├── io.py          # Basic I/O
-│   ├── memory.py      # Memory management
-│   ├── string.py      # String operations
-│   └── ...            # Other libraries
-├── apps/              # Applications (Hamnix source)
-├── tests/             # Test suite
-├── docs/              # Documentation
-└── build.sh           # Build script
+Hamnix/
+├── compiler/             # Adder compiler (CPython-hosted)
+│   ├── adder.py          # CLI: --target=x86_64-{bare-metal,adder-user,linux-kernel-module}
+│   ├── lexer.py          # Tokenizer
+│   ├── parser.py         # Recursive-descent parser
+│   ├── ast_nodes.py      # AST node definitions
+│   ├── codegen_x86.py    # x86_64 backend (hand-written, no LLVM)
+│   └── optimizer.py      # AST-level passes
+├── arch/x86/             # Bare-metal kernel entry, traps, IRQs, syscalls
+├── mm/                   # Memory allocators (memblock, page_alloc, slab)
+├── kernel/sched/         # Scheduler, TaskStruct, signals
+├── kernel/printk/        # Kernel log
+├── drivers/              # Device drivers (PCI, virtio-net, AHCI, NVMe,
+│                         # e1000e, atkbd, vga/fb console, UART, …)
+├── fs/                   # VFS + cpio + ELF loader + ext4 + FAT
+├── sys/src/9/port/       # Plan 9 Layer 1 syscall bodies
+│                         # (errstr, devcons, devtime, sysproc/rfork, …)
+├── linux_abi/            # Linux ABI shims (Layer 2): api_*.ad for .ko
+│                         # modules, u_*.ad for user ELFs.
+├── user/                 # Adder userland binaries (hamsh, coreutils)
+├── tests/                # Integration tests + u-binary host fixtures
+├── kernel-modules/       # Legacy M1..M15 .ko regression baseline
+├── init/main.ad          # Kernel entry
+├── scripts/              # build_user.sh, test_*.sh, build_iso.sh, …
+└── docs/                 # architecture.md, native-api.md, vtnext-v2.md,
+                          # x86-backend.md, BOOT.md, L_TRACK_HOWTO.md
 ```
 
 ## Development Setup
@@ -304,24 +311,40 @@ To add new syntax:
 2. Add parsing method in `Parser` class
 3. Call from appropriate context (statement, expression, etc.)
 
-### Code Generator (codegen_arm.py)
+### Code Generator (codegen_x86.py)
 
 To add code generation for new features:
 
 1. Add visitor method: `gen_XXX(self, node)`
-2. Handle register allocation
-3. Emit ARM assembly
+2. Honour the SysV AMD64 ABI (rdi/rsi/rdx/rcx/r8/r9 for args,
+   rax for return) and 16-byte stack alignment at call sites.
+3. Emit GNU `as` syntax. RIP-relative addressing for `.rodata`
+   references in kernel code (no red zone, no LLVM, ENDBR64 if IBT
+   is enabled by the target).
+
+See `docs/x86-backend.md` for the rationale (hand-written, not LLVM)
+and the constraints kernel codegen has to honour.
 
 ## Testing
 
 ### Running Tests
 
 ```bash
-# Compiler unit tests
-python3 tests/test_compiler.py
+# Compile the bare-metal kernel
+python3 -m compiler.adder compile \
+    --target=x86_64-bare-metal init/main.ad \
+    -o build/hamnix-vmlinux.elf
 
-# Build and check for errors
-./build.sh
+# Build Adder userland (~60 coreutils + hamsh)
+bash scripts/build_user.sh
+
+# Run the integration suite (each scripts/test_*.sh boots QEMU,
+# scrapes serial, asserts marker strings). Order them shortest-
+# first so quick failures fail fast.
+bash scripts/test_hamsh.sh
+bash scripts/test_devcons.sh
+bash scripts/test_net_dhcp.sh
+# … etc; see .github/workflows/ci.yml for the canonical list.
 ```
 
 ### Writing Tests

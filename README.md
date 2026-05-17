@@ -49,6 +49,23 @@ tracks share the same compiler and language:
    Still build and pass; kept as the regression baseline as bare-metal
    subsystems land.
 
+**Project direction lives in `docs/`:**
+
+- [`docs/architecture.md`](docs/architecture.md) — the layered model
+  (Layer 0 kernel internals = Linux-shape; Layer 1 native syscalls =
+  Plan 9-shape; Layer 2 Linux ABI shims; Layer 3 9P userspace
+  services; Layer 4 wire protocols including VTNext; Layer 5 apps).
+  Read this first.
+- [`docs/native-api.md`](docs/native-api.md) — the Plan 9-shape native
+  syscall surface (~25 calls) and the migration table for every
+  existing `SYS_*`.
+- [`docs/vtnext-v2.md`](docs/vtnext-v2.md) — graphical wire protocol
+  spec (apps → `hamwd` → renderer). The path to a windowed desktop
+  without DRM/Mesa/Vulkan.
+- [`TODO.md`](TODO.md) — open work items, organised by layer.
+- [`docs/BOOT.md`](docs/BOOT.md) — building + booting the ISO,
+  real-hardware notes.
+
 The end-game is a fully Hamnix-authored kernel that **also loads
 stock Linux kernel modules and userspace binaries** — shipped as
 a real installable **server OS** that can run Debian-packaged
@@ -207,6 +224,7 @@ GUI app are explicitly **out of scope**. Snapshot:
 | M16.98 | Phase C: Plan 9 `rfork(2)` (SYS_RFORK = 256) lands its real body in `sys/src/9/port/sysproc.ad`, replacing the M16.93 -ENOSYS stub. POSIX-fork combo `rfork(RFPROC \| RFFDG \| RFNAMEG \| RFENVG)` creates a new task that returns the child pid in the parent and 0 in the child; in-place mutation (no RFPROC) privatises the namespace via RFNAMEG / RFCNAMEG. `TaskStruct` grows three sharing-state fields (`fd_table_refcount`, `namespace_id`, `note_group`) with matching accessors + monotonic id allocators (`alloc_namespace_id` / `alloc_note_group_id`) in `kernel/sched/core.ad`. `user/runtime.S` adds a `sys_rfork(flags)` wrapper that stashes the parent's user-side `%rbp` into syscall arg a5 so `do_rfork` can patch the child's initial `__switch_to` stack image (without this the child's first RBP-relative local read after rfork lands on the parent's stack page). `RFMEM` (thread path) returns -ENOSYS in this commit — full thread route lands in a follow-up. SYS_CLONE (3) stays untouched for the Linux ABI; both work concurrently. See `scripts/test_rfork.sh` for the end-to-end fixture. Cornerstone of the Plan 9-shape process control surface — replaces fork / vfork / clone / pthread_create / unshare with one flag-bit primitive | **Done** |
 | M16.99 | Minimal DNS resolver client (`drivers/net/dns.ad`) — UDP/53 A-record queries against the DHCP-supplied DNS server (option 6, captured by `dhcp_get_dns` added to `drivers/net/dhcp.ad`). `dns_lookup("example.com", out_ip, timeout)` is the synchronous entry point: it primes the ARP cache with a one-shot REQUEST for the DNS server (10.0.2.3 under SLIRP has its own MAC distinct from the gateway at 10.0.2.2, so the M16.88 probe doesn't cover it), builds a 12-byte header + length-prefixed QNAME + QTYPE=A/QCLASS=IN, sends from an ephemeral source port in the 53000..53003 pool, and polls `virtio_net_poll()` until `dns_rx` flips the slot to "answered" or the deadline elapses. Response parser walks past the question section (honoring 0xC0-0xC0 compression pointers) and scans the answer section for the first A-record's RDATA. 4-slot in-flight table dodges the M16.97 2-D-array-address codegen quirk by flattening per-slot result bytes into a 1-D `Array[16, uint8]`. `udp_rx` dispatches dst-port 53000..53003 → `dns_rx`. `[dns] resolved example.com -> 172.66.147.243` against QEMU SLIRP's DNS forwarder is the proof-of-life marker; test accepts `[dns] timeout` as a SKIP for sandboxed CI without internet. See `scripts/test_dns.sh`. Unblocks `apt update http://deb.debian.org` reaching real package mirrors by name | **Done** |
 | M16.100 | PS/2 keyboard polish for real-hardware install console (`drivers/input/atkbd.ad`). Extends the M16.75 Set-1 scaffold with: extended-scancode handling via a sticky `in_e0_prefix` flag (arrow keys, Home/End, Insert/Delete, PageUp/Down, right Ctrl, right Alt/AltGr); modifier-state bitmask (`MOD_SHIFT`/`CTRL`/`ALT`/`CAPS`/`NUM`) driven by make/break for Shift/Ctrl/Alt and toggle-on-make-only for CapsLock/NumLock; Shift+letter and Caps+letter folded via XOR (both pressed cancels, matching every PC keyboard since 1985); Shift+symbol routed through a parallel `sc1_to_shifted` table (`1`→`!`, ``` ` ```→`~`, …, US-104 layout); Ctrl+letter folded to 0x01..0x1A via `& 0x1F` so Ctrl-C still produces 0x03 and the M16.42 SIGINT path keeps working; F1..F4 emit VT220 SS3 escapes (`ESC O P/Q/R/S`), F5..F12 + Insert/Delete/PageUp/PageDown emit `ESC [ <digits> ~`, arrows emit `ESC [ A/B/C/D`. Boot-time `atkbd_self_test()` feeds 12 synthetic scancode sequences through `atkbd_process_byte()` and asserts 25 FIFO bytes; banner `atkbd: self-test PASS (25 cases)` is the regression criterion in `scripts/test_atkbd_ext.sh`. Still polled from the timer tick (no IRQ 1 wiring yet); USB HID + international layouts + dead-keys are explicit follow-ups | **Done** |
+| M16.101 | Phase C: Plan 9 file-operations cluster — `create` (260), `stat` (261), `fstat` (262), `remove` (263), `fd2path` (264) — real bodies land in `sys/src/9/port/sysfile.ad`, replacing the M16.93 -ENOSYS stubs. `do_create` resolves the path then delegates to `vfs_open_write` for the create-or-truncate + open dance; DMDIR (directory creation) returns -1 with `set_current_errstr("create failed: DMDIR not supported")` because no `vfs_mkdir` backend exists yet (SYS_MKDIR has been a no-op stub since M16.45). `do_stat` walks the cpio archive via `_cpio_lookup` and serialises a 9P-shape `Dir` record into the user buffer per `docs/native-api.md`'s "Directory format": size[2] type[2] dev[4] qid{type[1] vers[4] path[8]} mode[4] atime[4] mtime[4] length[8] name[s] uid[s] gid[s] muid[s], where each `s` is length[2] + UTF-8 bytes (no NUL); atime/mtime carry `get_jiffies()*10_000_000`, and the universal `"hamnix"` owner triple matches `/etc/passwd`. `do_fstat` handles per-`FD_*_MARK` synthetic dirs (cons / time / pid / random / null / zero / stdin / stdout / stderr / dir / pipe) plus initramfs-backed fds; tmpfs / fat / ext4 / socket fds return -1 with `set_current_errstr("fstat: backend not supported")` for now. `do_remove` is a thin `vfs_unlink` wrapper. `do_fd2path` returns the canonical cpio archive name for initramfs fds (best-effort — may differ from the path the caller called open() with; documented gap, Phase G adds a per-fd path slot to TaskStruct) plus synthetic `/dev/<name>` for cdev fds. `user/runtime.S` gains a generic `syscall6(nr, a0..a5)` trampoline so test fixtures can reach 260..264 without one wrapper each. End-to-end fixture `tests/test_p9file.ad`: stat + open + fstat + fd2path on `/etc/motd`, then create + remove on `/tmp/p9` (tmpfs). PASS = six per-primitive markers plus aggregate `[p9file] PASS`. Cluster covers the foundational file primitives Phase G needs before retiring SYS_OPEN_WRITE (13) / SYS_UNLINK (21) / SYS_MKDIR (22). `bind` (257) / `mount` (258) / `unmount` (259) remain -ENOSYS — they need a `chan.ad` skeleton + namespace mount table (Phase D scope). See `scripts/test_p9file.sh` | **Done** |
 
 ## L-series: Linux ABI compatibility
 
@@ -361,7 +379,7 @@ L-series order: L0/L1 (loader + structs) → L2..L28
 Adder source (.ad with static types, def/while/if, structs)
    │
    ▼
-compiler/  (CPython-hosted; hamnix.py CLI dispatches by --target)
+compiler/  (CPython-hosted; adder.py CLI dispatches by --target)
    │
    ├──► codegen_x86.py  ─► .S
    │     │
@@ -370,18 +388,20 @@ compiler/  (CPython-hosted; hamnix.py CLI dispatches by --target)
    │     │    ──► hamnix-vmlinux.elf
    │     │    ──► QEMU -kernel multiboot1 ──► long mode ──► start_kernel()
    │     │
+   │     ├──► x86_64-adder-user                       (M16.33+)
+   │     │    as + ld -static ──► CPL-3 ELF
+   │     │    ──► loaded by /init or hamsh exec
+   │     │
    │     └──► x86_64-linux-kernel-module              (M1..M15)
    │          kbuild + modpost ──► .ko
    │          custom mitigations-off kernel + busybox initramfs
    │          ──► QEMU -serial stdio ──► dev loop closes
-   │
-   └──► codegen_arm.py  ─►  arm-none-eabi-as/ld ──► .elf ──► QEMU mps2-an385  (legacy MCU OS)
 ```
 
 The x86_64 backend is hand-written — no LLVM — for zero external
-dependencies and consistency with the existing ARM backend. Kernel
-codegen constraints (SysV AMD64 ABI, 16-byte stack alignment, ENDBR64
-for IBT, no red zone, RIP-relative `.rodata` refs) are handled directly.
+dependencies. Kernel codegen constraints (SysV AMD64 ABI, 16-byte
+stack alignment, ENDBR64 for IBT, no red zone, RIP-relative `.rodata`
+refs) are handled directly.
 
 ## Quick start
 
@@ -449,14 +469,13 @@ and writes bytes via `outb`.
 ## Project structure
 
 ```
-compiler/        Hamnix compiler (CPython-hosted)
-  hamnix.py       CLI: --target= arm-cortex-m3 | x86_64-linux-kernel-module | x86_64-bare-metal
-  lexer.py       Tokenizer
-  parser.py      Recursive-descent parser → AST
-  ast_nodes.py   AST node definitions
-  codegen_x86.py x86_64 backend (hand-written, growing per milestone)
-  codegen_arm.py ARM Thumb-2 backend for the MCU OS (frozen reference)
-  optimizer.py   AST-level passes
+compiler/        Adder compiler (CPython-hosted)
+  adder.py        CLI: --target= x86_64-linux-kernel-module | x86_64-bare-metal | x86_64-adder-user
+  lexer.py        Tokenizer
+  parser.py       Recursive-descent parser → AST
+  ast_nodes.py    AST node definitions
+  codegen_x86.py  x86_64 backend (hand-written, no LLVM)
+  optimizer.py    AST-level passes
 
 # Bare-metal Hamnix kernel (M16+) — layout mirrors Linux source tree
 arch/x86/
@@ -558,13 +577,16 @@ scripts/         x86 dev-loop infrastructure
   run_x86_module.sh      Build module → pack initramfs → boot QEMU → scrape serial
 
 docs/
-  x86-backend.md         Rationale: hand-written encoder, not LLVM
-  ARCHITECTURE.md        Compiler internals
-  API.md, HARDWARE.md    Legacy MCU OS reference
-
-# Legacy MCU OS (still compiles, not the focus):
-kernel/  lib/  programs/  runtime/  bsp/  tests/  coreutils/  vtnext/
-build.sh  boot_vm.sh                # ARM Cortex-M build/boot
+  architecture.md          Layered model (Layer 0..5), migration plan,
+                           per-subsystem layer assignments. Start here.
+  native-api.md            Layer 1 Plan 9-shape syscall reference + the
+                           migration table for every existing SYS_*.
+  vtnext-v2.md             Layer 4 graphical wire protocol — apps →
+                           hamwd → pygame/local renderer.
+  x86-backend.md           Why the x86_64 backend is hand-written (no LLVM).
+  BOOT.md                  How to build + boot the ISO, real-hardware notes.
+  L_TRACK_HOWTO.md         How to add a stock-Debian .ko to the L-track.
+  L30_DISTRO_MODULE_NOTES.md  First-distro-.ko milestone (crc32c_generic).
 ```
 
 ## Working agreements

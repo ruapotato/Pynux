@@ -19,10 +19,10 @@ for x in range(3): print(x)
 
 and the rest of the basic language (arithmetic, lists, dicts,
 control flow, functions, classes, exceptions). Standard-library
-coverage is intentionally tiny -- this is the Python that fits
-inside an MCU port. It is NOT pip-installable Python; this is a
-proof-of-concept that the Hamnix Linux ABI is wide enough to host
-a real interpreter.
+coverage is intentionally tiny — this is MicroPython's stripped-
+down embedded build, not pip-installable CPython. The point is
+proof-of-concept: the Hamnix Linux ABI is wide enough to host a
+real interpreter. Full CPython is a follow-up milestone.
 
 ## Why not CPython?
 

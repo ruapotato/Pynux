@@ -1,6 +1,12 @@
 # Adder Language Reference
 
-Adder is a Python-syntax systems programming language that compiles to ARM Thumb-2 assembly for Cortex-M3 microcontrollers.
+Adder is a Python-syntax systems programming language that compiles
+directly to x86_64 assembly via a hand-written backend (no LLVM).
+It's the language Hamnix is written in — the bare-metal kernel
+(`init/main.ad` and everything under `arch/`, `mm/`, `kernel/`,
+`drivers/`, `fs/`, `sys/`), the Linux ABI shims (`linux_abi/`),
+and userland binaries (`user/*.ad` and `tests/test_*.ad`). See
+`docs/architecture.md` for how those pieces fit together.
 
 ## Table of Contents
 - [Types](#types)
@@ -591,10 +597,21 @@ def main() -> int32:
 
 ---
 
-## Target: ARM Cortex-M3
+## Target: x86_64
 
-- **Instruction Set**: Thumb-2
-- **Calling Convention**: AAPCS (r0-r3 for args, r0 for return)
-- **Stack**: Full descending
-- **Endianness**: Little-endian
-- **FPU**: Soft-float (no hardware FPU on M3)
+Three sub-targets via `python3 -m compiler.adder compile --target=<X>`:
+
+- **`x86_64-bare-metal`** — links into the multiboot1 kernel image at
+  `build/hamnix-vmlinux.elf`. Used for everything under `arch/`, `mm/`,
+  `kernel/`, `drivers/`, `fs/`, `sys/`, `init/main.ad`. No red zone,
+  ENDBR64 for IBT, RIP-relative `.rodata`, 16-byte stack alignment.
+- **`x86_64-adder-user`** — CPL-3 userland ELFs (`user/*.ad`,
+  `tests/test_*.ad`). Calls into the native syscall ABI documented in
+  `docs/native-api.md`. SysV AMD64 ABI, static binaries, runtime in
+  `user/runtime.S`.
+- **`x86_64-linux-kernel-module`** — emits a `.S` file the stock
+  Linux kbuild system compiles into a regulation `.ko` (M1..M15
+  regression baseline; the `kernel-modules/` tree).
+
+Common to all three: SysV AMD64 calling convention (`rdi/rsi/rdx/rcx/
+r8/r9` for first six args, `rax` for return).

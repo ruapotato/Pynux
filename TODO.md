@@ -3,6 +3,26 @@
 Open work items not yet scheduled to a specific milestone. Items here
 are fair game for any contributor — human or AI agent.
 
+**Source of truth for the project direction lives in `docs/`:**
+
+- [`docs/architecture.md`](docs/architecture.md) — the layered model
+  (Layer 0..5), boundary rules, per-subsystem layer assignments, and
+  the eight-phase migration plan. Read this first; the L+U tracks
+  must keep passing through every phase.
+- [`docs/native-api.md`](docs/native-api.md) — Layer 1 Plan 9-shape
+  syscall reference (~25 calls). Includes the full migration table
+  mapping every existing `SYS_*` to its new home.
+- [`docs/vtnext-v2.md`](docs/vtnext-v2.md) — Layer 4 graphical wire
+  protocol (apps → `hamwd` → renderer). The OS's path to a windowed
+  desktop without DRM/Mesa/Vulkan.
+- [`README.md`](README.md) — current implementation snapshot:
+  shipped milestones (M16.x bare-metal kernel, L-track .ko's,
+  U-track Linux ELFs), commit references, working agreements.
+
+When picking a TODO item, check which layer it belongs to and which
+phase it's blocking, then look at the relevant doc for the contract
+it has to honour.
+
 ## Language
 
 - ~~**`do-while` loop** — shipped in commit `c563762`.~~
@@ -57,16 +77,35 @@ are fair game for any contributor — human or AI agent.
         RFNOWAIT children automatically.
   - `bind` (257) + `mount` (258) + `unmount` (259) — namespace
     primitives. Need the channel/`chan` skeleton in
-    `sys/src/9/port/chan.ad` (new) first.
-  - `create` (260) — file creation distinct from `open(O_CREAT)`;
-    OWRITE plus DMDIR for directories. Builds on `vfs_open_write`.
-  - `remove` (263) — alias for the existing `vfs_unlink`. Renames
-    `SYS_UNLINK` (21) to `remove` semantically; Phase G deletes 21.
-  - `stat` / `fstat` (261 / 262) — Dir-record encoding (see
-    `docs/native-api.md` directory format). Distinct from any
-    future Linux `SYS_STAT` we keep on the L-track.
-  - `fd2path` (264) — `read(.../cwd)` proxy for getcwd-style use
-    once `/proc/<pid>/cwd` is a real file.
+    `sys/src/9/port/chan.ad` (new) first. Still -ENOSYS.
+  - ~~`create` (260) — shipped in M16.101. Body in
+    `sys/src/9/port/sysfile.ad::do_create`. Delegates to
+    `vfs_open_write` for the regular-file path. DMDIR returns -1
+    with `errstr("create failed: DMDIR not supported")` until a
+    real `vfs_mkdir` backend exists (SYS_MKDIR=22 is still a no-op
+    stub).~~ Follow-up: wire DMDIR to a real directory-create path
+    once tmpfs / ext4 grow `mkdir` (Phase G).
+  - ~~`remove` (263) — shipped in M16.101. Body in
+    `sys/src/9/port/sysfile.ad::do_remove`, thin `vfs_unlink`
+    wrapper. SYS_UNLINK (21) stays live concurrently; Phase G
+    retires the old number.~~
+  - ~~`stat` / `fstat` (261 / 262) — shipped in M16.101. 9P-shape
+    `Dir` record serialiser in `sys/src/9/port/sysfile.ad`
+    (`_write_dir_record` + `do_stat` + `do_fstat`). stat walks the
+    cpio archive (`_cpio_lookup`); fstat synthesises per-`FD_*_MARK`
+    records (cons / time / pid / random / null / zero / stdio /
+    dir / pipe) plus initramfs-backed fds. tmpfs / fat / ext4 /
+    socket fds return -1 with `errstr("fstat: backend not
+    supported")` — follow-up to grow per-backend stat hooks.~~
+  - ~~`fd2path` (264) — shipped in M16.101. Best-effort: returns
+    the canonical cpio archive name for initramfs fds (may differ
+    from the path the caller called open() with), synthetic
+    `/dev/<name>` for cdev fds, and -1 + `errstr("fd2path:
+    backend has no path")` for pipes / sockets / tmpfs / fat /
+    ext4. Documented gap — Phase G adds a per-fd path slot to
+    TaskStruct (deferred this round because the brk agent owns
+    TaskStruct edits) so we can return the EXACT open()-time path
+    9front's sysfd2path guarantees.~~
 - **Phase D** prerequisite — `srvfd` channels at `/srv/<name>`.
   `mount` needs `srvfd` to come from somewhere; without it the
   Phase C `mount` body has nothing to consume.

@@ -475,5 +475,8 @@ zero-friction migration during Phase D.
   drove the bracket choice — `ESC ]` (OSC) is well-precedented
   for application-defined commands; `ESC [` (CSI) for cursor
   and control.
+- `docs/architecture.md` — where `hamwd` (Layer 3) and the renderer
+  (Layer 5) live in the layered model; the migration plan's Phase D
+  is when this protocol actually gets implemented in code.
 - `docs/native-api.md` — the `/dev/win/*` filesystem shape and
   the `ctl`-file discovery dance this protocol completes.

@@ -1,20 +1,25 @@
 # x86_64 Backend
 
-Adder is being used to incrementally rewrite Linux kernel code on x86_64, one
-loadable kernel module at a time. This requires an x86_64 code generator
-distinct from the ARM Thumb-2 backend used by the microcontroller OS.
+Adder targets x86_64 only — the entire bare-metal Hamnix kernel
+(`init/main.ad`, everything under `arch/`, `mm/`, `kernel/`, `drivers/`,
+`fs/`, `sys/`), the Linux ABI shims (`linux_abi/`), and userland binaries
+(`user/`, `tests/test_*.ad`) all compile through this backend.
+
+> Historical note: an earlier prototype had an ARM Thumb-2 backend for
+> Cortex-M3 microcontrollers; that backend and the legacy MCU OS were
+> removed in commit `288adad` (2026-05-16) and microcontroller targets
+> are no longer supported.
 
 ## Decision: hand-written encoder, not LLVM
 
-The x86_64 backend (`compiler/codegen_x86.py`) is a **hand-written encoder**
-that emits GNU `as` assembly, mirroring the architecture of the existing
-hand-written ARM backend (`compiler/codegen_arm.py`).
+The x86_64 backend (`compiler/codegen_x86.py`) is a **hand-written
+encoder** that emits GNU `as` assembly directly.
 
-Routing through LLVM (llvmlite or textual IR) was considered and explicitly
-rejected. LLVM would have provided the SysV AMD64 ABI, ELF relocatable output,
-and kernel mitigation flags "for free", but at the cost of an external
-dependency. The hand-written path keeps Adder dependency-free and consistent
-with the ARM backend, at the cost of implementing the ABI and the x86
+Routing through LLVM (llvmlite or textual IR) was considered and
+explicitly rejected. LLVM would have provided the SysV AMD64 ABI, ELF
+relocatable output, and kernel mitigation flags "for free", but at the
+cost of an external dependency. The hand-written path keeps Adder
+dependency-free, at the cost of implementing the ABI and the x86
 mitigations by hand. That cost is accepted deliberately.
 
 ## Target
