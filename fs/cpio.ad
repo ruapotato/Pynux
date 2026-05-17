@@ -37,8 +37,8 @@ class FileEntry:
     size:  uint64
 
 
-NR_FILES: uint64 = 128
-file_table: Array[128, FileEntry]
+NR_FILES: uint64 = 192
+file_table: Array[192, FileEntry]
 nr_files:   uint64 = 0
 
 

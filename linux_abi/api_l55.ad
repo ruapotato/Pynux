@@ -1,0 +1,945 @@
+# linux_abi/api_l55.ad
+#
+# L55: shims for stock Debian 6.12 8021q.ko (VLAN core). One module,
+# 87 new UND symbols — by far our biggest single-module hit. Most are
+# runtime-path helpers (rtnetlink, ethtool, procfs, GARP/MRP, netpoll,
+# netdev address-list management); the init path itself touches only
+# six: register_netdevice_notifier, unregister_netdevice_notifier,
+# rtnl_link_register, garp_register_application, mrp_register_application,
+# and vlan_ioctl_set. Everything else is shimmed for relocation-time
+# resolution so the loader doesn't spam "unresolved external symbol".
+#
+# Init-path disassembly (objdump -drC -j .init.text 8021q.ko):
+#
+#   init_module:
+#       call __fentry__
+#       printk("8021q: %s v%s\n", &vlan_fullname, &vlan_version)
+#       call register_pernet_subsys(&vlan_net_ops)        # L41
+#       call register_netdevice_notifier(&vlan_notifier_block)
+#       call vlan_gvrp_init()                              # internal:
+#           -> garp_register_application(&vlan_gvrp_app)
+#       call vlan_mvrp_init()                              # internal:
+#           -> mrp_register_application(&vlan_mvrp_app)
+#       call vlan_netlink_init()                           # internal:
+#           -> rtnl_link_register(&vlan_link_ops)
+#       vlan_ioctl_set(&vlan_ioctl_handler)
+#       return 0
+#
+# Cross-check against L1..L54 confirmed 87 distinct UND not yet exported.
+# Six on the init path (above); 81 on runtime paths the loader's
+# relocation pass binds even though the call site never fires during
+# module load. Future milestones (full VLAN runtime — vconfig, real
+# netdev ops, GARP/MRP timers) will grow these stubs into real
+# implementations without touching call sites here.
+#
+# Symbol-name notes:
+#   * The `nbytes` reservation (see feedback_compiler_quirks.md) doesn't
+#     fire in this batch — no param is named `bytes`.
+#   * `dev` is fine; `match` is reserved (Python keyword) but doesn't
+#     appear here.
+#   * `dev_addr_mod` keeps its name; the parameter list uses `nb`.
+#
+# Stub philosophy (matches L51..L54):
+#   * Return 0 (success) for any function whose Linux signature returns
+#     int. -EINVAL only when a null pointer would crash a real consumer.
+#   * Return 0 (NULL) for any alloc-style function — no consumer here
+#     dereferences the result during module load.
+#   * No-op for void functions.
+#   * DATA exports point at backing buffers / variables in this file;
+#     the relocation pass patches the *address* of the storage into
+#     the module's reference site.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree
+
+
+# =====================================================================
+# Group 1: netdev notifier chain
+# =====================================================================
+#
+# Linux:
+#   int  register_netdevice_notifier(struct notifier_block *nb);
+#   int  unregister_netdevice_notifier(struct notifier_block *nb);
+#   int  call_netdevice_notifiers(unsigned long val, struct net_device *dev);
+#
+# 8021q's init registers a notifier block (vlan_notifier_block) so the
+# VLAN core gets NETDEV_UP / NETDEV_DOWN / NETDEV_UNREGISTER callbacks
+# when its lower devices change state. Hamnix has no netdev events yet,
+# so registration is a logical no-op and call_netdevice_notifiers (used
+# only on runtime VLAN-device add/remove) returns NOTIFY_DONE (0).
+
+def _l_register_netdevice_notifier(nb: uint64) -> int32:
+    # int register_netdevice_notifier(struct notifier_block *nb);
+    return 0
+
+
+def _l_unregister_netdevice_notifier(nb: uint64) -> int32:
+    # int unregister_netdevice_notifier(struct notifier_block *nb);
+    return 0
+
+
+def _l_call_netdevice_notifiers(val: uint64, dev: uint64) -> int32:
+    # int call_netdevice_notifiers(unsigned long val, struct net_device *dev);
+    # NOTIFY_DONE = 0x0000.
+    return 0
+
+
+# =====================================================================
+# Group 2: rtnetlink link-ops registration
+# =====================================================================
+#
+# Linux:
+#   int  rtnl_link_register(struct rtnl_link_ops *ops);
+#   void rtnl_link_unregister(struct rtnl_link_ops *ops);
+#   void rtnl_lock(void);
+#   void rtnl_unlock(void);
+#   int  rtnl_is_locked(void);
+#
+# rtnl_link_register publishes a struct rtnl_link_ops (`vlan_link_ops`)
+# so userspace `ip link add link eth0 name eth0.10 type vlan id 10`
+# can find the VLAN newlink handler. No userspace consumer exists yet;
+# register is success, lock/unlock are no-ops, is_locked answers 1
+# (callers of rtnl_is_locked typically assert it's true).
+
+def _l_rtnl_link_register(ops: uint64) -> int32:
+    # int rtnl_link_register(struct rtnl_link_ops *ops);
+    if ops == 0:
+        return -22
+    return 0
+
+
+def _l_rtnl_link_unregister(ops: uint64):
+    # void rtnl_link_unregister(struct rtnl_link_ops *ops);
+    return
+
+
+def _l_rtnl_lock():
+    # void rtnl_lock(void);
+    return
+
+
+def _l_rtnl_unlock():
+    # void rtnl_unlock(void);
+    return
+
+
+def _l_rtnl_is_locked() -> int32:
+    # int rtnl_is_locked(void);
+    return 1
+
+
+# =====================================================================
+# Group 3: GARP applicant registration (vlan_gvrp_init init path)
+# =====================================================================
+#
+# Linux (net/802/garp.c):
+#   int  garp_register_application(struct garp_application *app);
+#   void garp_unregister_application(struct garp_application *app);
+#   int  garp_init_applicant(struct net_device *dev,
+#                              struct garp_application *app);
+#   void garp_uninit_applicant(struct net_device *dev,
+#                                struct garp_application *app);
+#   int  garp_request_join(const struct net_device *dev,
+#                            const struct garp_application *app,
+#                            const void *data, u8 len, u8 type);
+#   void garp_request_leave(const struct net_device *dev,
+#                             const struct garp_application *app,
+#                             const void *data, u8 len, u8 type);
+#
+# GARP = Generic Attribute Registration Protocol (IEEE 802.1D). 8021q's
+# vlan_gvrp_init calls garp_register_application; the rest fire on
+# per-VLAN-device add/remove (init never reaches them).
+
+def _l_garp_register_application(app: uint64) -> int32:
+    # int garp_register_application(struct garp_application *app);
+    return 0
+
+
+def _l_garp_unregister_application(app: uint64):
+    # void garp_unregister_application(struct garp_application *app);
+    return
+
+
+def _l_garp_init_applicant(dev: uint64, app: uint64) -> int32:
+    # int garp_init_applicant(struct net_device *dev,
+    #                          struct garp_application *app);
+    return 0
+
+
+def _l_garp_uninit_applicant(dev: uint64, app: uint64):
+    # void garp_uninit_applicant(struct net_device *dev,
+    #                              struct garp_application *app);
+    return
+
+
+def _l_garp_request_join(dev: uint64, app: uint64, data: uint64,
+                          n: uint32, ty: uint32) -> int32:
+    # int garp_request_join(...);
+    return 0
+
+
+def _l_garp_request_leave(dev: uint64, app: uint64, data: uint64,
+                           n: uint32, ty: uint32):
+    # void garp_request_leave(...);
+    return
+
+
+# =====================================================================
+# Group 4: MRP applicant registration (vlan_mvrp_init init path)
+# =====================================================================
+#
+# Linux (net/802/mrp.c) — mirror of the GARP set above for MRP (IEEE
+# 802.1ak), the modern replacement for GARP. vlan_mvrp_init calls
+# mrp_register_application; the rest fire on per-VLAN-device runtime
+# add/remove.
+
+def _l_mrp_register_application(app: uint64) -> int32:
+    # int mrp_register_application(struct mrp_application *app);
+    return 0
+
+
+def _l_mrp_unregister_application(app: uint64):
+    # void mrp_unregister_application(struct mrp_application *app);
+    return
+
+
+def _l_mrp_init_applicant(dev: uint64, app: uint64) -> int32:
+    # int mrp_init_applicant(struct net_device *dev,
+    #                         struct mrp_application *app);
+    return 0
+
+
+def _l_mrp_uninit_applicant(dev: uint64, app: uint64):
+    # void mrp_uninit_applicant(struct net_device *dev,
+    #                             struct mrp_application *app);
+    return
+
+
+def _l_mrp_request_join(dev: uint64, app: uint64, data: uint64,
+                         n: uint32, ty: uint32) -> int32:
+    # int mrp_request_join(...);
+    return 0
+
+
+def _l_mrp_request_leave(dev: uint64, app: uint64, data: uint64,
+                          n: uint32, ty: uint32):
+    # void mrp_request_leave(...);
+    return
+
+
+# =====================================================================
+# Group 5: net_device allocation + registration runtime
+# =====================================================================
+#
+# Linux (include/linux/netdevice.h):
+#   struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
+#                                         unsigned char name_assign_type,
+#                                         void (*setup)(struct net_device *),
+#                                         unsigned int txqs, unsigned int rxqs);
+#   int  register_netdevice(struct net_device *dev);
+#   void unregister_netdevice_queue(struct net_device *dev, struct list_head *head);
+#   void unregister_netdevice_many(struct list_head *head);
+#
+# Allocator returns a buffer the caller subsequently fills; 16 KiB is
+# more than enough for stock struct net_device + sizeof_priv slack.
+# Register/unregister are runtime — userspace `ip link add type vlan`
+# is what triggers them, and we have no userspace ip(8) yet.
+
+def _l_alloc_netdev_mqs(sizeof_priv: int32, name: uint64, name_type: uint32,
+                         setup: uint64, txqs: uint32, rxqs: uint32) -> uint64:
+    # struct net_device *alloc_netdev_mqs(...);
+    n: uint64 = 16384
+    if sizeof_priv > 0:
+        n = n + cast[uint64](sizeof_priv)
+    p: uint64 = kmalloc(n)
+    return p
+
+
+def _l_register_netdevice(dev: uint64) -> int32:
+    # int register_netdevice(struct net_device *dev);
+    return 0
+
+
+def _l_unregister_netdevice_queue(dev: uint64, head: uint64):
+    # void unregister_netdevice_queue(struct net_device *dev,
+    #                                  struct list_head *head);
+    return
+
+
+def _l_unregister_netdevice_many(head: uint64):
+    # void unregister_netdevice_many(struct list_head *head);
+    return
+
+
+# =====================================================================
+# Group 6: dev_get / dev_set / dev_uc / dev_mc runtime helpers
+# =====================================================================
+#
+# Linux:
+#   struct net_device *__dev_get_by_index(struct net *net, int ifindex);
+#   struct net_device *__dev_get_by_name(struct net *net, const char *name);
+#   void dev_get_stats(struct net_device *dev, struct rtnl_link_stats64 *st);
+#   unsigned int dev_get_flags(const struct net_device *dev);
+#   int  dev_change_flags(struct net_device *dev, unsigned int flags,
+#                          struct netlink_ext_ack *extack);
+#   void dev_close_many(struct list_head *head, bool unlink);
+#   int  dev_set_mtu(struct net_device *dev, int new_mtu);
+#   int  dev_set_promiscuity(struct net_device *dev, int inc);
+#   int  dev_set_allmulti(struct net_device *dev, int inc);
+#   int  dev_addr_mod(struct net_device *dev, unsigned int offset,
+#                      const void *addr, size_t len);
+#   int  dev_uc_add(struct net_device *dev, const unsigned char *addr);
+#   int  dev_uc_del(struct net_device *dev, const unsigned char *addr);
+#   int  dev_uc_sync(struct net_device *to, struct net_device *from);
+#   void dev_uc_unsync(struct net_device *to, struct net_device *from);
+#   int  dev_mc_sync(struct net_device *to, struct net_device *from);
+#   void dev_mc_unsync(struct net_device *to, struct net_device *from);
+#   int  __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev);
+#
+# All runtime — used when a VLAN device is active and a frame transits,
+# or when userspace flips flags via SIOCSIFFLAGS. None fire during
+# 8021q module load.
+
+def _l___dev_get_by_index(net: uint64, ifindex: int32) -> uint64:
+    return 0
+
+
+def _l___dev_get_by_name(net: uint64, name: uint64) -> uint64:
+    return 0
+
+
+def _l_dev_get_stats(dev: uint64, st: uint64) -> uint64:
+    return st
+
+
+def _l_dev_get_flags(dev: uint64) -> uint32:
+    return 0
+
+
+def _l_dev_change_flags(dev: uint64, flags: uint32, extack: uint64) -> int32:
+    return 0
+
+
+def _l_dev_close_many(head: uint64, unlink: int32):
+    return
+
+
+def _l_dev_set_mtu(dev: uint64, new_mtu: int32) -> int32:
+    return 0
+
+
+def _l_dev_set_promiscuity(dev: uint64, inc: int32) -> int32:
+    return 0
+
+
+def _l_dev_set_allmulti(dev: uint64, inc: int32) -> int32:
+    return 0
+
+
+def _l_dev_addr_mod(dev: uint64, off: uint32, addr: uint64, n: uint64) -> int32:
+    return 0
+
+
+def _l_dev_uc_add(dev: uint64, addr: uint64) -> int32:
+    return 0
+
+
+def _l_dev_uc_del(dev: uint64, addr: uint64) -> int32:
+    return 0
+
+
+def _l_dev_uc_sync(to: uint64, fr: uint64) -> int32:
+    return 0
+
+
+def _l_dev_uc_unsync(to: uint64, fr: uint64):
+    return
+
+
+def _l_dev_mc_sync(to: uint64, fr: uint64) -> int32:
+    return 0
+
+
+def _l_dev_mc_unsync(to: uint64, fr: uint64):
+    return
+
+
+def _l___dev_queue_xmit(skb: uint64, sb_dev: uint64) -> int32:
+    # NET_XMIT_SUCCESS = 0.
+    return 0
+
+
+# =====================================================================
+# Group 7: netdev feature / upper-link / TSO inheritance
+# =====================================================================
+#
+# Linux:
+#   void netdev_update_features(struct net_device *dev);
+#   int  netdev_upper_dev_link(struct net_device *dev,
+#                                struct net_device *upper_dev,
+#                                struct netlink_ext_ack *extack);
+#   void netdev_upper_dev_unlink(struct net_device *dev,
+#                                  struct net_device *upper_dev);
+#   void netif_inherit_tso_max(struct net_device *to,
+#                                const struct net_device *from);
+#   void netif_stacked_transfer_operstate(const struct net_device *rootdev,
+#                                            struct net_device *dev);
+#   void linkwatch_fire_event(struct net_device *dev);
+
+def _l_netdev_update_features(dev: uint64):
+    return
+
+
+def _l_netdev_upper_dev_link(dev: uint64, upper: uint64, extack: uint64) -> int32:
+    return 0
+
+
+def _l_netdev_upper_dev_unlink(dev: uint64, upper: uint64):
+    return
+
+
+def _l_netif_inherit_tso_max(to: uint64, fr: uint64):
+    return
+
+
+def _l_netif_stacked_transfer_operstate(rootdev: uint64, dev: uint64):
+    return
+
+
+def _l_linkwatch_fire_event(dev: uint64):
+    return
+
+
+# =====================================================================
+# Group 8: ethtool helpers
+# =====================================================================
+#
+# Linux:
+#   int  __ethtool_get_link_ksettings(struct net_device *dev,
+#                                       struct ethtool_link_ksettings *ks);
+#   int  ethtool_get_ts_info_by_layer(struct net_device *dev,
+#                                       struct kernel_ethtool_ts_info *info);
+#   u32  ethtool_op_get_link(struct net_device *dev);
+#
+# Used by VLAN's ethtool ops (passthrough to the lower device). Runtime
+# only — ethtool(8) is the consumer; we have none.
+
+def _l___ethtool_get_link_ksettings(dev: uint64, ks: uint64) -> int32:
+    return 0
+
+
+def _l_ethtool_get_ts_info_by_layer(dev: uint64, info: uint64) -> int32:
+    return 0
+
+
+def _l_ethtool_op_get_link(dev: uint64) -> uint32:
+    return 1
+
+
+# =====================================================================
+# Group 9: ether / eth header helpers
+# =====================================================================
+#
+# Linux:
+#   void ether_setup(struct net_device *dev);
+#   int  eth_header_parse(const struct sk_buff *skb, unsigned char *haddr);
+#   int  eth_validate_addr(struct net_device *dev);
+#
+# ether_setup is called by alloc_etherdev paths to populate a netdev's
+# Ethernet defaults (MTU=1500, type=ARPHRD_ETHER, hard_header_len=14,
+# tx_queue_len, flags, eth_header_ops). VLAN's setup() calls into it.
+# Stub: no-op; the caller's downstream uses don't fire on load.
+
+def _l_ether_setup(dev: uint64):
+    return
+
+
+def _l_eth_header_parse(skb: uint64, haddr: uint64) -> int32:
+    # Returns ETH_ALEN = 6 on success.
+    return 6
+
+
+def _l_eth_validate_addr(dev: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 10: hwtstamp generic helpers
+# =====================================================================
+#
+# Linux:
+#   int generic_hwtstamp_get_lower(struct net_device *dev,
+#                                    struct kernel_hwtstamp_config *cfg);
+#   int generic_hwtstamp_set_lower(struct net_device *dev,
+#                                    struct kernel_hwtstamp_config *cfg,
+#                                    struct netlink_ext_ack *extack);
+
+def _l_generic_hwtstamp_get_lower(dev: uint64, cfg: uint64) -> int32:
+    return 0
+
+
+def _l_generic_hwtstamp_set_lower(dev: uint64, cfg: uint64, extack: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 11: netpoll
+# =====================================================================
+#
+# Linux:
+#   int  __netpoll_setup(struct netpoll *np, struct net_device *ndev);
+#   void __netpoll_free(struct netpoll *np);
+#   netdev_tx_t netpoll_send_skb(struct netpoll *np, struct sk_buff *skb);
+#
+# Out-of-band oops/printk-over-the-wire path. Nothing fires it here.
+
+def _l___netpoll_setup(np: uint64, ndev: uint64) -> int32:
+    return 0
+
+
+def _l___netpoll_free(np: uint64):
+    return
+
+
+def _l_netpoll_send_skb(np: uint64, skb: uint64) -> int32:
+    # NETDEV_TX_OK = 0.
+    return 0
+
+
+# =====================================================================
+# Group 12: netlink + extack helpers
+# =====================================================================
+#
+# Linux:
+#   int  nla_put(struct sk_buff *skb, int attrtype, int attrlen,
+#                  const void *data);
+#   int  __nla_validate(const struct nlattr *head, int len, int maxtype,
+#                         const struct nla_policy *policy,
+#                         unsigned int validate,
+#                         struct netlink_ext_ack *extack);
+#   void do_trace_netlink_extack(const char *msg);
+#
+# Used by VLAN's netlink put_link / fill_info paths. Runtime — no
+# userspace netlink client yet.
+
+def _l_nla_put(skb: uint64, attrtype: int32, attrlen: int32, data: uint64) -> int32:
+    return 0
+
+
+def _l___nla_validate(head: uint64, n: int32, maxtype: int32,
+                       policy: uint64, validate: uint32, extack: uint64) -> int32:
+    return 0
+
+
+def _l_do_trace_netlink_extack(msg: uint64):
+    return
+
+
+# =====================================================================
+# Group 13: skb + proc + seq + xa runtime
+# =====================================================================
+#
+# Linux:
+#   void *skb_push(struct sk_buff *skb, unsigned int len);
+#   struct proc_dir_entry *proc_create_net_data(...);
+#   struct proc_dir_entry *proc_create_single_data(...);
+#   struct proc_dir_entry *_proc_mkdir(const char *name, umode_t mode,
+#                                        struct proc_dir_entry *parent);
+#   void remove_proc_entry(const char *name, struct proc_dir_entry *parent);
+#   int  seq_putc(struct seq_file *m, char c);
+#   int  seq_write(struct seq_file *m, const void *data, size_t len);
+#   void *xa_find(struct xarray *xa, unsigned long *index,
+#                   unsigned long max, xa_mark_t filter);
+#
+# /proc/net/vlan/* runtime — VLAN exposes per-VID status files. Not
+# touched during module load.
+
+def _l_skb_push(skb: uint64, n: uint32) -> uint64:
+    return skb
+
+
+def _l_proc_create_net_data(name: uint64, mode: uint32, parent: uint64,
+                              ops: uint64, state_size: uint32, data: uint64) -> uint64:
+    return 0
+
+
+def _l_proc_create_single_data(name: uint64, mode: uint32, parent: uint64,
+                                 show: uint64, data: uint64) -> uint64:
+    return 0
+
+
+def _l__proc_mkdir(name: uint64, mode: uint32, parent: uint64) -> uint64:
+    return 0
+
+
+def _l_remove_proc_entry(name: uint64, parent: uint64):
+    return
+
+
+def _l_seq_putc(m: uint64, c: int32) -> int32:
+    return 0
+
+
+def _l_seq_write(m: uint64, data: uint64, n: uint64) -> int32:
+    return 0
+
+
+def _l_xa_find(xa: uint64, index: uint64, max: uint64, filter: uint32) -> uint64:
+    return 0
+
+
+# =====================================================================
+# Group 14: VLAN-internal cross-module symbols
+# =====================================================================
+#
+# vlan_ioctl_set, vlan_uses_dev, vlan_dev_vlan_id, vlan_filter_push_vids,
+# vlan_filter_drop_vids, vlan_vid_add, vlan_vid_del are all defined in
+# stock Linux's net/8021q/vlan_core.c (built-in) or net/socket.c
+# (vlan_ioctl_set). When 8021q.ko loads it references them as kernel
+# exports.
+#
+# vlan_ioctl_set IS called by init (init_module assigns the VLAN ioctl
+# handler into a global function pointer in net/socket.c). Stub: store
+# the handler into a local backing slot and return.
+
+vlan_ioctl_handler_slot: uint64 = 0
+
+
+def _l_vlan_ioctl_set(handler: uint64):
+    # void vlan_ioctl_set(int (*hook)(struct net *, void __user *));
+    vlan_ioctl_handler_slot = handler
+
+
+def _l_vlan_uses_dev(dev: uint64) -> int32:
+    return 0
+
+
+def _l_vlan_dev_vlan_id(dev: uint64) -> uint32:
+    return 0
+
+
+def _l_vlan_filter_push_vids(skb: uint64, vlan_proto: uint32) -> int32:
+    return 0
+
+
+def _l_vlan_filter_drop_vids(skb: uint64) -> int32:
+    return 0
+
+
+def _l_vlan_vid_add(dev: uint64, proto: uint32, vid: uint32) -> int32:
+    return 0
+
+
+def _l_vlan_vid_del(dev: uint64, proto: uint32, vid: uint32):
+    return
+
+
+# =====================================================================
+# Group 15: capability + percpu + RCU + bit-search runtime
+# =====================================================================
+#
+# Linux:
+#   bool ns_capable(struct user_namespace *ns, int cap);
+#   void __percpu *pcpu_alloc_noprof(size_t size, size_t align, bool reserved,
+#                                      gfp_t gfp);
+#   void free_percpu(void __percpu *ptr);
+#   void rcu_barrier(void);
+#   unsigned long _find_next_bit(const unsigned long *addr1,
+#                                  const unsigned long *addr2,
+#                                  unsigned long nbits, unsigned long start,
+#                                  unsigned long invert, unsigned long le);
+#   void BUG_func(void);
+#   void netdev_warn(const struct net_device *dev, const char *fmt, ...);
+#
+# Hamnix has no namespaces, no per-CPU areas yet, no RCU. Stubs return
+# success / NULL / no-op. BUG_func / netdev_warn log and continue
+# (BUG_func in real Linux panics, but we don't fire it).
+
+def _l_ns_capable(ns: uint64, cap: int32) -> int32:
+    # Returns true (1).
+    return 1
+
+
+def _l_pcpu_alloc_noprof(n: uint64, align: uint64, reserved: int32, gfp: uint64) -> uint64:
+    # void __percpu *pcpu_alloc_noprof(...);
+    if n == 0:
+        return 0
+    return kmalloc(n)
+
+
+def _l_free_percpu(ptr: uint64):
+    if ptr == 0:
+        return
+    kfree(ptr)
+
+
+def _l_rcu_barrier():
+    return
+
+
+def _l_find_next_bit(addr1: uint64, addr2: uint64, nbits: uint64,
+                      start: uint64, invert: uint64, le: uint64) -> uint64:
+    # Mirrors lib/find_bit.c; stub returns nbits (caller's "not found").
+    return nbits
+
+
+def _l_BUG_func():
+    printk0("BUG_func\n")
+    return
+
+
+def _l_netdev_warn(dev: uint64, fmt: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 16: DATA exports (cpu masks + percpu offset + paravirt ops)
+# =====================================================================
+#
+# Linux:
+#   extern const struct cpumask __cpu_possible_mask;     # bitmap, NR_CPUS bits
+#   extern unsigned int          nr_cpu_ids;             # active CPU count
+#   extern unsigned long         this_cpu_off;           # %gs-relative offset
+#   extern struct paravirt_patch_template pv_ops;
+#
+# All are referenced by inlines / inlines-via-headers baked into
+# 8021q.ko (RCU read-side, percpu accessor, cpumask iter, paravirt'd
+# native_{read,write}_*). Init's actual control flow doesn't traverse
+# them, but the relocations against the symbols need a live address.
+#
+# Backing storage:
+#   * __cpu_possible_mask — 64-byte bitmap, only bit 0 set (UP-only).
+#   * nr_cpu_ids — uint32 = 1.
+#   * this_cpu_off — uint64 = 0 (no real per-CPU yet).
+#   * pv_ops — 1 KiB of zeroed function-pointer table; any call through
+#     a NULL entry would crash, but no module-load path invokes one.
+
+__cpu_possible_mask_buf:  Array[64, uint8]
+nr_cpu_ids_var:           uint32 = 1
+this_cpu_off_var:         uint64 = 0
+pv_ops_buf:               Array[1024, uint8]
+
+
+def _l55_init_data():
+    # Set bit 0 of __cpu_possible_mask. The other 511 bits stay zero.
+    __cpu_possible_mask_buf[0] = 1
+    return
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_l55():
+    # Called from linux_abi_exports_init() after L54's rows.
+    # Adds 87 exports for 8021q.ko's full UND closure.
+
+    # Initialize backing data first (cpu_possible_mask bit-0).
+    _l55_init_data()
+
+    # Group 1: netdev notifier chain
+    _add_export("register_netdevice_notifier",
+                cast[uint64](&_l_register_netdevice_notifier))
+    _add_export("unregister_netdevice_notifier",
+                cast[uint64](&_l_unregister_netdevice_notifier))
+    _add_export("call_netdevice_notifiers",
+                cast[uint64](&_l_call_netdevice_notifiers))
+
+    # Group 2: rtnetlink link-ops
+    _add_export("rtnl_link_register",
+                cast[uint64](&_l_rtnl_link_register))
+    _add_export("rtnl_link_unregister",
+                cast[uint64](&_l_rtnl_link_unregister))
+    _add_export("rtnl_lock",
+                cast[uint64](&_l_rtnl_lock))
+    _add_export("rtnl_unlock",
+                cast[uint64](&_l_rtnl_unlock))
+    _add_export("rtnl_is_locked",
+                cast[uint64](&_l_rtnl_is_locked))
+
+    # Group 3: GARP applicant
+    _add_export("garp_register_application",
+                cast[uint64](&_l_garp_register_application))
+    _add_export("garp_unregister_application",
+                cast[uint64](&_l_garp_unregister_application))
+    _add_export("garp_init_applicant",
+                cast[uint64](&_l_garp_init_applicant))
+    _add_export("garp_uninit_applicant",
+                cast[uint64](&_l_garp_uninit_applicant))
+    _add_export("garp_request_join",
+                cast[uint64](&_l_garp_request_join))
+    _add_export("garp_request_leave",
+                cast[uint64](&_l_garp_request_leave))
+
+    # Group 4: MRP applicant
+    _add_export("mrp_register_application",
+                cast[uint64](&_l_mrp_register_application))
+    _add_export("mrp_unregister_application",
+                cast[uint64](&_l_mrp_unregister_application))
+    _add_export("mrp_init_applicant",
+                cast[uint64](&_l_mrp_init_applicant))
+    _add_export("mrp_uninit_applicant",
+                cast[uint64](&_l_mrp_uninit_applicant))
+    _add_export("mrp_request_join",
+                cast[uint64](&_l_mrp_request_join))
+    _add_export("mrp_request_leave",
+                cast[uint64](&_l_mrp_request_leave))
+
+    # Group 5: net_device alloc + register
+    _add_export("alloc_netdev_mqs",
+                cast[uint64](&_l_alloc_netdev_mqs))
+    _add_export("register_netdevice",
+                cast[uint64](&_l_register_netdevice))
+    _add_export("unregister_netdevice_queue",
+                cast[uint64](&_l_unregister_netdevice_queue))
+    _add_export("unregister_netdevice_many",
+                cast[uint64](&_l_unregister_netdevice_many))
+
+    # Group 6: dev_get / dev_set / dev_uc / dev_mc runtime
+    _add_export("__dev_get_by_index",
+                cast[uint64](&_l___dev_get_by_index))
+    _add_export("__dev_get_by_name",
+                cast[uint64](&_l___dev_get_by_name))
+    _add_export("dev_get_stats",
+                cast[uint64](&_l_dev_get_stats))
+    _add_export("dev_get_flags",
+                cast[uint64](&_l_dev_get_flags))
+    _add_export("dev_change_flags",
+                cast[uint64](&_l_dev_change_flags))
+    _add_export("dev_close_many",
+                cast[uint64](&_l_dev_close_many))
+    _add_export("dev_set_mtu",
+                cast[uint64](&_l_dev_set_mtu))
+    _add_export("dev_set_promiscuity",
+                cast[uint64](&_l_dev_set_promiscuity))
+    _add_export("dev_set_allmulti",
+                cast[uint64](&_l_dev_set_allmulti))
+    _add_export("dev_addr_mod",
+                cast[uint64](&_l_dev_addr_mod))
+    _add_export("dev_uc_add",
+                cast[uint64](&_l_dev_uc_add))
+    _add_export("dev_uc_del",
+                cast[uint64](&_l_dev_uc_del))
+    _add_export("dev_uc_sync",
+                cast[uint64](&_l_dev_uc_sync))
+    _add_export("dev_uc_unsync",
+                cast[uint64](&_l_dev_uc_unsync))
+    _add_export("dev_mc_sync",
+                cast[uint64](&_l_dev_mc_sync))
+    _add_export("dev_mc_unsync",
+                cast[uint64](&_l_dev_mc_unsync))
+    _add_export("__dev_queue_xmit",
+                cast[uint64](&_l___dev_queue_xmit))
+
+    # Group 7: netdev features + upper-link + TSO
+    _add_export("netdev_update_features",
+                cast[uint64](&_l_netdev_update_features))
+    _add_export("netdev_upper_dev_link",
+                cast[uint64](&_l_netdev_upper_dev_link))
+    _add_export("netdev_upper_dev_unlink",
+                cast[uint64](&_l_netdev_upper_dev_unlink))
+    _add_export("netif_inherit_tso_max",
+                cast[uint64](&_l_netif_inherit_tso_max))
+    _add_export("netif_stacked_transfer_operstate",
+                cast[uint64](&_l_netif_stacked_transfer_operstate))
+    _add_export("linkwatch_fire_event",
+                cast[uint64](&_l_linkwatch_fire_event))
+
+    # Group 8: ethtool
+    _add_export("__ethtool_get_link_ksettings",
+                cast[uint64](&_l___ethtool_get_link_ksettings))
+    _add_export("ethtool_get_ts_info_by_layer",
+                cast[uint64](&_l_ethtool_get_ts_info_by_layer))
+    _add_export("ethtool_op_get_link",
+                cast[uint64](&_l_ethtool_op_get_link))
+
+    # Group 9: ether / eth headers
+    _add_export("ether_setup",
+                cast[uint64](&_l_ether_setup))
+    _add_export("eth_header_parse",
+                cast[uint64](&_l_eth_header_parse))
+    _add_export("eth_validate_addr",
+                cast[uint64](&_l_eth_validate_addr))
+
+    # Group 10: hwtstamp generic
+    _add_export("generic_hwtstamp_get_lower",
+                cast[uint64](&_l_generic_hwtstamp_get_lower))
+    _add_export("generic_hwtstamp_set_lower",
+                cast[uint64](&_l_generic_hwtstamp_set_lower))
+
+    # Group 11: netpoll
+    _add_export("__netpoll_setup",
+                cast[uint64](&_l___netpoll_setup))
+    _add_export("__netpoll_free",
+                cast[uint64](&_l___netpoll_free))
+    _add_export("netpoll_send_skb",
+                cast[uint64](&_l_netpoll_send_skb))
+
+    # Group 12: netlink + extack
+    _add_export("nla_put",
+                cast[uint64](&_l_nla_put))
+    _add_export("__nla_validate",
+                cast[uint64](&_l___nla_validate))
+    _add_export("do_trace_netlink_extack",
+                cast[uint64](&_l_do_trace_netlink_extack))
+
+    # Group 13: skb + proc + seq + xa
+    _add_export("skb_push",
+                cast[uint64](&_l_skb_push))
+    _add_export("proc_create_net_data",
+                cast[uint64](&_l_proc_create_net_data))
+    _add_export("proc_create_single_data",
+                cast[uint64](&_l_proc_create_single_data))
+    _add_export("_proc_mkdir",
+                cast[uint64](&_l__proc_mkdir))
+    _add_export("remove_proc_entry",
+                cast[uint64](&_l_remove_proc_entry))
+    _add_export("seq_putc",
+                cast[uint64](&_l_seq_putc))
+    _add_export("seq_write",
+                cast[uint64](&_l_seq_write))
+    _add_export("xa_find",
+                cast[uint64](&_l_xa_find))
+
+    # Group 14: VLAN-internal cross-module
+    _add_export("vlan_ioctl_set",
+                cast[uint64](&_l_vlan_ioctl_set))
+    _add_export("vlan_uses_dev",
+                cast[uint64](&_l_vlan_uses_dev))
+    _add_export("vlan_dev_vlan_id",
+                cast[uint64](&_l_vlan_dev_vlan_id))
+    _add_export("vlan_filter_push_vids",
+                cast[uint64](&_l_vlan_filter_push_vids))
+    _add_export("vlan_filter_drop_vids",
+                cast[uint64](&_l_vlan_filter_drop_vids))
+    _add_export("vlan_vid_add",
+                cast[uint64](&_l_vlan_vid_add))
+    _add_export("vlan_vid_del",
+                cast[uint64](&_l_vlan_vid_del))
+
+    # Group 15: capability + percpu + RCU + bit-search
+    _add_export("ns_capable",
+                cast[uint64](&_l_ns_capable))
+    _add_export("pcpu_alloc_noprof",
+                cast[uint64](&_l_pcpu_alloc_noprof))
+    _add_export("free_percpu",
+                cast[uint64](&_l_free_percpu))
+    _add_export("rcu_barrier",
+                cast[uint64](&_l_rcu_barrier))
+    _add_export("_find_next_bit",
+                cast[uint64](&_l_find_next_bit))
+    _add_export("BUG_func",
+                cast[uint64](&_l_BUG_func))
+    _add_export("netdev_warn",
+                cast[uint64](&_l_netdev_warn))
+
+    # Group 16: DATA exports
+    _add_export("__cpu_possible_mask",
+                cast[uint64](&__cpu_possible_mask_buf[0]))
+    _add_export("nr_cpu_ids",
+                cast[uint64](&nr_cpu_ids_var))
+    _add_export("this_cpu_off",
+                cast[uint64](&this_cpu_off_var))
+    _add_export("pv_ops",
+                cast[uint64](&pv_ops_buf[0]))

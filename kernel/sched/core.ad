@@ -41,6 +41,16 @@ extern def local_irq_enable()
 extern def get_bsp_cr3() -> uint64
 extern def load_cr3(value: uint64)
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+# U27: MSR access for per-task FS_BASE save/restore across context
+# switches. The asm body is the generic write_msr in
+# arch/x86/kernel/syscall_64.S — same primitive arch_prctl uses on the
+# Linux ABI side.
+extern def write_msr(index: uint32, value: uint64)
+
+# U27: IA32_FS_BASE — MSR 0xC0000100. Mirrored from u_syscalls.ad's
+# constant of the same name; duplicated here so core.ad doesn't pull in
+# the linux_abi side just for a number.
+SCHED_IA32_FS_BASE: uint32 = 0xC0000100
 
 
 class TaskStruct:
@@ -96,6 +106,24 @@ class TaskStruct:
     # Without this, the parent races the child on the SHARED user stack
     # — both running glibc fork() return paths whose locals collide.
     vfork_done: int32                 # offset 676
+    # U27: per-task FS_BASE (MSR 0xC0000100). glibc's pthread bring-up
+    # writes the TLS base via arch_prctl(ARCH_SET_FS, &tcb), and threads
+    # spawned via clone(CLONE_SETTLS) carry a per-thread tls value. Each
+    # task records its own FS_BASE here so the context-switch path can
+    # restore it on dispatch — without per-task save/restore, the last
+    # thread's TLS base would silently overwrite siblings'. Native
+    # (Hamnix-ABI) tasks leave this at 0, which is harmless: they never
+    # read %fs-relative.
+    fs_base:    uint64                # offset 680
+    # U27: per-task CLONE_CHILD_CLEARTID address. Linux records the
+    # user pointer set by set_tid_address() or clone(CLONE_CHILD_CLEARTID,
+    # ctid=...). On task exit the kernel writes 0 there and futex-wakes
+    # any waiters — that's how glibc's pthread_join() detects child
+    # death without polling. The wake side is handled by
+    # task_exit_current() below; pthread_create stashes the ctid into
+    # this slot via do_clone's thread path. 0 means "no clear pending"
+    # (default for native tasks + fork children).
+    clear_child_tid: uint64           # offset 688
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -114,8 +142,13 @@ USER_DS_R3: uint64 = 0x1B                # 0x18 | RPL=3
 RFLAGS_INITIAL: uint64 = 0x202           # bit 1 reserved | bit 9 IF=1
 
 # Runqueue + bookkeeping.
-NTASKS:      uint64 = 4
-task_table:  Array[4, TaskStruct]
+# U27: bumped from 4 to 8. pthread_create() needs 1 slot per worker
+# thread (in addition to hamsh, the main thread, and any forked
+# children); a 2-worker test fixture is already at the old ceiling
+# with no headroom. 8 fits the U27 fixture comfortably and leaves
+# room for pipelines + pthread test growth without revisiting.
+NTASKS:      uint64 = 8
+task_table:  Array[8, TaskStruct]
 next_pid:    uint64 = 1
 current_idx: uint64 = 0                  # index into task_table
 
@@ -126,7 +159,8 @@ def _build_initial_kstack(kstack_top: uint64, iret_cs: uint64,
                           iret_ss: uint64, iret_rsp: uint64,
                           iret_rip: uint64,
                           iret_rdi: uint64,
-                          iret_rsi: uint64) -> uint64:
+                          iret_rsi: uint64,
+                          iret_r9: uint64) -> uint64:
     # Plant the same layout every task ends up with after one round
     # of preemption: iret frame + vec/ec + 9 caller-saved + ret to
     # kthread_bootstrap + 6 callee-saved. After __switch_to_asm pops
@@ -135,6 +169,14 @@ def _build_initial_kstack(kstack_top: uint64, iret_cs: uint64,
     # RFLAGS = RFLAGS_INITIAL. iret_rdi / iret_rsi are written into
     # the rdi / rsi slots so SYS_SPAWN children land in _start with
     # argc / argv already in the right SysV registers.
+    #
+    # U27: iret_r9 is the value to plant in the user's %r9 register.
+    # For SYS_SPAWN and kthread bootstrap callers this stays 0 — they
+    # don't propagate any caller-side r9. For the CLONE_THREAD path
+    # the value is the parent's user %r9 at syscall entry, because
+    # musl's __clone wrapper saves the worker function in %r9 and the
+    # child uses `call *%r9` after the syscall returns. Without this,
+    # the child immediately jumps to NULL.
     sp: uint64 = kstack_top
 
     sp = sp - 8
@@ -170,7 +212,7 @@ def _build_initial_kstack(kstack_top: uint64, iret_cs: uint64,
     sp = sp - 8
     cast[Ptr[uint64]](sp)[0] = 0                  # r8
     sp = sp - 8
-    cast[Ptr[uint64]](sp)[0] = 0                  # r9
+    cast[Ptr[uint64]](sp)[0] = iret_r9            # r9
     sp = sp - 8
     cast[Ptr[uint64]](sp)[0] = 0                  # r10
     sp = sp - 8
@@ -225,7 +267,7 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
 
     sp: uint64 = _build_initial_kstack(
         kstack_top, SCHED_KERNEL_CS, 0x10, kstack_top, entry,
-        0, 0,
+        0, 0, 0,
     )
 
     s: uint64 = cast[uint64](slot)
@@ -259,6 +301,18 @@ def create_user_task(entry: uint64, name0: uint64) -> int32:
 def create_user_task_argv(entry: uint64, name0: uint64,
                           user_rsp: uint64, argc: uint64,
                           argv: uint64) -> int32:
+    # Thin wrapper that plants 0 into the child's user %r9. SYS_SPAWN
+    # and the legacy SYS_CLONE entry path don't propagate any user-side
+    # r9 — they're building a brand-new user image from scratch. The
+    # CLONE_THREAD path in do_clone calls create_user_thread directly
+    # so the child resumes with the parent's r9 (the musl __clone
+    # wrapper parks the worker function there).
+    return create_user_thread(entry, name0, user_rsp, argc, argv, 0)
+
+
+def create_user_thread(entry: uint64, name0: uint64,
+                       user_rsp: uint64, argc: uint64,
+                       argv: uint64, user_r9: uint64) -> int32:
     # Allocate kstack + ustack, build a freshly-preempted-looking
     # stack image whose iret frame returns to CPL=3 at `entry`.
     # If `user_rsp` is non-zero the caller is supplying a stack with
@@ -266,7 +320,9 @@ def create_user_task_argv(entry: uint64, name0: uint64,
     # that address in the iret frame. Otherwise we allocate a fresh
     # page and use its top. argc / argv are written into the rdi /
     # rsi slots so the first iretq into _start delivers them as the
-    # standard SysV first two arguments.
+    # standard SysV first two arguments. user_r9 is the value to
+    # plant in the user's %r9 — non-zero only on the CLONE_THREAD
+    # path (musl's __clone parks the worker function there).
     slot: int32 = _find_free_slot()
     if slot < 0:
         printk0("create_user_task: no free task slot\n")
@@ -287,7 +343,7 @@ def create_user_task_argv(entry: uint64, name0: uint64,
 
     sp: uint64 = _build_initial_kstack(
         kstack_top, USER_CS_R3, USER_DS_R3, ustack_top, entry,
-        argc, argv,
+        argc, argv, user_r9,
     )
 
     s: uint64 = cast[uint64](slot)
@@ -379,6 +435,17 @@ def schedule():
     if task_table[nxt].cr3 != task_table[prev].cr3:
         load_cr3(task_table[nxt].cr3)
 
+    # U27: per-task FS_BASE save/restore. Linux's __switch_to writes
+    # the next task's TLS base via wrfsbase / wrmsr. Threads created by
+    # clone(CLONE_SETTLS) each carry their own TLS, and the only way
+    # %fs:0x10 reads the right value after a context switch is to
+    # reprogram MSR_FS_BASE on every swap. Native Hamnix tasks store
+    # fs_base = 0 and never read %fs-relative; writing 0 is harmless.
+    # We unconditionally write (no fast path on equal values) because
+    # comparing two uint64 fields is the same number of instructions
+    # as the wrmsr and we'd just trade a branch for a memory hit.
+    write_msr(SCHED_IA32_FS_BASE, task_table[nxt].fs_base)
+
     __switch_to_asm(cast[Ptr[uint8]](&task_table[prev]),
                     cast[Ptr[uint8]](&task_table[nxt]))
 
@@ -391,6 +458,17 @@ def task_exit_current(code: int64):
     # is simply unread.
     task_close_all_fds(current_idx)
     task_table[current_idx].exit_code = code
+    # U27: CLONE_CHILD_CLEARTID handshake. If this task (typically a
+    # pthread created via clone(CLONE_CHILD_CLEARTID, ctid=&desc->tid))
+    # registered a user pointer via set_tid_address / the clone ctid
+    # arg, zero that uint32 and futex-wake any thread blocked on it.
+    # pthread_join's wait loop is exactly FUTEX_WAIT on that address —
+    # without this wake, joiners spin forever on a stale non-zero tid.
+    ctid: uint64 = task_table[current_idx].clear_child_tid
+    if ctid != 0:
+        cast[Ptr[int32]](ctid)[0] = 0
+        task_table[current_idx].clear_child_tid = 0
+        futex_wake_all(ctid)
     task_table[current_idx].state = STATE_EXITED
     printk2("task: pid %d exited (code=%d)\n",
             task_table[current_idx].pid, cast[uint64](code))
@@ -547,6 +625,71 @@ def set_task_vfork_done(slot: int32, v: int32):
     # task right before the SYSRETQ into the new image — that's the
     # latest moment we can wake a blocked vfork parent without races.
     task_table[cast[uint64](slot)].vfork_done = v
+
+
+def task_fs_base(slot: int32) -> uint64:
+    # U27: read accessor for the task's saved FS_BASE.
+    return task_table[cast[uint64](slot)].fs_base
+
+
+def set_task_fs_base(slot: int32, v: uint64):
+    # U27: write accessor for the task's saved FS_BASE. Called from
+    # do_clone (thread path planting the child's TLS) and from
+    # arch_prctl(ARCH_SET_FS) so the value survives the next context
+    # switch — schedule() rewrites MSR_FS_BASE from this field.
+    task_table[cast[uint64](slot)].fs_base = v
+
+
+def task_clear_child_tid(slot: int32) -> uint64:
+    # U27: read accessor for the per-task CLONE_CHILD_CLEARTID pointer.
+    return task_table[cast[uint64](slot)].clear_child_tid
+
+
+def set_task_clear_child_tid(slot: int32, v: uint64):
+    # U27: write accessor. do_clone stashes ctid here; set_tid_address
+    # stashes its tidptr; task_exit_current reads it on the way out and
+    # zeroes *clear_child_tid + futex-wakes a joiner.
+    task_table[cast[uint64](slot)].clear_child_tid = v
+
+
+def count_live_user_tasks() -> int32:
+    # U27: count tasks that are alive (RUNNING / READY) AND user-mode.
+    # _u_futex consults this to short-circuit the WAIT path when the
+    # caller is the only thing that could write to its own futex word
+    # (a deadlock pattern in startup-time glibc probes). When real
+    # threads exist the count is >= 2 and we park properly.
+    n: uint64 = NTASKS
+    i: uint64 = 0
+    live: int32 = 0
+    while i < n:
+        if task_table[i].is_user != 0:
+            st: uint64 = task_table[i].state
+            if st == STATE_READY or st == STATE_RUNNING:
+                live = live + 1
+        i = i + 1
+    return live
+
+
+def count_live_linux_peers() -> int32:
+    # U27: count live Linux-ABI user tasks OTHER than the current
+    # task. Threads created via clone(CLONE_THREAD) inherit the
+    # is_linux_userspace flag, so a parked FUTEX_WAIT can only be
+    # woken by another Linux-ABI peer (or by the kernel's exit-time
+    # CLEARTID futex-wake on this very task — that's handled
+    # separately). hamsh is is_user=1 but is_linux_userspace=0; it
+    # can't wake any futex, so we exclude it from the peer count.
+    n: uint64 = NTASKS
+    i: uint64 = 0
+    peers: int32 = 0
+    cur: uint64 = current_idx
+    while i < n:
+        if i != cur and task_table[i].is_user != 0 \
+                    and task_table[i].is_linux_userspace != 0:
+            st: uint64 = task_table[i].state
+            if st == STATE_READY or st == STATE_RUNNING:
+                peers = peers + 1
+        i = i + 1
+    return peers
 
 
 def task_name0_at(slot: int32) -> uint64:

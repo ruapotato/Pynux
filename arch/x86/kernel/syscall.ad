@@ -28,7 +28,8 @@ from kernel.printk.printk import printk0, printk1, printk2
 from arch.x86.kernel.time import get_jiffies
 from kernel.sched.core import (
     TaskStruct, current_task,
-    create_user_task, create_user_task_argv, task_exit_current,
+    create_user_task, create_user_task_argv, create_user_thread,
+    task_exit_current,
     current_task_pid, task_lookup_by_pid, task_state, task_exit_code,
     task_pid_at, task_reap, yield_to_others, STATE_EXITED,
     dup_fd_to_child,
@@ -36,6 +37,7 @@ from kernel.sched.core import (
     get_cwd_buf, set_task_cwd, current_idx_get,
     set_linux_userspace_mode,
     task_vfork_done, set_task_vfork_done,
+    set_task_fs_base, set_task_clear_child_tid,
 )
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_write,
@@ -504,40 +506,45 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     return 0
 
 
+# U27: clone-flag bits we branch on. Numerically identical to the
+# Linux <linux/sched.h> values — kept local so the kernel surface
+# doesn't depend on the linux_abi headers just for a constant.
+CLONE_VM:                uint64 = 0x100
+CLONE_FS:                uint64 = 0x200
+CLONE_FILES:             uint64 = 0x400
+CLONE_SIGHAND:           uint64 = 0x800
+CLONE_THREAD:            uint64 = 0x10000
+CLONE_SETTLS:            uint64 = 0x80000
+CLONE_PARENT_SETTID:     uint64 = 0x100000
+CLONE_CHILD_CLEARTID:    uint64 = 0x200000
+
+
 def do_clone(flags: uint64, child_stack: uint64,
-             ptid: uint64, ctid: uint64, tls: uint64) -> int64:
-    # U26: vfork-style fork. Allocate a child task slot that shares the
-    # parent's user image (no fresh ELF load — child inherits the
-    # parent's address space exactly). The child's first iretq lands at
-    # the parent's saved user RIP (the instruction immediately after
-    # the SYSCALL that invoked us) with rax=0, so glibc's fork()
-    # wrapper sees "I am the child". The parent gets back the child's
-    # pid as the normal syscall return value.
+             ptid: uint64, ctid: uint64, tls: uint64,
+             user_r9: uint64) -> int64:
+    # Branches on CLONE_VM | CLONE_THREAD:
     #
-    # `flags` carries the standard Linux clone bits — for plain fork()
-    # this is SIGCHLD (0x11) and we honour none of the CLONE_* sharing
-    # bits at this milestone (no CLONE_VM/CLONE_FS/CLONE_FILES splits;
-    # the child gets its own cloned task_struct + an effectively shared
-    # user address space because both PML4s point at the same lower-
-    # level page tables). child_stack / ptid / ctid / tls are accepted
-    # for ABI compatibility with future CLONE_THREAD work but ignored
-    # here. The next milestone (U27) lights up real thread creation by
-    # honouring CLONE_VM | CLONE_THREAD and respecting child_stack.
+    #   * Thread path  (CLONE_VM | CLONE_THREAD set): the caller is
+    #     musl's pthread_create / glibc's pthread_create. It already
+    #     mmap'd a thread stack and populated `child_stack` with the
+    #     entry-point trampoline frame; we use that pointer verbatim
+    #     as the child's RSP, do NOT copy the parent's stack page,
+    #     schedule the child STATE_READY, and return immediately.
+    #     Parent and child run concurrently from here. CLONE_SETTLS
+    #     plants `tls` into the child's per-task fs_base so the next
+    #     context switch restores it. PARENT_SETTID writes the new
+    #     pid into *ptid; CHILD_CLEARTID stashes ctid in the child's
+    #     clear_child_tid slot so task_exit_current zeroes it +
+    #     futex-wakes a joiner on the way out. user_r9 propagates the
+    #     parent's syscall-entry %r9 because musl's __clone wrapper
+    #     parks the worker function there and the child does
+    #     `call *%r9` after the syscall returns.
     #
-    # Blocking-parent semantics (vfork-equivalent). Until we have real
-    # copy-on-write page tables, parent and child literally share the
-    # same user stack page. If both run concurrently, the child's glibc
-    # post-fork() bookkeeping (canary check, _IO locks, ___run_postfork_
-    # handlers stack frames) pushes return addresses, locals, and a
-    # tcbhead_t robust-list write into the SAME memory that the parent's
-    # fork() return path expects to find unmodified — wild jumps to TLS
-    # data (e.g. 0xb6550) and abort() loops result. POSIX vfork solves
-    # this by blocking the parent until the child execve's or _exit's;
-    # we do the same here. do_execve sets task.vfork_done = 1 on its way
-    # out of the kernel, and task_exit_current implicitly wakes us by
-    # leaving STATE_RUNNING. Yields run with IRQs enabled briefly so the
-    # scheduler can swap to the child; otherwise the parent would loop
-    # forever with the child never getting a CPU slice.
+    #   * Fork path  (no CLONE_VM): the legacy U26 vfork-style behaviour
+    #     — deep-copy the parent's user stack page onto a fresh page,
+    #     create a child whose RIP/RSP resume at the parent's syscall
+    #     return, BLOCK the parent until the child execve's or exits.
+    #     This is what plain fork() and vfork() pass us (SIGCHLD only).
     parent: Ptr[TaskStruct] = current_task()
     kstack_top: uint64 = parent[0].kstack_top
     # syscall_64.S parks (user_rsp - 8) at kstack_top-8 (the user's
@@ -546,6 +553,81 @@ def do_clone(flags: uint64, child_stack: uint64,
     # child resumes at the parent's natural user RSP.
     parent_user_rsp: uint64 = cast[Ptr[uint64]](kstack_top - 8)[0] + 8
     parent_user_rip: uint64 = cast[Ptr[uint64]](kstack_top - 24)[0]
+
+    # --- thread path -----------------------------------------------
+    is_thread: int32 = 0
+    if (flags & CLONE_VM) != 0 and (flags & CLONE_THREAD) != 0:
+        is_thread = 1
+
+    if is_thread != 0:
+        # Caller-supplied stack — must be non-zero for a real
+        # pthread_create. Honour it verbatim: musl/glibc has already
+        # laid out the trampoline (return-to-__clone_func then
+        # start_routine) at the top of the mmap'd thread stack and
+        # handed us a pointer just below it. We don't allocate a new
+        # page or copy from the parent — that would corrupt the
+        # trampoline the libc just wrote.
+        if child_stack == 0:
+            return cast[int64](-22)           # -EINVAL
+        # create_user_thread plants user_r9 into the iret frame's r9
+        # slot. musl's __clone wrapper saves the worker function in
+        # %r9 across the syscall and the child does `call *%r9` after
+        # the syscall returns. Without preserving user_r9 here, the
+        # child calls into NULL.
+        child_slot: int32 = create_user_thread(parent_user_rip,
+                                               0x5f5f7468725f5f5f,    # "__thr___"
+                                               child_stack, 0, 0,
+                                               user_r9)
+        if child_slot < 0:
+            return cast[int64](-11)           # -EAGAIN
+        # Inherit Linux-ABI mode (pthread_create only happens in
+        # Linux user binaries; defensive against future native callers).
+        if parent[0].is_linux_userspace != 0:
+            set_linux_userspace_mode(child_slot, 1)
+        # Share fd table — CLONE_FILES is the conventional bit; we
+        # always do this on the thread path since the alternative
+        # (a thread with its own fd table) makes no semantic sense.
+        i: uint64 = 0
+        while i < 16:
+            dup_fd_to_child(child_slot, i, parent, i)
+            i = i + 1
+        # Share cwd (CLONE_FS). Hamnix tracks cwd per-task by value, not
+        # by reference, so technically threads have independent cwd
+        # views — fixing that is a separate refactor. Most pthread code
+        # doesn't chdir, so the divergence is harmless at this scale.
+        set_task_cwd(cast[uint64](child_slot),
+                     get_cwd_buf(current_idx_get()))
+        # CLONE_SETTLS: child's fs_base = tls. Schedule()'s wrmsr
+        # restores this when it next picks the thread; we don't
+        # write MSR_FS_BASE here because the parent is still
+        # running and a wrmsr would clobber HER %fs.
+        if (flags & CLONE_SETTLS) != 0:
+            set_task_fs_base(child_slot, tls)
+        # CLONE_PARENT_SETTID: write the new tid into *ptid for the
+        # parent to read on syscall return. The parent passes a
+        # pointer into ITS own thread descriptor; the address is in
+        # the shared address space so it's reachable from kernel mode.
+        child_pid: uint64 = task_pid_at(child_slot)
+        if (flags & CLONE_PARENT_SETTID) != 0 and ptid != 0:
+            cast[Ptr[int32]](ptid)[0] = cast[int32](child_pid)
+        # CLONE_CHILD_CLEARTID: stash ctid in the child so its
+        # task_exit_current zeros *ctid + futex-wakes pthread_join.
+        if (flags & CLONE_CHILD_CLEARTID) != 0 and ctid != 0:
+            set_task_clear_child_tid(child_slot, ctid)
+        # vfork_done is irrelevant on the thread path — set it to 1 so
+        # nothing in a future audit can spin-wait on it. The parent
+        # never reads this for a thread because we don't enter the
+        # blocking yield loop below.
+        set_task_vfork_done(child_slot, 1)
+        # Child is STATE_READY by create_user_thread. We return the
+        # tid (which is the pid at this scale) to the libc and let
+        # the next timer tick (or this task's next yield) hand the
+        # CPU to it. Parent and child run concurrently from here.
+        printk1("clone: thread created, child_pid=%d\n",
+                cast[int32](child_pid))
+        return cast[int64](child_pid)
+
+    # --- fork path (legacy U26 behaviour) ---------------------------
     # Give the child its OWN user stack page, page-aligned, with the
     # parent's stack content copied byte-for-byte so the child sees the
     # same locals/canary/return chain as the parent did. Without this
@@ -581,6 +663,10 @@ def do_clone(flags: uint64, child_stack: uint64,
                                         child_user_rsp, 0, 0)
     if slot < 0:
         return cast[int64](-11)               # -EAGAIN
+    # Inherit parent's fs_base so the child's first syscall sees the
+    # same TLS the parent had. Threads override this via CLONE_SETTLS;
+    # fork shares the parent's TCB pointer until exec replaces it.
+    set_task_fs_base(slot, parent[0].fs_base)
     # Make the child's first read of the wake flag explicit. It's also
     # zeroed by bss/_find_free_slot reuse, but defensive setting here
     # keeps the contract obvious.

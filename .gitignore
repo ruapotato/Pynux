@@ -86,3 +86,7 @@ tests/u-binary/src/glibc_idprobe/hello
 tests/u-binary/src/cpp_demo/hello
 tests/u-binary/src/glibc_exec/hello
 tests/u-binary/src/glibc_system/hello
+tests/u-binary/src/glibc_thread/hello
+tests/u-binary/src/musl_thread/hello
+tests/u-binary/src/musl_thread1/hello
+tests/u-binary/src/musl_thread2/hello

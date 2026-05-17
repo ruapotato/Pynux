@@ -75,46 +75,72 @@ syscall_entry:
     pushq   %r11                      /* user RFLAGS */
     pushq   %rcx                      /* user RIP    */
 
-    /* Shuffle user syscall ABI into SysV ABI for do_syscall. The user
-     * register layout coming in:
-     *   rax=nr  rdi=a0  rsi=a1  rdx=a2  r10=a3  r8=a4  r9=a5
-     * SysV (callee) layout for do_syscall(nr, a0, a1, a2, a3, a4, a5):
-     *   rdi=nr  rsi=a0  rdx=a1  rcx=a2  r8=a3  r9=a4  stack=a5
+    /* Save all 6 user-arg regs + nr. Linux's x86_64 syscall ABI says
+     * %rdi/%rsi/%rdx/%r10/%r8/%r9 are preserved across SYSCALL.
+     * Musl's __lockfile spin loop holds &f->lock in %rdi across
+     * FUTEX_WAIT and re-CASes after wake — so %rdi MUST be preserved
+     * for musl pthread mutex contention to work.
      *
-     * U7: widened from 4 args (a0..a3) to 6 args (a0..a5) so the Linux
-     * mmap (9) syscall — and any other 6-arg Linux syscall — can see
-     * %r8 / %r9. The 7th arg (a5) is passed on the stack per SysV.
+     * However: our static-pie glibc-2.39 binaries trip a search-path
+     * malloc failure path when %rdi is preserved past arch_prctl etc.
+     * (root cause unidentified — may be a Hamnix-build quirk; reproduces
+     * deterministically). Workaround: preserve %rdi ONLY for FUTEX
+     * (nr=202); zero it for every other syscall. We stash nr at entry
+     * and branch on it at exit.
      *
-     * Stack layout right before `call do_syscall`:
-     *   kstack_top - 24 : already used (r11, rcx, r12-of-user via the
-     *                     popq %rsp trick — see the parking dance above)
-     *   kstack_top - 32 : alignment pad (must be at higher addr than a5)
-     *   kstack_top - 40 : a5 (callee reads at 8(%rsp) after `call`
-     *                     pushes the return address)
-     *
-     * Pre-call rsp = kstack_top - 40, which is 8 mod 16 (because
-     * kstack_top is 16-aligned). After `call` pushes return: rsp =
-     * -48, 16-aligned — SysV alignment satisfied. The two pushes get
-     * undone after the call with `addq $16, %rsp`.
-     */
-    pushq   $0                        /* alignment pad (higher addr)  */
-    pushq   %r9                       /* a5 -> stack arg 7            */
+     * Push order is the reverse of pop order. 8 pushes (6 args + nr +
+     * pad) keep `call` 16-byte aligned with the subsequent pad + a5. */
+    pushq   %r9
+    pushq   %r8
+    pushq   %r10
+    pushq   %rdx
+    pushq   %rsi
+    pushq   %rdi
+    pushq   %rax                      /* stash nr (orig user %rax) */
+    pushq   $0                        /* pad to keep `call` 16B aligned */
+    pushq   $0                        /* alignment pad (higher addr than a5) */
+    pushq   %r9                       /* a5 -> stack arg 7 (still user_r9
+                                       *      — shuffle hasn't run yet) */
 
     /* Now do the register shuffle. Order matters: read each source
      * register before any move that would clobber it. r9 (target a4)
      * needs the old r8 (a4) BEFORE we trash r8 with r10 (a3). */
-    movq    %r8,  %r9                 /* a4 (r9 = user r8)            */
-    movq    %r10, %r8                 /* a3 (r8 = user r10)           */
-    movq    %rdx, %rcx                /* a2                           */
-    movq    %rsi, %rdx                /* a1                           */
-    movq    %rdi, %rsi                /* a0                           */
-    movq    %rax, %rdi                /* nr                           */
+    movq    %r8,  %r9                 /* a4 (r9 = user r8) */
+    movq    %r10, %r8                 /* a3 (r8 = user r10) */
+    movq    %rdx, %rcx                /* a2 */
+    movq    %rsi, %rdx                /* a1 */
+    movq    %rdi, %rsi                /* a0 */
+    movq    %rax, %rdi                /* nr */
 
     call    do_syscall                /* return value lands in %rax */
 
-    /* Reclaim the 16 bytes pushed for a5 + pad before unwinding the
-     * rest of the kernel-side spill. */
+    /* Reclaim the 16 bytes pushed for a5 + alignment pad. */
     addq    $16, %rsp
+
+    /* Pop the second pad we added for nr-stash alignment, then read
+     * stashed nr into %rcx (which we'll overwrite with user RIP
+     * shortly anyway). */
+    addq    $8, %rsp                  /* drop the inner pad */
+    popq    %rcx                      /* %rcx = stashed nr */
+    cmpq    $202, %rcx                /* SYS_futex? */
+    je      .Lrestore_rdi
+
+    /* Non-FUTEX path: zero %rdi (matches the prior pre-bisect kernel
+     * behavior that glibc-2.39 static-pie depends on for reasons not
+     * yet understood). Skip the saved %rdi slot. */
+    addq    $8, %rsp                  /* skip saved %rdi */
+    xorq    %rdi, %rdi
+    jmp     .Lrestore_rest
+
+.Lrestore_rdi:
+    popq    %rdi                      /* user a0 — preserved for FUTEX */
+
+.Lrestore_rest:
+    popq    %rsi
+    popq    %rdx
+    popq    %r10
+    popq    %r8
+    popq    %r9
 
     /* Restore syscall-control regs and user RSP. We pop the
      * (per-task) stored user RSP straight into %rsp; the next pop

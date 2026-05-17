@@ -71,8 +71,11 @@ from fs.vfs import (
     vfs_dup, vfs_dup2, vfs_unlink, resolve_path,
 )
 from kernel.sched.core import (
+    TaskStruct, current_task,
     current_task_pid, task_lookup_by_pid, task_exit_current,
     signal_post, get_cwd_buf, set_task_cwd, current_idx_get,
+    set_task_fs_base, set_task_clear_child_tid,
+    count_live_linux_peers, yield_to_others,
 )
 from arch.x86.kernel.time import get_jiffies
 from mm.slab import kmalloc, kfree, kzalloc
@@ -833,16 +836,19 @@ def _u_clone(a0: uint64, a1: uint64, a2: uint64,
     # mappings shared), child resumes at the parent's saved syscall
     # return RIP with rax=0 so glibc's fork() sees the conventional
     # "I'm the child" return value. child_stack / ptid / ctid / tls
-    # are passed through for ABI compatibility and ignored until U27
-    # (real pthread_create via CLONE_VM | CLONE_THREAD).
-    return do_clone(a0, a1, a2, a3, a4)
+    # are passed through for ABI compatibility. U27 lights up the
+    # thread path (CLONE_VM | CLONE_THREAD) and adds a5 (user's
+    # original %r9) so the child's `call *%r9` after the musl __clone
+    # wrapper returns lands on the right function pointer.
+    return do_clone(a0, a1, a2, a3, a4, a5)
 
 
 def _u_fork(a0: uint64, a1: uint64, a2: uint64,
             a3: uint64, a4: uint64, a5: uint64) -> int64:
     # pid_t fork(void). Identical to clone(SIGCHLD, NULL, NULL, NULL, 0)
-    # — the canonical Linux mapping. 0x11 == SIGCHLD.
-    return do_clone(cast[uint64](0x11), 0, 0, 0, 0)
+    # — the canonical Linux mapping. 0x11 == SIGCHLD. user_r9 = 0
+    # because fork() takes no caller arg that lives in %r9.
+    return do_clone(cast[uint64](0x11), 0, 0, 0, 0, 0)
 
 
 def _u_vfork(a0: uint64, a1: uint64, a2: uint64,
@@ -853,7 +859,7 @@ def _u_vfork(a0: uint64, a1: uint64, a2: uint64,
     # so vfork and fork are the same call here. CLONE_VM | CLONE_VFORK
     # | SIGCHLD would be the faithful flag set; we don't need to
     # distinguish them in do_clone yet.
-    return do_clone(cast[uint64](0x4111), 0, 0, 0, 0)
+    return do_clone(cast[uint64](0x4111), 0, 0, 0, 0, 0)
 
 
 def _u_execve(a0: uint64, a1: uint64, a2: uint64,
@@ -1133,13 +1139,16 @@ def _u_unimpl_arch_prctl(a0: uint64, a1: uint64, a2: uint64,
     # the form `mov %fs:0x28, %rax` (stack canary) and `mov %fs:0x10, %rax`
     # (TLS DTV pointer) depend on FS_BASE pointing at the TCB.
     #
-    # We write the user-supplied address straight into IA32_FS_BASE.
-    # Validation against canonical-form is the CPU's job (a non-canonical
-    # value triggers #GP on the wrmsr); the trap will be reported through
-    # the existing fault handler. When per-task FS_BASE state lands we'll
-    # also stash addr in task_struct so context switches can restore it.
+    # We write the user-supplied address straight into IA32_FS_BASE AND
+    # stash it in current_task->fs_base so the next context switch
+    # restores it (U27 — without per-task save/restore, a second thread
+    # would silently overwrite the parent's TCB pointer on its own
+    # ARCH_SET_FS). Validation against canonical-form is the CPU's job:
+    # a non-canonical value triggers #GP on the wrmsr and lands in the
+    # existing fault handler.
     if a0 == ARCH_SET_FS:
         write_msr(IA32_FS_BASE, a1)
+        set_task_fs_base(cast[int32](current_idx_get()), a1)
         return 0
     return ELINUX_INVAL
 
@@ -1149,13 +1158,11 @@ def _u_unimpl_set_tid_address(a0: uint64, a1: uint64, a2: uint64,
     # long set_tid_address(int *tidptr).
     # Linux records tidptr in current->clear_child_tid and returns the
     # caller's tid. On task exit the kernel writes 0 there and futex-
-    # wakes waiters (the CLONE_CHILD_CLEARTID handshake). We park it in
-    # a single global because there's no per-task slot yet and only one
-    # Linux task is in flight at this milestone — the exit-time clear
-    # is a TODO that lands with proper thread-group support. The return
-    # value is required by glibc to be the tid, which on a single-thread
-    # task is just the pid.
-    linux_clear_child_tid = a0
+    # wakes waiters (the CLONE_CHILD_CLEARTID handshake). U27 promotes
+    # this from a single global to per-task storage in TaskStruct so
+    # multiple Linux tasks (e.g. parent + pthreads) each track their
+    # own pointer. set_task_clear_child_tid is the accessor.
+    set_task_clear_child_tid(cast[int32](current_idx_get()), a0)
     return cast[int64](current_task_pid())
 
 
@@ -1380,6 +1387,10 @@ def _u_sysinfo(a0: uint64, a1: uint64, a2: uint64,
 
 FUTEX_WAIT:            uint64 = 0
 FUTEX_WAKE:            uint64 = 1
+FUTEX_REQUEUE:         uint64 = 3
+FUTEX_CMP_REQUEUE:     uint64 = 4
+FUTEX_WAIT_BITSET:     uint64 = 9
+FUTEX_WAKE_BITSET:     uint64 = 10
 FUTEX_PRIVATE_FLAG:    uint64 = 128
 FUTEX_CLOCK_REALTIME:  uint64 = 256
 # Mask used to peel off PRIVATE / CLOCK_REALTIME bits before
@@ -1389,24 +1400,148 @@ FUTEX_OP_MASK:         uint64 = 127
 ELINUX_AGAIN:          int64  = -11
 
 
+# U27: minimal futex wait queue. A small table of (uaddr, waiter slot,
+# in-use) records. FUTEX_WAIT parks the caller in a free slot and
+# yields; FUTEX_WAKE / futex_wake_all walks the table and clears any
+# matching entries (the woken task's next yield iteration will see its
+# slot vacated and return). Capacity is 16, enough for a few threads +
+# pthread_join joiners; overflow returns -EAGAIN, which glibc/musl
+# treat as spurious wakeup and retry.
+#
+# Why this lives in u_syscalls.ad and not core.ad: the table is owned
+# by the Linux ABI surface (futex semantics are a userspace contract).
+# core.ad reaches up via the futex_wake_all symbol on the task-exit
+# CLEARTID path — Adder's module dedup lets the upward call resolve
+# without an explicit import cycle.
+FUTEX_NSLOTS: uint64 = 16
+futex_addr:   Array[16, uint64]   # 0 means "free slot"
+futex_slot:   Array[16, int32]    # task slot index of the waiter
+
+
+def futex_wake_all(uaddr: uint64) -> int32:
+    # Wake every waiter parked on `uaddr`. Returns the count of slots
+    # we cleared. Called from task_exit_current's CLEARTID handshake
+    # and from FUTEX_WAKE. The woken task itself doesn't need to be
+    # state-poked here — _u_futex's WAIT loop polls futex_addr[my_slot]
+    # after each yield_to_others, so clearing the slot is enough.
+    i: uint64 = 0
+    woke: int32 = 0
+    while i < FUTEX_NSLOTS:
+        if futex_addr[i] == uaddr:
+            futex_addr[i] = 0
+            futex_slot[i] = -1
+            woke = woke + 1
+        i = i + 1
+    return woke
+
+
 def _u_futex(a0: uint64, a1: uint64, a2: uint64,
              a3: uint64, a4: uint64, a5: uint64) -> int64:
     # long futex(uint32_t *uaddr, int op, uint32_t val,
     #            const struct timespec *timeout,  /* or uint32_t val2 */
     #            uint32_t *uaddr2, uint32_t val3)
+    #
+    # SYSCALL ABI NOTE: musl's __lockfile spin loop keeps `&f->lock`
+    # in %rdi across this syscall and re-CASes after wake (see
+    # arch/x86/kernel/syscall_64.S — we preserve %rdi only for FUTEX
+    # to make musl pthread mutex contention work).
     op: uint64 = a1 & FUTEX_OP_MASK
+    # FUTEX_WAIT_BITSET (9) and FUTEX_WAKE_BITSET (10) are the same as
+    # WAIT/WAKE plus a per-bit mask in val3 (a5). glibc's pthread_join
+    # uses BITSET with mask = FUTEX_BITSET_MATCH_ANY (0xffffffff), so
+    # the mask is identity and we fold both into the basic WAIT/WAKE
+    # implementations. A faithful kernel would gate the wake on
+    # (bitset & val3) != 0; if a future workload uses partial masks
+    # this fold loses precision, but glibc itself only uses the all-
+    # ones mask in the call sites we hit.
+    if op == FUTEX_WAIT_BITSET:
+        op = FUTEX_WAIT
+    if op == FUTEX_WAKE_BITSET:
+        op = FUTEX_WAKE
+    # FUTEX_REQUEUE / CMP_REQUEUE (3/4) — glibc/musl use these in
+    # pthread_cond_*. We fold to FUTEX_WAKE for the wake half and
+    # ignore the requeue half. Not faithful, but unblocks the U27
+    # workload (mutexes + join, no condition variables).
+    if op == FUTEX_REQUEUE or op == FUTEX_CMP_REQUEUE:
+        op = FUTEX_WAKE
     if op == FUTEX_WAIT:
-        # WRONG-but-tolerable: we never sleep. A real implementation
-        # would park the caller on a kernel wait queue and let
-        # FUTEX_WAKE unblock it. With one task in flight, "spurious
-        # wakeup via -EAGAIN" is observationally equivalent.
         if a0 == 0:
             return ELINUX_INVAL
-        return ELINUX_AGAIN
-    if op == FUTEX_WAKE:
-        # No waiters — single-task system. Returning 0 means "woke 0
-        # waiters", which is the truth.
+        # Atomic-equivalent precheck: if *uaddr != val (the third arg),
+        # the wake we'd be waiting for has already happened — return
+        # -EAGAIN per the futex(2) man page. glibc/musl read this as
+        # "spurious wakeup" and recheck the lock word.
+        cur: uint32 = cast[Ptr[uint32]](a0)[0]
+        if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
+            return ELINUX_AGAIN
+        # If there's no other live Linux-ABI peer that could write
+        # the wake value, a real park would deadlock. Park-with-budget:
+        # yield N times so the scheduler can advance any other work
+        # (hamsh's waitpid timer), then return -EAGAIN. glibc's
+        # lll_lock_wait_inf re-attempts the cmpxchg; if it still
+        # fails, it re-enters wait. Threads created via clone(CLONE_THREAD)
+        # bump the peer count, at which point the park path below
+        # (real wait on the futex queue) is the right answer.
+        if count_live_linux_peers() == 0:
+            budget: int32 = 0
+            while budget < 8:
+                yield_to_others()
+                if count_live_linux_peers() != 0:
+                    break
+                cur = cast[Ptr[uint32]](a0)[0]
+                if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
+                    return 0
+                budget = budget + 1
+            if count_live_linux_peers() == 0:
+                return ELINUX_AGAIN
+        # Park in a free slot. Linear scan is fine — 16 slots, called
+        # rarely on the bring-up workload.
+        my_slot: int32 = cast[int32](current_idx_get())
+        i: uint64 = 0
+        spot: int32 = -1
+        while i < FUTEX_NSLOTS:
+            if futex_addr[i] == 0:
+                spot = cast[int32](i)
+                i = FUTEX_NSLOTS
+            else:
+                i = i + 1
+        if spot < 0:
+            return ELINUX_AGAIN
+        su: uint64 = cast[uint64](spot)
+        futex_addr[su] = a0
+        futex_slot[su] = my_slot
+        # Yield until our slot is cleared (futex_wake_all) OR the user
+        # value moves off `val` (mutex unlock wrote the new word; a
+        # racing wake would race us here, which is fine — we re-check
+        # *uaddr each iteration so a missed wake is a one-yield delay).
+        do:
+            yield_to_others()
+            if futex_addr[su] == 0:
+                break
+            cur = cast[Ptr[uint32]](a0)[0]
+            if cast[uint64](cur) != (a2 & 0xFFFFFFFF):
+                # Value moved — pretend we were woken. Clear our slot
+                # ourselves so a stale entry doesn't haunt the table.
+                futex_addr[su] = 0
+                futex_slot[su] = -1
+                break
+        while 1
         return 0
+    if op == FUTEX_WAKE:
+        if a0 == 0:
+            return ELINUX_INVAL
+        # a2 is the maximum number of waiters to wake. glibc passes
+        # 1 for mutexes, INT_MAX for cv-broadcast. We honour the cap.
+        max_wake: uint64 = a2 & 0xFFFFFFFF
+        woke: int64 = 0
+        i: uint64 = 0
+        while i < FUTEX_NSLOTS:
+            if futex_addr[i] == a0 and cast[uint64](woke) < max_wake:
+                futex_addr[i] = 0
+                futex_slot[i] = -1
+                woke = woke + 1
+            i = i + 1
+        return woke
     return ELINUX_NOSYS
 
 
