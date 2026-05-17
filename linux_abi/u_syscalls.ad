@@ -83,6 +83,9 @@ from kernel.sched.core import (
     get_task_sig_handler, set_task_sig_handler,
     get_task_comm_ptr, set_task_pdeathsig,
     saved_user_rip_ptr, saved_user_rsp_ptr, saved_user_rflags_ptr,
+    get_task_alt_stack_sp, set_task_alt_stack_sp,
+    get_task_alt_stack_size, set_task_alt_stack_size,
+    get_task_alt_stack_flags, set_task_alt_stack_flags,
 )
 from arch.x86.kernel.time import get_jiffies
 from mm.slab import kmalloc, kfree, kzalloc
@@ -290,6 +293,12 @@ SYS_getpgid:         uint64 = 121
 SYS_getsid:          uint64 = 124
 SYS_gettid:          uint64 = 186
 SYS_tgkill:          uint64 = 234
+# U37: sigaltstack — glibc reaches for this during static-PIE signal
+# setup so a SIGSEGV handler can land on a known-good page if the
+# user's main stack is the thing that overflowed. Hamnix has no
+# nested handler delivery and never switches to the alt stack; the
+# handler just records the values and returns 0 so glibc keeps moving.
+SYS_sigaltstack:     uint64 = 131
 
 
 # Linux errno values returned by stub handlers. Kept local to avoid
@@ -2288,6 +2297,57 @@ def _u_getpgrp(a0: uint64, a1: uint64, a2: uint64,
 
 
 # =====================================================================
+# U37: sigaltstack
+# =====================================================================
+#
+# int sigaltstack(const stack_t *ss, stack_t *oss)
+#
+# struct stack_t {
+#     void   *ss_sp;     /* offset  0, 8 bytes */
+#     int     ss_flags;  /* offset  8, 4 bytes */
+#     /* 4 bytes pad */
+#     size_t  ss_size;   /* offset 16, 8 bytes */
+# };
+#
+# Total size: 24 bytes. glibc's static-PIE startup installs an alt
+# stack so a SIGSEGV handler can run on a known-good page if the
+# user's main stack is the thing that overflowed. Hamnix has exactly
+# one task per thread and signal_check_and_handle never delivers a
+# second signal on top of an in-flight handler, so we never need to
+# actually SWITCH to the alt stack — the values just need to be
+# recorded so the syscall stops returning -ENOSYS.
+#
+# Layout offsets — kept as constants for readability at the call sites.
+STACK_T_OFF_SP:    uint64 = 0
+STACK_T_OFF_FLAGS: uint64 = 8
+STACK_T_OFF_SIZE:  uint64 = 16
+
+
+def _u_sigaltstack(a0: uint64, a1: uint64, a2: uint64,
+                   a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # const stack_t *ss  -> a0   (may be NULL: query only)
+    # stack_t       *oss -> a1   (may be NULL: install only)
+    slot: uint64 = current_idx_get()
+    # Capture the previous values FIRST so a single combined call
+    # (ss + oss both non-NULL) reports the state in effect on entry.
+    prev_sp:    uint64 = get_task_alt_stack_sp(slot)
+    prev_size:  uint64 = get_task_alt_stack_size(slot)
+    prev_flags: int32  = get_task_alt_stack_flags(slot)
+    if a1 != 0:
+        cast[Ptr[uint64]](a1 + STACK_T_OFF_SP)[0]   = prev_sp
+        cast[Ptr[int32]](a1 + STACK_T_OFF_FLAGS)[0] = prev_flags
+        cast[Ptr[uint64]](a1 + STACK_T_OFF_SIZE)[0] = prev_size
+    if a0 != 0:
+        new_sp:    uint64 = cast[Ptr[uint64]](a0 + STACK_T_OFF_SP)[0]
+        new_flags: int32  = cast[Ptr[int32]](a0 + STACK_T_OFF_FLAGS)[0]
+        new_size:  uint64 = cast[Ptr[uint64]](a0 + STACK_T_OFF_SIZE)[0]
+        set_task_alt_stack_sp(slot, new_sp)
+        set_task_alt_stack_size(slot, new_size)
+        set_task_alt_stack_flags(slot, new_flags)
+    return 0
+
+
+# =====================================================================
 # U21: gettimeofday
 # =====================================================================
 #
@@ -2895,6 +2955,12 @@ def linux_u_syscall_dispatch(nr: uint64,
         return _u_setpgid(a0, a1, a2, a3, a4, a5)
     if nr == SYS_getpgrp:
         return _u_getpgrp(a0, a1, a2, a3, a4, a5)
+    # U37: sigaltstack — record per-task alt-stack registration. Hamnix
+    # never actually switches stacks on signal delivery (single-task,
+    # no nested handlers), but glibc's static-pie startup reaches for
+    # the syscall during signal setup and stalls if it returns -ENOSYS.
+    if nr == SYS_sigaltstack:
+        return _u_sigaltstack(a0, a1, a2, a3, a4, a5)
     # Unknown syscall — same convention as Linux: log + return -ENOSYS.
     # The printk includes nr so a trace of "unknown linux syscall X"
     # tells you exactly which entry to add to the ladder above.

@@ -52,7 +52,7 @@ from fs.elf import (
     elf_last_load_base, elf_last_phoff, elf_last_phnum,
     elf_apply_last_user_mapping,
 )
-from mm.page_alloc import alloc_page
+from mm.page_alloc import alloc_page, alloc_pages
 from linux_abi.loader import kmod_linux_load, kmod_linux_unload
 from linux_abi.u_syscalls import linux_u_syscall_dispatch
 
@@ -490,7 +490,12 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     # Fresh user stack for the new program. The previous user
     # stack page is leaked for now (no per-task ustack tracking
     # in this code path); proper teardown comes with mm_struct.
-    new_ustack_top: uint64 = alloc_page() + 4096
+    # U38: 16 KiB (4 contiguous pages, order 2) so glibc's static-PIE
+    # startup has room for its argv/envp/auxv copy + the _dl_static_init
+    # tower of stack frames. Earlier U26..U37 used a single 4 KiB page;
+    # busybox-static post-exec then page-faulted partway through
+    # _dl_relocate_static_pie when the stack walked off the bottom.
+    new_ustack_top: uint64 = alloc_pages(2) + (4096 * 4)
     argc_out: uint64 = 0
     argv_out: uint64 = 0
     new_rsp: uint64 = 0
@@ -707,17 +712,23 @@ def do_clone(flags: uint64, child_stack: uint64,
     # silently break fork(). set_task_cwd is idempotent.
     set_task_cwd(cast[uint64](slot), get_cwd_buf(current_idx_get()))
     child_pid: uint64 = task_pid_at(slot)
-    # Block until the child has either exited or replaced its user
-    # image via execve. Even with the private ustack copy above, glibc's
-    # post-fork bookkeeping mutates the SHARED Linux-side address space
-    # (heap, FILE list, _dl_load_lock) and ought not to overlap with
-    # the parent's continued execution at this milestone. This matches
-    # POSIX vfork semantics, which we approximate until we have real
-    # COW page tables. yield_to_others sti+hlt+cli's so the scheduler
-    # actually picks up the new task even though we entered with IF=0.
-    while task_vfork_done(slot) == 0 and \
-          task_state(slot) != STATE_EXITED:
-        yield_to_others()
+    # U38: parent returns immediately; parent + child run concurrently.
+    # Earlier U26..U37 code blocked here on task_vfork_done to approximate
+    # POSIX vfork — that worked for the simple system() / posix_spawn()
+    # pattern (fork → immediate exec) but breaks pipelines. A shell
+    # building `echo a | grep a` needs the read end of the pipe to have
+    # a live reader BEFORE the writer fills it; with vfork-style blocking,
+    # the parent shell can't fork the second stage until the first has
+    # exec'd, so the pipeline never gets both ends wired up concurrently
+    # and the first stage either deadlocks (pipe write to a not-yet-read
+    # reader) or its post-fork bookkeeping aborts (glibc fork-epilogue
+    # stack canary checks fail when the child wakes on a different RSP).
+    # With concurrent execution, both tasks are STATE_READY and the
+    # scheduler picks the next one on every timer tick / yield. Address
+    # space is shared (per-task PML4 clones share lower-level PDPT/PD
+    # entries), and each task got its own ustack page above, so no
+    # stack aliasing. wait4 still uses the vfork_done / STATE_EXITED
+    # transition for waitpid bookkeeping.
     return cast[int64](child_pid)
 
 
@@ -900,10 +911,17 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         entry: uint64 = elf_load_blob(cast[Ptr[uint8]](blob), sz)
         if entry == 0:
             return cast[uint64](-8)            # -ENOEXEC
-        ustack: uint64 = alloc_page()
+        # U38: 16 KiB user stack (4 contiguous pages, order 2). Earlier
+        # U26..U37 gave SYS_SPAWN'd tasks a single 4 KiB page; busybox
+        # sh (vs. simpler applets like echo / cat) consumes most of
+        # that running its argv parser + applet dispatch + the
+        # static-PIE glibc startup that precedes main(), and trips
+        # a #GP on stack underflow on its way into the pipeline
+        # builder. Matches the execve(2) ustack growth above.
+        ustack: uint64 = alloc_pages(2)
         if ustack == 0:
             return cast[uint64](-12)           # -ENOMEM
-        ustack_top: uint64 = ustack + 4096
+        ustack_top: uint64 = ustack + (4096 * 4)
         argc_out: uint64 = 0
         argv_out: uint64 = 0
         new_rsp: uint64 = 0

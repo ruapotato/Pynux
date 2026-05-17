@@ -92,6 +92,45 @@ def build_archive() -> bytes:
               f"{p.relative_to(here) if p.is_relative_to(here) else p}) "
               f"[INIT_ELF override]")
 
+    # U37: busybox multi-call applet staging. The kernel's _lookup_name
+    # (fs/vfs.ad) returns the FIRST cpio entry matching a path — so we
+    # plant busybox-bytes at common applet paths BEFORE the build/user
+    # glob lands its Adder-built shadows. Without this, busybox sh's
+    # PATH walk for `echo a | grep a` finds Adder grep at /bin/grep but
+    # passes Linux-ABI argv to it (mismatched), and the pipe stalls.
+    # With this, busybox sh finds busybox at every PATH entry it
+    # probes; busybox's own argv[0] dispatcher selects the applet.
+    # The cost is ~2 MiB per applet path in the initramfs; at the
+    # 256 MiB qemu budget every U-track test uses, that's affordable.
+    #
+    # Source: tests/u-binary/busybox (a copy of u_busybox staged by
+    # the test harness). When that file isn't present (CI without
+    # host busybox), this block is a no-op.
+    ubin_dir_pre = here / "tests" / "u-binary"
+    busybox_bytes: bytes | None = None
+    bb_src = ubin_dir_pre / "busybox"
+    if bb_src.is_file():
+        busybox_bytes = bb_src.read_bytes()
+        # Curated minimal set. The goal is to cover the names busybox
+        # sh actually walks during a `echo a | grep a`-style PATH search
+        # without bloating /bin so much that downstream busybox ls /bin
+        # output overflows the 4 KiB user stack glibc starts with.
+        # /sbin and /usr/sbin paths are first in busybox's default PATH;
+        # /bin/sh + /bin/grep are the names sh's exec-fallback touches.
+        # When U38 grows the execve ustack we can widen this list back
+        # to a full applet roster without breaking ls /bin regressions.
+        bb_applets = [
+            "/bin/sh",
+            "/bin/grep",
+            "/sbin/grep",
+            "/usr/bin/grep",
+            "/usr/sbin/grep",
+        ]
+        for applet in bb_applets:
+            blob += cpio_entry(applet, busybox_bytes)
+        print(f"  staged busybox at {len(bb_applets)} applet paths "
+              f"({len(bb_applets) * len(busybox_bytes)} bytes total)")
+
     # Userland ELFs: anything in build/user/ lands at /bin/<name>.
     # Exception: init.elf is the kernel's boot entrypoint and
     # always goes to /init (unless overridden via INIT_ELF above).

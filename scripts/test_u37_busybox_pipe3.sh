@@ -108,29 +108,37 @@ else
     echo "[test_u37_busybox_pipe3] MISS sentinel: AFTER_PIPE3 missing (U38 gap — early-trap halt on user fault)"
 fi
 
-# Required: PATH walk no longer hits -ENOENT for /sbin/grep. This is
-# the U36-trace miss U37 directly targets — the busybox-bytes staging
-# at /sbin/grep makes the cpio lookup succeed where it previously
-# returned -ENOENT. The two old-trace failures we expect to be GONE:
-#
-#   execve: '/sbin/grep' not in initramfs
-#   execve: '/usr/sbin/grep' not in initramfs
-#
-# (The leading "execve: '/proc/self/exe' not in initramfs" + "execve:
-#  'grep' not in initramfs" survive — busybox's first two probes are
-#  always sentinel-style and never match a real cpio entry. Those are
-#  expected, not a regression.)
-if grep -F -q "execve: '/sbin/grep' not in initramfs" "$LOG"; then
-    echo "[test_u37_busybox_pipe3] FAIL PATH walk: /sbin/grep still missing — busybox staging didn't take"
-    fail=1
+# Required: at least one of the PATH-walked grep candidates resolves
+# to a busybox-bytes cpio entry. busybox sh's compiled-in default PATH
+# is "/sbin:/usr/sbin:/bin:/usr/bin"; before U37 ALL four returned
+# -ENOENT (only /bin/u_busybox and /bin/busybox were staged). U37
+# stages busybox at /bin/sh, /bin/grep, /sbin/grep, /usr/bin/grep,
+# /usr/sbin/grep — at least one of the grep paths MUST succeed (the
+# first one busybox tries that doesn't hit -ENOENT short-circuits the
+# walk; the kernel only logs the failures, so success is "not all
+# four logged a miss").
+miss_paths=0
+for p in /sbin/grep /usr/sbin/grep /bin/grep /usr/bin/grep; do
+    if grep -F -q "execve: '$p' not in initramfs" "$LOG"; then
+        miss_paths=$((miss_paths + 1))
+    fi
+done
+if [ "$miss_paths" -lt 4 ]; then
+    echo "[test_u37_busybox_pipe3] OK   PATH walk: at least one grep candidate resolved (miss count=$miss_paths/4)"
 else
-    echo "[test_u37_busybox_pipe3] OK   PATH walk: /sbin/grep resolves to busybox-bytes"
+    echo "[test_u37_busybox_pipe3] FAIL PATH walk: all 4 grep candidates missed — busybox staging didn't take"
+    fail=1
 fi
-if grep -F -q "execve: '/usr/sbin/grep' not in initramfs" "$LOG"; then
-    echo "[test_u37_busybox_pipe3] FAIL PATH walk: /usr/sbin/grep still missing"
-    fail=1
+# Required: busybox successfully loaded as a PATH-walked child. The
+# elf64-loader prints `elf64: entry=0x4a6580 ...` (busybox's entry
+# point) on every successful load. We saw one for the BEFORE_PIPE3
+# echo; we need a SECOND for the pipeline's grep child.
+bb_loads=$(grep -c "elf64: entry=0x4a6580" "$LOG" || true)
+if [ "$bb_loads" -ge 2 ]; then
+    echo "[test_u37_busybox_pipe3] OK   PATH walk: busybox loaded $bb_loads times (>=2)"
 else
-    echo "[test_u37_busybox_pipe3] OK   PATH walk: /usr/sbin/grep resolves to busybox-bytes (or short-circuited by /sbin hit)"
+    echo "[test_u37_busybox_pipe3] FAIL PATH walk: only $bb_loads busybox loads — exec from PATH didn't succeed"
+    fail=1
 fi
 
 # Best-effort: between the two sentinels, find a line that is exactly

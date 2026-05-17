@@ -139,6 +139,22 @@ class TaskStruct:
     # when its parent dies. 0 means "none". Stored but not yet
     # acted on (parent-death wiring is a separate milestone).
     pdeathsig: uint64                 # offset 1224
+    # U37: sigaltstack(2) storage. glibc reaches for this during signal
+    # handler setup (the static-pie startup path installs an alt stack
+    # so SIGSEGV handlers can run on a known-good page if the user's
+    # main stack is the thing that overflowed). Hamnix has exactly one
+    # task per thread and no nested handler delivery, so we never
+    # actually SWITCH to the alt stack — but storing the values quiets
+    # the -ENOSYS that otherwise stalls busybox's sh on first probe.
+    # Layout mirrors `struct stack_t { void *ss_sp; int ss_flags; size_t ss_size; }`
+    # — three fields, total 24 bytes when packed; we keep them as
+    # individual uint64 / int32 slots to avoid a nested-struct field
+    # access pattern the loader-level codegen hasn't grown yet.
+    alt_stack_sp:    uint64           # offset 1232
+    alt_stack_size:  uint64           # offset 1240
+    alt_stack_flags: int32            # offset 1248
+    # 4 bytes implicit pad to next 8-byte boundary; future fields land
+    # at offset 1256.
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -317,6 +333,12 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
         task_table[s].comm[kci] = 0
         kci = kci + 1
     task_table[s].pdeathsig = 0
+    # U37: zero the alt-stack triple. Same defensive scrub as the
+    # sig_handlers / comm fields above — a recycled slot must not
+    # inherit the previous tenant's sigaltstack(2) view.
+    task_table[s].alt_stack_sp    = 0
+    task_table[s].alt_stack_size  = 0
+    task_table[s].alt_stack_flags = 0
     _init_fd_table(s)
     next_pid = next_pid + 1
     return slot
@@ -418,6 +440,12 @@ def create_user_thread(entry: uint64, name0: uint64,
         task_table[s].comm[ci] = 0
         ci = ci + 1
     task_table[s].pdeathsig = 0
+    # U37: same alt-stack scrub as kthread_create — every freshly-
+    # spawned user task starts with sigaltstack(SS_DISABLE-equivalent).
+    # A subsequent _u_sigaltstack call lays down the real values.
+    task_table[s].alt_stack_sp    = 0
+    task_table[s].alt_stack_size  = 0
+    task_table[s].alt_stack_flags = 0
     _init_fd_table(s)
     _inherit_cwd_from_parent(s)
     next_pid = next_pid + 1
@@ -927,6 +955,33 @@ def set_task_pdeathsig(slot: uint64, sig: uint64):
 
 def get_task_pdeathsig(slot: uint64) -> uint64:
     return task_table[slot].pdeathsig
+
+
+# U37: sigaltstack(2) accessors. Three values stored per task; the
+# linux_abi side reads/writes them through these getters/setters
+# instead of poking task_table directly across the module boundary.
+def get_task_alt_stack_sp(slot: uint64) -> uint64:
+    return task_table[slot].alt_stack_sp
+
+
+def set_task_alt_stack_sp(slot: uint64, v: uint64):
+    task_table[slot].alt_stack_sp = v
+
+
+def get_task_alt_stack_size(slot: uint64) -> uint64:
+    return task_table[slot].alt_stack_size
+
+
+def set_task_alt_stack_size(slot: uint64, v: uint64):
+    task_table[slot].alt_stack_size = v
+
+
+def get_task_alt_stack_flags(slot: uint64) -> int32:
+    return task_table[slot].alt_stack_flags
+
+
+def set_task_alt_stack_flags(slot: uint64, v: int32):
+    task_table[slot].alt_stack_flags = v
 
 
 # U31: read the saved iret-style user RIP / RSP / RFLAGS slots that
