@@ -303,6 +303,26 @@ class X86CodeGen:
         else:
             self.emit(f"    movq ({addr_reg}), {dst}")
 
+    def emit_load_sized_signed(self, size: int, signed: bool,
+                               addr_reg: str = "%rax",
+                               dst: str = "%rax") -> None:
+        """Load `size` bytes from [addr_reg] into `dst`. Sign-extends if
+        `signed` is True, zero-extends otherwise.
+        Used by scalar local reads so that signed sub-8-byte locals (the
+        common case for int32/int16/int8 return codes) compare correctly
+        against negative immediates (`if rc < 0:`)."""
+        if not signed:
+            self.emit_load_sized(size, addr_reg, dst)
+            return
+        if size == 1:
+            self.emit(f"    movsbq ({addr_reg}), {dst}")
+        elif size == 2:
+            self.emit(f"    movswq ({addr_reg}), {dst}")
+        elif size == 4:
+            self.emit(f"    movslq ({addr_reg}), {dst}")
+        else:
+            self.emit(f"    movq ({addr_reg}), {dst}")
+
     def emit_store_sized(self, size: int, addr_reg: str,
                          val_reg: str = "%rax") -> None:
         """Store the low `size` bytes of `val_reg` to [addr_reg]."""
@@ -320,6 +340,86 @@ class X86CodeGen:
             self.emit(f"    movl {low[2]}, ({addr_reg})")
         else:
             self.emit(f"    movq {val_reg}, ({addr_reg})")
+
+    # 32-bit names of the SysV integer arg registers, in the same order
+    # as ARG_REGS. Used by parameter spill when the param's declared
+    # type is 4 bytes (int32/uint32/int) — we emit `movl %edi, -N(%rbp)`
+    # so the stored slot is exactly 4 wide. Same Ptr[T] reasoning as the
+    # local store/load fix: keep the slot's layout consistent with what
+    # `&param` would expose to callees.
+    _ARG_REGS32 = ["%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"]
+    _ARG_REGS16 = ["%di",  "%si",  "%dx",  "%cx",  "%r8w", "%r9w"]
+    _ARG_REGS8  = ["%dil", "%sil", "%dl",  "%cl",  "%r8b", "%r9b"]
+
+    def _emit_local_store(self, var: "LocalVar",
+                          val_reg: str = "%rax") -> None:
+        """Store the value in `val_reg` into the stack slot for `var`,
+        using a sized store for sub-8-byte scalar locals (so the slot's
+        byte layout matches what Ptr[T] writes through `&local` would
+        expose) and a plain `movq` for everything else."""
+        sz = self._scalar_local_size(var)
+        if sz is None:
+            self.emit(f"    movq {val_reg}, {var.offset}(%rbp)")
+            return
+        low_map = {
+            "%rax": (None, "%al", "%ax", None, "%eax"),
+            "%rcx": (None, "%cl", "%cx", None, "%ecx"),
+            "%rdx": (None, "%dl", "%dx", None, "%edx"),
+        }
+        low = low_map[val_reg]
+        mnem = {1: "movb", 2: "movw", 4: "movl"}[sz]
+        self.emit(f"    {mnem} {low[sz]}, {var.offset}(%rbp)")
+
+    def _emit_local_load(self, var: "LocalVar",
+                         dst: str = "%rax") -> None:
+        """Load the value from the stack slot for `var` into `dst`,
+        sign-extending sub-8-byte signed scalars (so `if rc < 0:`
+        works) and zero-extending unsigned ones."""
+        sz = self._scalar_local_size(var)
+        if sz is None:
+            self.emit(f"    movq {var.offset}(%rbp), {dst}")
+            return
+        signed = self._is_unsigned_type(var.var_type) is False
+        if signed:
+            mnem = {1: "movsbq", 2: "movswq", 4: "movslq"}[sz]
+            self.emit(f"    {mnem} {var.offset}(%rbp), {dst}")
+        else:
+            if sz == 4:
+                # movl auto-zero-extends to the 64-bit reg.
+                dst32 = dst.replace("%r", "%e") if dst.startswith("%r") else dst
+                self.emit(f"    movl {var.offset}(%rbp), {dst32}")
+            elif sz == 2:
+                self.emit(f"    movzwq {var.offset}(%rbp), {dst}")
+            else:  # sz == 1
+                self.emit(f"    movzbq {var.offset}(%rbp), {dst}")
+
+    def _scalar_local_size(self, var: "LocalVar") -> Optional[int]:
+        """Return the natural byte size (1/2/4) of a scalar local whose
+        stack slot we should access with sized loads/stores instead of
+        the default 8-byte `movq`. Returns None for:
+          - aggregates (ArrayType / struct types) — they decay to address
+          - pointer/funcptr/8-byte types — `movq` is already correct
+          - typeless or unknown-type locals — preserve old behaviour
+        The point of sized I/O is purely to keep the slot's layout
+        consistent with what a Ptr[T] write would do, so callees that
+        receive `&local` and emit a sized store don't leave the upper
+        bytes of the slot holding stale junk from the initialiser."""
+        t = var.var_type
+        if t is None:
+            return None
+        if isinstance(t, (ArrayType, PointerType, FunctionPointerType)):
+            return None
+        if isinstance(t, PercpuType):
+            return None
+        # Struct-typed locals (the local IS the struct, stored inline)
+        # already decay to address in gen_identifier; treat them as
+        # aggregates here too.
+        if hasattr(t, "name") and t.name in self.structs:
+            return None
+        size = self.get_type_size(t)
+        if size in (1, 2, 4):
+            return size
+        return None
 
     # -- program ------------------------------------------------------------
 
@@ -550,15 +650,36 @@ class X86CodeGen:
         # Spill parameters from arg-regs / caller's stack into their local
         # slots. Args 0..5 come in via ARG_REGS; args 6+ live at +16(%rbp),
         # +24(%rbp), ... in right-to-left push order (so arg 6 is closest
-        # to the return address).
+        # to the return address). Sized stores for sub-8-byte scalar
+        # params keep the slot's layout consistent with what `&param`
+        # would expose — same reasoning as VarDecl init.
         for i, param in enumerate(func.params):
             var = self.ctx.locals[param.name]
+            sz = self._scalar_local_size(var)
             if i < len(ARG_REGS):
-                self.emit(f"    movq {ARG_REGS[i]}, {var.offset}(%rbp)")
+                if sz == 4:
+                    self.emit(
+                        f"    movl {self._ARG_REGS32[i]}, "
+                        f"{var.offset}(%rbp)"
+                    )
+                elif sz == 2:
+                    self.emit(
+                        f"    movw {self._ARG_REGS16[i]}, "
+                        f"{var.offset}(%rbp)"
+                    )
+                elif sz == 1:
+                    self.emit(
+                        f"    movb {self._ARG_REGS8[i]}, "
+                        f"{var.offset}(%rbp)"
+                    )
+                else:
+                    self.emit(
+                        f"    movq {ARG_REGS[i]}, {var.offset}(%rbp)"
+                    )
             else:
                 stack_off = 16 + (i - len(ARG_REGS)) * 8
                 self.emit(f"    movq {stack_off}(%rbp), %rax")
-                self.emit(f"    movq %rax, {var.offset}(%rbp)")
+                self._emit_local_store(var, "%rax")
 
         # Body.
         for stmt in func.body:
@@ -595,7 +716,15 @@ class X86CodeGen:
                 )
                 if value is not None:
                     self.gen_expr(value)
-                    self.emit(f"    movq %rax, {var.offset}(%rbp)")
+                    # Sized store for sub-8-byte scalar locals so the
+                    # slot's byte layout matches what `&local` exposes
+                    # to a callee writing through Ptr[T]. Without this,
+                    # the initialiser's `movq` would dirty the upper
+                    # bytes of the slot, and a callee's sized `movl`
+                    # (or smaller) through the pointer would leave that
+                    # dirt in place — the caller's readback then saw
+                    # 0xFFFFFFFF<low4> instead of just <low4>.
+                    self._emit_local_store(var, "%rax")
 
             case Assignment(target=target, value=value, op=op):
                 self.gen_assignment(target, value, op)
@@ -646,7 +775,8 @@ class X86CodeGen:
             name = target.name
             if name in self.ctx.locals:
                 var = self.ctx.locals[name]
-                self.emit(f"    movq %rax, {var.offset}(%rbp)")
+                # Sized store; see _emit_local_store / VarDecl for why.
+                self._emit_local_store(var, "%rax")
             elif name in self.percpu_globals:
                 # Per-CPU store: literal `%gs:offset` displacement, no
                 # relocations.
@@ -894,7 +1024,15 @@ class X86CodeGen:
                 # Array / struct local: decay to the slot's address.
                 self.emit(f"    leaq {var.offset}(%rbp), %rax")
             else:
-                self.emit(f"    movq {var.offset}(%rbp), %rax")
+                # Sized load for sub-8-byte scalar locals (sign- or
+                # zero-extending based on the declared type) so the
+                # value round-trips correctly even when an external
+                # writer touched the slot via `&local` and only wrote
+                # the typed number of bytes. _emit_local_load falls
+                # back to plain `movq` for pointers / 8-byte / typeless
+                # locals — preserves the historical behaviour for
+                # everything that wasn't broken.
+                self._emit_local_load(var, "%rax")
         elif name in self.defined_funcs or name in self.extern_funcs:
             # Function reference: load the symbol's address (RIP-relative).
             self.emit(f"    leaq {name}(%rip), %rax")
