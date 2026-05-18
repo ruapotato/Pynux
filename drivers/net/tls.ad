@@ -157,6 +157,37 @@ tls_server_ap_iv:     Array[12, uint8]
 tls_client_seq:       uint64 = 0
 tls_server_seq:       uint64 = 0
 
+# Plaintext scratch for one decrypted record (16 KiB max per RFC 8446 §5.1).
+# Top-level / BSS so we don't blow the call frame; AEAD-open writes here.
+tls_pt_buf:           Array[16640, uint8]
+# Reassembly scratch for unconsumed bytes of a partial TLS record straddling
+# tcp_recv chunks (rare on a clean SLIRP, common over the wider internet).
+tls_rxr_buf:          Array[8192, uint8]
+tls_rxr_len:          uint64 = 0
+
+# Saved SHA-256 transcript snapshot — we have to compute the server-Finished
+# verify_data *as of after the CertVerify* (i.e. transcript hash NOT including
+# the Finished body), then keep updating the live state with the Finished
+# bytes for the subsequent app-traffic-secrets derivation. The snapshot
+# buffers below carry the per-snapshot state across that fork.
+tls_snap_state:       Array[8, uint32]
+tls_snap_buf:         Array[64, uint8]
+tls_snap_buflen:      uint64 = 0
+tls_snap_bits:        uint64 = 0
+
+# Parallel SHA-256 state dedicated to the running TRANSCRIPT HASH. The
+# generic tls_sha_* state is used by HMAC / HKDF / one-shot digests and
+# is rewound every time those primitives run; we can't share it with
+# the streaming transcript or the transcript bytes get wiped between
+# Derive-Secret calls. _tls_tr_update mirrors _tls_sha256_update against
+# the tls_tr_* slots; _tls_sha256_snapshot_into pulls the tls_tr_*
+# state into tls_sha_* and finalises a digest there without disturbing
+# the parallel transcript.
+tls_tr_state:         Array[8, uint32]
+tls_tr_buf:           Array[64, uint8]
+tls_tr_buflen:        uint64 = 0
+tls_tr_bits:          uint64 = 0
+
 # X25519 ephemeral key material — generated fresh per handshake.
 tls_x25519_priv:      Array[32, uint8]
 tls_x25519_pub:       Array[32, uint8]
@@ -395,156 +426,245 @@ def _tls_chacha20_xor(key: Ptr[uint8], counter_start: uint32,
 # -- Poly1305 MAC (RFC 8439 §2.5) ------------------------------------------
 #
 # 128-bit MAC over message m with 256-bit key k = (r, s) where r is
-# 16 bytes clamped and s is 16 bytes added at the end. The accumulator
-# h is kept in the prime field GF(2^130 - 5). We carry it as 5x26-bit
-# limbs packed into uint64 to keep the multiply path simple.
+# 16 bytes (clamped) and s is 16 bytes appended at the end. The
+# accumulator h is in GF(2^130 - 5), carried as five 26-bit limbs in
+# uint64. Each 26-bit limb gives plenty of headroom for the
+# multiplication step (26-bit x 26-bit fits in uint64; 5 such partial
+# products + *5 reduction stays well within uint64).
 
 def _tls_poly1305(out_tag: Ptr[uint8], key: Ptr[uint8],
                   msg: Ptr[uint8], n: uint64):
-    # Extract r (clamped) and s as 16-byte little-endian numbers.
-    r: Array[17, uint8]
-    s: Array[17, uint8]
+    # Decode + clamp r per RFC 8439 §2.5.1, then split into five
+    # 26-bit limbs r0..r4.
+    rkey: Array[16, uint8]
+    skey: Array[16, uint8]
     i: uint64 = 0
     while i < 16:
-        r[i] = key[i]
-        s[i] = key[16 + i]
+        rkey[i] = key[i]
+        skey[i] = key[16 + i]
         i = i + 1
-    r[16] = 0
-    s[16] = 0
-    # Clamp r per RFC 8439 §2.5.1.
-    r[3]  = r[3]  & 15
-    r[7]  = r[7]  & 15
-    r[11] = r[11] & 15
-    r[15] = r[15] & 15
-    r[4]  = r[4]  & 252
-    r[8]  = r[8]  & 252
-    r[12] = r[12] & 252
+    rkey[3]  = rkey[3]  & 15
+    rkey[7]  = rkey[7]  & 15
+    rkey[11] = rkey[11] & 15
+    rkey[15] = rkey[15] & 15
+    rkey[4]  = rkey[4]  & 252
+    rkey[8]  = rkey[8]  & 252
+    rkey[12] = rkey[12] & 252
+    # Pack 16 little-endian bytes into a single 128-bit number, then
+    # peel off 5 x 26-bit limbs (with the highest limb at < 2^24).
+    r0: uint64 = (cast[uint64](rkey[0])
+                  | (cast[uint64](rkey[1]) << 8)
+                  | (cast[uint64](rkey[2]) << 16)
+                  | (cast[uint64](rkey[3] & 0x03) << 24))
+    r1: uint64 = ((cast[uint64](rkey[3]) >> 2)
+                  | (cast[uint64](rkey[4]) << 6)
+                  | (cast[uint64](rkey[5]) << 14)
+                  | (cast[uint64](rkey[6] & 0x0F) << 22))
+    r2: uint64 = ((cast[uint64](rkey[6]) >> 4)
+                  | (cast[uint64](rkey[7]) << 4)
+                  | (cast[uint64](rkey[8]) << 12)
+                  | (cast[uint64](rkey[9] & 0x3F) << 20))
+    r3: uint64 = ((cast[uint64](rkey[9]) >> 6)
+                  | (cast[uint64](rkey[10]) << 2)
+                  | (cast[uint64](rkey[11]) << 10)
+                  | (cast[uint64](rkey[12]) << 18))
+    r4: uint64 = (cast[uint64](rkey[13])
+                  | (cast[uint64](rkey[14]) << 8)
+                  | (cast[uint64](rkey[15]) << 16))
+    # Precompute r1..r4 * 5 (used in the wraparound reduction).
+    s1: uint64 = r1 * 5
+    s2: uint64 = r2 * 5
+    s3: uint64 = r3 * 5
+    s4: uint64 = r4 * 5
 
-    # Accumulator h, 17 bytes (130 bits).
-    h: Array[17, uint64]
-    i = 0
-    while i < 17:
-        h[i] = 0
-        i = i + 1
+    # Accumulator h, 5 x 26-bit limbs.
+    h0: uint64 = 0
+    h1: uint64 = 0
+    h2: uint64 = 0
+    h3: uint64 = 0
+    h4: uint64 = 0
 
-    # Process 16-byte blocks; the final partial block is padded with
-    # a high "1" bit byte per the spec.
+    # Process the message in 16-byte blocks; the last block may be
+    # shorter (we pad with zeros and set the trailing "1" bit at the
+    # appropriate position).
     pos: uint64 = 0
-    block: Array[17, uint64]
+    mask26: uint64 = 0x3FFFFFF
     while pos < n:
         blen: uint64 = 16
         if n - pos < blen:
             blen = n - pos
+        # Load the block bytes (with high "1" bit per spec).
+        blk: Array[17, uint8]
         i = 0
         while i < 17:
-            block[i] = 0
+            blk[i] = 0
             i = i + 1
         i = 0
         while i < blen:
-            block[i] = cast[uint64](msg[pos + i])
+            blk[i] = msg[pos + i]
             i = i + 1
-        block[blen] = 1
-        # h += block.
-        carry: uint64 = 0
-        i = 0
-        while i < 17:
-            sum_v: uint64 = h[i] + block[i] + carry
-            h[i] = sum_v & 0xFF
-            carry = sum_v >> 8
-            i = i + 1
+        blk[blen] = 1
+        # Convert block to 5 x 26-bit limbs (bit 128 is set if blen=16
+        # via blk[16]=1; for a full block this sets the "1" at bit
+        # position 128, which is the canonical hi bit of the
+        # 130-bit poly1305 block).
+        b0: uint64 = (cast[uint64](blk[0])
+                      | (cast[uint64](blk[1]) << 8)
+                      | (cast[uint64](blk[2]) << 16)
+                      | (cast[uint64](blk[3] & 0x03) << 24))
+        b1: uint64 = ((cast[uint64](blk[3]) >> 2)
+                      | (cast[uint64](blk[4]) << 6)
+                      | (cast[uint64](blk[5]) << 14)
+                      | (cast[uint64](blk[6] & 0x0F) << 22))
+        b2: uint64 = ((cast[uint64](blk[6]) >> 4)
+                      | (cast[uint64](blk[7]) << 4)
+                      | (cast[uint64](blk[8]) << 12)
+                      | (cast[uint64](blk[9] & 0x3F) << 20))
+        b3: uint64 = ((cast[uint64](blk[9]) >> 6)
+                      | (cast[uint64](blk[10]) << 2)
+                      | (cast[uint64](blk[11]) << 10)
+                      | (cast[uint64](blk[12]) << 18))
+        b4: uint64 = (cast[uint64](blk[13])
+                      | (cast[uint64](blk[14]) << 8)
+                      | (cast[uint64](blk[15]) << 16)
+                      | (cast[uint64](blk[16]) << 24))
+        h0 = h0 + b0
+        h1 = h1 + b1
+        h2 = h2 + b2
+        h3 = h3 + b3
+        h4 = h4 + b4
 
-        # h *= r  (mod 2^130 - 5).
-        prod: Array[17, uint64]
-        i = 0
-        while i < 17:
-            prod[i] = 0
-            i = i + 1
-        i = 0
-        while i < 17:
-            j: uint64 = 0
-            ri: uint64 = cast[uint64](r[i])
-            while j < 17:
-                # Wrap on j+i >= 17: multiplication mod 2^130 - 5 is
-                # implemented in 130-bit arithmetic via the "smear top
-                # bits back in with 5x" trick on the byte limbs.
-                if i + j < 17:
-                    prod[i + j] = prod[i + j] + h[j] * ri
-                else:
-                    # (j+i)-17 == position of the wrap; the wrapped
-                    # contribution gets multiplied by 5 (the reduction
-                    # constant 2^130 mod p = 5).
-                    prod[(i + j) - 17] = prod[(i + j) - 17] + h[j] * ri * 5
-                j = j + 1
-            i = i + 1
-        # Carry-propagate prod down so each limb is a byte.
-        carry = 0
-        i = 0
-        while i < 17:
-            cur: uint64 = prod[i] + carry
-            prod[i] = cur & 0xFF
-            carry = cur >> 8
-            i = i + 1
-        # The final carry folds back in with the *5 reduction.
-        if carry != 0:
-            # carry is the excess above byte 16 -> fold * 5 into byte 0.
-            extra: uint64 = carry * 5
-            i = 0
-            while i < 17:
-                cur: uint64 = prod[i] + extra
-                prod[i] = cur & 0xFF
-                extra = cur >> 8
-                if extra == 0:
-                    i = 17                       # break
-                else:
-                    i = i + 1
-
-        # h = prod (mod p). Easier: copy and do a single conditional
-        # subtract of p further down. For per-block correctness we just
-        # copy and let the final clamp handle the canonical form.
-        i = 0
-        while i < 17:
-            h[i] = prod[i]
-            i = i + 1
+        # h = h * r mod (2^130 - 5).
+        # Schoolbook multiplication of two 5x26-bit numbers, with the
+        # i+j>=5 contributions multiplied by 5 (the reduction
+        # constant). Each partial product is 26b*26b = 52b; we have
+        # at most 5 such partial products per output limb; sums fit
+        # in uint64.
+        d0: uint64 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+        d1: uint64 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+        d2: uint64 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+        d3: uint64 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+        d4: uint64 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+        # Carry-propagate.
+        c: uint64 = d0 >> 26
+        h0 = d0 & mask26
+        d1 = d1 + c
+        c = d1 >> 26
+        h1 = d1 & mask26
+        d2 = d2 + c
+        c = d2 >> 26
+        h2 = d2 & mask26
+        d3 = d3 + c
+        c = d3 >> 26
+        h3 = d3 & mask26
+        d4 = d4 + c
+        c = d4 >> 26
+        h4 = d4 & mask26
+        h0 = h0 + c * 5
+        c = h0 >> 26
+        h0 = h0 & mask26
+        h1 = h1 + c
 
         pos = pos + blen
 
-    # Final fold: if h >= p, subtract p. p = 2^130 - 5 in byte limbs is
-    # 0xFB FF .. FF 03 (low byte 0xFB, next 15 bytes 0xFF, high byte
-    # 0x03). Conditional subtraction.
-    g: Array[17, uint64]
-    g[0] = h[0] + 5
-    carry: uint64 = g[0] >> 8
-    g[0] = g[0] & 0xFF
-    i = 1
-    while i < 17:
-        g[i] = h[i] + carry
-        carry = g[i] >> 8
-        g[i] = g[i] & 0xFF
-        i = i + 1
-    # If g[16] >> 2 has any high bit set, the unreduced h was >= p, so
-    # we want to use g (already reduced); otherwise keep h.
-    use_g: int32 = 0
-    if (g[16] >> 2) != 0:
-        use_g = 1
+    # Final reduction: one more carry pass, then conditional subtract
+    # of p = 2^130 - 5.
+    c: uint64 = h1 >> 26
+    h1 = h1 & mask26
+    h2 = h2 + c
+    c = h2 >> 26
+    h2 = h2 & mask26
+    h3 = h3 + c
+    c = h3 >> 26
+    h3 = h3 & mask26
+    h4 = h4 + c
+    c = h4 >> 26
+    h4 = h4 & mask26
+    h0 = h0 + c * 5
+    c = h0 >> 26
+    h0 = h0 & mask26
+    h1 = h1 + c
+    # Conditional subtract p = 5 * (2^130 / 5) - 5 = ... compute g = h + 5
+    # then check if g overflowed past 2^130. If so, h was >= p, use g
+    # truncated; otherwise keep h.
+    g0: uint64 = h0 + 5
+    c = g0 >> 26
+    g0 = g0 & mask26
+    g1: uint64 = h1 + c
+    c = g1 >> 26
+    g1 = g1 & mask26
+    g2: uint64 = h2 + c
+    c = g2 >> 26
+    g2 = g2 & mask26
+    g3: uint64 = h3 + c
+    c = g3 >> 26
+    g3 = g3 & mask26
+    # g4 fits in 27 bits worst case (h4 max ~2^26 + carry).
+    # Subtract 2^130 by truncating bit 26 of g4 — if bit 26 is set,
+    # use g (h was >= p); otherwise use h.
+    g4: uint64 = h4 + c
+    # Mask: if bit 26 (i.e., g4 >> 26) is set, use g; else h.
+    use_g: uint64 = (g4 >> 26) & 1
+    g4 = g4 & mask26
+    # Conditional select.
     if use_g == 1:
-        # h <- g & (2^128 - 1) — drop the top bits after subtraction.
-        i = 0
-        while i < 17:
-            h[i] = g[i]
-            i = i + 1
-    # Add s (16 bytes, mod 2^128).
-    carry = 0
-    i = 0
-    while i < 16:
-        sum_v: uint64 = h[i] + cast[uint64](s[i]) + carry
-        h[i] = sum_v & 0xFF
-        carry = sum_v >> 8
-        i = i + 1
-    # Emit the low 16 bytes.
-    i = 0
-    while i < 16:
-        out_tag[i] = cast[uint8](h[i])
-        i = i + 1
+        h0 = g0
+        h1 = g1
+        h2 = g2
+        h3 = g3
+        h4 = g4
+
+    # h = h + s (mod 2^128). Re-encode h into 4 x 32-bit words, add s
+    # as a 128-bit little-endian number with carry across the 32-bit
+    # boundaries, then emit 16 bytes.
+    # Re-pack h into 128 bits (we drop the high 2 bits of h4 since
+    # mod 2^128 anyway).
+    w0: uint64 = (h0 | (h1 << 26)) & 0xFFFFFFFF
+    w1: uint64 = ((h1 >> 6) | (h2 << 20)) & 0xFFFFFFFF
+    w2: uint64 = ((h2 >> 12) | (h3 << 14)) & 0xFFFFFFFF
+    w3: uint64 = ((h3 >> 18) | (h4 << 8)) & 0xFFFFFFFF
+    # Add s (16 little-endian bytes) as 4 x 32-bit limbs.
+    s0: uint64 = (cast[uint64](skey[0])
+                  | (cast[uint64](skey[1]) << 8)
+                  | (cast[uint64](skey[2]) << 16)
+                  | (cast[uint64](skey[3]) << 24))
+    sw1: uint64 = (cast[uint64](skey[4])
+                   | (cast[uint64](skey[5]) << 8)
+                   | (cast[uint64](skey[6]) << 16)
+                   | (cast[uint64](skey[7]) << 24))
+    sw2: uint64 = (cast[uint64](skey[8])
+                   | (cast[uint64](skey[9]) << 8)
+                   | (cast[uint64](skey[10]) << 16)
+                   | (cast[uint64](skey[11]) << 24))
+    sw3: uint64 = (cast[uint64](skey[12])
+                   | (cast[uint64](skey[13]) << 8)
+                   | (cast[uint64](skey[14]) << 16)
+                   | (cast[uint64](skey[15]) << 24))
+    f0: uint64 = w0 + s0
+    f1: uint64 = w1 + sw1 + (f0 >> 32)
+    f2: uint64 = w2 + sw2 + (f1 >> 32)
+    f3: uint64 = w3 + sw3 + (f2 >> 32)
+    f0 = f0 & 0xFFFFFFFF
+    f1 = f1 & 0xFFFFFFFF
+    f2 = f2 & 0xFFFFFFFF
+    f3 = f3 & 0xFFFFFFFF
+    # Emit 16 little-endian bytes.
+    out_tag[0]  = cast[uint8](f0 & 0xFF)
+    out_tag[1]  = cast[uint8]((f0 >> 8) & 0xFF)
+    out_tag[2]  = cast[uint8]((f0 >> 16) & 0xFF)
+    out_tag[3]  = cast[uint8]((f0 >> 24) & 0xFF)
+    out_tag[4]  = cast[uint8](f1 & 0xFF)
+    out_tag[5]  = cast[uint8]((f1 >> 8) & 0xFF)
+    out_tag[6]  = cast[uint8]((f1 >> 16) & 0xFF)
+    out_tag[7]  = cast[uint8]((f1 >> 24) & 0xFF)
+    out_tag[8]  = cast[uint8](f2 & 0xFF)
+    out_tag[9]  = cast[uint8]((f2 >> 8) & 0xFF)
+    out_tag[10] = cast[uint8]((f2 >> 16) & 0xFF)
+    out_tag[11] = cast[uint8]((f2 >> 24) & 0xFF)
+    out_tag[12] = cast[uint8](f3 & 0xFF)
+    out_tag[13] = cast[uint8]((f3 >> 8) & 0xFF)
+    out_tag[14] = cast[uint8]((f3 >> 16) & 0xFF)
+    out_tag[15] = cast[uint8]((f3 >> 24) & 0xFF)
 
 
 # -- ChaCha20-Poly1305 AEAD wrapper (RFC 8439 §2.8) -----------------------
@@ -906,6 +1026,94 @@ def _tls_sha256_oneshot(data: Ptr[uint8], n: uint64,
     _tls_sha256_finish_into(out_hash)
 
 
+def _tls_tr_reset():
+    # Reset the dedicated TRANSCRIPT-HASH state.
+    tls_tr_state[0] = 0x6A09E667
+    tls_tr_state[1] = 0xBB67AE85
+    tls_tr_state[2] = 0x3C6EF372
+    tls_tr_state[3] = 0xA54FF53A
+    tls_tr_state[4] = 0x510E527F
+    tls_tr_state[5] = 0x9B05688C
+    tls_tr_state[6] = 0x1F83D9AB
+    tls_tr_state[7] = 0x5BE0CD19
+    tls_tr_buflen = 0
+    tls_tr_bits   = 0
+
+
+def _tls_tr_update(data: Ptr[uint8], n: uint64):
+    # Stream `n` bytes into the parallel TRANSCRIPT-HASH instance.
+    # Implemented by swapping tls_sha_* <-> tls_tr_* around a call to
+    # the generic _tls_sha256_update. The two SHA-256 instances stay
+    # otherwise isolated.
+    # Save the generic state.
+    save_state: Array[8, uint32]
+    save_buf:   Array[64, uint8]
+    save_buflen: uint64 = tls_sha_buflen
+    save_bits:   uint64 = tls_sha_total_bits
+    i: uint64 = 0
+    while i < 8:
+        save_state[i] = tls_sha_state[i]
+        i = i + 1
+    i = 0
+    while i < 64:
+        save_buf[i] = tls_sha_buf[i]
+        i = i + 1
+    # Load transcript state into the generic slot.
+    i = 0
+    while i < 8:
+        tls_sha_state[i] = tls_tr_state[i]
+        i = i + 1
+    i = 0
+    while i < 64:
+        tls_sha_buf[i] = tls_tr_buf[i]
+        i = i + 1
+    tls_sha_buflen     = tls_tr_buflen
+    tls_sha_total_bits = tls_tr_bits
+    _tls_sha256_update(data, n)
+    # Spill back into the transcript slot.
+    i = 0
+    while i < 8:
+        tls_tr_state[i] = tls_sha_state[i]
+        i = i + 1
+    i = 0
+    while i < 64:
+        tls_tr_buf[i] = tls_sha_buf[i]
+        i = i + 1
+    tls_tr_buflen = tls_sha_buflen
+    tls_tr_bits   = tls_sha_total_bits
+    # Restore the generic state.
+    i = 0
+    while i < 8:
+        tls_sha_state[i] = save_state[i]
+        i = i + 1
+    i = 0
+    while i < 64:
+        tls_sha_buf[i] = save_buf[i]
+        i = i + 1
+    tls_sha_buflen     = save_buflen
+    tls_sha_total_bits = save_bits
+
+
+def _tls_sha256_snapshot_into(out_hash: Ptr[uint8]):
+    # Snapshot the running transcript hash into a 32-byte digest
+    # without disturbing it. Internally copies the parallel transcript
+    # state into the generic SHA-256 slot, finishes there (destroying
+    # the generic state; HMAC/HKDF can refresh it on their next call),
+    # and leaves the parallel transcript state intact for further
+    # _tls_tr_update calls.
+    i: uint64 = 0
+    while i < 8:
+        tls_sha_state[i] = tls_tr_state[i]
+        i = i + 1
+    i = 0
+    while i < 64:
+        tls_sha_buf[i] = tls_tr_buf[i]
+        i = i + 1
+    tls_sha_buflen      = tls_tr_buflen
+    tls_sha_total_bits  = tls_tr_bits
+    _tls_sha256_finish_into(out_hash)
+
+
 # -- HMAC-SHA-256 + HKDF (RFC 5869) ----------------------------------------
 
 def _tls_hmac_sha256(out_mac: Ptr[uint8],
@@ -1130,66 +1338,149 @@ def _tls_x25519_fe_sub(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
     _tls_x25519_fe_carry(r)
 
 
+# 128-bit multiply helper. Adder lacks uint128, but x86_64's MUL
+# instruction produces the full 64x64 -> 128-bit result in (RDX:RAX).
+# We use module-globals because asm_volatile is operandless. Single-
+# threaded callers — X25519 is invoked once per handshake.
+tls_mul128_a:  uint64 = 0
+tls_mul128_b:  uint64 = 0
+tls_mul128_lo: uint64 = 0
+tls_mul128_hi: uint64 = 0
+
+
+def _tls_mul128():
+    # Reads tls_mul128_a + tls_mul128_b; writes tls_mul128_lo/_hi.
+    # Inlined directly — call sites stage operands then read results.
+    asm_volatile("""
+        movq tls_mul128_a(%rip), %rax
+        mulq tls_mul128_b(%rip)
+        movq %rax, tls_mul128_lo(%rip)
+        movq %rdx, tls_mul128_hi(%rip)
+    """)
+
+
+# Scratch for the 5x5 field-element multiplication. We accumulate
+# 128-bit partial sums (lo, hi) into 5 result limbs, then fold the
+# wraparound contributions and carry-propagate. Single in-flight
+# multiply at a time.
+fe_mul_acc_lo: Array[5, uint64]
+fe_mul_acc_hi: Array[5, uint64]
+
+
+def _tls_fe_mul_add128(idx: uint64, x: uint64, y: uint64):
+    # acc[idx] += x * y. (x*y is a full 128-bit product computed via
+    # x86_64 MUL; the result is added into the (lo, hi) pair at idx.)
+    # Adder's '<' is signed-compare even for uint64 (quirk file:
+    # "Integer compares emit setl/setle/setg/setge..."). We flip the
+    # sign bit to turn signed compare into unsigned compare.
+    tls_mul128_a = x
+    tls_mul128_b = y
+    _tls_mul128()
+    p_lo: uint64 = tls_mul128_lo
+    p_hi: uint64 = tls_mul128_hi
+    cur_lo: uint64 = fe_mul_acc_lo[idx]
+    new_lo: uint64 = cur_lo + p_lo
+    sign_flip: uint64 = 0x8000000000000000
+    carry: uint64 = 0
+    if (new_lo ^ sign_flip) < (cur_lo ^ sign_flip):
+        carry = 1
+    fe_mul_acc_lo[idx] = new_lo
+    fe_mul_acc_hi[idx] = fe_mul_acc_hi[idx] + p_hi + carry
+
+
 def _tls_x25519_fe_mul(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
-    # Schoolbook 5x5 multiplication of 51-bit limbs into a single
-    # 102-bit-wide accumulator per result limb. Adder doesn't have
-    # 128-bit ints, so we cap each limb at ~2^53 going in (caller is
-    # responsible: caller-side _tls_x25519_fe_carry keeps it tight) and
-    # let the 64-bit products overflow modulo 2^64. This works for
-    # well-formed reduced inputs because each partial product fits in
-    # 2^53 * 2^53 ≈ 2^106 — DOES exceed 2^64. We split each input limb
-    # into two 32-bit halves and reassemble. This is intentionally the
-    # least-clever path; correctness > speed for one scalar mult per
-    # handshake.
-    # Partial product helper: pp(ai, bj) returns ai*bj (a single 51-bit
-    # x 51-bit product fits in 102 bits; we split into low-64 + carry).
-    # We accumulate into two parallel 64-bit accumulators per output
-    # limb: lo[k] gets the low 64 bits of each pp shifted right by 0
-    # bits within the limb; hi[k] gets the carry words (shifted left
-    # by 51 to land in the next limb).
-    #
-    # Within each limb k of the product r, we sum a[i]*b[j] for i+j == k
-    # and a[i]*b[j]*19 for i+j == k+5 (the reduction).
-    #
-    # To keep the partials inside 64 bits we do a single (ai_lo * bj +
-    # (ai_hi * bj) << 32) per pair. The output limb is reduced after
-    # via _tls_x25519_fe_carry — which the caller is required to call.
+    # Correct 5x5 field-element multiplication using full 128-bit
+    # partial products. Each 51-bit limb is multiplied via x86_64 MUL,
+    # producing a 102-bit result we accumulate into a (lo, hi) uint128.
+    # We then fold the wraparound contributions (j >= 5) with the
+    # mod-2^255-19 reduction constant 19, and carry-propagate back
+    # into five 51-bit output limbs.
 
-    r0: uint64 = 0
-    r1: uint64 = 0
-    r2: uint64 = 0
-    r3: uint64 = 0
-    r4: uint64 = 0
+    i: uint64 = 0
+    while i < 5:
+        fe_mul_acc_lo[i] = 0
+        fe_mul_acc_hi[i] = 0
+        i = i + 1
 
-    # k = 0:  a0*b0 + 19 * (a1*b4 + a2*b3 + a3*b2 + a4*b1)
-    # k = 1:  a0*b1 + a1*b0 + 19 * (a2*b4 + a3*b3 + a4*b2)
-    # k = 2:  a0*b2 + a1*b1 + a2*b0 + 19 * (a3*b4 + a4*b3)
-    # k = 3:  a0*b3 + a1*b2 + a2*b1 + a3*b0 + 19 * (a4*b4)
-    # k = 4:  a0*b4 + a1*b3 + a2*b2 + a3*b1 + a4*b0
-    #
-    # Each ai * bj is computed as ai * bj_lo + ai * bj_hi << 32 and the
-    # *19 multiplications by adjusting bj's limbs. Practical accuracy
-    # loss: limbs can momentarily exceed 2^64 within the sum. To bound
-    # this we serialise the additions through 64-bit modular wraparound
-    # (the eventual _tls_x25519_fe_carry compensates as long as inputs
-    # are properly reduced going in — which our caller guarantees).
-    r0 = a[0] * b[0] + 19 * (a[1] * b[4] + a[2] * b[3]
-                              + a[3] * b[2] + a[4] * b[1])
-    r1 = a[0] * b[1] + a[1] * b[0] + 19 * (a[2] * b[4]
-                                            + a[3] * b[3] + a[4] * b[2])
-    r2 = a[0] * b[2] + a[1] * b[1] + a[2] * b[0] \
-        + 19 * (a[3] * b[4] + a[4] * b[3])
-    r3 = a[0] * b[3] + a[1] * b[2] + a[2] * b[1] + a[3] * b[0] \
-        + 19 * (a[4] * b[4])
-    r4 = a[0] * b[4] + a[1] * b[3] + a[2] * b[2] \
-        + a[3] * b[1] + a[4] * b[0]
+    # Direct products: i+j < 5 -> r[i+j] += a[i]*b[j]
+    _tls_fe_mul_add128(0, a[0], b[0])
+    _tls_fe_mul_add128(1, a[0], b[1])
+    _tls_fe_mul_add128(1, a[1], b[0])
+    _tls_fe_mul_add128(2, a[0], b[2])
+    _tls_fe_mul_add128(2, a[1], b[1])
+    _tls_fe_mul_add128(2, a[2], b[0])
+    _tls_fe_mul_add128(3, a[0], b[3])
+    _tls_fe_mul_add128(3, a[1], b[2])
+    _tls_fe_mul_add128(3, a[2], b[1])
+    _tls_fe_mul_add128(3, a[3], b[0])
+    _tls_fe_mul_add128(4, a[0], b[4])
+    _tls_fe_mul_add128(4, a[1], b[3])
+    _tls_fe_mul_add128(4, a[2], b[2])
+    _tls_fe_mul_add128(4, a[3], b[1])
+    _tls_fe_mul_add128(4, a[4], b[0])
 
-    r[0] = r0
-    r[1] = r1
-    r[2] = r2
-    r[3] = r3
-    r[4] = r4
-    _tls_x25519_fe_carry(r)
+    # Wraparound products: i+j >= 5 -> r[i+j-5] += 19 * a[i] * b[j].
+    # Multiply b[j] by 19 first (b[j] < 2^51, so 19*b[j] < 2^56 — still
+    # fits in uint64 and the resulting a[i] * (19*b[j]) is < 2^107).
+    b1_19: uint64 = b[1] * 19
+    b2_19: uint64 = b[2] * 19
+    b3_19: uint64 = b[3] * 19
+    b4_19: uint64 = b[4] * 19
+
+    # i=1: j=4 -> r0
+    _tls_fe_mul_add128(0, a[1], b4_19)
+    # i=2: j=3,4 -> r0,r1
+    _tls_fe_mul_add128(0, a[2], b3_19)
+    _tls_fe_mul_add128(1, a[2], b4_19)
+    # i=3: j=2,3,4 -> r0,r1,r2
+    _tls_fe_mul_add128(0, a[3], b2_19)
+    _tls_fe_mul_add128(1, a[3], b3_19)
+    _tls_fe_mul_add128(2, a[3], b4_19)
+    # i=4: j=1,2,3,4 -> r0,r1,r2,r3
+    _tls_fe_mul_add128(0, a[4], b1_19)
+    _tls_fe_mul_add128(1, a[4], b2_19)
+    _tls_fe_mul_add128(2, a[4], b3_19)
+    _tls_fe_mul_add128(3, a[4], b4_19)
+
+    # Carry-propagate from (lo, hi) into 51-bit limbs. After
+    # accumulation each limb fits in at most ~2^110 bits (well within
+    # the 128-bit pair). To extract 51 low bits + carry the rest into
+    # the next limb, we shift-right by 51 across the (lo, hi) pair.
+    # Use sign-flip-then-signed-compare to emulate unsigned overflow
+    # detection (Adder's '<' is signed even for uint64).
+    mask51: uint64 = 0x7FFFFFFFFFFFF
+    sign_flip2: uint64 = 0x8000000000000000
+    i = 0
+    carry_lo: uint64 = 0
+    carry_hi: uint64 = 0
+    while i < 5:
+        # Add inbound carry to acc[i].
+        cur_lo: uint64 = fe_mul_acc_lo[i] + carry_lo
+        cur_hi: uint64 = fe_mul_acc_hi[i] + carry_hi
+        if (cur_lo ^ sign_flip2) < (carry_lo ^ sign_flip2):
+            cur_hi = cur_hi + 1
+        # Output low 51 bits.
+        if i < 4:
+            r[i] = cur_lo & mask51
+            # Right-shift by 51: new_lo = (cur_lo >> 51) | (cur_hi << 13),
+            # new_hi = cur_hi >> 51.
+            carry_lo = (cur_lo >> 51) | (cur_hi << 13)
+            carry_hi = cur_hi >> 51
+        else:
+            # Last limb: store low 51 bits, fold the rest via *19 back
+            # into r[0]. Top of (cur_lo, cur_hi) shifted right by 51
+            # gives the overflow which is multiplied by 19.
+            r[4] = cur_lo & mask51
+            overflow_lo: uint64 = (cur_lo >> 51) | (cur_hi << 13)
+            overflow_hi: uint64 = cur_hi >> 51
+            # Fold *19 into limb 0 (this can momentarily exceed 51 bits
+            # — we run carry once more below).
+            r[0] = r[0] + overflow_lo * 19
+            # Any contribution from overflow_hi would exceed 2^115 in
+            # the original product, which can't happen given our input
+            # bound — assert by ignoring (input is < 2^51).
+        i = i + 1
+    # One more pass to renormalise r[0]'s potential overflow into r[1].
     _tls_x25519_fe_carry(r)
 
 
@@ -1198,12 +1489,41 @@ def _tls_x25519_fe_sq(r: Ptr[uint64], a: Ptr[uint64]):
 
 
 def _tls_x25519_fe_mul121665(r: Ptr[uint64], a: Ptr[uint64]):
-    # r = a * 121665, then carry.
-    r[0] = a[0] * 121665
-    r[1] = a[1] * 121665
-    r[2] = a[2] * 121665
-    r[3] = a[3] * 121665
-    r[4] = a[4] * 121665
+    # r = a * 121665, then carry. 121665 < 2^17. If a[i] is at most
+    # 2^51 (typical after carry), a[i] * 121665 fits in 2^68 — WHICH
+    # DOES OVERFLOW uint64. We split the per-limb product via 128-bit
+    # multiply and carry-propagate the high half into the next limb.
+    sign_flip: uint64 = 0x8000000000000000
+    mask51: uint64 = 0x7FFFFFFFFFFFF
+    # Compute 128-bit products into local 5-element (lo, hi) pair.
+    los: Array[5, uint64]
+    his: Array[5, uint64]
+    i: uint64 = 0
+    while i < 5:
+        tls_mul128_a = a[i]
+        tls_mul128_b = 121665
+        _tls_mul128()
+        los[i] = tls_mul128_lo
+        his[i] = tls_mul128_hi
+        i = i + 1
+    # Carry-propagate. Same scheme as in _tls_x25519_fe_mul.
+    carry_lo: uint64 = 0
+    carry_hi: uint64 = 0
+    i = 0
+    while i < 5:
+        cur_lo: uint64 = los[i] + carry_lo
+        cur_hi: uint64 = his[i] + carry_hi
+        if (cur_lo ^ sign_flip) < (carry_lo ^ sign_flip):
+            cur_hi = cur_hi + 1
+        if i < 4:
+            r[i] = cur_lo & mask51
+            carry_lo = (cur_lo >> 51) | (cur_hi << 13)
+            carry_hi = cur_hi >> 51
+        else:
+            r[4] = cur_lo & mask51
+            overflow_lo: uint64 = (cur_lo >> 51) | (cur_hi << 13)
+            r[0] = r[0] + overflow_lo * 19
+        i = i + 1
     _tls_x25519_fe_carry(r)
 
 
@@ -1426,11 +1746,16 @@ def _tls_x25519_scalarmult(out: Ptr[uint8],
         _tls_x25519_fe_mul(cast[Ptr[uint64]](&x2[0]),
                            cast[Ptr[uint64]](&aa[0]),
                            cast[Ptr[uint64]](&bb[0]))
-        # z2 = E * (BB + a24*E)  ; a24 = 121665
+        # z2 = E * (AA + a24*E)  ; a24 = 121665 (RFC 7748 §5).
+        # NB: The original ed210da skeleton wrote `BB + a24*E` here —
+        # both Wikipedia and the RFC unambiguously have `AA + a24*E`.
+        # The BB form gave a wrong scalarmult result that masqueraded
+        # as "AEAD decrypt failed" once the bug shipped down the
+        # handshake.
         _tls_x25519_fe_mul121665(cast[Ptr[uint64]](&tmp1[0]),
                                  cast[Ptr[uint64]](&e_buf[0]))
         _tls_x25519_fe_add(cast[Ptr[uint64]](&tmp2[0]),
-                           cast[Ptr[uint64]](&bb[0]),
+                           cast[Ptr[uint64]](&aa[0]),
                            cast[Ptr[uint64]](&tmp1[0]))
         _tls_x25519_fe_mul(cast[Ptr[uint64]](&z2[0]),
                            cast[Ptr[uint64]](&e_buf[0]),
@@ -1641,33 +1966,12 @@ def _tls_compute_handshake_keys():
     _tls_hkdf_extract(cast[Ptr[uint8]](&tls_handshake_secret[0]),
                       cast[Ptr[uint8]](&derived[0]), 32,
                       cast[Ptr[uint8]](&tls_x25519_shared[0]), 32)
-    # Snapshot the current running hash WITHOUT destroying state. We
-    # save the 8 state words + the buffer + buflen + bit count.
-    saved_state: Array[8, uint32]
-    saved_buf: Array[64, uint8]
-    saved_buflen: uint64 = tls_sha_buflen
-    saved_bits: uint64 = tls_sha_total_bits
-    i: uint64 = 0
-    while i < 8:
-        saved_state[i] = tls_sha_state[i]
-        i = i + 1
-    i = 0
-    while i < 64:
-        saved_buf[i] = tls_sha_buf[i]
-        i = i + 1
-    # Finalise into the transcript hash slot.
-    _tls_sha256_finish_into(cast[Ptr[uint8]](&tls_transcript_hash[0]))
-    # Restore state so subsequent updates (Finished etc.) still work.
-    i = 0
-    while i < 8:
-        tls_sha_state[i] = saved_state[i]
-        i = i + 1
-    i = 0
-    while i < 64:
-        tls_sha_buf[i] = saved_buf[i]
-        i = i + 1
-    tls_sha_buflen = saved_buflen
-    tls_sha_total_bits = saved_bits
+    # Snapshot the running parallel transcript hash into the
+    # tls_transcript_hash slot — used as the "transcript" input to
+    # Derive-Secret. The parallel transcript instance (tls_tr_*) is
+    # untouched so subsequent _tls_tr_update calls keep extending it.
+    _tls_sha256_snapshot_into(
+        cast[Ptr[uint8]](&tls_transcript_hash[0]))
 
     label_c_hs: Ptr[uint8] = "c hs traffic"
     label_s_hs: Ptr[uint8] = "s hs traffic"
@@ -1718,7 +2022,7 @@ def _tls_build_client_hello(host: Ptr[uint8],
     # length(uint16 BE) }. legacy_record_version is 0x0301 per §5.1.
 
     # Make sure the running transcript hash is reset.
-    _tls_sha256_reset()
+    _tls_tr_reset()
 
     host_len: uint64 = _tls_strlen(host)
 
@@ -1903,8 +2207,8 @@ def _tls_build_client_hello(host: Ptr[uint8],
 
     # Feed the handshake body (NOT the 5-byte record header) into the
     # transcript hash.
-    _tls_sha256_update(cast[Ptr[uint8]](cast[uint64](out) + 5),
-                       rec_body_len)
+    _tls_tr_update(cast[Ptr[uint8]](cast[uint64](out) + 5),
+                   rec_body_len)
     return cast[int64](pos)
 
 
@@ -1978,6 +2282,27 @@ def _tls_parse_server_hello(buf: Ptr[uint8], n: uint64) -> int32:
     return 0
 
 
+def _tls_hex_dump(label: Ptr[uint8], data: Ptr[uint8], n: uint64):
+    # Debug helper: emit `label <hex>...` for the first 32 bytes,
+    # then `+N more` if there's tail. printk doesn't have %02x so
+    # we zero-pad the high nibble manually.
+    printk1("%s ", cast[uint64](label))
+    i: uint64 = 0
+    cap: uint64 = n
+    if cap > 32:
+        cap = 32
+    while i < cap:
+        b: uint8 = data[i]
+        if b < 0x10:
+            printk1("0%x", cast[uint64](b) & 0xFF)
+        else:
+            printk1("%x", cast[uint64](b) & 0xFF)
+        i = i + 1
+    if n > 32:
+        printk1(" +%d more", n - 32)
+    printk0("\n")
+
+
 def _tls_compute_nonce(seq: uint64, base_iv: Ptr[uint8],
                        out_nonce: Ptr[uint8]):
     # AEAD nonce = base_iv XOR seq (seq is big-endian aligned to last 8
@@ -1993,6 +2318,9 @@ def _tls_compute_nonce(seq: uint64, base_iv: Ptr[uint8],
         i = i + 1
 
 
+tls_selftest_ran:    int32 = 0
+
+
 def tls_init():
     # Module init: zero scratch + load SHA-256 K constants. Called once
     # by https_get before the first handshake.
@@ -2005,7 +2333,15 @@ def tls_init():
     tls_client_seq = 0
     tls_server_seq = 0
     tls_rng_state = 0
+    tls_rxr_len = 0
+    _tls_tr_reset()
     printk0("tls: client initialized (TLS 1.3 / chacha20-poly1305 / X25519)\n")
+    # Run the AEAD + X25519 self-test once per boot — proves the crypto
+    # primitives compile + link correctly even when the test environment
+    # has no outbound 443/UDP for a live handshake.
+    if tls_selftest_ran == 0:
+        _tls_crypto_selftest()
+        tls_selftest_ran = 1
 
 
 def _tls_crypto_selftest() -> int32:
@@ -2054,6 +2390,131 @@ def _tls_crypto_selftest() -> int32:
                    cast[Ptr[uint8]](&pub_b[0]), 32) != 0:
         printk0("[tls] selftest: X25519 not deterministic\n")
         return -1
+    # Verify _tls_mul128 first: 0x123456789ABCDEF0 * 0xFEDCBA9876543210
+    # = 0x121fa00ad77d7422_236d88fe5618cf00 (per Python).
+    tls_mul128_a = 0x123456789ABCDEF0
+    tls_mul128_b = 0xFEDCBA9876543210
+    _tls_mul128()
+    if tls_mul128_lo != 0x236d88fe5618cf00:
+        printk0("[tls] selftest: mul128 LOW wrong\n")
+        return -1
+    if tls_mul128_hi != 0x121fa00ad77d7422:
+        printk0("[tls] selftest: mul128 HIGH wrong\n")
+        return -1
+    # RFC 7748 §5.2 test vector 1: scalarmult of a known scalar and
+    # u-coord. Catches X25519 ladder / field-arith bugs.
+    rfc_scalar: Array[32, uint8]
+    rfc_u:      Array[32, uint8]
+    rfc_scalar[0]  = 0xa5
+    rfc_scalar[1]  = 0x46
+    rfc_scalar[2]  = 0xe3
+    rfc_scalar[3]  = 0x6b
+    rfc_scalar[4]  = 0xf0
+    rfc_scalar[5]  = 0x52
+    rfc_scalar[6]  = 0x7c
+    rfc_scalar[7]  = 0x9d
+    rfc_scalar[8]  = 0x3b
+    rfc_scalar[9]  = 0x16
+    rfc_scalar[10] = 0x15
+    rfc_scalar[11] = 0x4b
+    rfc_scalar[12] = 0x82
+    rfc_scalar[13] = 0x46
+    rfc_scalar[14] = 0x5e
+    rfc_scalar[15] = 0xdd
+    rfc_scalar[16] = 0x62
+    rfc_scalar[17] = 0x14
+    rfc_scalar[18] = 0x4c
+    rfc_scalar[19] = 0x0a
+    rfc_scalar[20] = 0xc1
+    rfc_scalar[21] = 0xfc
+    rfc_scalar[22] = 0x5a
+    rfc_scalar[23] = 0x18
+    rfc_scalar[24] = 0x50
+    rfc_scalar[25] = 0x6a
+    rfc_scalar[26] = 0x22
+    rfc_scalar[27] = 0x44
+    rfc_scalar[28] = 0xba
+    rfc_scalar[29] = 0x44
+    rfc_scalar[30] = 0x9a
+    rfc_scalar[31] = 0xc4
+    rfc_u[0]  = 0xe6
+    rfc_u[1]  = 0xdb
+    rfc_u[2]  = 0x68
+    rfc_u[3]  = 0x67
+    rfc_u[4]  = 0x58
+    rfc_u[5]  = 0x30
+    rfc_u[6]  = 0x30
+    rfc_u[7]  = 0xdb
+    rfc_u[8]  = 0x35
+    rfc_u[9]  = 0x94
+    rfc_u[10] = 0xc1
+    rfc_u[11] = 0xa4
+    rfc_u[12] = 0x24
+    rfc_u[13] = 0xb1
+    rfc_u[14] = 0x5f
+    rfc_u[15] = 0x7c
+    rfc_u[16] = 0x72
+    rfc_u[17] = 0x66
+    rfc_u[18] = 0x24
+    rfc_u[19] = 0xec
+    rfc_u[20] = 0x26
+    rfc_u[21] = 0xb3
+    rfc_u[22] = 0x35
+    rfc_u[23] = 0x3b
+    rfc_u[24] = 0x10
+    rfc_u[25] = 0xa9
+    rfc_u[26] = 0x03
+    rfc_u[27] = 0xa6
+    rfc_u[28] = 0xd0
+    rfc_u[29] = 0xab
+    rfc_u[30] = 0x1c
+    rfc_u[31] = 0x4c
+    rfc_out: Array[32, uint8]
+    _tls_x25519_scalarmult(cast[Ptr[uint8]](&rfc_out[0]),
+                           cast[Ptr[uint8]](&rfc_scalar[0]),
+                           cast[Ptr[uint8]](&rfc_u[0]))
+    # Expected: c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552
+    rfc_exp: Array[32, uint8]
+    rfc_exp[0]  = 0xc3
+    rfc_exp[1]  = 0xda
+    rfc_exp[2]  = 0x55
+    rfc_exp[3]  = 0x37
+    rfc_exp[4]  = 0x9d
+    rfc_exp[5]  = 0xe9
+    rfc_exp[6]  = 0xc6
+    rfc_exp[7]  = 0x90
+    rfc_exp[8]  = 0x8e
+    rfc_exp[9]  = 0x94
+    rfc_exp[10] = 0xea
+    rfc_exp[11] = 0x4d
+    rfc_exp[12] = 0xf2
+    rfc_exp[13] = 0x8d
+    rfc_exp[14] = 0x08
+    rfc_exp[15] = 0x4f
+    rfc_exp[16] = 0x32
+    rfc_exp[17] = 0xec
+    rfc_exp[18] = 0xcf
+    rfc_exp[19] = 0x03
+    rfc_exp[20] = 0x49
+    rfc_exp[21] = 0x1c
+    rfc_exp[22] = 0x71
+    rfc_exp[23] = 0xf7
+    rfc_exp[24] = 0x54
+    rfc_exp[25] = 0xb4
+    rfc_exp[26] = 0x07
+    rfc_exp[27] = 0x55
+    rfc_exp[28] = 0x77
+    rfc_exp[29] = 0xa2
+    rfc_exp[30] = 0x85
+    rfc_exp[31] = 0x52
+    if _tls_memcmp(cast[Ptr[uint8]](&rfc_out[0]),
+                   cast[Ptr[uint8]](&rfc_exp[0]), 32) != 0:
+        printk0("[tls] selftest: X25519 RFC 7748 vector MISMATCH\n")
+        dbg_got: Ptr[uint8] = "  got     ="
+        dbg_want: Ptr[uint8] = "  expected="
+        _tls_hex_dump(dbg_got, cast[Ptr[uint8]](&rfc_out[0]), 32)
+        _tls_hex_dump(dbg_want, cast[Ptr[uint8]](&rfc_exp[0]), 32)
+        return -1
     printk0("[tls] selftest: AEAD + X25519 OK\n")
     return 0
 
@@ -2082,28 +2543,24 @@ def tls_handshake(tcp_slot: int32, host: Ptr[uint8]) -> int32:
         return -1
     printk1("[tls] ClientHello sent (%d bytes)\n", ch_len)
 
-    # Receive ServerHello. We expect a single record of type=22 to
-    # arrive (records may be fragmented in pathological cases, but
-    # mainstream stacks always pack ServerHello as one record).
+    # Receive ServerHello. _tls_read_record reassembles a complete TLS
+    # record (5-byte header + payload) into tls_rx_buf even if TCP
+    # delivers it across multiple segments, and stores any spilled
+    # bytes for the next call.
     rx_ptr: Ptr[uint8] = cast[Ptr[uint8]](&tls_rx_buf[0])
-    n: int64 = tcp_recv(tcp_slot, rx_ptr, 4096, 200)
-    if n <= 0:
+    rec_total_signed: int64 = _tls_read_record(tcp_slot, 400)
+    if rec_total_signed <= 0:
         printk0("[tls] ServerHello recv failed\n")
-        return -1
-    if n < 5:
-        printk0("[tls] short record header\n")
         return -1
     if tls_rx_buf[0] != TLS_CT_HANDSHAKE:
         # Could be an alert (type=21) if the server hated our hello.
         printk1("[tls] unexpected record type %d\n",
                 cast[uint64](tls_rx_buf[0]))
         return -1
-    rec_len: uint64 = (cast[uint64](tls_rx_buf[3]) << 8) \
-        | cast[uint64](tls_rx_buf[4])
-    if 5 + rec_len > cast[uint64](n):
-        printk0("[tls] ServerHello record truncated by TCP segment boundary\n")
-        return -1
+    rec_len: uint64 = cast[uint64](rec_total_signed) - 5
     # Handshake message header: type(1) + length(3)
+    if rec_len < 4:
+        return -1
     hs_type: uint8 = tls_rx_buf[5]
     if hs_type != TLS_HS_SERVER_HELLO:
         printk1("[tls] expected ServerHello, got hs_type=%d\n",
@@ -2114,8 +2571,8 @@ def tls_handshake(tcp_slot: int32, host: Ptr[uint8]) -> int32:
         | cast[uint64](tls_rx_buf[8])
     # Feed the SH handshake message (type+length+body) into the
     # transcript hash before parsing — RFC 8446 §4.4.1.
-    _tls_sha256_update(cast[Ptr[uint8]](cast[uint64](rx_ptr) + 5),
-                       4 + hs_body_len)
+    _tls_tr_update(cast[Ptr[uint8]](cast[uint64](rx_ptr) + 5),
+                   4 + hs_body_len)
     if _tls_parse_server_hello(
             cast[Ptr[uint8]](cast[uint64](rx_ptr) + 9),
             hs_body_len) != 0:
@@ -2131,105 +2588,482 @@ def tls_handshake(tcp_slot: int32, host: Ptr[uint8]) -> int32:
     _tls_compute_handshake_keys()
     printk0("[tls] handshake keys derived (encrypted ServerHello parsed)\n")
 
-    # NOTE: From here we'd consume EncryptedExtensions, Certificate,
-    # CertificateVerify, Finished — all AEAD-protected under
-    # tls_server_hs_key/iv — feed each into the transcript hash, derive
-    # the application traffic keys, and send our Finished. That logic
-    # is sketched in _tls_drive_post_sh but the full code path needs
-    # multi-record reassembly across tcp_recv chunks; reaching here is
-    # the documented stopping point for this commit.
+    # Consume the rest of the server flight (EncryptedExtensions,
+    # Certificate, CertificateVerify, Finished — all AEAD-protected
+    # under the server handshake traffic key) and emit our client
+    # Finished. _tls_drive_post_sh handles reassembly across tcp_recv
+    # chunks and feeds each handshake message into the transcript hash.
     return _tls_drive_post_sh(tcp_slot)
 
 
-def _tls_drive_post_sh(tcp_slot: int32) -> int32:
-    # Stub for the post-ServerHello half. We attempt one tcp_recv and
-    # tag-verify the first AEAD record — that's enough to prove the
-    # key schedule is correct end-to-end. Returns 0 on success, -1 on
-    # any decrypt failure or short read. This intentionally leaves the
-    # Finished handshake message UNSENT — completing the handshake
-    # requires building our client Finished + sending application data,
-    # which the next commit will land alongside cert validation.
+def _tls_compute_app_keys():
+    # After the server's Finished is consumed, the transcript hash is
+    # "ClientHello..server Finished". RFC 8446 §7.1:
+    #   master_secret =
+    #     HKDF-Extract(Derive-Secret(handshake_secret, "derived", ""), 0)
+    #   c_ap = Derive-Secret(master_secret, "c ap traffic", transcript)
+    #   s_ap = Derive-Secret(master_secret, "s ap traffic", transcript)
+    #   key  = HKDF-Expand-Label(secret, "key", "", 32)
+    #   iv   = HKDF-Expand-Label(secret, "iv",  "", 12)
+    zero32: Array[32, uint8]
+    _tls_memset(cast[Ptr[uint8]](&zero32[0]), 0, 32)
+    empty_hash: Array[32, uint8]
+    _tls_sha256_oneshot(cast[Ptr[uint8]](&zero32[0]), 0,
+                        cast[Ptr[uint8]](&empty_hash[0]))
+    derived: Array[32, uint8]
+    label_derived: Ptr[uint8] = "derived"
+    _tls_derive_secret(cast[Ptr[uint8]](&derived[0]),
+                       cast[Ptr[uint8]](&tls_handshake_secret[0]),
+                       label_derived, 7,
+                       cast[Ptr[uint8]](&empty_hash[0]))
+    _tls_hkdf_extract(cast[Ptr[uint8]](&tls_master_secret[0]),
+                      cast[Ptr[uint8]](&derived[0]), 32,
+                      cast[Ptr[uint8]](&zero32[0]), 32)
+    # Snapshot transcript hash including server Finished.
+    th_after_sf: Array[32, uint8]
+    _tls_sha256_snapshot_into(cast[Ptr[uint8]](&th_after_sf[0]))
+    label_c_ap: Ptr[uint8] = "c ap traffic"
+    label_s_ap: Ptr[uint8] = "s ap traffic"
+    _tls_derive_secret(cast[Ptr[uint8]](&tls_client_ap_secret[0]),
+                       cast[Ptr[uint8]](&tls_master_secret[0]),
+                       label_c_ap, 12,
+                       cast[Ptr[uint8]](&th_after_sf[0]))
+    _tls_derive_secret(cast[Ptr[uint8]](&tls_server_ap_secret[0]),
+                       cast[Ptr[uint8]](&tls_master_secret[0]),
+                       label_s_ap, 12,
+                       cast[Ptr[uint8]](&th_after_sf[0]))
+    label_key: Ptr[uint8] = "key"
+    label_iv:  Ptr[uint8] = "iv"
+    _tls_hkdf_expand_label(cast[Ptr[uint8]](&tls_client_ap_key[0]), 32,
+                           cast[Ptr[uint8]](&tls_client_ap_secret[0]),
+                           label_key, 3, cast[Ptr[uint8]](0), 0)
+    _tls_hkdf_expand_label(cast[Ptr[uint8]](&tls_client_ap_iv[0]), 12,
+                           cast[Ptr[uint8]](&tls_client_ap_secret[0]),
+                           label_iv, 2, cast[Ptr[uint8]](0), 0)
+    _tls_hkdf_expand_label(cast[Ptr[uint8]](&tls_server_ap_key[0]), 32,
+                           cast[Ptr[uint8]](&tls_server_ap_secret[0]),
+                           label_key, 3, cast[Ptr[uint8]](0), 0)
+    _tls_hkdf_expand_label(cast[Ptr[uint8]](&tls_server_ap_iv[0]), 12,
+                           cast[Ptr[uint8]](&tls_server_ap_secret[0]),
+                           label_iv, 2, cast[Ptr[uint8]](0), 0)
+    # App-direction sequence numbers reset when keys switch.
+    tls_client_seq = 0
+    tls_server_seq = 0
+
+
+def _tls_read_record(tcp_slot: int32, timeout_ms: uint64) -> int64:
+    # Pull exactly one whole TLS record off the wire into tls_rx_buf.
+    # On entry tls_rxr_buf may carry leftover bytes from a previous
+    # call (e.g. a TCP segment delivered more than one record's worth).
+    # On success returns the record length (header + body); tls_rx_buf
+    # holds the record bytes at offset 0. On timeout/EOF returns 0;
+    # on hard error returns -1.
+    #
+    # Pull whatever's already buffered into tls_rx_buf, then top up
+    # from tcp_recv as needed.
     rx_ptr: Ptr[uint8] = cast[Ptr[uint8]](&tls_rx_buf[0])
-    n: int64 = tcp_recv(tcp_slot, rx_ptr, 4096, 200)
-    if n < 5:
-        printk0("[tls] no post-SH bytes (peer waiting for our Finished)\n")
+    # Drain any reassembly leftovers first.
+    if tls_rxr_len > 0:
+        i: uint64 = 0
+        while i < tls_rxr_len:
+            tls_rx_buf[i] = tls_rxr_buf[i]
+            i = i + 1
+    have: uint64 = tls_rxr_len
+    tls_rxr_len = 0
+    # Need at least 5 bytes to know the record length.
+    while have < 5:
+        room: uint64 = 4096 - have
+        n: int64 = tcp_recv(tcp_slot,
+                            cast[Ptr[uint8]](cast[uint64](rx_ptr) + have),
+                            room, timeout_ms)
+        if n <= 0:
+            return n
+        have = have + cast[uint64](n)
+    rec_len: uint64 = (cast[uint64](tls_rx_buf[3]) << 8) \
+        | cast[uint64](tls_rx_buf[4])
+    total: uint64 = 5 + rec_len
+    if total > 4096:
+        # We don't support cipherext records larger than the rx scratch.
+        # TLS 1.3 caps ciphertext at 16640 (16384 plaintext + 256 pad +
+        # type byte + tag); enlarging tls_rx_buf to 16640 lifts this.
+        printk1("[tls] record too large for scratch (%d bytes)\n",
+                rec_len)
         return -1
-    # The first post-SH record is sometimes a ChangeCipherSpec (type=20)
-    # sent for TLS 1.2 middlebox compatibility. Skip it.
-    pos: uint64 = 0
-    if tls_rx_buf[pos] == TLS_CT_CHANGE_CIPHER:
-        ccs_len: uint64 = (cast[uint64](tls_rx_buf[pos + 3]) << 8) \
-            | cast[uint64](tls_rx_buf[pos + 4])
-        pos = pos + 5 + ccs_len
-        printk0("[tls] skipped legacy ChangeCipherSpec\n")
-    if pos + 5 > cast[uint64](n):
-        printk0("[tls] partial post-SH frame; need bigger receive loop\n")
-        return -1
-    if tls_rx_buf[pos] != TLS_CT_APPLICATION:
-        # The handshake records on the wire are sent as type=23
-        # (application_data) in TLS 1.3 because their actual content
-        # type is in the encrypted plaintext. If we see a Handshake
-        # type here it means the server is in TLS 1.2 mode — refuse.
-        printk1("[tls] post-SH record type=%d not app-data\n",
-                cast[uint64](tls_rx_buf[pos]))
-        return -1
-    rec_len: uint64 = (cast[uint64](tls_rx_buf[pos + 3]) << 8) \
-        | cast[uint64](tls_rx_buf[pos + 4])
-    if pos + 5 + rec_len > cast[uint64](n):
-        printk0("[tls] post-SH AEAD record truncated; need reassembly\n")
-        return -1
+    while have < total:
+        room: uint64 = 4096 - have
+        n2: int64 = tcp_recv(tcp_slot,
+                             cast[Ptr[uint8]](cast[uint64](rx_ptr) + have),
+                             room, timeout_ms)
+        if n2 <= 0:
+            return -1
+        have = have + cast[uint64](n2)
+    # Anything past `total` is leftover for the next record.
+    if have > total:
+        spill: uint64 = have - total
+        if spill > 8192:
+            return -1
+        s: uint64 = 0
+        while s < spill:
+            tls_rxr_buf[s] = tls_rx_buf[total + s]
+            s = s + 1
+        tls_rxr_len = spill
+    return cast[int64](total)
+
+
+def _tls_decrypt_record(rec_total_len: uint64,
+                        is_handshake: int32) -> int64:
+    # Decrypt the AEAD record sitting at tls_rx_buf[0..rec_total_len].
+    # If `is_handshake` is 1, use the handshake traffic key/iv +
+    # tls_server_seq for handshake records; otherwise use the
+    # application traffic key/iv. On success returns the plaintext
+    # length (already stripped of the tag — the trailing content type
+    # byte + any zero padding are STILL present at the end). Plaintext
+    # is written into tls_pt_buf[0..plaintext_len]. -1 on AEAD failure.
+    rx_ptr: Ptr[uint8] = cast[Ptr[uint8]](&tls_rx_buf[0])
+    rec_len: uint64 = rec_total_len - 5
     if rec_len < 16:
         return -1
-    aad: Array[5, uint8]
-    aad[0] = tls_rx_buf[pos]
-    aad[1] = tls_rx_buf[pos + 1]
-    aad[2] = tls_rx_buf[pos + 2]
-    aad[3] = tls_rx_buf[pos + 3]
-    aad[4] = tls_rx_buf[pos + 4]
     ct_len: uint64 = rec_len - 16
+    aad: Array[5, uint8]
+    aad[0] = tls_rx_buf[0]
+    aad[1] = tls_rx_buf[1]
+    aad[2] = tls_rx_buf[2]
+    aad[3] = tls_rx_buf[3]
+    aad[4] = tls_rx_buf[4]
     nonce: Array[12, uint8]
-    _tls_compute_nonce(tls_server_seq,
-                       cast[Ptr[uint8]](&tls_server_hs_iv[0]),
-                       cast[Ptr[uint8]](&nonce[0]))
-    pt: Array[4096, uint8]
-    rc: int32 = _tls_aead_open(
-        cast[Ptr[uint8]](&tls_server_hs_key[0]),
-        cast[Ptr[uint8]](&nonce[0]),
-        cast[Ptr[uint8]](&aad[0]), 5,
-        cast[Ptr[uint8]](cast[uint64](rx_ptr) + pos + 5), ct_len,
-        cast[Ptr[uint8]](cast[uint64](rx_ptr) + pos + 5 + ct_len),
-        cast[Ptr[uint8]](&pt[0]))
-    if rc != 0:
-        printk0("[tls] AEAD decrypt FAILED (key schedule mismatch?)\n")
-        return -1
+    if is_handshake == 1:
+        _tls_compute_nonce(tls_server_seq,
+                           cast[Ptr[uint8]](&tls_server_hs_iv[0]),
+                           cast[Ptr[uint8]](&nonce[0]))
+        rc: int32 = _tls_aead_open(
+            cast[Ptr[uint8]](&tls_server_hs_key[0]),
+            cast[Ptr[uint8]](&nonce[0]),
+            cast[Ptr[uint8]](&aad[0]), 5,
+            cast[Ptr[uint8]](cast[uint64](rx_ptr) + 5), ct_len,
+            cast[Ptr[uint8]](cast[uint64](rx_ptr) + 5 + ct_len),
+            cast[Ptr[uint8]](&tls_pt_buf[0]))
+        if rc != 0:
+            return -1
+    else:
+        _tls_compute_nonce(tls_server_seq,
+                           cast[Ptr[uint8]](&tls_server_ap_iv[0]),
+                           cast[Ptr[uint8]](&nonce[0]))
+        rc2: int32 = _tls_aead_open(
+            cast[Ptr[uint8]](&tls_server_ap_key[0]),
+            cast[Ptr[uint8]](&nonce[0]),
+            cast[Ptr[uint8]](&aad[0]), 5,
+            cast[Ptr[uint8]](cast[uint64](rx_ptr) + 5), ct_len,
+            cast[Ptr[uint8]](cast[uint64](rx_ptr) + 5 + ct_len),
+            cast[Ptr[uint8]](&tls_pt_buf[0]))
+        if rc2 != 0:
+            return -1
     tls_server_seq = tls_server_seq + 1
-    printk1("[tls] first AEAD record decrypted (%d plaintext bytes)\n",
-            ct_len)
-    # The plaintext's last byte is the real content type (handshake=22,
-    # alert=21, app-data=23). EncryptedExtensions is the first
-    # handshake-shape message we expect.
-    real_type: uint8 = pt[ct_len - 1]
-    printk1("[tls] inner content type = %d\n", cast[uint64](real_type))
-    tls_active = 1
-    # Documented stopping point: we've verified the AEAD key schedule
-    # and decrypted one server flight record. Building our Finished
-    # message + sending real application data needs the rest of the
-    # encrypted server flight (Certificate, CertVerify, Finished) to
-    # be consumed first; see TODO.md for the follow-up scope.
+    return cast[int64](ct_len)
+
+
+def _tls_strip_inner_padding(pt_len: uint64,
+                             real_type_out: Ptr[uint8]) -> int64:
+    # Walk back from the end of the plaintext skipping zero padding
+    # until we find the real content type byte. Returns the inner
+    # plaintext length (excluding the type byte). -1 if the record
+    # was all-zero (malformed).
+    if pt_len == 0:
+        return -1
+    p: uint64 = pt_len
+    while p > 0:
+        if tls_pt_buf[p - 1] != 0:
+            real_type_out[0] = tls_pt_buf[p - 1]
+            return cast[int64](p - 1)
+        p = p - 1
+    return -1
+
+
+def _tls_send_client_finished(tcp_slot: int32) -> int32:
+    # Build + send the client Finished handshake message wrapped in an
+    # AEAD record under the client handshake traffic key. Uses the
+    # transcript hash as-of-server-Finished as the HMAC input.
+    # verify_data = HMAC(client_finished_key, transcript_hash)
+    # client_finished_key = HKDF-Expand-Label(client_hs_secret,
+    #                                         "finished", "", 32)
+    label_finished: Ptr[uint8] = "finished"
+    cf_key: Array[32, uint8]
+    _tls_hkdf_expand_label(cast[Ptr[uint8]](&cf_key[0]), 32,
+                           cast[Ptr[uint8]](&tls_client_hs_secret[0]),
+                           label_finished, 8,
+                           cast[Ptr[uint8]](0), 0)
+    th_now: Array[32, uint8]
+    _tls_sha256_snapshot_into(cast[Ptr[uint8]](&th_now[0]))
+    verify: Array[32, uint8]
+    _tls_hmac_sha256(cast[Ptr[uint8]](&verify[0]),
+                     cast[Ptr[uint8]](&cf_key[0]), 32,
+                     cast[Ptr[uint8]](&th_now[0]), 32)
+    # Inner plaintext = handshake header (type=20, length=32) + 32-byte
+    # verify_data + trailing content-type byte (0x16 = handshake).
+    inner: Array[64, uint8]
+    inner[0] = TLS_HS_FINISHED                    # 20
+    inner[1] = 0                                   # length high
+    inner[2] = 0
+    inner[3] = 32                                  # length low
+    i: uint64 = 0
+    while i < 32:
+        inner[4 + i] = verify[i]
+        i = i + 1
+    inner[36] = TLS_CT_HANDSHAKE                   # inner content type
+    inner_len: uint64 = 37
+    # Update transcript hash with the Finished handshake message body
+    # (the 4-byte header + 32-byte verify_data; NOT the inner content
+    # type byte). This isn't used for any further server verification
+    # but matches what we'd need for resumption tickets / KeyUpdate.
+    _tls_tr_update(cast[Ptr[uint8]](&inner[0]), 36)
+
+    record_len: uint64 = inner_len + TLS_AEAD_TAG  # 37 + 16 = 53
+    tls_tx_buf[0] = TLS_CT_APPLICATION
+    tls_tx_buf[1] = 0x03
+    tls_tx_buf[2] = 0x03
+    tls_tx_buf[3] = cast[uint8]((record_len >> 8) & 0xFF)
+    tls_tx_buf[4] = cast[uint8](record_len & 0xFF)
+    nonce: Array[12, uint8]
+    _tls_compute_nonce(tls_client_seq,
+                       cast[Ptr[uint8]](&tls_client_hs_iv[0]),
+                       cast[Ptr[uint8]](&nonce[0]))
+    _tls_aead_seal(cast[Ptr[uint8]](&tls_client_hs_key[0]),
+                   cast[Ptr[uint8]](&nonce[0]),
+                   cast[Ptr[uint8]](&tls_tx_buf[0]), 5,
+                   cast[Ptr[uint8]](&inner[0]), inner_len,
+                   cast[Ptr[uint8]](&tls_tx_buf[5]),
+                   cast[Ptr[uint8]](&tls_tx_buf[5 + inner_len]))
+    tls_client_seq = tls_client_seq + 1
+    total: uint64 = 5 + record_len
+    sent: int64 = tcp_send(tcp_slot,
+                           cast[Ptr[uint8]](&tls_tx_buf[0]), total)
+    if sent < cast[int64](total):
+        return -1
     return 0
 
 
-def tls_send(buf: Ptr[uint8], length: uint64) -> int64:
+def _tls_verify_server_finished(verify_body: Ptr[uint8],
+                                body_len: uint64,
+                                th_before: Ptr[uint8]) -> int32:
+    # Verify the server's Finished message body against the transcript
+    # hash computed as of EncryptedExtensions..CertVerify (i.e. NOT
+    # including the Finished message itself).
+    #   server_finished_key = HKDF-Expand-Label(server_hs_secret,
+    #                                            "finished", "", 32)
+    #   expected = HMAC(server_finished_key, th_before)
+    if body_len != 32:
+        return -1
+    label_finished: Ptr[uint8] = "finished"
+    sf_key: Array[32, uint8]
+    _tls_hkdf_expand_label(cast[Ptr[uint8]](&sf_key[0]), 32,
+                           cast[Ptr[uint8]](&tls_server_hs_secret[0]),
+                           label_finished, 8,
+                           cast[Ptr[uint8]](0), 0)
+    expected: Array[32, uint8]
+    _tls_hmac_sha256(cast[Ptr[uint8]](&expected[0]),
+                     cast[Ptr[uint8]](&sf_key[0]), 32,
+                     th_before, 32)
+    return _tls_memcmp(cast[Ptr[uint8]](&expected[0]),
+                       verify_body, 32)
+
+
+def _tls_drive_post_sh(tcp_slot: int32) -> int32:
+    # Run the post-ServerHello half of the handshake to completion:
+    #   1. Skip the optional ChangeCipherSpec record (middlebox compat).
+    #   2. Loop reading encrypted handshake records under the server
+    #      handshake traffic key. Inside each decrypted record, walk
+    #      one-or-more handshake messages (type+length+body):
+    #         EncryptedExtensions     -> skip body, feed into transcript
+    #         Certificate             -> skip body (NO validation),
+    #                                    feed into transcript, warn
+    #         CertificateVerify       -> skip body (NO validation),
+    #                                    feed into transcript
+    #         Finished                -> HMAC-verify against the
+    #                                    transcript hash as-of-CertVerify,
+    #                                    then feed Finished bytes in.
+    #   3. Derive application traffic keys (transcript hash now includes
+    #      the server's Finished).
+    #   4. Send our client Finished.
+    #
+    # Returns 0 on success, -1 on any failure. The peer's TCP slot is
+    # left open so the caller can switch to tls_send/tls_recv.
+    saw_server_finished: int32 = 0
+    th_before_sf: Array[32, uint8]
+    # Per-message walk state across multiple records (a Certificate
+    # alone is sometimes > 1 record, but the cipher fragments are
+    # already reassembled inside one decrypted plaintext, so each
+    # call here works on one record's plaintext). Stitching messages
+    # across plaintext records would need an inter-record buffer; we
+    # haven't seen that shape on example.com / Let's Encrypt origins.
+    # For TLS 1.3 the EE..Finished flight is typically packed into a
+    # single AEAD record.
+    while saw_server_finished == 0:
+        rec_total_signed: int64 = _tls_read_record(tcp_slot, 400)
+        if rec_total_signed <= 0:
+            printk0("[tls] post-SH: tcp recv timed out / EOF\n")
+            return -1
+        rec_total: uint64 = cast[uint64](rec_total_signed)
+        rt: uint8 = tls_rx_buf[0]
+        if rt == TLS_CT_CHANGE_CIPHER:
+            printk0("[tls] skipped legacy ChangeCipherSpec\n")
+            continue
+        if rt == TLS_CT_ALERT:
+            # Plaintext alert (before keys are switched the server
+            # might send a fatal alert in cleartext).
+            printk0("[tls] received plaintext alert; aborting\n")
+            return -1
+        if rt != TLS_CT_APPLICATION:
+            printk1("[tls] post-SH unexpected record type %d\n",
+                    cast[uint64](rt))
+            return -1
+        pt_signed: int64 = _tls_decrypt_record(rec_total, 1)
+        if pt_signed < 0:
+            printk0("[tls] AEAD decrypt FAILED (key schedule mismatch?)\n")
+            return -1
+        pt_len: uint64 = cast[uint64](pt_signed)
+        real_type: uint8 = 0
+        real_type_ptr: Ptr[uint8] = cast[Ptr[uint8]](&real_type)
+        inner_signed: int64 = _tls_strip_inner_padding(pt_len,
+                                                        real_type_ptr)
+        if inner_signed < 0:
+            return -1
+        inner_len: uint64 = cast[uint64](inner_signed)
+        if real_type == TLS_CT_ALERT:
+            printk0("[tls] post-SH inner alert; aborting\n")
+            return -1
+        if real_type != TLS_CT_HANDSHAKE:
+            printk1("[tls] post-SH inner type=%d (want handshake)\n",
+                    cast[uint64](real_type))
+            return -1
+        # Walk handshake messages in this plaintext.
+        mpos: uint64 = 0
+        while mpos < inner_len:
+            if mpos + 4 > inner_len:
+                printk0("[tls] truncated handshake header\n")
+                return -1
+            ht: uint8 = tls_pt_buf[mpos]
+            mlen: uint64 = (cast[uint64](tls_pt_buf[mpos + 1]) << 16) \
+                | (cast[uint64](tls_pt_buf[mpos + 2]) << 8) \
+                | cast[uint64](tls_pt_buf[mpos + 3])
+            if mpos + 4 + mlen > inner_len:
+                printk0("[tls] handshake message overruns plaintext\n")
+                return -1
+            if ht == TLS_HS_ENCRYPTED_EXT:
+                printk1("[tls] EncryptedExtensions (%d bytes)\n", mlen)
+                # Update transcript hash with the whole message
+                # (type + 3-byte length + body) per RFC 8446 §4.4.1.
+                _tls_tr_update(
+                    cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
+            elif ht == TLS_HS_CERTIFICATE:
+                # Parse the Certificate message just enough to log how
+                # many certs were in the chain. Wire shape (RFC 8446
+                # §4.4.2):
+                #   opaque certificate_request_context<0..255>;
+                #   CertificateEntry certificate_list<0..2^24-1>;
+                # Each CertificateEntry: 3-byte cert_data length + cert
+                # bytes + 2-byte extensions length + extensions.
+                #
+                # V0: skip-validate. The cert bytes are real X.509 DER
+                # but we discard them rather than parse — needs a real
+                # ASN.1 + signature pipeline, deferred. Update the
+                # transcript hash with the whole message so the server's
+                # Finished HMAC still checks out.
+                cnt: uint64 = 0
+                cpos: uint64 = mpos + 4
+                if cpos + 1 <= mpos + 4 + mlen:
+                    ctx_len: uint64 = cast[uint64](tls_pt_buf[cpos])
+                    cpos = cpos + 1 + ctx_len
+                    if cpos + 3 <= mpos + 4 + mlen:
+                        list_len: uint64 = \
+                            (cast[uint64](tls_pt_buf[cpos]) << 16) \
+                            | (cast[uint64](tls_pt_buf[cpos + 1]) << 8) \
+                            | cast[uint64](tls_pt_buf[cpos + 2])
+                        cpos = cpos + 3
+                        list_end: uint64 = cpos + list_len
+                        if list_end <= mpos + 4 + mlen:
+                            while cpos + 3 <= list_end:
+                                clen: uint64 = \
+                                    (cast[uint64](tls_pt_buf[cpos]) << 16) \
+                                    | (cast[uint64](tls_pt_buf[cpos + 1]) << 8) \
+                                    | cast[uint64](tls_pt_buf[cpos + 2])
+                                cpos = cpos + 3 + clen
+                                if cpos + 2 > list_end:
+                                    break
+                                ext_len: uint64 = \
+                                    (cast[uint64](tls_pt_buf[cpos]) << 8) \
+                                    | cast[uint64](tls_pt_buf[cpos + 1])
+                                cpos = cpos + 2 + ext_len
+                                cnt = cnt + 1
+                printk1("[tls] Certificate: %d certs in chain (NOT validated)\n",
+                        cnt)
+                printk0("[tls] WARNING: server cert NOT validated\n")
+                _tls_tr_update(
+                    cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
+            elif ht == TLS_HS_CERT_VERIFY:
+                # Wire shape: 2-byte signature_algorithm + 2-byte
+                # signature length + signature bytes. V0 skip-validates;
+                # we still feed it into the transcript hash so the
+                # subsequent Finished verifies.
+                if mlen >= 2:
+                    sa: uint16 = (cast[uint16](tls_pt_buf[mpos + 4]) << 8) \
+                        | cast[uint16](tls_pt_buf[mpos + 5])
+                    printk1("[tls] CertVerify sig_alg=0x%x (NOT validated)\n",
+                            cast[uint64](sa))
+                _tls_tr_update(
+                    cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
+            elif ht == TLS_HS_FINISHED:
+                # Snapshot transcript hash BEFORE feeding Finished —
+                # that's what the server HMAC'd.
+                _tls_sha256_snapshot_into(
+                    cast[Ptr[uint8]](&th_before_sf[0]))
+                vrc: int32 = _tls_verify_server_finished(
+                    cast[Ptr[uint8]](&tls_pt_buf[mpos + 4]), mlen,
+                    cast[Ptr[uint8]](&th_before_sf[0]))
+                if vrc != 0:
+                    printk0("[tls] server Finished HMAC mismatch — abort\n")
+                    return -1
+                printk0("[tls] server Finished verified OK\n")
+                _tls_tr_update(
+                    cast[Ptr[uint8]](&tls_pt_buf[mpos]), 4 + mlen)
+                saw_server_finished = 1
+            else:
+                printk1("[tls] post-SH unknown handshake type %d\n",
+                        cast[uint64](ht))
+                return -1
+            mpos = mpos + 4 + mlen
+    # Compute application traffic keys (transcript hash now includes
+    # the server Finished message).
+    _tls_compute_app_keys()
+    printk0("[tls] application traffic keys derived\n")
+    # Send our Finished under the handshake traffic key.
+    if _tls_send_client_finished(tcp_slot) != 0:
+        printk0("[tls] client Finished send failed\n")
+        return -1
+    printk0("[tls] client Finished sent\n")
+    # Switch sequence numbers and mark the connection live. We DO send
+    # a dummy ChangeCipherSpec record from some clients for middlebox
+    # compatibility; we omit it here — RFC 8446 §D.4 leaves that
+    # optional, and the SLIRP path / Let's Encrypt origins accept the
+    # straight ClientHello -> ClientFinished sequence we emit.
+    tls_client_seq = 0          # reset for app-key sequence
+    tls_server_seq = 0
+    tls_active = 1
+    printk0("[tls] handshake COMPLETE (app keys live)\n")
+    return 0
+
+
+def tls_send(slot: int32, buf: Ptr[uint8], length: uint64) -> int64:
     # Encrypt + frame `length` bytes of application data, then tcp_send.
-    # Returns bytes accepted (== length on success) or -1. Currently
-    # unreachable until the full handshake lands; the wiring is here
-    # so the next commit can drop in a complete _tls_drive_post_sh.
+    # `slot` must be the same TCP slot the active TLS handshake ran on
+    # (single-connection state in V0). Returns bytes encrypted on
+    # success (== length) or -1 on error.
     if tls_active != 1:
         return -1
-    if tls_tcp_slot < 0:
+    if slot < 0:
         return -1
-    # Inner plaintext = `buf` || 0x17 (TLSInnerPlaintext content type
-    # byte; 0x17 = application_data). No zero padding.
+    if slot != tls_tcp_slot:
+        return -1
+    # Inner plaintext = `buf` || 0x17 (TLSInnerPlaintext.type for
+    # application_data). No zero padding (V0 — pad is optional).
     inner_len: uint64 = length + 1
     if inner_len + TLS_AEAD_TAG + TLS_REC_HEADER > 2048:
         return -1
@@ -2254,21 +3088,103 @@ def tls_send(buf: Ptr[uint8], length: uint64) -> int64:
                    cast[Ptr[uint8]](&tls_tx_buf[5 + inner_len]))
     tls_client_seq = tls_client_seq + 1
     total: uint64 = 5 + record_len
-    return tcp_send(tls_tcp_slot, cast[Ptr[uint8]](&tls_tx_buf[0]),
-                    total)
+    sent: int64 = tcp_send(slot, cast[Ptr[uint8]](&tls_tx_buf[0]), total)
+    if sent < cast[int64](total):
+        return -1
+    return cast[int64](length)
 
 
-def tls_recv(buf: Ptr[uint8], cap: uint64) -> int64:
-    # Drain one AEAD-protected record off the wire, return decrypted
-    # length. Stub matching tls_send's shape; full impl lands next
-    # commit alongside Finished.
+def tls_recv(slot: int32, buf: Ptr[uint8], max_len: uint64,
+             timeout_ms: uint64) -> int64:
+    # Pull the next decrypted application_data record off the wire and
+    # copy up to `max_len` plaintext bytes into `buf`. Returns the
+    # plaintext byte count (excluding the trailing TLS inner content
+    # type) on success; 0 on clean EOF / timeout-with-no-bytes; -1 on
+    # hard failure (decrypt error or unexpected record shape).
+    #
+    # Post-handshake NewSessionTicket records (handshake type 4) are
+    # transparent: we decrypt + ignore them and re-read.
     if tls_active != 1:
         return -1
-    return 0
+    if slot < 0:
+        return -1
+    if slot != tls_tcp_slot:
+        return -1
+    while True:
+        rec_total_signed: int64 = _tls_read_record(slot, timeout_ms)
+        if rec_total_signed == 0:
+            return 0
+        if rec_total_signed < 0:
+            return -1
+        rec_total: uint64 = cast[uint64](rec_total_signed)
+        rt: uint8 = tls_rx_buf[0]
+        if rt == TLS_CT_CHANGE_CIPHER:
+            # Late CCS from a chatty server; skip.
+            continue
+        if rt != TLS_CT_APPLICATION:
+            printk1("[tls] recv unexpected record type %d\n",
+                    cast[uint64](rt))
+            return -1
+        pt_signed: int64 = _tls_decrypt_record(rec_total, 0)
+        if pt_signed < 0:
+            printk0("[tls] app-data AEAD decrypt FAILED\n")
+            return -1
+        pt_len: uint64 = cast[uint64](pt_signed)
+        real_type: uint8 = 0
+        real_type_ptr: Ptr[uint8] = cast[Ptr[uint8]](&real_type)
+        inner_signed: int64 = _tls_strip_inner_padding(pt_len,
+                                                        real_type_ptr)
+        if inner_signed < 0:
+            return -1
+        inner_len: uint64 = cast[uint64](inner_signed)
+        if real_type == TLS_CT_HANDSHAKE:
+            # NewSessionTicket and other post-handshake messages.
+            # Plaintext starts with handshake type byte; log + skip.
+            if inner_len >= 1:
+                ht: uint8 = tls_pt_buf[0]
+                if ht == TLS_HS_NEW_SESSION_TICKET:
+                    printk0("[tls] skipped post-handshake NewSessionTicket\n")
+                else:
+                    printk1("[tls] skipped post-handshake hs type %d\n",
+                            cast[uint64](ht))
+            continue
+        if real_type == TLS_CT_ALERT:
+            # close_notify is alert level=warning, desc=0 → treat as EOF.
+            if inner_len >= 2:
+                lvl: uint8 = tls_pt_buf[0]
+                desc: uint8 = tls_pt_buf[1]
+                if desc == 0:
+                    printk0("[tls] received close_notify\n")
+                    return 0
+                printk2("[tls] received alert level=%d desc=%d\n",
+                        cast[uint64](lvl), cast[uint64](desc))
+            return -1
+        if real_type != TLS_CT_APPLICATION:
+            printk1("[tls] recv inner type=%d ignored\n",
+                    cast[uint64](real_type))
+            continue
+        # Application data: copy up to max_len plaintext bytes.
+        n: uint64 = inner_len
+        if n > max_len:
+            n = max_len
+        i: uint64 = 0
+        while i < n:
+            buf[i] = tls_pt_buf[i]
+            i = i + 1
+        return cast[int64](n)
+    return -1
 
 
 def tls_close():
-    if tls_tcp_slot >= 0:
-        tcp_close(tls_tcp_slot)
+    # NB: we deliberately DON'T call tcp_close here. The active-close
+    # FIN/ACK/FIN/ACK exchange ran fine on the TCP smoke path, but
+    # post-TLS the peer's FIN sometimes never arrives within tcp_close's
+    # 1-second polling budget (Python's SSLContext server keeps the
+    # socket lingering even after `c.close()`), and the polling loop
+    # in tcp.ad never observes the TIME_WAIT transition. For a one-
+    # shot HTTPS GET the slot leak is acceptable — the next handshake
+    # would just reuse a fresh slot. A proper send-close_notify-then-
+    # tcp_close path is V1 follow-up alongside cert validation.
     tls_tcp_slot = -1
     tls_active = 0
+    tls_rxr_len = 0

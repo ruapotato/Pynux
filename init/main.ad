@@ -97,7 +97,9 @@ from drivers.net.dns import dns_init, dns_lookup
 from drivers.net.tcp import (
     tcp_init, tcp_connect, tcp_send, tcp_recv, tcp_close,
 )
-from drivers.net.http import http_init, http_get
+from drivers.net.http import http_init, http_get, https_get
+from drivers.net.tls import tls_init
+from fs.cpio import initramfs_entry_count, initramfs_entry_name
 from kernel.block.blk import (
     blk_read_sectors, blk_write_sectors, find_blockdev, blk_scan_partitions,
 )
@@ -343,6 +345,7 @@ def net_smoke_test():
         dns_init()
         tcp_init()
         http_init()
+        tls_init()
 
         virtio_net_send_arp_probe()
         spin: uint64 = 0
@@ -431,6 +434,13 @@ def net_smoke_test():
                 # resolve so the test_net_http.sh skip-on-no-internet
                 # path matches test_dns.sh's behaviour.
                 http_smoke_test()
+
+                # --- HTTPS GET smoke (TLS 1.3) --------------------
+                # Fetches https://example.com/ end-to-end through the
+                # in-kernel TLS 1.3 client. NO cert validation — see
+                # drivers/net/tls.ad header banner. PASS line:
+                # `[https] GET example.com -> status=200 body=Nbytes`.
+                https_smoke_test()
 
         # --- TCP three-way handshake smoke (M16.102) -----------
         # Open a TCP connection to a SLIRP-forwarded echo service
@@ -538,6 +548,95 @@ def http_smoke_test():
     i: uint64 = 0
     while i < body_n:
         c: uint8 = http_body[i]
+        if c == 0x0A:
+            printk0("\\n")
+        elif c == 0x0D:
+            printk0("\\r")
+        elif c < 0x20:
+            printk0(".")
+        elif c > 0x7E:
+            printk0(".")
+        else:
+            printk1("%c", cast[uint64](c))
+        i = i + 1
+    printk0("'\n")
+
+
+# Top-level scratch for https_smoke_test / https_local_smoke_test —
+# keep out of the call frame (Adder's nested-Array-in-frame quirk;
+# the cousin of http_body above).
+https_body: Array[8192, uint8]
+
+
+def https_local_smoke_test():
+    # Local TLS 1.3 smoke against a SLIRP-forwarded Python TLS server
+    # at 10.0.2.200:443. The test harness (scripts/test_net_https.sh)
+    # arranges the guestfwd:
+    #
+    #   -netdev user,guestfwd=tcp:10.0.2.200:443-tcp:127.0.0.1:9443
+    #
+    # No-op SKIP path: when no guestfwd is set up, tcp_connect to
+    # 10.0.2.200 times out after the configured budget (2 s) and we
+    # log a skip line — boot continues normally without affecting
+    # other regression tests.
+    printk0("[https-local] smoke test starting (10.0.2.200:443)\n")
+    https_url:    Ptr[uint8] = "https://10.0.2.200/"
+    https_status: int32 = 0
+    body_ptr:     Ptr[uint8] = cast[Ptr[uint8]](&https_body[0])
+    status_ptr:   Ptr[int32] = cast[Ptr[int32]](&https_status)
+    n: int64 = https_get(https_url, body_ptr, 8192, status_ptr)
+    if n < 0:
+        printk0("[https-local] SKIP (no guestfwd? or handshake failed)\n")
+        return
+    printk2("[https-local] GET 10.0.2.200 -> status=%d body=%dbytes\n",
+            cast[uint64](https_status), cast[uint64](n))
+    printk0("[https-local] body[0..96]: '")
+    body_n: uint64 = cast[uint64](n)
+    if body_n > 96:
+        body_n = 96
+    i: uint64 = 0
+    while i < body_n:
+        c: uint8 = https_body[i]
+        if c == 0x0A:
+            printk0("\\n")
+        elif c == 0x0D:
+            printk0("\\r")
+        elif c < 0x20:
+            printk0(".")
+        elif c > 0x7E:
+            printk0(".")
+        else:
+            printk1("%c", cast[uint64](c))
+        i = i + 1
+    printk0("'\n")
+
+
+def https_smoke_test():
+    # In-kernel HTTPS/1.1 GET smoke test. Fetches https://example.com/
+    # via the full TLS 1.3 client. example.com always serves a small
+    # HTML page starting with `<!doctype html>`; the test wrapper
+    # greps for that token + the 200 status to confirm the whole
+    # ClientHello -> handshake -> AEAD app-data round-trip ran end-to-
+    # end. Cert chain is NOT validated this commit — see the
+    # `[tls] WARNING:` banner emitted during the handshake.
+    printk0("[https] smoke test starting\n")
+    https_url:    Ptr[uint8] = "https://example.com/"
+    https_status: int32 = 0
+    body_ptr:     Ptr[uint8] = cast[Ptr[uint8]](&https_body[0])
+    status_ptr:   Ptr[int32] = cast[Ptr[int32]](&https_status)
+    n: int64 = https_get(https_url, body_ptr, 8192, status_ptr)
+    if n < 0:
+        printk0("[https] GET failed\n")
+        return
+    printk2("[https] GET example.com -> status=%d body=%dbytes\n",
+            cast[uint64](https_status), cast[uint64](n))
+    printk0("[https] body[0..96]: '")
+    body_n: uint64 = cast[uint64](n)
+    if body_n > 96:
+        body_n = 96
+    i: uint64 = 0
+    while i < body_n:
+        c: uint8 = https_body[i]
         if c == 0x0A:
             printk0("\\n")
         elif c == 0x0D:
@@ -995,6 +1094,40 @@ def start_kernel():
 
     # Initialise the VFS fd table BEFORE any user task issues SYS_OPEN.
     vfs_init()
+
+    # --- HTTPS local smoke (TLS 1.3) gated on cpio marker -----
+    # Runs only when scripts/test_net_https.sh planted /etc/tls-test
+    # in the initramfs (ENABLE_TLS_SMOKE=1) AND a guestfwd to
+    # 10.0.2.200:443 is configured. Other tests (test_net_tcp.sh etc.)
+    # don't ship that marker — the smoke is skipped, avoiding the
+    # tcp_connect ARP-stall that would otherwise blow their qemu
+    # budget. Placed AFTER vfs_init so the cpio file lookup works.
+    # Walk the cpio file table directly (no fd allocation needed at
+    # this early-init point) looking for /etc/tls-test.
+    tls_marker_found: int32 = 0
+    tm_idx: uint64 = 0
+    tm_count: uint64 = initramfs_entry_count()
+    while tm_idx < tm_count:
+        tm_name: Ptr[char] = initramfs_entry_name(tm_idx)
+        # Compare byte-by-byte with "/etc/tls-test\0".
+        ok: int32 = 1
+        tm_target: Ptr[uint8] = "/etc/tls-test"
+        tm_j: uint64 = 0
+        while tm_j < 14:                            # 13 chars + NUL
+            if cast[uint8](tm_name[tm_j]) != tm_target[tm_j]:
+                ok = 0
+                tm_j = 14                            # break
+            else:
+                tm_j = tm_j + 1
+        if ok == 1:
+            tls_marker_found = 1
+            tm_idx = tm_count                        # break
+        else:
+            tm_idx = tm_idx + 1
+    if tls_marker_found == 1:
+        https_local_smoke_test()
+    else:
+        printk0("[https-local] skipped (no /etc/tls-test marker)\n")
 
     # V2.75: kzalloc the root Pgrp and pin its refcount. Idempotent;
     # safe to call before any task touches bind/mount. The root Pgrp

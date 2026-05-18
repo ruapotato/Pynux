@@ -31,6 +31,15 @@ FILES = [
     ("/hello.txt",  b"Hello from a third file. cpio supports many.\n"),
 ]
 
+# Optional opt-in markers controlled by env vars. Used by per-test
+# harness scripts to enable kernel-side smoke tests that would
+# otherwise hang/regress unrelated test runs. See
+# scripts/test_net_https.sh which sets ENABLE_TLS_SMOKE=1 to plant
+# `/etc/tls-test`; init/main.ad gates `https_local_smoke_test()` on
+# that file's presence.
+if os.environ.get("ENABLE_TLS_SMOKE") == "1":
+    FILES.append(("/etc/tls-test", b"1\n"))
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.

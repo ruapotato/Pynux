@@ -868,16 +868,59 @@ def _https_parse_url(url: Ptr[uint8],
     return 0
 
 
+def _https_parse_ipv4(host: Ptr[uint8], out_ip: Ptr[uint8]) -> int32:
+    # Parse a dotted-quad ASCII IPv4 (e.g. "10.0.2.200") into out_ip[0..4].
+    # Returns 0 on success; -1 if the string isn't a clean N.N.N.N
+    # with each N in 0..255.
+    host_len: uint64 = _http_strlen(host)
+    if host_len == 0:
+        return -1
+    pos: uint64 = 0
+    octet: uint32 = 0
+    octet_idx: uint32 = 0
+    has_digit: int32 = 0
+    while pos < host_len:
+        c: uint8 = host[pos]
+        if _http_is_digit(c) == 1:
+            octet = octet * 10 + cast[uint32](c - 0x30)
+            if octet > 255:
+                return -1
+            has_digit = 1
+        elif c == 0x2E:                       # '.'
+            if has_digit == 0:
+                return -1
+            if octet_idx > 2:
+                return -1
+            out_ip[octet_idx] = cast[uint8](octet)
+            octet_idx = octet_idx + 1
+            octet = 0
+            has_digit = 0
+        else:
+            return -1
+        pos = pos + 1
+    if has_digit == 0:
+        return -1
+    if octet_idx != 3:
+        return -1
+    out_ip[3] = cast[uint8](octet)
+    return 0
+
+
 def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
               status_out: Ptr[int32]) -> int64:
-    # Mirror of http_get for `https://` URLs. Returns body bytes
-    # written on success, or -1 on any pre-body failure. status_out
-    # carries the numeric HTTP status (200/...) on success.
-    #
-    # Current state (TLS 1.3 partial — see drivers/net/tls.ad header):
-    # the handshake state machine reaches the "AEAD round-trip on the
-    # first encrypted record" milestone; full body retrieval lands in
-    # the follow-up commit that closes Finished + app-data flow.
+    # Mirror of http_get for `https://` URLs. End-to-end HTTPS/1.1 GET:
+    #   1. Parse the URL into (host, port, path).
+    #   2. DNS lookup -> IPv4.
+    #   3. tcp_connect.
+    #   4. tls_handshake (full TLS 1.3 handshake: ClientHello +
+    #      ServerHello + X25519 ECDHE + HKDF + AEAD + server Finished
+    #      verify + client Finished. NO cert validation — see header.)
+    #   5. tls_send the HTTP request.
+    #   6. tls_recv chunks of the response, parse status line + headers
+    #      + body the same way http_get does — but talking to the TLS
+    #      slot instead of the raw TCP slot.
+    # Returns body bytes written on success, or -1 on any pre-body
+    # failure. status_out carries the numeric HTTP status.
     tls_init()
     status_out[0] = 0
     if url == cast[Ptr[uint8]](0):
@@ -896,17 +939,162 @@ def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
 
     ip_out: Array[4, uint8]
     ip_ptr: Ptr[uint8] = cast[Ptr[uint8]](&ip_out[0])
-    if dns_lookup(host_ptr, ip_ptr, 200) != 0:
-        printk0("[https] DNS lookup failed\n")
-        return -1
+    # IP-literal fast path: a dotted-quad host bypasses DNS — lets the
+    # smoke test reach a SLIRP-forwarded local TLS server (e.g.
+    # `guestfwd=tcp:10.0.2.200:443-cmd:openssl s_server ...`) without
+    # needing outbound UDP/53 to resolve a real hostname.
+    if _https_parse_ipv4(host_ptr, ip_ptr) == 0:
+        printk2("[https] using IP literal %d.%d.",
+                cast[uint64](ip_out[0]), cast[uint64](ip_out[1]))
+        printk2("%d.%d\n",
+                cast[uint64](ip_out[2]), cast[uint64](ip_out[3]))
+    else:
+        if dns_lookup(host_ptr, ip_ptr, 200) != 0:
+            printk0("[https] DNS lookup failed\n")
+            return -1
     slot: int32 = tcp_connect(ip_out[0], ip_out[1], ip_out[2],
                               ip_out[3], port_val, 200)
     if slot < 0:
         printk0("[https] tcp_connect failed\n")
         return -1
     if tls_handshake(slot, host_ptr) != 0:
-        printk0("[https] TLS handshake did not complete this commit\n")
+        printk0("[https] TLS handshake failed\n")
         tls_close()
         return -1
+
+    # Build the HTTP request via the same helper http_get uses; the
+    # bytes go into http_req_buf, then we hand them to tls_send rather
+    # than tcp_send.
+    req_len_signed: int64 = _http_build_request(host_ptr, path_ptr)
+    if req_len_signed < 0:
+        tls_close()
+        return -1
+    req_len: uint64 = cast[uint64](req_len_signed)
+    req_ptr: Ptr[uint8] = cast[Ptr[uint8]](&http_req_buf[0])
+    ts: int64 = tls_send(slot, req_ptr, req_len)
+    if ts < 0:
+        printk0("[https] tls_send failed\n")
+        tls_close()
+        return -1
+    printk1("[https] request sent (%d bytes encrypted)\n", req_len)
+
+    # Receive + parse response — same state machine as http_get, but
+    # using tls_recv as the byte source. We re-use http_rx_buf as the
+    # scratch chunk for each decrypted record.
+    head_done: int32 = 0
+    have_cl:   int32 = 0
+    cl_val:    uint64 = 0
+    body_written: uint64 = 0
+    rx_ptr: Ptr[uint8] = cast[Ptr[uint8]](&http_rx_buf[0])
+
+    while True:
+        n: int64 = tls_recv(slot, rx_ptr, HTTP_RX_BUF_BYTES, 400)
+        if n < 0:
+            printk0("[https] tls_recv error\n")
+            tls_close()
+            return -1
+        if n == 0:
+            break                              # clean EOF
+        chunk_n: uint64 = cast[uint64](n)
+        http_bytes_in = http_bytes_in + chunk_n
+
+        body_off: uint64 = 0
+
+        if head_done == 0:
+            if status_out[0] == 0:
+                so: int64 = _http_parse_status_line(
+                    rx_ptr, chunk_n, status_out)
+                if so < 0:
+                    tls_close()
+                    return -1
+                hdr_scan_start: uint64 = cast[uint64](so)
+                s_code: int32 = status_out[0]
+                if s_code >= 200:
+                    if s_code < 300:
+                        http_2xx = http_2xx + 1
+                if s_code >= 400:
+                    if s_code < 500:
+                        http_4xx = http_4xx + 1
+                if s_code >= 500:
+                    if s_code < 600:
+                        http_5xx = http_5xx + 1
+                hp: uint64 = hdr_scan_start
+                state: uint8 = HTTP_HS_TEXT
+                found_end: int32 = 0
+                end_off: uint64 = 0
+                while hp < chunk_n:
+                    c: uint8 = http_rx_buf[hp]
+                    if state == HTTP_HS_TEXT:
+                        if c == 0x0D:
+                            state = HTTP_HS_AFTER_R
+                    elif state == HTTP_HS_AFTER_R:
+                        if c == 0x0A:
+                            state = HTTP_HS_LINESTART
+                        else:
+                            state = HTTP_HS_TEXT
+                    elif state == HTTP_HS_LINESTART:
+                        if c == 0x0D:
+                            state = HTTP_HS_AFTER_RN_R
+                        else:
+                            state = HTTP_HS_TEXT
+                    elif state == HTTP_HS_AFTER_RN_R:
+                        if c == 0x0A:
+                            found_end = 1
+                            end_off = hp + 1
+                            hp = chunk_n
+                            break
+                        else:
+                            state = HTTP_HS_TEXT
+                    hp = hp + 1
+                if found_end == 1:
+                    head_done = 1
+                    cl_ptr: Ptr[uint64] = cast[Ptr[uint64]](&cl_val)
+                    rc_cl: int32 = _http_extract_content_length(
+                        rx_ptr, hdr_scan_start, end_off, cl_ptr)
+                    if rc_cl == 1:
+                        have_cl = 1
+                        printk1("[https] Content-Length: %d\n", cl_val)
+                    elif rc_cl == 0:
+                        printk0("[https] no Content-Length; reading until EOF\n")
+                    body_off = end_off
+                else:
+                    # Header block spans recv chunks — accept the
+                    # truncation for V0 (example.com headers all fit
+                    # in one TLS record).
+                    printk0("[https] headers > 4KiB scratch; truncated\n")
+                    tls_close()
+                    return cast[int64](body_written)
+            else:
+                printk0("[https] headers span recv chunks; truncated\n")
+                tls_close()
+                return cast[int64](body_written)
+
+        if body_off < chunk_n:
+            copy_avail: uint64 = chunk_n - body_off
+            copy_room:  uint64 = out_max - body_written
+            copy_n: uint64 = copy_avail
+            if copy_n > copy_room:
+                copy_n = copy_room
+            if have_cl == 1:
+                remaining: uint64 = cl_val - body_written
+                if copy_n > remaining:
+                    copy_n = remaining
+            i: uint64 = 0
+            while i < copy_n:
+                out_buf[body_written + i] = http_rx_buf[body_off + i]
+                i = i + 1
+            body_written = body_written + copy_n
+
+        if body_written >= out_max:
+            break
+        if have_cl == 1:
+            if body_written >= cl_val:
+                break
+
     tls_close()
-    return 0
+    if head_done == 0:
+        printk0("[https] no headers received\n")
+        return -1
+    printk2("[https] GET complete: status=%d body=%d bytes\n",
+            cast[uint64](status_out[0]), body_written)
+    return cast[int64](body_written)
