@@ -816,6 +816,11 @@ FD_CONS_MARK:   uint32 = 0xFFFFFFF1
 FD_TIME_MARK:   uint32 = 0xFFFFFFF0
 FD_PID_MARK:    uint32 = 0xFFFFFFEF
 FD_RANDOM_MARK: uint32 = 0xFFFFFFEE
+# M16.130: FD_MOUSE_MARK backs /dev/mouse — Plan 9-shape cdev wrapping
+# the drivers/input/auxmouse.ad event ring. devmouse_read pops one
+# event and renders it as "<dx> <dy> <buttons>\n"; writes return -1
+# (read-only). See sys/src/9/port/devmouse.ad for the body.
+FD_MOUSE_MARK:  uint32 = 0xFFFFFFED
 
 
 def current_task_pid() -> uint64:

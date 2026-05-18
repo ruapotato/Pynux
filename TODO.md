@@ -905,13 +905,28 @@ it has to honour.
   buttons}`). Boot-time decoder self-test asserts 7 cases (signed
   delta extraction, button-bitmap, Y-flip for screen-down, resync,
   overflow drop). See `scripts/test_mouse.sh`. Follow-ups:
-    - `/dev/mouse` cdev path (mirror M16.94 /dev/cons shape;
-      `mouse_rx_pop()` accessor already in place).
+    - ~~`/dev/mouse` cdev path (mirror M16.94 /dev/cons shape;
+      `mouse_rx_pop()` accessor already in place).~~ M16.130:
+      `sys/src/9/port/devmouse.ad` ships the Plan 9-shape cdev.
+      One read pops one event and emits ASCII
+      `"<dx> <dy> <buttons>\n"`; writes return -1 (read-only).
+      Empty ring returns 0 bytes (non-blocking poll semantics).
+      VFS wiring uses `FD_MOUSE_MARK = 0xFFFFFFED`. See
+      `scripts/test_devmouse.sh`.
     - 4-byte protocol with scroll wheel — the
       `0xF3 200, 0xF3 100, 0xF3 80` knock pattern enables it;
-      decoder needs a phase-3 byte for Z + extra buttons.
+      decoder needs a phase-3 byte for Z + extra buttons. After
+      M16.130 the wire format change also needs a fourth column
+      in `/dev/mouse`'s ASCII line ("<dx> <dy> <dz> <buttons>\n").
     - `hamwd` input dispatch — Layer-3 GUI consumer that maps
-      events to per-window cursor coordinates.
+      events to per-window cursor coordinates. Reads from
+      `/dev/mouse` instead of reaching into auxmouse.ad directly.
+    - Mouse cursor rendering in the framebuffer — depends on
+      hamwd; the cdev is the input source, the cursor sprite is
+      a separate Layer-3 concern.
+    - Blocking read on `/dev/mouse` (wait_event on
+      `mouse_ring_has`) — needs the syscall layer's wait-queue
+      story finalised; today the cdev is poll-only.
     - MADT IRQ-override consumption — today we accept the default
       level-triggered active-low IOAPIC redirection; ISA IRQ 12 is
       really edge-triggered active-high and a future ACPI-driven

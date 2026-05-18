@@ -1,0 +1,182 @@
+# sys/src/9/port/devmouse.ad
+#
+# Layer 1 (Plan 9-shape) mouse device — fifth concrete /dev/* cdev on
+# the Hamnix native surface, sibling to devcons.ad / devtime.ad /
+# devpid.ad / devrandom.ad. One read pops one event off the
+# drivers/input/auxmouse.ad ring and renders it as a single ASCII
+# line: "<dx> <dy> <buttons>\n" (signed integers, space-separated,
+# newline-terminated). Writes return -1 — the mouse is read-only.
+#
+# See drivers/input/auxmouse.ad (M16.128) for the upstream ring + the
+# `mouse_rx_pop()` accessor that encodes a MouseEvent into a packed
+# int32:
+#   bits  0..15  dx & 0xFFFF (low 16 bits of int32 delta)
+#   bits 16..23  buttons (uint8 bitmap: bit0=L bit1=R bit2=M)
+#   bits 24..31  dy & 0xFF  (sign-extends from 8 bits — adequate for
+#                            the 9-bit PS/2 delta after overflow drop)
+#   value -1     ring is empty (no real event encodes to all-ones —
+#                buttons is masked to 0x07)
+#
+# Non-blocking semantics: an empty ring returns 0 bytes read (EOF-ish),
+# letting future GUI code poll without descheduling. A blocking
+# variant — wait_event_interruptible(mouse_ring_has) — lands when
+# devpoll / select() arrive.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.input.auxmouse import mouse_rx_pop, mouse_rx_has
+
+
+# --- ASCII decimal formatting helpers ----------------------------------
+#
+# Mirrors fs/procfs.ad::_buf_put_dec and devtime.ad / devpid.ad shape:
+# reverse-fill on a tiny stack, copy out top-down. We add a signed
+# wrapper because dx/dy can be negative.
+
+def _devmouse_u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    if value == 0:
+        out[0] = 48                          # '0'
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while value != 0:
+        digits[n] = cast[uint8](value % 10) + 48
+        value = value / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def _devmouse_i32_to_dec(value: int32, out: Ptr[uint8]) -> uint64:
+    # Signed wrapper: emit '-' for negatives, then negate and reuse the
+    # unsigned path. INT_MIN edge case is harmless here — PS/2 deltas
+    # are bounded to roughly [-256, +255] before our int32 cast.
+    if value < 0:
+        out[0] = 45                          # '-'
+        abs_val: uint64 = cast[uint64](-value) & 0xFFFFFFFF
+        n: uint64 = _devmouse_u64_to_dec(abs_val, &out[1])
+        return n + 1
+    return _devmouse_u64_to_dec(cast[uint64](value) & 0xFFFFFFFF, out)
+
+
+# --- Decode helpers ----------------------------------------------------
+#
+# Reverse the packing in auxmouse.ad::mouse_rx_pop:
+#   bits  0..15  dx (sign-extend from 16-bit)
+#   bits 16..23  buttons (uint8)
+#   bits 24..31  dy (sign-extend from 8-bit)
+# The compiler quirk noted in feedback_compiler_quirks (cast[uint64]
+# of arr[i] zero-extends unreliably for negative int32 fields) doesn't
+# bite us here because `encoded` already arrived as int32 from the
+# auxmouse return value — we just bit-mask via uint64 width then
+# sign-extend explicitly.
+
+def _decode_dx(encoded: int32) -> int32:
+    raw: uint64 = cast[uint64](encoded) & 0xFFFF
+    # Sign-extend from bit 15.
+    if (raw & 0x8000) != 0:
+        return cast[int32](raw | 0xFFFFFFFFFFFF0000)
+    return cast[int32](raw)
+
+
+def _decode_dy(encoded: int32) -> int32:
+    raw: uint64 = (cast[uint64](encoded) >> 24) & 0xFF
+    # Sign-extend from bit 7.
+    if (raw & 0x80) != 0:
+        return cast[int32](raw | 0xFFFFFFFFFFFFFF00)
+    return cast[int32](raw)
+
+
+def _decode_buttons(encoded: int32) -> uint32:
+    return cast[uint32]((cast[uint64](encoded) >> 16) & 0xFF)
+
+
+# --- public API --------------------------------------------------------
+
+def devmouse_open(path: Ptr[uint8]) -> int32:
+    # Path-match guard. Today /dev/mouse is the only path that opens to
+    # this cdev; the vfs.ad open arms route here unconditionally so
+    # this helper is informational (kept for symmetry with the other
+    # Plan 9 dev*_open shapes that future commits may add).
+    # Returns FD_MOUSE_MARK (0xFFFFFFED) cast through int32; callers
+    # who care about the literal can import FD_MOUSE_MARK directly.
+    p: Ptr[uint8] = path
+    expected: Ptr[uint8] = "/dev/mouse"
+    i: uint64 = 0
+    while i < 10:
+        if p[i] != expected[i]:
+            return -1
+        i = i + 1
+    if p[10] != 0:
+        return -1
+    return cast[int32](0xFFFFFFED)
+
+
+def devmouse_read(buf: Ptr[uint8], count: uint64) -> int64:
+    # Non-blocking: empty ring -> 0 bytes read. Caller polls via repeat
+    # syscalls (or future select/poll). Format one event as
+    # "<dx> <dy> <buttons>\n" then copy up to `count` bytes.
+    if count == 0:
+        return 0
+    encoded: int32 = mouse_rx_pop()
+    if encoded == -1:
+        # Sentinel: ring empty. Plan 9 devmouse blocks here; we don't
+        # have wait queues wired through the syscall layer yet, so the
+        # caller sees a zero-length read and is expected to retry.
+        return 0
+
+    dx: int32 = _decode_dx(encoded)
+    dy: int32 = _decode_dy(encoded)
+    buttons: uint32 = _decode_buttons(encoded)
+
+    # "<dx> <dy> <buttons>\n" — worst-case width:
+    #   dx:   "-32768" = 6 bytes
+    #   sp:   1
+    #   dy:   "-128"   = 4 bytes  (8-bit signed range)
+    #   sp:   1
+    #   btns: "255"    = 3 bytes  (bitmap mask, in practice 0..7)
+    #   nl:   1
+    # Total <= 16. 48 is comfortable headroom for a future wider field.
+    scratch: Array[48, uint8]
+    pos: uint64 = 0
+    n: uint64 = _devmouse_i32_to_dec(dx, &scratch[pos])
+    pos = pos + n
+    scratch[pos] = 32                        # ' '
+    pos = pos + 1
+    n = _devmouse_i32_to_dec(dy, &scratch[pos])
+    pos = pos + n
+    scratch[pos] = 32                        # ' '
+    pos = pos + 1
+    n = _devmouse_u64_to_dec(cast[uint64](buttons) & 0xFFFFFFFF, &scratch[pos])
+    pos = pos + n
+    scratch[pos] = 10                        # '\n'
+    pos = pos + 1
+
+    take: uint64 = count
+    if take > pos:
+        take = pos
+    i: uint64 = 0
+    while i < take:
+        buf[i] = scratch[i]
+        i = i + 1
+    return cast[int64](take)
+
+
+def devmouse_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # /dev/mouse is read-only. Future commits may accept writes to
+    # synthesise events (test fixture / accessibility input) but for
+    # the M16.130 minimum we reject every writer.
+    return -1
+
+
+def devmouse_close(fd: int32) -> int32:
+    # Stateless cdev — no per-fd slot, no kmalloc, nothing to release.
+    # Mirrors the FD_TIME_MARK / FD_PID_MARK / FD_RANDOM_MARK close
+    # arms (which today fall through to close_fd_in_task without a
+    # per-cdev hook). Kept exported so a future blocking-read variant
+    # has a place to drop its wait-queue cleanup.
+    return 0

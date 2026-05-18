@@ -1,0 +1,120 @@
+# tests/test_devmouse.ad
+#
+# M16.130 regression: open /dev/mouse for read, attempt one short
+# read, echo the captured slice to stdout. The companion script asserts
+# the open(2) succeeded and — if any bytes were read — they match the
+# "<dx> <dy> <buttons>\n" contract devmouse_read() promises.
+#
+# Why we don't require a non-empty read:
+#   QEMU's `-nographic -no-reboot -monitor none` config (the rest of
+#   the test suite's baseline) gives us no monitor socket to inject
+#   `mouse_move` over, so the auxmouse ring is typically empty for the
+#   duration of this test. The PASS marker is the open-succeeded
+#   banner; the format check only fires when a non-zero read happens
+#   to land (e.g. via a future QMP-driven overlay).
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       tests/test_devmouse.ad -o build/user/test_devmouse.elf
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen(s))
+
+
+# Parse one ASCII "<int> <int> <int>\n" line.
+# Returns 1 if parse succeeds (all three integers consumed, terminated
+# by '\n'), 0 otherwise. Permissive about leading sign on dx/dy; the
+# buttons field is unsigned per devmouse.ad.
+def _parse_event_line(buf: Ptr[uint8], len_b: uint64) -> int32:
+    i: uint64 = 0
+    # field 0 = dx (signed)
+    if i >= len_b:
+        return 0
+    if buf[i] == 45:                         # '-'
+        i = i + 1
+    digits: int32 = 0
+    while i < len_b and buf[i] >= 48 and buf[i] <= 57:
+        digits = digits + 1
+        i = i + 1
+    if digits == 0:
+        return 0
+    if i >= len_b or buf[i] != 32:           # ' '
+        return 0
+    i = i + 1
+    # field 1 = dy (signed)
+    if i >= len_b:
+        return 0
+    if buf[i] == 45:                         # '-'
+        i = i + 1
+    digits = 0
+    while i < len_b and buf[i] >= 48 and buf[i] <= 57:
+        digits = digits + 1
+        i = i + 1
+    if digits == 0:
+        return 0
+    if i >= len_b or buf[i] != 32:           # ' '
+        return 0
+    i = i + 1
+    # field 2 = buttons (unsigned)
+    digits = 0
+    while i < len_b and buf[i] >= 48 and buf[i] <= 57:
+        digits = digits + 1
+        i = i + 1
+    if digits == 0:
+        return 0
+    if i >= len_b or buf[i] != 10:           # '\n'
+        return 0
+    return 1
+
+
+def main() -> int32:
+    write_str(1, "[test_devmouse] start\n")
+
+    fd: int32 = sys_open("/dev/mouse")
+    if fd < 0:
+        write_str(1, "[test_devmouse] open failed\n")
+        return 1
+
+    write_str(1, "[test_devmouse] opened /dev/mouse OK\n")
+
+    # devmouse_read packs "<dx> <dy> <buttons>\n" — worst case 16
+    # bytes. 64 covers the format change cleanly.
+    buf: Array[64, uint8]
+    n: int64 = sys_read(fd, &buf[0], 64)
+    if n < 0:
+        write_str(1, "[test_devmouse] read returned negative\n")
+        sys_close(fd)
+        return 1
+
+    if n == 0:
+        # Expected case under headless QEMU — auxmouse ring is empty.
+        write_str(1, "[test_devmouse] read=0 (ring empty, OK)\n")
+    else:
+        write_str(1, "[test_devmouse] line: ")
+        sys_write(1, &buf[0], cast[uint64](n))
+        # devmouse_read terminates the line with '\n', so no extra
+        # newline emit here.
+        ok: int32 = _parse_event_line(&buf[0], cast[uint64](n))
+        if ok == 0:
+            write_str(1, "[test_devmouse] parse FAIL\n")
+            sys_close(fd)
+            return 1
+        write_str(1, "[test_devmouse] parse OK\n")
+
+    sys_close(fd)
+    write_str(1, "[test_devmouse] done\n")
+    return 0
