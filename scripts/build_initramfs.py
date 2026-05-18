@@ -251,41 +251,31 @@ def build_archive() -> bytes:
                 blob += cpio_entry(name, data)
                 print(f"  embedded {name} ({len(data)} bytes)")
 
-    # U41: CPython 3.11 stdlib embedding. CPython needs to find
-    # `encodings/__init__.py` + `encodings/utf_8.py` + a handful of
-    # other stdlib modules on its sys.path at init_fs_encoding time,
-    # otherwise it aborts with:
+    # U41: CPython stdlib-on-disk embedding hook (DEPRECATED).
     #
-    #   Fatal Python error: init_fs_encoding: failed to get the Python
-    #   codec of the filesystem encoding
+    # The default U41 test no longer uses this path. CPython is now
+    # built with the bootstrap stdlib frozen INTO the binary's data
+    # segment via Tools/scripts/freeze_modules.py (see
+    # tests/u-binary/src/cpython/HOWTO.md "Frozen-modules build"),
+    # so init_fs_encoding doesn't need /usr/lib/python3.11/ in the
+    # initramfs anymore.
     #
-    # When HAMNIX_EMBED_PYLIB=<path-to-Lib-dir> is set, walk the
-    # directory and embed every .py file at /usr/lib/python3.11/<rel>.
-    # The CPython binary then finds them when PYTHONHOME=/usr/lib/
-    # python3.11 (or PYTHONPATH=/usr/lib/python3.11) is in envp.
+    # The hook is kept here (default-OFF) for flexibility: if a
+    # future Python distribution scenario wants to ship the on-disk
+    # stdlib (e.g. for pip-installed packages, or because a future
+    # CPython rebuild trims the frozen set), set HAMNIX_EMBED_PYLIB
+    # to the Lib/ path. The walker mirrors every .py file to
+    # /usr/lib/python3.11/<relpath> in the cpio archive.
     #
-    # SKIPs:
-    #   - __pycache__/ — compiled-bytecode caches are platform-specific
-    #     and just inflate the cpio without buying anything: CPython
-    #     happily compiles .py -> .pyc in memory at import time.
-    #   - lib-dynload/ — compiled C extensions (.so) need a dynamic
-    #     loader we don't have on the U-track.
-    #   - non-.py files (LICENSE, NEWS, *.png test fixtures, etc.)
-    #
-    # SIZE: the upstream Lib/ tree is ~32 MiB of .py source across
-    # ~1800 files. The cpio overhead is ~140 bytes per entry. The
-    # generated fs/initramfs_blob.S grows from ~18 MiB to ~50-60 MiB
-    # — well over GitHub's 100 MiB push cap on the assembly file,
-    # so HAMNIX_EMBED_PYLIB defaults OFF. Only the U41 test script
-    # sets it.
-    #
-    # KERNEL CAP: fs/cpio.ad caps the in-kernel file table at
-    # NR_FILES=192 entries. The full Lib/ tree plus the existing
-    # baseline (~150 entries) overflows that cap; the kernel will
-    # print "cpio: file table full" and silently drop the tail.
-    # If U41 fails for that reason, the fix is a one-line bump of
-    # NR_FILES in fs/cpio.ad (forbidden in this commit because fs/
-    # is owned by other agents this round).
+    # CAVEATS (historic):
+    #   - The full upstream Lib/ tree is ~1800 .py files. fs/cpio.ad's
+    #     NR_FILES cap (192 at the time of the M16.115 attempt) would
+    #     need bumping to 4096+ to accept that many entries.
+    #   - The generated fs/initramfs_blob.S grows ~6x larger than the
+    #     binary archive due to ASCII expansion; with the full stdlib
+    #     embedded the blob exceeds GitHub's 100 MiB push cap.
+    #   - SKIPs: __pycache__/ (platform-specific bytecode), lib-dynload/
+    #     (compiled C extensions — needs a dynamic loader we don't have).
     pylib_path = os.environ.get("HAMNIX_EMBED_PYLIB", "")
     if pylib_path:
         lib_root = Path(pylib_path)

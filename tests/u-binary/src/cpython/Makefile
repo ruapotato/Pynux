@@ -10,6 +10,25 @@
 # (mmap-heavy, brk-aggressive, getrandom, prlimit64, clock_nanosleep,
 # pselect6, ...).
 #
+# FROZEN-MODULES BUILD (this revision):
+#   We patch Tools/scripts/freeze_modules.py to widen the upstream
+#   FROZEN list. Beyond CPython 3.11's stock bootstrap set (importlib,
+#   abc, codecs, io, os, posixpath, site, ...), we add:
+#     <encodings.*>  -- the entire encodings package (~120 KB). This
+#                       is what init_fs_encoding needs at startup;
+#                       upstream leaves it OFF because of build-time
+#                       noise, but for us it's load-bearing.
+#     _weakrefset, types, enum, keyword, reprlib, operator, functools,
+#     <collections.*>, copyreg, token, tokenize, linecache, traceback,
+#     warnings, contextlib, heapq, weakref, inspect.
+#   With these frozen INTO the static binary's data segment, CPython
+#   runs with PYTHONHOME=/nonexistent + PYTHONPATH= cleanly. The
+#   /usr/lib/python3.11/ initramfs embedding path (HAMNIX_EMBED_PYLIB)
+#   is no longer needed — sidesteps the fs/cpio.ad NR_FILES=192 cap.
+#
+# SIZE: ~29 MB unstripped, ~7.9 MB stripped (was 5.7 MB pre-freeze).
+#   The +2.2 MB stripped overhead buys complete self-containment.
+#
 # REQUIRES (build host):
 #   - gcc + make + libc6-dev with static-libc (libc.a) available
 #   - wget or curl (to fetch the upstream tarball)
@@ -52,20 +71,18 @@ GCC      := $(shell command -v gcc 2>/dev/null)
 MAKE_BIN := $(shell command -v make 2>/dev/null)
 HAS_LIBC_A := $(shell test -f /usr/lib/x86_64-linux-gnu/libc.a && echo yes || echo no)
 
-.PHONY: all install clean stdlib-path
+.PHONY: all install clean stdlib-path freeze-patch
 
 all: hello
 
-# Prints (to stdout) the absolute path to the extracted upstream
-# CPython source's `Lib/` directory. The U41 test script captures
-# this with `$(make stdlib-path)` and feeds it to
-# `HAMNIX_EMBED_PYLIB=<path>` so scripts/build_initramfs.py can
-# embed the .py tree at /usr/lib/python3.11/.
+# DEPRECATED (kept for the HAMNIX_EMBED_PYLIB hook in
+# scripts/build_initramfs.py — still callable if some future Python
+# distribution scenario needs an on-disk stdlib). The default U41
+# build no longer uses this: the stdlib is frozen INTO u_cpython
+# so no /usr/lib/python3.11/ tree is needed.
 #
-# Output is empty (with a non-zero exit) when the source hasn't been
-# extracted yet — `make install` should be run first. We don't auto-
-# build here because the caller may already have a stale tarball and
-# we don't want make-side prints to leak into the consumed path.
+# Prints (to stdout) the absolute path to the extracted upstream
+# CPython source's `Lib/` directory.
 stdlib-path:
 	@if [ -d "$(PY_SRCDIR)/Lib" ]; then \
 	    cd $(PY_SRCDIR) && pwd | tr -d '\n' && echo "/Lib"; \
@@ -73,6 +90,32 @@ stdlib-path:
 	    echo "[cpython] stdlib-path: $(PY_SRCDIR)/Lib not found" >&2; \
 	    echo "[cpython]   run 'make -C tests/u-binary/src/cpython install' first" >&2; \
 	    exit 1; \
+	fi
+
+# Patch the extracted CPython source's freeze_modules.py to widen
+# the FROZEN list (encodings + site.py support modules). Idempotent:
+# the patch checks for the sentinel comment before re-applying. Run
+# from the $(PY_OUT) rule below before invoking ./configure + make.
+freeze-patch: $(PY_SRCDIR)/configure
+	@if grep -q "HAMNIX U41: freeze the encodings package" \
+	    $(PY_SRCDIR)/Tools/scripts/freeze_modules.py; then \
+	    echo "[cpython] freeze-patch already applied"; \
+	else \
+	    echo "[cpython] applying Hamnix freeze-modules patch"; \
+	    python3 -c 'import re, sys; \
+p = "$(PY_SRCDIR)/Tools/scripts/freeze_modules.py"; \
+s = open(p).read(); \
+old = "    (\x27stdlib - startup, without site (python -S)\x27, [\n        \x27abc\x27,\n        \x27codecs\x27,\n        # For now we do not freeze the encodings, due # to the noise all\n        # those extra modules add to the text printed during the build.\n        # (See https://github.com/python/cpython/pull/28398#pullrequestreview-756856469.)\n        #\x27<encodings.*>\x27,\n        \x27io\x27,\n        ]),"; \
+new = "    (\x27stdlib - startup, without site (python -S)\x27, [\n        \x27abc\x27,\n        \x27codecs\x27,\n        # HAMNIX U41: freeze the encodings package so CPython\x27s\n        # init_fs_encoding succeeds without an on-disk stdlib tree.\n        \x27<encodings.*>\x27,\n        \x27io\x27,\n        ]),"; \
+assert old in s, "freeze_modules.py upstream format drifted; refresh patch"; \
+s = s.replace(old, new); \
+old2 = "        \x27site\x27,\n        \x27stat\x27,\n        ]),"; \
+new2 = "        \x27site\x27,\n        \x27stat\x27,\n        # HAMNIX U41: site.py + eval-loop boot path support.\n        \x27_weakrefset\x27,\n        \x27types\x27,\n        \x27enum\x27,\n        \x27keyword\x27,\n        \x27reprlib\x27,\n        \x27operator\x27,\n        \x27functools\x27,\n        \x27<collections.*>\x27,\n        \x27copyreg\x27,\n        \x27token\x27,\n        \x27tokenize\x27,\n        \x27linecache\x27,\n        \x27traceback\x27,\n        \x27warnings\x27,\n        \x27contextlib\x27,\n        \x27heapq\x27,\n        \x27weakref\x27,\n        \x27inspect\x27,\n        ]),"; \
+assert old2 in s, "freeze_modules.py site section drifted; refresh patch"; \
+s = s.replace(old2, new2); \
+open(p, "w").write(s); \
+print("[cpython] patched freeze_modules.py")'; \
+	    cd $(PY_SRCDIR) && python3.11 ./Tools/scripts/freeze_modules.py; \
 	fi
 
 # `hello` is the fixture-target name (matches u_hello / u_python /
@@ -97,7 +140,7 @@ $(PY_SRCDIR)/configure: build/$(PY_TARBALL)
 	cd build && tar xf $(PY_TARBALL)
 	@touch $@
 
-$(PY_OUT): $(PY_SRCDIR)/configure
+$(PY_OUT): $(PY_SRCDIR)/configure freeze-patch
 ifeq ($(GCC),)
 	@echo "[cpython] SKIP: gcc not on PATH"
 	@exit 0
@@ -115,14 +158,23 @@ else
 	#                             (they're for CPython's own test suite).
 	#   CFLAGS=-fPIC          -- belt + braces; some PIC-needing libs need it.
 	#   LDFLAGS=-static       -- the actual static link flag.
+	#
+	# --enable-optimizations (PGO + LTO) is INTENTIONALLY OMITTED:
+	#   it lengthens the build from ~5 min to ~25 min on a modern host,
+	#   and PGO needs to run the test interpreter which doesn't add up
+	#   for our use case (boot-once-and-exit on Hamnix's serial). If a
+	#   future agent wants a faster runtime + ~5% size cut, append
+	#   `--enable-optimizations` here. Document the trade-off in the
+	#   commit + HOWTO.
 	cd $(PY_SRCDIR) && CFLAGS="-fPIC" ./configure \
 	    --disable-shared \
 	    --without-pymalloc-debug \
 	    --without-doc-strings \
 	    --disable-test-modules \
 	    LDFLAGS="-static"
-	# Build. This is the slow step (~15-30 min on a modern host;
-	# parallel make helps but the link is serial).
+	# Build. Parallel make helps the compile phase; the link is
+	# serial. ~5-10 min on a modern (8+ core) x86_64 host without
+	# PGO; ~25 min if --enable-optimizations is added above.
 	$(MAKE_BIN) -C $(PY_SRCDIR) -j$$(nproc)
 endif
 endif
@@ -139,9 +191,10 @@ else
 	    exit 0; \
 	fi
 	cp $(PY_OUT) ../../u_cpython
-	# Strip aggressively. CPython is ~25 MB before strip, ~5-8 MB
-	# after. We keep symbols off the staged binary; the build dir
-	# retains the unstripped copy for debugging.
+	# Strip aggressively. With the widened frozen-modules set,
+	# CPython is ~29 MB before strip, ~7.9 MB after. We keep
+	# symbols off the staged binary; the build dir retains the
+	# unstripped copy for debugging.
 	strip --strip-all ../../u_cpython || true
 	# Stamp e_ident[EI_OSABI] = ELFOSABI_LINUX (3). Same trick the
 	# other u_* fixtures use so the U1 detect path is unambiguous.

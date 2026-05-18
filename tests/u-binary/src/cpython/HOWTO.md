@@ -18,12 +18,19 @@ Debian packages and the same binary that runs every pip-installed
 package, every Django site, every `python3 manage.py runserver` you
 ever cared about. The fully-static build:
 
-- Embeds the full standard library (`os`, `sys`, `io`, `re`, `json`,
-  `collections`, `argparse`, `pathlib`, `unittest`, ...).
 - Statically links libc, libm, libpthread, libdl, libutil into one
   ELF -- no dynamic linker required, no shared objects to ship.
-- Lands at ~5.7 MB stripped (vs ~25 MB unstripped, vs ~900 KB
-  MicroPython).
+- **Freezes the bootstrap stdlib into the binary's data segment**
+  via CPython's `Tools/scripts/freeze_modules.py`. After this commit
+  the binary contains `encodings.*`, `collections.*`, `enum`,
+  `keyword`, `re`, `functools`, etc. as `unsigned char[]` arrays
+  produced by the upstream `_freeze_module` tool. CPython's
+  importlib finds them via the `<frozen>` loader — no filesystem
+  lookup needed.
+- Lands at ~7.9 MB stripped (vs ~29 MB unstripped, vs ~5.7 MB for
+  the pre-freeze build, vs ~900 KB MicroPython). The +2.2 MB
+  stripped overhead buys complete self-containment: drop the
+  binary into any namespace and `-c "print(...)"` just runs.
 - Exercises a much wider syscall surface than MicroPython:
   `getrandom`, `clock_nanosleep`, `prlimit64`, `fstatat`,
   `readlinkat`, `mprotect`, plus the same brk/mmap/futex set as
@@ -37,6 +44,17 @@ linked `-static` (NOT `-static-pie` -- see below). Built from
 upstream python.org tarball with:
 
 ```
+# 1. Patch Tools/scripts/freeze_modules.py to widen the FROZEN list:
+#    add <encodings.*> + the site.py / eval-loop support modules.
+#    The Makefile's `freeze-patch` target does this idempotently.
+make -C tests/u-binary/src/cpython freeze-patch
+
+# 2. Regenerate Makefile.pre.in + Python/frozen.c from the patched
+#    spec, then re-run configure so Makefile picks up the new
+#    FROZEN_FILES_OUT list.
+python3.11 Tools/scripts/freeze_modules.py
+
+# 3. Configure + build as before.
 CFLAGS="-fPIC" ./configure \
     --disable-shared \
     --without-pymalloc-debug \
@@ -46,6 +64,10 @@ CFLAGS="-fPIC" ./configure \
 make -j$(nproc)
 strip --strip-all python
 ```
+
+The `tests/u-binary/src/cpython/Makefile` orchestrates all three
+steps via `make install`. `freeze-patch` is idempotent — re-running
+it on an already-patched tree is a no-op.
 
 The interpreter implements full Python 3.11 semantics. The `-c
 "print('hello from CPython on Hamnix')"` invocation in the U41 test
@@ -200,15 +222,13 @@ Bump `PY_VERSION` in the Makefile. CPython's `--disable-shared`
 syscall surface during startup; expect a couple new `-ENOSYS` hits
 when you bump.
 
-## stdlib embedding (this commit)
+## Frozen-modules build (this commit)
 
 CPython's interpreter init unconditionally imports the `encodings`
 package + `encodings.utf_8` (plus `codecs`, `io`, `abc`,
 `_collections_abc`, `_weakrefset`, `types`, `os`, `posixpath`,
 `genericpath`, `enum`, `stat`, `_sitebuiltins`, `site`) before it
-hits the eval loop. None of those modules ship inside the static
-binary — they're plain `.py` files under the upstream source's
-`Lib/` directory. Without them, CPython aborts during
+hits the eval loop. Without them, CPython aborts during
 `init_fs_encoding`:
 
 ```
@@ -217,91 +237,93 @@ of the filesystem encoding
 ModuleNotFoundError: No module named 'encodings'
 ```
 
-This commit embeds the upstream `Lib/` tree into the Hamnix
-initramfs at `/usr/lib/python3.11/` via a new build-time hook in
-`scripts/build_initramfs.py`:
+The previous approach (commit `86b6b09`) embedded the upstream
+`Lib/` tree into the initramfs at `/usr/lib/python3.11/` via
+`HAMNIX_EMBED_PYLIB`. That worked in principle but blew through
+`fs/cpio.ad`'s `NR_FILES=192` cap (the full Lib/ tree is ~1828 .py
+files), and the resulting `fs/initramfs_blob.S` weighed ~190 MiB —
+well over GitHub's 100 MiB push limit on the assembly file.
+
+**This commit replaces the embedding path with CPython's own
+frozen-modules machinery.** We patch
+`Tools/scripts/freeze_modules.py` to widen the FROZEN spec list:
+
+```python
+('stdlib - startup, without site (python -S)', [
+    'abc',
+    'codecs',
+    '<encodings.*>',   # was commented out upstream
+    'io',
+]),
+('stdlib - startup, with site', [
+    ...                # upstream set
+    '_weakrefset',     # new from here down
+    'types',
+    'enum',
+    'keyword',
+    'reprlib',
+    'operator',
+    'functools',
+    '<collections.*>',
+    'copyreg',
+    'token',
+    'tokenize',
+    'linecache',
+    'traceback',
+    'warnings',
+    'contextlib',
+    'heapq',
+    'weakref',
+    'inspect',
+]),
+```
+
+`make regen-frozen` walks each entry, calls `_freeze_module` to
+marshal the `.py` source to `.pyc`, and emits a `Python/frozen_modules/
+<name>.h` containing the bytecode as `unsigned char[]`. Those headers
+are then linked into `python` as static data via `Python/frozen.c`.
+
+At import time, CPython's `_frozen_importlib` looks each module up
+in the in-binary frozen table BEFORE walking `sys.path`. Result:
+`encodings.utf_8` etc. resolve from the binary itself, with no
+filesystem lookup. The `/usr/lib/python3.11/` tree is no longer
+needed.
+
+### Verification
 
 ```
-HAMNIX_EMBED_PYLIB=$(make --no-print-directory \
-    -C tests/u-binary/src/cpython stdlib-path) \
-    INIT_ELF=build/user/hamsh.elf \
-    HAMNIX_EMBED_UBIN=1 \
-    python3 scripts/build_initramfs.py
+PYTHONHOME=/nonexistent PYTHONPATH= ./python -c "print('test')"
+# -> test
 ```
 
-The `stdlib-path` Make target prints
-`tests/u-binary/src/cpython/build/Python-3.11.10/Lib` — the path
-into which the Makefile's `tar xf` step lands the upstream source.
-
-`build_initramfs.py` walks that directory, mirrors every `.py` file
-to `/usr/lib/python3.11/<relpath>` in the cpio archive, and SKIPs:
-- `__pycache__/` — platform-specific bytecode caches, ~2 MiB of
-  bulk that CPython rebuilds from .py source at import time anyway.
-- `lib-dynload/` — compiled C extensions (.so) that need a dynamic
-  loader. Hamnix has none on the U-track.
-
-Final wire-up: the test script sets `PYTHONHOME=/usr/lib/python3.11`
-(and `PYTHONPATH` as a belt+braces fallback) via hamsh's
-`var_table`. `user/hamsh.ad::_build_envp_block` exports every shell
-variable to the spawned child's envp, so CPython sees them.
+If that prints `test`, the frozen build is self-contained. If it
+fails with `ModuleNotFoundError`, the FROZEN list is missing a
+transitively-imported module — either widen the list (re-run
+`make regen-frozen && make`) or accept a narrower test.
 
 ### Size cost
 
-- 1828 .py files, ~32 MiB of source.
-- cpio overhead: ~140 bytes per entry → ~256 KiB extra.
-- The generated `fs/initramfs_blob.S` (the .byte-encoded assembly
-  the kernel `.incbin`-includes) grows ~6x larger than the binary
-  archive due to ASCII expansion. With the stdlib embedded the
-  blob is ~190 MiB — well over GitHub's 100 MiB push cap, which
-  is why HAMNIX_EMBED_PYLIB defaults OFF. The default committed
-  initramfs stays small; only the U41 test sets the env var, and
-  the test's EXIT trap restores the default blob.
+| build              | unstripped | stripped |
+|--------------------|-----------:|---------:|
+| pre-freeze (5.7MB) | ~25 MB     | ~5.7 MB  |
+| frozen (this)      | ~29 MB     | ~7.9 MB  |
 
-## Known blocker after stdlib embed: in-kernel cpio cap
+The +2.2 MB stripped overhead is the bytecode of the additional
+frozen modules. The initramfs `fs/initramfs_blob.S` is back to its
+small baseline size (~18 MiB).
 
-After this commit, the U41 test may or may not PASS depending on
-whether `fs/cpio.ad`'s `NR_FILES=192` cap accommodates the full
-stdlib. The baseline initramfs already has ~150 entries (build/user
-ELFs, etc/, build/mod/, tests/linux-modules/*.ko, busybox applets),
-and the stdlib brings in ~1800 more `.py` files. The kernel's
-`cpio_init()` logs:
+### Follow-ups (deferred)
 
-```
-cpio: file table full at 192 entries
-```
-
-and the tail of the archive (whichever .py files land after entry
-192) is silently dropped. CPython then sees a partial stdlib — most
-notably `encodings/__init__.py` may be missing — and re-aborts at
-`init_fs_encoding`.
-
-The fix is a one-line bump of `NR_FILES` in `fs/cpio.ad` (e.g.,
-to 4096). It's deferred to a follow-up commit because `fs/` is
-owned by other agents this round (the cpio module sits next to the
-AHCI/NVMe write-path and partition-parser work). The Makefile +
-HOWTO + the build-side embedding hook are still valuable: once the
-cap bumps, this same `test_u41_cpython.sh` flips to PASS without
-further changes.
-
-Follow-up options if the cpio cap turns out to also be too small
-(unlikely — 4096 is plenty), or to fundamentally avoid the in-
-memory file_table:
-1. **Frozen modules.** Rebuild CPython with `Tools/scripts/
-   freeze_modules.py` so `encodings`, `importlib`, `codecs`, etc.
-   are compiled into the binary's static data. Eliminates the
-   /usr/lib/python3.11/ tree entirely. ~25 min rebuild + larger
-   binary (~7-8 MiB stripped instead of 5.7).
-2. **Lazy file_table.** Replace the fixed-size array in
-   `fs/cpio.ad` with a hash-keyed lazy lookup over the raw cpio
-   blob. Walks once per open(); takes the cap pressure off the
-   build side.
-
-Diagnostic next step for the follow-up agent:
-
-```
-# Bump NR_FILES in fs/cpio.ad to 4096, recompile, rerun
-# bash scripts/test_u41_cpython.sh.
-```
+- **Strip more.** `_weakrefset`, `keyword`, `token`, etc. are
+  small but `<collections.*>` + `<encodings.*>` together account
+  for most of the +2.2 MB. If size matters more than module
+  coverage, the encodings package can be trimmed to just
+  `ascii`, `latin_1`, `utf_8`, `aliases`, `__init__` — that's
+  ~80% of the encodings cost.
+- **--enable-optimizations.** PGO + LTO would shave another ~5%
+  and speed up the interpreter, but lengthens the build from
+  ~5 min to ~25 min. Not enabled by default; add the flag in
+  the Makefile if a future agent wants it.
 
 ## Files
 

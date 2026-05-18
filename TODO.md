@@ -540,40 +540,51 @@ it has to honour.
 - `clone` / `clone3` (56 / 435) — pthread bring-up.
 - Per-task heap state — `linux_brk` is a single global today;
   multi-process Linux binaries will collide.
-- ~~**U39 follow-up: swap MicroPython for full CPython.**~~
-  Partially shipped at U41 (`tests/u-binary/u_cpython` + Makefile +
-  HOWTO + `scripts/test_u41_cpython.sh`). CPython 3.11.10 builds
-  cleanly as a `-static` (not `-static-pie`) ~5.7 MB stripped ELF
-  via `make -C tests/u-binary/src/cpython install`. ~~The binary
-  exec's through the U-track ELF loader and reaches the importlib
-  init phase BUT then aborts with `Fatal Python error:
-  pycore_interp_init: failed to initialize importlib / MemoryError`
-  before reaching `print()`.~~ ~~Root cause: CPython 3.11's importlib
-  init needs ~10-15 MiB of heap during bootstrap, while Hamnix's
-  per-task `LINUX_BRK_RESERVE` (linux_abi/u_syscalls.ad) is 4 MiB
-  and `LINUX_MMAP_SLOTS` is 32.~~ Fixed at commit 1d543f1
-  (brk reserve / mmap slots bumped). ~~Next blocker:
-  init_fs_encoding fails with "No module named 'encodings'" because
-  the CPython stdlib isn't on sys.path.~~ Fixed by HAMNIX_EMBED_PYLIB
-  hook in `scripts/build_initramfs.py` — the U41 test script now
-  embeds the upstream `Lib/` tree at `/usr/lib/python3.11/` and
-  sets `PYTHONHOME` via hamsh's var_table → spawned-child envp.
-  See `tests/u-binary/src/cpython/HOWTO.md` "stdlib embedding".
-- **U41 follow-up: bump `NR_FILES` in `fs/cpio.ad`.** Today's cap
-  is 192 entries; the baseline initramfs already burns ~150 of
-  those, and the embedded CPython stdlib (~1800 `.py` files)
-  overflows it. Kernel logs `cpio: file table full at 192 entries`
-  and silently drops the tail of the cpio archive. Fix is a one-
-  line bump (4096 is plenty). Deferred this round because `fs/`
-  is owned by other agents (AHCI/NVMe write, partition parser).
-- **U41 follow-up: rebuild CPython with frozen-modules.** The
-  HAMNIX_EMBED_PYLIB path costs ~32 MiB of `.py` source in the
-  initramfs and pushes the assembled `fs/initramfs_blob.S` past
-  GitHub's 100 MiB cap (so we can't commit the populated blob).
-  CPython's `Tools/scripts/freeze_modules.py` compiles the stdlib
-  into the static binary's data segment, eliminating the
-  /usr/lib/python3.11/ tree entirely. ~25 min rebuild + larger
-  binary (~7-8 MiB stripped instead of 5.7).
+- ~~**U39 follow-up: swap MicroPython for full CPython.**~~ DONE
+  at U41. Shipped: `tests/u-binary/u_cpython` + Makefile + HOWTO +
+  `scripts/test_u41_cpython.sh`. CPython 3.11.10 builds as a
+  `-static` (not `-static-pie`) ~7.9 MB stripped ELF via
+  `make -C tests/u-binary/src/cpython install`. The binary
+  exec's through the U-track ELF loader, runs through
+  pycore_interp_init / _frozen_importlib / site.py init, reaches
+  init_fs_encoding, finds frozen `encodings.utf_8`, and prints
+  "U41OK-5 hello from CPython on Hamnix" via write(1, ...). History:
+  ~~First blocker (pycore_interp_init MemoryError) fixed at commit
+  1d543f1 (brk reserve / mmap slots bumped).~~
+  ~~Second blocker (init_fs_encoding "No module named 'encodings'")
+  first patched by the HAMNIX_EMBED_PYLIB hook in
+  scripts/build_initramfs.py at commit 86b6b09, but the embedded
+  Lib/ tree overflowed fs/cpio.ad's NR_FILES=192 cap.~~ Final fix
+  this commit: rebuilt CPython with a widened FROZEN list in
+  Tools/scripts/freeze_modules.py (`<encodings.*>`, `<collections.*>`,
+  `enum`, `keyword`, `re`, `functools`, `_weakrefset`, `types`,
+  `inspect`, `warnings`, `traceback`, `linecache`, `tokenize`,
+  `contextlib`, `heapq`, `weakref`, `operator`, `copyreg`,
+  `reprlib`, `token`). All bootstrap modules live in the binary's
+  data segment via `_freeze_module`; no /usr/lib/python3.11/ tree
+  needed. Binary 5.7→7.9 MB stripped (+2.2 MB for the bytecode).
+- ~~**U41 follow-up: bump `NR_FILES` in `fs/cpio.ad`.**~~ Sidestepped
+  by the frozen-modules build (no /usr/lib/python3.11/ tree means no
+  pressure on the cpio file_table). The cap can still be bumped if
+  some future workload needs more files; no longer blocks U41.
+- ~~**U41 follow-up: rebuild CPython with frozen-modules.**~~ DONE
+  (this commit). Pending follow-ups:
+    * **Trim the frozen set if size matters.** The `<encodings.*>`
+      glob pulls in ~120 .h files (~1.5 MB of bytecode). The boot
+      path only touches `encodings.utf_8` + `encodings.aliases` +
+      `encodings.__init__` + `encodings.ascii` + `encodings.latin_1`.
+      Cutting the glob to those five would shave ~1 MB off the
+      stripped binary.
+    * **`--enable-optimizations` (PGO + LTO).** Would shave another
+      ~5% + speed up the interpreter, but lengthens the build from
+      ~5 min to ~25 min. Not enabled by default; add the flag to
+      `tests/u-binary/src/cpython/Makefile` if a future agent wants
+      the size + perf win.
+    * **C extensions (lib-dynload/).** No dynamic loader on the
+      U-track, so `_ssl`, `_hashlib`, `_socket`, `_curses` etc. are
+      not loadable today. Needs a U-track equivalent of `ld.so`,
+      or static linking of the C extensions into u_cpython (which
+      requires a CPython build flag we don't have today).
 - **U39 follow-up: fix glibc-malloc brk-grow corner case.**
   MicroPython under U39 needs `-X heapsize=64k` because a
   1 MiB heap forces glibc-malloc's main_arena onto our
@@ -678,19 +689,34 @@ it has to honour.
 - NVMe multi-namespace support — current driver hard-codes NSID=1.
   Real controllers carve multiple namespaces; need IDENTIFY active
   namespace list (CNS=0x02) + a per-NS state struct.
-- M16.118 follow-up: register AHCI + NVMe with `kernel/block/blk.ad`.
-  The driver-level write/read primitives (`ahci_write_sectors`,
-  `nvme_write_lba` + their read counterparts) are in place, and
-  BlockDeviceOps already has a `write_sectors` slot. Wiring requires
-  picking a name ("sda" / "nvme0n1"), allocating a per-controller
-  priv cookie, and calling `register_blockdev` after the smoke test
-  succeeds. Then ext4 / FAT32 / partition-table mounts work
-  uniformly across virtio-blk, brd, AHCI, NVMe.
+- ~~M16.118 follow-up: register AHCI + NVMe with `kernel/block/blk.ad`.~~
+  Shipped in M16.119: `drivers/ata/ahci.ad` and `drivers/nvme/nvme.ad`
+  now build a `BlockDeviceOps` vtable with thin `_blkop` adapter
+  wrappers (block layer's `(priv, lba, count, buf)` shape onto the
+  driver-level `(port|nsid, lba, nblocks, buf)` shape), then call
+  `register_blockdev("sd0", ...)` / `register_blockdev("nvme0n1", ...)`
+  after the M16.118 write-smoke tests have passed. Boot-time
+  block-layer round-trip writes a pattern at LBA 1 through
+  `blk_write_sectors(slot, ...)` and reads it back via
+  `blk_read_sectors(slot, ...)`. PASS markers: `[blk] write sd0
+  LBA=1 OK`, `[blk] readback sd0 matches`, and equivalents for
+  `nvme0n1`. See `scripts/test_block_layer_write.sh`. Follow-ups:
+    * Partition-aware naming (`sd0p1`, `nvme0n1p1`) so the installer
+      can `open("/dev/sd0p1")` and have the kernel map that to slot +
+      LBA-base via `partition_for(slot, idx)`.
+    * Multi-port AHCI naming (`sd1`, `sd2`, ...) — today only the
+      first active port wins; the rest of the PI mask is logged but
+      not registered.
+    * NVMe multi-namespace (`nvme0n2`, `nvme0n3`, ...) — paired with
+      IDENTIFY active-namespace-list (CNS=0x02) bringup.
 - M16.118 follow-up: partition-table parsing for AHCI + NVMe disks.
   drivers/block/partition.ad (parallel agent) already decodes
-  MBR + GPT against the block layer; once AHCI/NVMe are registered
-  via the previous bullet, `blk_scan_partitions(slot)` immediately
-  works for them too.
+  MBR + GPT against the block layer; with M16.119's AHCI/NVMe
+  block-layer registration in place, `blk_scan_partitions(slot)`
+  immediately works for them too — but the kernel doesn't yet call
+  it after the AHCI/NVMe register_blockdev path. Wiring is a single
+  call inside the driver's `_smoke_test` epilogue once a multi-disk
+  partition fixture exists in the regression suite.
 - M16.118 follow-up: ext4 write path + bootloader-install plumbing.
   With AHCI + NVMe writes in place, `dd if=hamnix.iso of=/dev/sda`
   from inside Hamnix becomes feasible; the higher-level installer

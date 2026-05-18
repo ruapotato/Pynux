@@ -40,27 +40,23 @@
 # with a notice so CI in environments without the host build still
 # passes -- same shape as U22/U24/U39/U40. The build takes 15-30 min.
 #
-# U41 status after the brk/mmap fix + stdlib embed:
+# U41 status after the brk/mmap fix + frozen-modules build:
 #   - The original blocker (Fatal Python error: pycore_interp_init:
 #     failed to initialize importlib / MemoryError) is gone. CPython
 #     now runs through pycore_interp_init, _frozen_importlib bootstrap,
 #     site.py initialisation, and reaches init_fs_encoding.
-#   - The next blocker was "ModuleNotFoundError: No module named
-#     'encodings'" at init_fs_encoding time. This commit fixes that
-#     by embedding the upstream Lib/ tree at /usr/lib/python3.11/ in
-#     the initramfs via HAMNIX_EMBED_PYLIB + setting PYTHONHOME so
-#     CPython finds its stdlib.
+#   - The init_fs_encoding "No module named 'encodings'" blocker is
+#     also gone. We rebuilt CPython with a widened FROZEN list in
+#     Tools/scripts/freeze_modules.py — `encodings.*`, `collections.*`,
+#     `enum`, `keyword`, `re`, `functools`, etc. are now compiled into
+#     the binary's data segment via `_freeze_module`. The previous
+#     HAMNIX_EMBED_PYLIB approach (embed upstream Lib/ tree into the
+#     initramfs at /usr/lib/python3.11/) was blocked by fs/cpio.ad's
+#     NR_FILES=192 cap + by the assembly blob exceeding GitHub's
+#     100 MiB push limit. Frozen-modules sidesteps both. See
+#     tests/u-binary/src/cpython/HOWTO.md "Frozen-modules build".
 #   - "REGRESSION:" markers below guard against the pycore_interp_init
 #     / mmap-alignment regressions returning.
-#   - If a NEW blocker surfaces after the stdlib lands (most likely
-#     the in-kernel cpio file_table cap at NR_FILES=192 entries in
-#     fs/cpio.ad — the full Lib/ tree is ~1800 .py files plus the
-#     baseline ~150 entries already in the initramfs), it shows up
-#     as "cpio: file table full" in the kernel log and a different
-#     ModuleNotFoundError after the encodings dir starts loading
-#     but stops partway. Fix is a one-line bump of NR_FILES in
-#     fs/cpio.ad, deferred to a follow-up agent because fs/ is
-#     owned by other agents this round.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -85,22 +81,12 @@ echo "[test_u41_cpython] (1/4) Build userland (hamsh + helpers)"
 bash scripts/build_user.sh
 bash scripts/build_modules.sh
 
-echo "[test_u41_cpython] (2/4) Swap /init = $HAMSH_ELF + embed u_cpython + stdlib"
-# Pick up the CPython stdlib path from the same Makefile that built
-# the binary. The `stdlib-path` target prints the absolute path to
-# build/Python-3.11.10/Lib/ — feed that to scripts/build_initramfs.py
-# via HAMNIX_EMBED_PYLIB so the .py tree lands at
-# /usr/lib/python3.11/* in the initramfs. CPython then finds its
-# `encodings` package via PYTHONHOME at init_fs_encoding time.
-PYLIB=$(make --no-print-directory -C tests/u-binary/src/cpython stdlib-path 2>/dev/null || true)
-if [ -z "$PYLIB" ] || [ ! -d "$PYLIB" ]; then
-    echo "[test_u41_cpython] SKIP: CPython stdlib not extracted"
-    echo "    expected at \$(make stdlib-path) — run:"
-    echo "    make -C tests/u-binary/src/cpython install"
-    exit 0
-fi
-echo "[test_u41_cpython]   stdlib source: $PYLIB"
-HAMNIX_EMBED_UBIN=1 HAMNIX_EMBED_PYLIB="$PYLIB" \
+echo "[test_u41_cpython] (2/4) Swap /init = $HAMSH_ELF + embed u_cpython"
+# The CPython stdlib is now frozen INTO u_cpython itself (see
+# tests/u-binary/src/cpython/HOWTO.md "Frozen-modules build"), so
+# no /usr/lib/python3.11/ tree is embedded in the initramfs. Just
+# embed the binary via HAMNIX_EMBED_UBIN.
+HAMNIX_EMBED_UBIN=1 \
     INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py
 
 echo "[test_u41_cpython] (3/4) Rebuild kernel image"
@@ -130,19 +116,12 @@ set +e
     # write(1, ...). We give it 60s before sending the `exit` line, which
     # is well within the 150s qemu timeout.
     sleep 5
-    # hamsh exports every var_table slot to spawned children's envp
-    # (user/hamsh.ad:_build_envp_block). Set PYTHONHOME so CPython's
-    # site.py / init_fs_encoding walks /usr/lib/python3.11/encodings
-    # — the directory build_initramfs.py populates from the upstream
-    # Lib/ tree via HAMNIX_EMBED_PYLIB above. PYTHONPATH gets the
-    # same target as a belt-and-braces fallback (CPython 3.11 falls
-    # back to PYTHONPATH when PYTHONHOME's bin/python3 layout
-    # doesn't match, which it won't here — we have no bin/ under
-    # /usr/lib/python3.11).
-    printf 'PYTHONHOME=/usr/lib/python3.11\n'
-    sleep 1
-    printf 'PYTHONPATH=/usr/lib/python3.11\n'
-    sleep 1
+    # With the frozen-modules build, no PYTHONHOME / PYTHONPATH
+    # plumbing is needed — encodings + collections + the site.py
+    # support set are all in the binary's data segment, found by
+    # CPython's `_frozen_importlib` loader before sys.path is even
+    # consulted.
+    #
     # u_cpython -c "print('U41OK-' + str(2+3), 'hello from CPython on Hamnix')"
     # hamsh's tokenizer supports double quotes (see user/hamsh.ad:240);
     # we use that to keep the print() expression as a single argv slot.
@@ -212,17 +191,14 @@ if grep -F -q "MALLOC_ALIGN_MASK) == 0" "$LOG"; then
     echo "[test_u41_cpython] REGRESSION: glibc-malloc mmap alignment assertion"
     fail=1
 fi
-# New gap surfaced by the stdlib embed: the cpio file_table caps at
-# NR_FILES=192 in fs/cpio.ad. With ~150 baseline entries plus
-# ~1800 .py files from the upstream Lib/ tree, the cap overflows
-# and CPython sees a partial stdlib. Diagnostic only (the kernel
-# logs it once at boot); the fix lives in fs/cpio.ad which other
-# agents own this round.
+# With the frozen-modules build, the cpio file_table cap should
+# no longer come into play for U41 — no /usr/lib/python3.11/
+# tree is embedded. If "cpio: file table full" surfaces, it's
+# unrelated to U41 (some other initramfs growth).
 if grep -F -q "cpio: file table full" "$LOG"; then
     echo "[test_u41_cpython] DIAG: in-kernel cpio file_table overflowed"
-    echo "    fs/cpio.ad NR_FILES=192 is too small for the stdlib"
-    echo "    fix is a one-line bump (deferred — fs/ is forbidden"
-    echo "    this round)."
+    echo "    (unrelated to U41 — frozen-modules build doesn't"
+    echo "    touch /usr/lib/python3.11/)"
 fi
 if grep -F -q "init_fs_encoding" "$LOG"; then
     echo "[test_u41_cpython] DIAG: init_fs_encoding marker present"
