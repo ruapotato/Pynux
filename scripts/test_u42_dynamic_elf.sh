@@ -191,24 +191,23 @@ echo "[test_u42_dynamic_elf] --- end output ---"
 fail=0
 infra_ok=0
 
-# PRIMARY pass criterion (full success): the application's main()
-# was reached and puts() landed on serial. Requires every U42 piece
-# AND a working VMA layer (which today is best-effort via the
-# MAP_FIXED-overlay-into-prior-mapping hack in _u_mmap).
+# PRIMARY pass criterion: the application's main() was reached and
+# puts() landed on serial. With the per-task VMA layer (mm/vma.ad)
+# this is now the hard pass — the kernel-side bookkeeping that ld.so
+# needs (MAP_FIXED inside an existing reservation, mprotect of the
+# overlay region, munmap of unused tail) is honest, so once ld.so
+# transfers control to the app's _start the application's puts()
+# should reach the serial port.
 if grep -F -q "U42 dynamic hello" "$LOG"; then
     echo "[test_u42_dynamic_elf] OK: u_dynamic_hello reached main()"
-    full_pass=1
 else
-    echo "[test_u42_dynamic_elf] MISS: 'U42 dynamic hello'" \
-         "(see infrastructure checks below)"
-    full_pass=0
+    echo "[test_u42_dynamic_elf] MISS: 'U42 dynamic hello' did not" \
+         "land on serial"
+    fail=1
 fi
 
-# INFRASTRUCTURE checks (must hit even if main() doesn't print). They
-# prove fs/elf.ad's PT_INTERP arm fires and ld.so was handed off to
-# in userspace — the actual point of U42. Failures here mean the
-# kernel side of the loader is broken; remaining bugs past these
-# points are in ld.so's perception of our mmap return values.
+# Supporting kernel-side checks (must still fire — they prove
+# fs/elf.ad's PT_INTERP arm + auxv plumbing didn't regress).
 
 # 1. fs/elf.ad detected PT_INTERP and printed the interp path.
 if grep -F -q "PT_INTERP=" "$LOG"; then
@@ -241,30 +240,10 @@ fi
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_u42_dynamic_elf] FAIL (qemu rc=$rc):" \
-         "kernel-side U42 infrastructure didn't fire"
+         "U42 dynamic ELF did not run end-to-end"
     exit 1
 fi
 
-if [ "$full_pass" -eq 1 ]; then
-    echo "[test_u42_dynamic_elf] PASS — first dynamic ELF on Hamnix!"
-    exit 0
-fi
-
-# Infrastructure-only PASS: kernel side works, ld.so executed in
-# userspace, but the final puts() didn't make it out. Treat this as
-# a soft-pass for the U42 milestone — the gate the spec cared about
-# (kernel-side PT_INTERP / auxv / interp loading) is open. Document
-# the userspace side as a follow-up in TODO.md.
-echo "[test_u42_dynamic_elf] INFRASTRUCTURE-PASS" \
-     "($infra_ok/3 kernel-side checks)"
-echo "[test_u42_dynamic_elf]   Kernel side of U42 is solid:"
-echo "[test_u42_dynamic_elf]     - PT_INTERP detected and parsed"
-echo "[test_u42_dynamic_elf]     - ld.so loaded at a distinct memblock base"
-echo "[test_u42_dynamic_elf]     - AT_BASE/AT_ENTRY/AT_PHDR plumbed in auxv"
-echo "[test_u42_dynamic_elf]     - Userspace handed control to ld.so"
-echo "[test_u42_dynamic_elf]   Remaining: ld.so picked up libc.so.6 (real"
-echo "[test_u42_dynamic_elf]   mmap + relocations etc happen in user mode);"
-echo "[test_u42_dynamic_elf]   final hand-off to app main() needs a real"
-echo "[test_u42_dynamic_elf]   VMA layer (MAP_FIXED with per-page protection)"
-echo "[test_u42_dynamic_elf]   to complete. Tracked in TODO.md."
+echo "[test_u42_dynamic_elf] PASS — first dynamic ELF on Hamnix!" \
+     "($infra_ok/3 kernel-side checks + main() reached)"
 exit 0

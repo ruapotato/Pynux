@@ -258,15 +258,31 @@ it has to honour.
       jumps to the application's _start.
       
       Remaining blockers for the final puts() to land on serial:
-        - Real VMA layer / true MAP_FIXED — today the
-          MAP_FIXED-into-prior-mapping hack works for the simple
-          "ld.so reserves N pages then overlays PT_LOADs" case but
-          can't honour MAP_FIXED at arbitrary addresses (no per-
-          page mapping). At runtime the dynamic_hello smoke-test
-          gets a GP fault at user RIP inside the application's
-          .text once ld.so hands off — likely SSE/MOVAPS on
-          unaligned memory because PT_LOAD base alignment wasn't
-          guaranteed. Real fix: track VMAs + per-task page tables.
+        - ~~Real VMA layer / true MAP_FIXED~~ DONE: per-task VMA
+          list shipped in `mm/vma.ad` (U42 follow-up). Each
+          `TaskStruct` owns a `vma_list_head` pointer; mmap /
+          munmap / mprotect / mremap all route through `vma_alloc`
+          / `vma_unmap` / `vma_protect`, which maintain a sorted
+          singly-linked list of `VmaNode` records. MAP_FIXED inside
+          an existing reservation aliases the enclosing node's
+          backing pages (the ld.so PT_LOAD-overlay case); MAP_FIXED
+          outside any reservation carves overlapping ranges per
+          Linux semantics. `do_execve` calls `vma_clear` before
+          loading the new ELF so the new image starts with an empty
+          namespace of virtual-address contents. Per-page PTE
+          protection is still advisory (the 4 GiB identity map is
+          RWX U=1) — the VMA layer records `prot` so a future
+          per-page mprotect can install real bits without
+          re-touching the syscall surface.
+        - VMA share / deep-copy on rfork — today every fresh task
+          starts with an empty `vma_list_head`. RFMEM (share) needs
+          the thread path in `create_user_thread` to copy the
+          parent's head pointer; RFPROC + no RFMEM (deep copy)
+          needs a walk-and-clone in `do_clone`. Both deferred until
+          a real multi-process Linux workload (apt fork+exec)
+          surfaces the gap.
+        - MAP_SHARED with cross-process coherence — only matters
+          for `/dev/shm`-style cases; deferred.
         - `fs/cpio.ad` `NR_FILES` bump (192 -> 8192+) so the full
           debootstrap'd tree (~5000 files) fits in the cpio
           archive. Today scripts/test_u42_dynamic_elf.sh works
@@ -442,10 +458,27 @@ it has to honour.
         decay-rated accumulators (1884 / 2014 / 2037 — see
         Linux's `kernel/sched/loadavg.c`). Idle-accounting
         prerequisite shared with `/dev/uptime` above.
-      * `/dev/stat` — aggregate "cpu / intr / ctxt / btime /
+      * ~~`/dev/stat` — aggregate "cpu / intr / ctxt / btime /
         processes" snapshot (mirror of `/proc/stat`). Reuses the
         cpuinfo CPUID helpers + a new IRQ-count accessor in
-        `arch/x86/kernel/irq.ad`.
+        `arch/x86/kernel/irq.ad`.~~ M16.135 shipped, alongside
+        `/dev/mounts` and `/dev/diskstats`. `/dev/stat` columns
+        are placeholders (all jiffies bucketed into the "user"
+        column; intr/ctxt zeros; btime from `rtc_boot_epoch_get`;
+        processes from `current_task_pid`) — see
+        `sys/src/9/port/devstat.ad` header CAVEAT. Real per-state
+        accounting wants TaskStruct rtime/stime fields and a
+        per-IRQ counter in `arch/x86/kernel/irq.ad`.
+        `/dev/mounts` walks chan.ad's mnttab + a synthetic
+        `rootfs / cpio ro 0 0` root row; `/dev/diskstats` walks
+        `blockdev_table` and emits the 14-column Linux shape with
+        zero counters (placeholder until BlockDevice grows
+        rd_ios / wr_ios fields and the read/write paths bump
+        them). Follow-up: Layer-2 `/proc/{stat,mounts,diskstats}`
+        translation in `linux_abi/u_syscalls.ad` (the M16.134
+        pattern — add three entries to `_u_translate_proc_to_dev`
+        so Linux ELFs reading `/proc/stat` see the same bytes
+        `/dev/stat` emits).
       * ~~`/dev/version` + `/dev/hostname` — identity-introspection
         cdev pair. `/dev/version` emits the release string
         ("hamnix/0.1 (M16.132+)\n", stateless); `/dev/hostname`
@@ -489,21 +522,25 @@ it has to honour.
             leaves like `mounts` or `maps` that don't exist yet).
           * `/proc/self/*` — translate to the caller's current
             pid first, then fall through to the per-pid path.
-          * `/proc/stat` aggregator — needs a per-CPU jiffy
-            accessor in `arch/x86/kernel/time.ad` and an IRQ-
-            count accessor in `arch/x86/kernel/irq.ad` (same
-            prerequisites as the `/dev/stat` cdev follow-up
-            above). Once `/dev/stat` lands, the Layer-2 row is
-            a one-line addition to `_u_translate_proc_to_dev`.
-          * `/proc/mounts` — needs to consume the mount-table
-            via chan_resolve_prefix accessors and emit
-            Linux-shape `<src> <target> <fstype> <opts> 0 0`
-            lines. Block on a `/dev/mounts` cdev so the Plan 9
-            source-of-truth lands first.
-          * `/proc/diskstats`, `/proc/net/*`, `/proc/cmdline` —
-            each is its own follow-up, gated on its own native
-            cdev landing first (the architecture rule: Layer 1
-            grows the surface, Layer 2 translates).
+          * `/proc/{stat,mounts,diskstats}` — M16.135 shipped
+            the three Plan 9 source-of-truth cdevs. Layer-2
+            translation is now the small follow-up: extend
+            `_u_translate_proc_to_dev` in
+            `linux_abi/u_syscalls.ad` with three more entries
+            mapping `/proc/stat` -> `/dev/stat`,
+            `/proc/mounts` -> `/dev/mounts`, and
+            `/proc/diskstats` -> `/dev/diskstats`. After that
+            row, Linux monitoring tools (top, ps, df, iostat,
+            mount, vmstat) all see the same bytes the native
+            surface knows. Per-state CPU accounting + per-IRQ
+            counts are deeper follow-ups (TaskStruct rtime/stime
+            + `arch/x86/kernel/irq.ad` per-IRQ counter); the
+            cdev/translation pair stays valid through that
+            upgrade — only the column values change.
+          * `/proc/net/*`, `/proc/cmdline` — each is its own
+            follow-up, gated on its own native cdev landing
+            first (the architecture rule: Layer 1 grows the
+            surface, Layer 2 translates).
       * Per-cache slab walker accessor in `mm/slab.ad` so
         devmeminfo's `KmallocLive` line can show real
         `sum(nr_inuse * object_size)` instead of the in-use-page

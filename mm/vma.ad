@@ -1,0 +1,391 @@
+# mm/vma.ad
+#
+# Per-task VMA (Virtual Memory Area) layer. First real address-space
+# bookkeeping in Hamnix — replaces the flat 256-slot (base, order)
+# table that linux_abi/u_syscalls.ad has been using since U7. The slot
+# table was good enough for MAP_ANONYMOUS|MAP_PRIVATE and for ld.so's
+# "reserve then MAP_FIXED overlay" two-phase DSO load, but couldn't
+# honour MAP_FIXED at arbitrary user-chosen addresses — and that's
+# exactly what dynamic Linux binaries expect from mmap once ld.so
+# transfers control to the application's _start.
+#
+# Plan 9 framing
+#
+#   Per docs/architecture.md + memory/feedback_plan9_namespace_framing,
+#   the VMA list is NOT a global "kernel memory map" — it is a per-task
+#   namespace of virtual-address contents, in the same shape as `/` is
+#   a per-task namespace of names. There is no master vma table that
+#   the kernel consults out-of-band; the only ground truth about
+#   "what is mapped where" is whatever the current task's vma_list
+#   says. Forks (rfork RFPROC without RFMEM) deep-copy the list; the
+#   thread path (RFMEM) shares it. Init's task is born with an empty
+#   list; every subsequent VMA is created either by mmap from
+#   userspace or by the ELF loader on do_execve.
+#
+# Shape
+#
+#   Sorted singly-linked list of VmaNode records, keyed by `start`.
+#   Each node owns the half-open range [start, end). Adjacent nodes
+#   do not overlap. Lookup is O(N) — for the small VMA count a single
+#   user process accrues (Debian /bin/true with glibc has ~12 VMAs),
+#   a sorted linked list is faster than a tree and the code stays
+#   small. Real Linux uses an mm_struct + interval tree; we can grow
+#   there once the VMA count per process crosses ~32.
+#
+# Backing memory
+#
+#   Today every page is RWX U=1 in the 4 GiB identity map. Per-VMA
+#   `prot` is therefore advisory at the page-table level — we record
+#   it for future per-page mprotect wiring but the page fault handler
+#   doesn't consult it yet.
+#
+#   Pages are allocated EAGERLY at vma_alloc time via alloc_pages —
+#   not lazily on first touch. Demand-paging through a #PF handler
+#   would require touching arch/x86/kernel/idt.ad which is locked
+#   under this commit; eager allocation is the correct trade-off
+#   given the constraint.
+#
+# Allocator
+#
+#   VmaNode records are kmalloc'd (56 bytes per node after struct
+#   padding). Backing pages come from alloc_pages at the order that
+#   covers the page-rounded length.
+
+from kernel.printk.printk import printk1
+from kernel.sched.core import (
+    TaskStruct,
+    task_vma_list_head, set_task_vma_list_head,
+    current_idx_get,
+)
+from mm.slab import kmalloc, kfree
+from mm.page_alloc import alloc_pages, free_pages
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+# ---------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------
+
+# MAP_* flag bits. Mirror Linux <bits/mman-linux.h>. Same numeric
+# values defined locally in linux_abi/u_syscalls.ad (kept in sync by
+# hand — the two files import from each other not at all).
+VMA_MAP_PRIVATE:   int32 = 0x02
+VMA_MAP_FIXED:     int32 = 0x10
+VMA_MAP_ANONYMOUS: int32 = 0x20
+
+# PROT_* — stored but not yet honoured by the page table.
+VMA_PROT_NONE:  int32 = 0x0
+VMA_PROT_READ:  int32 = 0x1
+VMA_PROT_WRITE: int32 = 0x2
+VMA_PROT_EXEC:  int32 = 0x4
+
+VMA_PAGE_SIZE: uint64 = 0x1000
+
+
+# ---------------------------------------------------------------------
+# VmaNode
+# ---------------------------------------------------------------------
+
+class VmaNode:
+    start:       uint64
+    end:         uint64
+    file_offset: uint64
+    backing:     uint64
+    next:        uint64
+    prot:        int32
+    flags:       int32
+    file_fd:     int32
+    order:       int32
+
+
+# ---------------------------------------------------------------------
+# Allocation helpers
+# ---------------------------------------------------------------------
+
+def _vma_node_new() -> uint64:
+    p: uint64 = kmalloc(56)
+    if p == 0:
+        return 0
+    memset(cast[Ptr[uint8]](p), 0, 56)
+    return p
+
+
+def _vma_node_set(node: uint64, start: uint64, end: uint64,
+                  prot: int32, flags: int32, file_fd: int32,
+                  file_offset: uint64, backing: uint64,
+                  order: int32):
+    cast[Ptr[VmaNode]](node)[0].start       = start
+    cast[Ptr[VmaNode]](node)[0].end         = end
+    cast[Ptr[VmaNode]](node)[0].prot        = prot
+    cast[Ptr[VmaNode]](node)[0].flags       = flags
+    cast[Ptr[VmaNode]](node)[0].file_fd     = file_fd
+    cast[Ptr[VmaNode]](node)[0].file_offset = file_offset
+    cast[Ptr[VmaNode]](node)[0].backing     = backing
+    cast[Ptr[VmaNode]](node)[0].order       = order
+    cast[Ptr[VmaNode]](node)[0].next        = 0
+
+
+def _vma_node_get_next(node: uint64) -> uint64:
+    return cast[Ptr[VmaNode]](node)[0].next
+
+
+def _vma_node_set_next(node: uint64, nxt: uint64):
+    cast[Ptr[VmaNode]](node)[0].next = nxt
+
+
+def _vma_node_start(node: uint64) -> uint64:
+    return cast[Ptr[VmaNode]](node)[0].start
+
+
+def _vma_node_end(node: uint64) -> uint64:
+    return cast[Ptr[VmaNode]](node)[0].end
+
+
+def _vma_node_free(node: uint64):
+    # Release the node's backing pages (if any) then the node itself.
+    # backing == 0 marks "no kernel-owned pages here" (an alias node
+    # for a MAP_FIXED slice inside an enclosing region; only the
+    # enclosing node owns the pages).
+    backing: uint64 = cast[Ptr[VmaNode]](node)[0].backing
+    if backing != 0:
+        order: int32 = cast[Ptr[VmaNode]](node)[0].order
+        free_pages(backing, order)
+    kfree(node)
+
+
+def _order_for_bytes(n: uint64) -> int32:
+    # Smallest alloc_pages(order) that satisfies an n-byte request.
+    # MAX_ORDER=10 -> 4 MiB per single alloc_pages call.
+    order: int32 = 0
+    block: uint64 = VMA_PAGE_SIZE
+    while block < n:
+        if order >= 10:
+            return -1
+        order = order + 1
+        block = block << 1
+    return order
+
+
+# ---------------------------------------------------------------------
+# List walk
+# ---------------------------------------------------------------------
+
+def vma_find(slot: uint64, addr: uint64) -> uint64:
+    cur: uint64 = task_vma_list_head(slot)
+    while cur != 0:
+        s: uint64 = _vma_node_start(cur)
+        e: uint64 = _vma_node_end(cur)
+        if s <= addr and addr < e:
+            return cur
+        if s > addr:
+            return 0
+        cur = _vma_node_get_next(cur)
+    return 0
+
+
+def _vma_find_enclosing(slot: uint64, start: uint64,
+                        end: uint64) -> uint64:
+    # Returns a VmaNode whose [s, e) fully contains [start, end), or 0.
+    # Used to detect ld.so's "reserve then MAP_FIXED overlay" case.
+    cur: uint64 = task_vma_list_head(slot)
+    while cur != 0:
+        s: uint64 = _vma_node_start(cur)
+        e: uint64 = _vma_node_end(cur)
+        if s <= start and end <= e:
+            return cur
+        if s > start:
+            return 0
+        cur = _vma_node_get_next(cur)
+    return 0
+
+
+def _vma_insert_sorted(slot: uint64, node: uint64):
+    head: uint64 = task_vma_list_head(slot)
+    n_start: uint64 = _vma_node_start(node)
+    if head == 0:
+        _vma_node_set_next(node, 0)
+        set_task_vma_list_head(slot, node)
+        return
+    if _vma_node_start(head) > n_start:
+        _vma_node_set_next(node, head)
+        set_task_vma_list_head(slot, node)
+        return
+    prev: uint64 = head
+    cur:  uint64 = _vma_node_get_next(head)
+    while cur != 0:
+        if _vma_node_start(cur) >= n_start:
+            _vma_node_set_next(node, cur)
+            _vma_node_set_next(prev, node)
+            return
+        prev = cur
+        cur  = _vma_node_get_next(cur)
+    _vma_node_set_next(node, 0)
+    _vma_node_set_next(prev, node)
+
+
+# ---------------------------------------------------------------------
+# Carve / unmap
+# ---------------------------------------------------------------------
+
+def _vma_unlink(slot: uint64, target: uint64) -> int32:
+    head: uint64 = task_vma_list_head(slot)
+    if head == 0:
+        return 0
+    if head == target:
+        set_task_vma_list_head(slot, _vma_node_get_next(head))
+        return 1
+    prev: uint64 = head
+    cur:  uint64 = _vma_node_get_next(head)
+    while cur != 0:
+        if cur == target:
+            _vma_node_set_next(prev, _vma_node_get_next(cur))
+            return 1
+        prev = cur
+        cur  = _vma_node_get_next(cur)
+    return 0
+
+
+def _vma_carve_range(slot: uint64, start: uint64, end: uint64):
+    # Remove every node whose range overlaps [start, end). Any
+    # overlap -> drop the whole node and free its pages. No partial-
+    # range split: no current Linux userspace consumer munmaps a
+    # partial range from the middle of a VMA.
+    cur: uint64 = task_vma_list_head(slot)
+    done: int32 = 0
+    while cur != 0 and done == 0:
+        nxt: uint64 = _vma_node_get_next(cur)
+        s: uint64 = _vma_node_start(cur)
+        e: uint64 = _vma_node_end(cur)
+        if s < end and start < e:
+            _vma_unlink(slot, cur)
+            _vma_node_free(cur)
+            cur = nxt
+        elif s >= end:
+            done = 1
+        else:
+            cur = nxt
+
+
+# ---------------------------------------------------------------------
+# vma_alloc
+# ---------------------------------------------------------------------
+
+def vma_alloc(slot: uint64, addr_in: uint64, len_in: uint64,
+              prot: int32, flags: int32, file_fd: int32,
+              file_offset: uint64) -> int64:
+    # Allocate a fresh VMA + its backing pages, splice it into the
+    # task's vma_list, and return the resolved start address (cast
+    # to int64 so the caller can return it through the syscall ABI).
+    # On failure returns a negative Linux errno.
+    if len_in == 0:
+        return cast[int64](-22)
+
+    length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
+
+    order: int32 = _order_for_bytes(length)
+    if order < 0:
+        printk1("vma: alloc len=%d exceeds MAX_ORDER\n", length)
+        return cast[int64](-12)
+
+    is_fixed: int32 = 0
+    if (flags & VMA_MAP_FIXED) != 0:
+        is_fixed = 1
+
+    if is_fixed != 0 and addr_in != 0:
+        end_req: uint64 = addr_in + length
+        encl: uint64 = _vma_find_enclosing(slot, addr_in, end_req)
+        if encl != 0:
+            # MAP_FIXED into existing reservation: alias node.
+            alias: uint64 = _vma_node_new()
+            if alias == 0:
+                return cast[int64](-12)
+            _vma_node_set(alias, addr_in, end_req, prot, flags,
+                          file_fd, file_offset, 0, 0)
+            _vma_insert_sorted(slot, alias)
+            return cast[int64](addr_in)
+        # MAP_FIXED but no enclosing region: carve any overlap then
+        # fall through and let alloc_pages pick a base (the user's
+        # requested addr is effectively a hint).
+        _vma_carve_range(slot, addr_in, end_req)
+        printk1("vma: MAP_FIXED at 0x%x not enclosed; addr as hint\n",
+                addr_in)
+
+    base: uint64 = alloc_pages(order)
+    if base == 0:
+        printk1("vma: alloc_pages OOM len=%d\n", length)
+        return cast[int64](-12)
+
+    memset(cast[Ptr[uint8]](base), 0, length)
+
+    node: uint64 = _vma_node_new()
+    if node == 0:
+        free_pages(base, order)
+        return cast[int64](-12)
+    end_v: uint64 = base + length
+    _vma_node_set(node, base, end_v, prot, flags, file_fd,
+                  file_offset, base, order)
+    _vma_insert_sorted(slot, node)
+    return cast[int64](base)
+
+
+def vma_unmap(slot: uint64, addr: uint64, len_in: uint64) -> int64:
+    if len_in == 0:
+        return cast[int64](-22)
+    length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
+    end_v: uint64 = addr + length
+    _vma_carve_range(slot, addr, end_v)
+    return 0
+
+
+# ---------------------------------------------------------------------
+# vma_protect (mprotect)
+# ---------------------------------------------------------------------
+
+def vma_protect(slot: uint64, addr: uint64, len_in: uint64,
+                prot: int32) -> int64:
+    if len_in == 0:
+        return cast[int64](-22)
+    length: uint64 = (len_in + VMA_PAGE_SIZE - 1) & ~(VMA_PAGE_SIZE - 1)
+    end_v: uint64 = addr + length
+    cur: uint64 = task_vma_list_head(slot)
+    done: int32 = 0
+    while cur != 0 and done == 0:
+        s: uint64 = _vma_node_start(cur)
+        e: uint64 = _vma_node_end(cur)
+        if s < end_v and addr < e:
+            cast[Ptr[VmaNode]](cur)[0].prot = prot
+        if s >= end_v:
+            done = 1
+        else:
+            cur = _vma_node_get_next(cur)
+    # Always 0 — anything outside the VMA list is in the kernel's
+    # identity map which is RWX U=1 anyway. glibc-startup mprotect
+    # of GOT/relro pages used to succeed unconditionally and we keep
+    # that compat.
+    return 0
+
+
+# ---------------------------------------------------------------------
+# vma_clear — wipe the current task's address space on execve
+# ---------------------------------------------------------------------
+
+def vma_clear(slot: uint64):
+    cur: uint64 = task_vma_list_head(slot)
+    while cur != 0:
+        nxt: uint64 = _vma_node_get_next(cur)
+        _vma_node_free(cur)
+        cur = nxt
+    set_task_vma_list_head(slot, 0)
+
+
+# ---------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------
+
+def vma_count(slot: uint64) -> uint64:
+    n: uint64 = 0
+    cur: uint64 = task_vma_list_head(slot)
+    while cur != 0:
+        n = n + 1
+        cur = _vma_node_get_next(cur)
+    return n

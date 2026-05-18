@@ -61,6 +61,11 @@ from fs.elf import (
     elf_last_interp_base, elf_last_app_entry_user,
 )
 from mm.page_alloc import alloc_page, alloc_pages
+# U42 follow-up: per-task VMA list. do_execve clears the outgoing
+# image's mappings before ELF-loading the incoming image so the new
+# program starts with a clean vma_list. Subsequent mmap() calls from
+# the new image extend the list via mm/vma.ad::vma_alloc.
+from mm.vma import vma_clear
 from linux_abi.loader import kmod_linux_load, kmod_linux_unload
 from linux_abi.u_syscalls import linux_u_syscall_dispatch
 # Phase B / M16.93: Plan 9-shape errstr body. Lives at
@@ -543,6 +548,23 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
         set_current_errstr("execve: file does not exist")
         return cast[int64](-2)            # -ENOENT
     sz: uint64 = initramfs_data_size(path)
+    # U42 VMA: drop the outgoing image's mappings BEFORE we load the
+    # new ELF. Without this, the new program would inherit the parent
+    # image's stack/heap/mmap VMAs and a subsequent mprotect or munmap
+    # could touch addresses that no longer belong to the new image's
+    # address-space namespace. We do this after the initramfs lookup
+    # (so a failed execve doesn't destroy the caller's address space)
+    # but before elf_load_blob — the new PT_LOAD-derived VMAs land on
+    # the cleared list. Note: at this scale (single Linux task at a
+    # time, no per-process pagetables enforcing isolation between
+    # tasks) the backing-page free here is what matters for
+    # bookkeeping; the actual ELF-image pages were memblock-allocated
+    # via elf_load_blob's allocator path and aren't tracked through
+    # vma_list yet, so they leak across execve same as before. The
+    # VMAs being cleared here are anonymous + file-backed mmaps the
+    # OUTGOING program made (glibc-malloc arenas, mmap'd libc DSOs)
+    # — those are correctly freed.
+    vma_clear(current_idx_get())
     entry: uint64 = elf_load_blob(cast[Ptr[uint8]](blob), sz)
     if entry == 0:
         printk1("execve: ELF load of '%s' failed\n", a0)
