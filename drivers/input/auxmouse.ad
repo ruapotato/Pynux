@@ -1,0 +1,658 @@
+# drivers/input/auxmouse.py
+#
+# PS/2 auxiliary-device (mouse) driver. Sibling to drivers/input/atkbd.ad
+# — same i8042 controller, same 0x60/0x64 ports, different "channel".
+#
+# Linux mapping:
+#   drivers/input/mouse/psmouse-base.c -> auxmouse_init + mouse_irq_handler
+#   serio2 (the i8042 second port)     -> the 0xD4 prefix write path
+#
+# We call this driver `auxmouse` rather than `psmouse` to avoid the
+# overload with "PS/2" (the keyboard is also PS/2; the *mouse* is the
+# *auxiliary device* in 8042 spec parlance — "AUX port", controller
+# command 0xA8 enables it, command 0xD4 routes the next host byte to
+# it). 9front calls it `mouse(3)`; we follow Linux's "input over the
+# 8042 aux port" architecture but keep the unambiguous name.
+#
+# Protocol summary (3-byte standard PS/2 mouse — ID=0x00):
+#   On every motion or button event the device sends 3 bytes:
+#     byte0 = [Yov Xov Ysn Xsn 1 MB RB LB]
+#     byte1 = X delta (signed, sign-extended via Xsn into 9-bit)
+#     byte2 = Y delta (signed, sign-extended via Ysn into 9-bit)
+#   The "always_1" bit in byte0 is our packet-resync sentinel: if we
+#   ever see byte0 with that bit clear we drop it and re-seek.
+#
+# This commit is "init + IRQ + decode + ring buffer". The /dev/mouse
+# cdev path follows the M16.94 /dev/cons pattern — separate commit.
+# The 4-byte scroll-wheel knock pattern (0xF3 200, 0xF3 100, 0xF3 80)
+# is also deferred — 3-byte is universally supported and adequate.
+#
+# outb/inb are Adder codegen intrinsics; same pattern as atkbd.ad and
+# drivers/tty/serial/early_8250.ad — no extern needed.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from arch.x86.kernel.apic import ioapic_redirect
+from arch.x86.kernel.irq import register_irq_handler
+
+
+# --- i8042 ports + bits -------------------------------------------------
+#
+# Same hardware as the keyboard. The "second port" / AUX path uses the
+# same 0x60 data port; what changes is the controller-command-byte (CCB)
+# configuration plus the 0xD4 prefix byte that re-routes the NEXT host
+# write from 0x60 to the AUX device instead of the KBD device.
+
+I8042_DATA_PORT:   int32 = 0x60
+I8042_STATUS_PORT: int32 = 0x64
+I8042_CMD_PORT:    int32 = 0x64
+
+# Status register bits.
+I8042_STATUS_OBF: int32 = 0x01      # Output Buffer Full (data->host)
+I8042_STATUS_IBF: int32 = 0x02      # Input  Buffer Full (host->ctrl)
+I8042_STATUS_AUX: int32 = 0x20      # Bit 5: data is from AUX, not KBD
+
+# Controller commands (written to 0x64).
+I8042_CMD_READ_CCB:    int32 = 0x20    # read controller-command-byte
+I8042_CMD_WRITE_CCB:   int32 = 0x60    # write controller-command-byte
+I8042_CMD_DISABLE_AUX: int32 = 0xA7    # disable AUX port
+I8042_CMD_ENABLE_AUX:  int32 = 0xA8    # enable  AUX port
+I8042_CMD_TEST_AUX:    int32 = 0xA9    # self-test AUX interface (0x00=OK)
+I8042_CMD_WRITE_AUX:   int32 = 0xD4    # next byte->AUX dev (not KBD)
+
+# CCB bit layout (8042 standard):
+#   bit 0  IRQ1 enable (KBD)
+#   bit 1  IRQ12 enable (AUX)
+#   bit 4  KBD clock disable
+#   bit 5  AUX clock disable
+#   bit 6  KBD translation (Set2 -> Set1)
+CCB_IRQ_AUX:      int32 = 0x02
+CCB_DISABLE_AUX:  int32 = 0x20
+
+# Device commands (written to AUX via 0xD4 prefix).
+MOUSE_CMD_RESET:        int32 = 0xFF
+MOUSE_CMD_RESEND:       int32 = 0xFE
+MOUSE_CMD_SET_DEFAULTS: int32 = 0xF6
+MOUSE_CMD_DISABLE:      int32 = 0xF5
+MOUSE_CMD_ENABLE:       int32 = 0xF4   # enable streaming reports
+MOUSE_CMD_SET_RATE:     int32 = 0xF3   # followed by sample rate byte
+MOUSE_CMD_GET_DEVID:    int32 = 0xF2
+
+# Device responses.
+MOUSE_ACK:      int32 = 0xFA
+MOUSE_NAK:      int32 = 0xFE
+MOUSE_BAT_OK:   int32 = 0xAA       # self-test passed (Basic Assurance Test)
+
+
+# --- IRQ wiring ---------------------------------------------------------
+#
+# IRQ 12 is the legacy PIC line for the i8042 AUX port. After the
+# M16.22 PIC->APIC swap we route IRQ12 via the IOAPIC. Vector choice
+# follows the M16.113..M16.117 allocation map:
+#   0x40 virtio-net  0x41 ahci  0x42 nvme  0x43 e1000e  0x44 r8169
+# Next free is 0x45 — we claim it.
+
+AUXMOUSE_IRQ_VECTOR: uint32 = 0x45
+AUXMOUSE_LAPIC_ID:   uint32 = 0
+AUXMOUSE_IOAPIC_PIN: uint32 = 12       # ISA IRQ12 == IOAPIC pin 12 (1:1 ID-mapped)
+
+
+# --- Packet decode + event ring ----------------------------------------
+#
+# byte0 bit layout (LSB first):
+#   bit 0  Left button
+#   bit 1  Right button
+#   bit 2  Middle button
+#   bit 3  always-1 (resync sentinel)
+#   bit 4  X sign     (1 = X delta is negative; high bit of 9-bit X)
+#   bit 5  Y sign
+#   bit 6  X overflow (delta exceeded 8-bit signed range — drop)
+#   bit 7  Y overflow
+
+PKT_BTN_LEFT:   uint32 = 0x01
+PKT_BTN_RIGHT:  uint32 = 0x02
+PKT_BTN_MIDDLE: uint32 = 0x04
+PKT_ALWAYS_ONE: uint32 = 0x08
+PKT_X_SIGN:     uint32 = 0x10
+PKT_Y_SIGN:     uint32 = 0x20
+PKT_X_OVER:     uint32 = 0x40
+PKT_Y_OVER:     uint32 = 0x80
+
+
+# Each event in the ring is a packed 32-bit word:
+#   bits  0..15  dx (int16, sign-extended from 9-bit)
+#   bits 16..31  dy (int16)
+# Buttons go to a separate ring slot? No — too much state churn for
+# what's effectively three booleans. Pack buttons into the high byte
+# of dy's word: the protocol's X+Y deltas only need 9 bits each
+# (range -256..+255), so the upper bits of each int16 are spare. We
+# use bits 24..31 of the event word for buttons, leaving bits 0..15
+# for dx (int16) and bits 16..23 for dy (int8, since 9-bit signed
+# truncates cleanly into 8 bits for most motion — fine for a cursor).
+#
+# Actually keep it simple: separate the ring into a struct array. A
+# parallel agent might add a /dev/mouse cdev that wants the cleaner
+# shape, and packing-into-int32 saves nothing of consequence here.
+
+class MouseEvent:
+    dx:      int32          # signed 9-bit X delta (sign-extended)
+    dy:      int32          # signed 9-bit Y delta
+    buttons: uint32         # bitmask: bit0=L bit1=R bit2=M
+    pad:     uint32
+
+
+MOUSE_RING_SIZE: uint64 = 64
+
+mouse_ring:      Array[64, MouseEvent]
+mouse_ring_head: uint64 = 0
+mouse_ring_tail: uint64 = 0
+
+# Packet assembly state. We arrive at byte 0 every time mouse_phase
+# is 0 and the AUX status bit was set; advancement is byte-by-byte
+# because the IRQ delivers one byte at a time on most controllers
+# (QEMU coalesces but the per-byte path still works).
+mouse_phase: int32 = 0
+mouse_b0:    int32 = 0
+mouse_b1:    int32 = 0
+
+# Diagnostic counters.
+mouse_irq_count:   uint64 = 0
+mouse_pkt_count:   uint64 = 0
+mouse_dropped:     uint64 = 0       # packets dropped (overflow / resync)
+mouse_initialized: int32  = 0
+
+
+# --- Low-level controller helpers --------------------------------------
+
+def _i8042_wait_input_clear() -> int32:
+    # Spin until IBF clears (controller is ready to accept a byte from
+    # us). Bounded so a wedged controller can't hang the kernel during
+    # boot. Returns 1 on success, 0 on timeout.
+    timeout: int32 = 100000
+    while timeout > 0:
+        if (inb(I8042_STATUS_PORT) & I8042_STATUS_IBF) == 0:
+            return 1
+        timeout = timeout - 1
+    return 0
+
+
+def _i8042_wait_output_full() -> int32:
+    # Spin until OBF sets (controller has a byte for us). Same bounded
+    # discipline — used during init when we're expecting an ACK/result
+    # and don't want a missing device to stall the kernel.
+    timeout: int32 = 100000
+    while timeout > 0:
+        if (inb(I8042_STATUS_PORT) & I8042_STATUS_OBF) != 0:
+            return 1
+        timeout = timeout - 1
+    return 0
+
+
+def _i8042_drain():
+    # Drain any stale bytes the firmware / BIOS left in the output
+    # buffer. Hard-capped — a status register stuck high (which we've
+    # seen on some odd virtualisation layers) won't spin us forever.
+    n: int32 = 0
+    while (inb(I8042_STATUS_PORT) & I8042_STATUS_OBF) != 0:
+        inb(I8042_DATA_PORT)
+        n = n + 1
+        if n > 32:
+            return
+
+
+def _i8042_cmd(cmd: int32):
+    # Write a controller command (0x64 port). Caller must wait for IBF
+    # afterwards if a parameter byte follows on 0x60.
+    _i8042_wait_input_clear()
+    outb(cmd, I8042_CMD_PORT)
+
+
+def _i8042_write_data(b: int32):
+    # Write a data byte to 0x60 (parameter for the previous command,
+    # OR keyboard command for the KBD channel).
+    _i8042_wait_input_clear()
+    outb(b, I8042_DATA_PORT)
+
+
+def _i8042_aux_write(b: int32) -> int32:
+    # Send a byte to the AUX device. The 0xD4 controller command tells
+    # the i8042 "the NEXT host write to 0x60 goes to AUX, not KBD".
+    # Returns 1 on success (the byte was queued), 0 on IBF-stuck
+    # timeout.
+    if _i8042_wait_input_clear() == 0:
+        return 0
+    outb(I8042_CMD_WRITE_AUX, I8042_CMD_PORT)
+    if _i8042_wait_input_clear() == 0:
+        return 0
+    outb(b, I8042_DATA_PORT)
+    return 1
+
+
+def _i8042_aux_read() -> int32:
+    # Read one byte from the AUX device. Returns -1 on timeout.
+    # During init we explicitly poll because IRQ 12 isn't routed yet;
+    # at runtime the IRQ delivers bytes one at a time.
+    if _i8042_wait_output_full() == 0:
+        return -1
+    # We expect status bit 5 (AUX) to be set on AUX-source bytes. If
+    # it's clear the byte came from the keyboard mid-init — drop it
+    # so it doesn't masquerade as a mouse ACK. Note: QEMU does set
+    # the AUX bit correctly; on real hardware the bit is reliable.
+    st: int32 = inb(I8042_STATUS_PORT)
+    b: int32 = inb(I8042_DATA_PORT) & 0xFF
+    if (st & I8042_STATUS_AUX) == 0:
+        return -1
+    return b
+
+
+def _aux_send_expect_ack(cmd: int32) -> int32:
+    # Convenience for the init sequence: send `cmd` to AUX, wait for
+    # the standard 0xFA ACK. Returns 1 on ACK, 0 otherwise. The mouse
+    # also sends NAK (0xFE) on parse error, in which case we don't
+    # retry — every command we issue is well-defined.
+    if _i8042_aux_write(cmd) == 0:
+        return 0
+    r: int32 = _i8042_aux_read()
+    if r == MOUSE_ACK:
+        return 1
+    return 0
+
+
+# --- Event ring --------------------------------------------------------
+
+def _mouse_ring_push(dx: int32, dy: int32, buttons: uint32):
+    # Drop-oldest is wrong for input — we'd lose context for the cursor
+    # delta accumulation. Drop-newest preserves the trail. Returns
+    # silently on full; mouse_dropped is the diagnostic.
+    nxt: uint64 = (mouse_ring_tail + 1) % MOUSE_RING_SIZE
+    if nxt == mouse_ring_head:
+        mouse_dropped = mouse_dropped + 1
+        return
+    mouse_ring[mouse_ring_tail].dx = dx
+    mouse_ring[mouse_ring_tail].dy = dy
+    mouse_ring[mouse_ring_tail].buttons = buttons
+    mouse_ring_tail = nxt
+
+
+def mouse_rx_pop() -> int32:
+    # Pop one event, encoded as int32. Future /dev/mouse cdev will use
+    # a richer struct path (read of sizeof(MouseEvent)); this is the
+    # minimum scaffolding so users can verify "an event arrived".
+    #
+    # Encoding (matches the in-ring packed shape the cdev will adopt):
+    #   bits  0..15  dx & 0xFFFF (signed delta, low 16 bits)
+    #   bits 16..23  buttons (uint8)
+    #   bits 24..31  dy & 0xFF  (signed 8-bit truncation — sufficient
+    #                            for the 9-bit delta after overflow
+    #                            handling)
+    # Returns -1 if the ring is empty (sentinel; user code is expected
+    # to check for -1 because no real event encodes to -1 — buttons
+    # field is bounded to 3 bits and would have to be 0xFF, which
+    # never happens with our 0x07 mask).
+    if mouse_ring_head == mouse_ring_tail:
+        return -1
+    dx: int32 = mouse_ring[mouse_ring_head].dx
+    dy: int32 = mouse_ring[mouse_ring_head].dy
+    bt: uint32 = mouse_ring[mouse_ring_head].buttons
+    mouse_ring_head = (mouse_ring_head + 1) % MOUSE_RING_SIZE
+    out: int32 = (dx & 0xFFFF) \
+               | cast[int32]((bt & 0xFF) << 16) \
+               | ((dy & 0xFF) << 24)
+    return out
+
+
+def mouse_rx_has() -> int32:
+    if mouse_ring_head == mouse_ring_tail:
+        return 0
+    return 1
+
+
+def mouse_irq_count_get() -> uint64:
+    return mouse_irq_count
+
+
+def mouse_pkt_count_get() -> uint64:
+    return mouse_pkt_count
+
+
+# --- Packet decode (called per-byte from the IRQ handler) --------------
+
+def _sign_extend_9bit(byte_val: int32, sign_bit: int32) -> int32:
+    # PS/2 mouse deltas are 9-bit signed: 8 bits of magnitude in
+    # byte1/byte2 plus 1 sign bit in byte0. Reconstruct the signed
+    # int via two's complement: if sign bit is set, OR in 0xFFFFFF00
+    # to sign-extend into int32 negative space.
+    if sign_bit != 0:
+        return cast[int32](cast[uint32](byte_val) | cast[uint32](0xFFFFFF00))
+    return byte_val & 0xFF
+
+
+def auxmouse_process_byte(raw: int32):
+    # State machine: 3-byte packet, advanced per-byte.
+    b: int32 = raw & 0xFF
+
+    if mouse_phase == 0:
+        # Resync check: bit 3 of byte0 must be 1 for a valid packet.
+        # If it isn't, we've lost packet alignment — drop this byte
+        # and stay in phase 0. The next byte that has bit 3 set
+        # restarts the assembly.
+        if (cast[uint32](b) & PKT_ALWAYS_ONE) == 0:
+            mouse_dropped = mouse_dropped + 1
+            return
+        mouse_b0 = b
+        mouse_phase = 1
+        return
+
+    if mouse_phase == 1:
+        mouse_b1 = b
+        mouse_phase = 2
+        return
+
+    # phase == 2 — full packet arrived.
+    b2: int32 = b
+    mouse_phase = 0
+
+    flags: uint32 = cast[uint32](mouse_b0)
+
+    # Overflow: drop the entire packet. The mouse signalled it
+    # couldn't fit the delta in 8 bits, so neither sign-extended
+    # value would represent the real motion. Better to drop than
+    # to deliver a wrong-by-256 cursor jump.
+    if (flags & (PKT_X_OVER | PKT_Y_OVER)) != 0:
+        mouse_dropped = mouse_dropped + 1
+        return
+
+    x_sign: int32 = 0
+    y_sign: int32 = 0
+    if (flags & PKT_X_SIGN) != 0:
+        x_sign = 1
+    if (flags & PKT_Y_SIGN) != 0:
+        y_sign = 1
+
+    dx: int32 = _sign_extend_9bit(mouse_b1, x_sign)
+    # PS/2 mouse Y is positive-UP (away from the user). Most cursor
+    # consumers want positive-DOWN screen coordinates; we negate here
+    # so the event we publish matches the screen-space convention.
+    dy_raw: int32 = _sign_extend_9bit(b2, y_sign)
+    dy: int32 = -dy_raw
+
+    buttons: uint32 = flags & (PKT_BTN_LEFT | PKT_BTN_RIGHT | PKT_BTN_MIDDLE)
+
+    _mouse_ring_push(dx, dy, buttons)
+    mouse_pkt_count = mouse_pkt_count + 1
+
+
+# --- IRQ 12 handler ----------------------------------------------------
+
+def auxmouse_irq_handler():
+    # IRQ-context entry. The 8042 raises IRQ 12 on every AUX byte that
+    # lands in the output buffer. We drain everything currently pending
+    # (status OBF + AUX bit) — QEMU sometimes delivers two bytes for one
+    # IRQ when the controller is slightly behind; drain-on-IRQ keeps the
+    # state machine in sync.
+    mouse_irq_count = mouse_irq_count + 1
+    n: int32 = 0
+    while (inb(I8042_STATUS_PORT) & I8042_STATUS_OBF) != 0:
+        st: int32 = inb(I8042_STATUS_PORT)
+        if (st & I8042_STATUS_AUX) == 0:
+            # Keyboard byte slipped in while we were servicing the AUX
+            # IRQ. Read + drop: the keyboard's own IRQ (or its polled
+            # path) will handle real key state — we can't get one here
+            # without the controller routing being misconfigured.
+            inb(I8042_DATA_PORT)
+        else:
+            b: int32 = inb(I8042_DATA_PORT) & 0xFF
+            auxmouse_process_byte(b)
+        n = n + 1
+        # Hard cap to prevent ISR storm if status bit ever sticks high.
+        if n > 16:
+            return
+
+
+# --- Initialisation ----------------------------------------------------
+#
+# Sequence (mirrors Linux's i8042_aux_init() + psmouse_extensions()):
+#
+#   1. Enable the AUX port (controller cmd 0xA8).
+#   2. Read the CCB, set IRQ12-enable (bit 1) and clear DISABLE-AUX
+#      (bit 5), write it back.
+#   3. (Optional) test AUX interface (cmd 0xA9; 0x00 = OK).
+#   4. Reset the mouse (cmd 0xFF via 0xD4 prefix). Expect ACK + 0xAA
+#      (BAT pass) + 0x00 (device ID).
+#   5. Set sample rate to 100 (0xF3 0x64). Optional, conservative.
+#   6. Enable streaming (0xF4 via 0xD4 prefix).
+#   7. Register IRQ 12 handler at vector 0x45, route IOAPIC pin 12.
+
+def auxmouse_init() -> int32:
+    # Drain anything stale first. The keyboard self-test in atkbd_init()
+    # already drained a few bytes; this is belt-and-braces for the AUX
+    # channel.
+    _i8042_drain()
+
+    # Step 1: enable AUX port. No response byte expected.
+    _i8042_cmd(I8042_CMD_ENABLE_AUX)
+
+    # Step 2: read CCB, mask AUX bits, write back. The exact RMW is:
+    #   ccb |= IRQ_AUX (enable IRQ12 delivery on AUX byte)
+    #   ccb &= ~DISABLE_AUX (re-enable AUX clock if firmware masked it)
+    _i8042_cmd(I8042_CMD_READ_CCB)
+    if _i8042_wait_output_full() == 0:
+        printk0("auxmouse: timeout reading controller-command-byte\n")
+        return -1
+    ccb: int32 = inb(I8042_DATA_PORT) & 0xFF
+    ccb = (ccb | CCB_IRQ_AUX) & (~CCB_DISABLE_AUX)
+    _i8042_cmd(I8042_CMD_WRITE_CCB)
+    _i8042_write_data(ccb)
+    printk0("auxmouse: i8042 second port enabled\n")
+
+    # Step 3: (skipped) AUX interface self-test (cmd 0xA9). QEMU
+    # always returns 0x00; on real hardware a non-zero is informative
+    # but we'd still try to bring up the device. Save the I/O.
+
+    # Step 4: reset the mouse. Mouse reset is the slowest device
+    # command (it runs a BAT — Basic Assurance Test). We expect three
+    # response bytes in sequence: ACK, BAT_OK (0xAA), DEVID (0x00).
+    if _i8042_aux_write(MOUSE_CMD_RESET) == 0:
+        printk0("auxmouse: reset write timeout (no device?)\n")
+        return -1
+    r_ack:  int32 = _i8042_aux_read()
+    r_bat:  int32 = _i8042_aux_read()
+    r_id:   int32 = _i8042_aux_read()
+    if r_ack != MOUSE_ACK:
+        printk1("auxmouse: reset NAK (got=0x%x)\n", cast[uint64](r_ack))
+        return -1
+    if r_bat != MOUSE_BAT_OK:
+        printk1("auxmouse: BAT fail (got=0x%x)\n", cast[uint64](r_bat))
+        return -1
+    printk1("auxmouse: ID=0x%x (standard 3-byte PS/2 mouse)\n",
+            cast[uint64](r_id & 0xFF))
+
+    # Step 5: set sample rate to 100 Hz. Two-byte command: 0xF3, 100.
+    # Each byte ACKs independently. Failure here is non-fatal — the
+    # default rate (100 Hz on most controllers) is identical.
+    if _aux_send_expect_ack(MOUSE_CMD_SET_RATE) != 0:
+        _aux_send_expect_ack(100)
+
+    # Step 6: enable streaming. From this point the mouse sends
+    # 3-byte packets whenever motion or button-state changes.
+    if _aux_send_expect_ack(MOUSE_CMD_ENABLE) == 0:
+        printk0("auxmouse: enable-streaming NAK\n")
+        return -1
+    printk0("auxmouse: streaming enabled\n")
+
+    # Step 7: wire IRQ 12. IOAPIC pin 12 == ISA IRQ 12 (1:1 mapping
+    # for ISA pins on every PC/AT-compatible chipset). Route to our
+    # chosen vector 0x45 on LAPIC 0, then register the handler in the
+    # 256-slot table from arch/x86/kernel/irq.ad.
+    #
+    # Note: ioapic_redirect() defaults the entry to level-triggered
+    # active-low (PCI convention). ISA IRQs are edge-triggered
+    # active-high, but the IOAPIC accepts edge-on-level configuration
+    # for AUX in practice (QEMU honours the LAPIC delivery either way;
+    # on real hardware the BIOS-built MADT carries override entries
+    # we'd consume in a later pass). For this commit the polled-from-
+    # init code path is the load-bearing one — the IRQ is best-effort.
+    register_irq_handler(cast[uint64](AUXMOUSE_IRQ_VECTOR),
+                         cast[uint64](&auxmouse_irq_handler))
+    ioapic_redirect(AUXMOUSE_IOAPIC_PIN, AUXMOUSE_IRQ_VECTOR,
+                    AUXMOUSE_LAPIC_ID)
+    printk2("auxmouse: irq pin=%d vec=0x%x\n",
+            cast[uint64](AUXMOUSE_IOAPIC_PIN),
+            cast[uint64](AUXMOUSE_IRQ_VECTOR))
+
+    mouse_initialized = 1
+
+    # Run a small synthetic-packet self-test through the decoder so a
+    # regression in _sign_extend_9bit or the phase machine is reported
+    # even if QEMU never delivers real mouse packets in -no-reboot
+    # mode. Mirrors the atkbd_self_test() shape.
+    auxmouse_self_test()
+
+    return 0
+
+
+# --- Boot-time self test (no I/O ports, decoder only) ------------------
+#
+# Feed three synthesised packets into auxmouse_process_byte() and assert
+# the resulting MouseEvents in the ring. This catches sign-extension /
+# Y-flip / phase-machine regressions in CI without needing real mouse
+# input from QEMU (which the -no-reboot console doesn't faithfully
+# simulate).
+
+mouse_selftest_pass: int32 = 0
+mouse_selftest_fail: int32 = 0
+
+
+def _st_reset():
+    mouse_ring_head = 0
+    mouse_ring_tail = 0
+    mouse_phase = 0
+    mouse_b0 = 0
+    mouse_b1 = 0
+    mouse_pkt_count = 0
+    mouse_dropped = 0
+
+
+def _st_expect(dx_exp: int32, dy_exp: int32, btn_exp: uint32):
+    # Compare via masked uint32 bit-patterns rather than signed int32
+    # equality: the Adder compiler occasionally generates an
+    # unsigned-extended load for struct-field reads that breaks
+    # signed-equality on negative values (cousin of the M16.97
+    # `cast[uint64](arr[i])` quirk noted in feedback_compiler_quirks).
+    # Bit-pattern equality is sufficient because the stored field
+    # IS the int32 two's-complement representation we want to test.
+    if mouse_ring_head == mouse_ring_tail:
+        mouse_selftest_fail = mouse_selftest_fail + 1
+        printk0("auxmouse: self-test FAIL: ring empty (expected event)\n")
+        return
+    slot_dx: Ptr[uint32] = cast[Ptr[uint32]](&mouse_ring[mouse_ring_head].dx)
+    slot_dy: Ptr[uint32] = cast[Ptr[uint32]](&mouse_ring[mouse_ring_head].dy)
+    slot_bt: Ptr[uint32] = cast[Ptr[uint32]](&mouse_ring[mouse_ring_head].buttons)
+    # Hoist into uint64 with an explicit 32-bit mask. Mirrors the
+    # arp_lookup fix in feedback_compiler_quirks: makes the load
+    # observable in a width the compiler reliably zero-extends, then
+    # compares as plain uint64.
+    ev_dx64: uint64 = cast[uint64](slot_dx[0]) & 0xFFFFFFFF
+    ev_dy64: uint64 = cast[uint64](slot_dy[0]) & 0xFFFFFFFF
+    ev_bt64: uint64 = cast[uint64](slot_bt[0]) & 0xFFFFFFFF
+    exp_dx64: uint64 = cast[uint64](cast[uint32](dx_exp)) & 0xFFFFFFFF
+    exp_dy64: uint64 = cast[uint64](cast[uint32](dy_exp)) & 0xFFFFFFFF
+    exp_bt64: uint64 = cast[uint64](btn_exp) & 0xFFFFFFFF
+    mouse_ring_head = (mouse_ring_head + 1) % MOUSE_RING_SIZE
+    if ev_dx64 == exp_dx64 and ev_dy64 == exp_dy64 and ev_bt64 == exp_bt64:
+        mouse_selftest_pass = mouse_selftest_pass + 1
+    else:
+        mouse_selftest_fail = mouse_selftest_fail + 1
+        printk2("auxmouse: self-test FAIL: dx/dy got=0x%x/0x%x\n",
+                ev_dx64, ev_dy64)
+        printk2("auxmouse: self-test FAIL: dx/dy exp=0x%x/0x%x\n",
+                exp_dx64, exp_dy64)
+
+
+def auxmouse_self_test():
+    mouse_selftest_pass = 0
+    mouse_selftest_fail = 0
+
+    # Case 1: simple positive X delta. byte0=0x08 (always-1 only),
+    # byte1=+10 (0x0A), byte2=0 (no Y motion). Y is then negated by
+    # our convention to match screen-down semantics: dy stays 0.
+    _st_reset()
+    auxmouse_process_byte(0x08)
+    auxmouse_process_byte(0x0A)
+    auxmouse_process_byte(0x00)
+    _st_expect(10, 0, 0)
+
+    # Case 2: negative X delta. byte0 = 0x08 | X_SIGN (0x18),
+    # byte1 = 0xF6 (which is 246 unsigned, -10 in 9-bit signed).
+    # Expected dx = -10, dy = 0.
+    _st_reset()
+    auxmouse_process_byte(0x18)
+    auxmouse_process_byte(0xF6)
+    auxmouse_process_byte(0x00)
+    _st_expect(-10, 0, 0)
+
+    # Case 3: positive Y delta (mouse moved AWAY from user). Protocol
+    # encodes +5, we flip to -5 for screen-down semantics. byte0=0x08
+    # (no sign), byte1=0, byte2=5.
+    _st_reset()
+    auxmouse_process_byte(0x08)
+    auxmouse_process_byte(0x00)
+    auxmouse_process_byte(0x05)
+    _st_expect(0, -5, 0)
+
+    # Case 4: left button held + small motion. byte0 = ALWAYS_ONE |
+    # BTN_LEFT = 0x09, byte1 = 1, byte2 = 1 (PS/2 Y up -> screen -1).
+    _st_reset()
+    auxmouse_process_byte(0x09)
+    auxmouse_process_byte(0x01)
+    auxmouse_process_byte(0x01)
+    _st_expect(1, -1, PKT_BTN_LEFT)
+
+    # Case 5: all three buttons held, no motion.
+    _st_reset()
+    auxmouse_process_byte(0x0F)        # ALWAYS_1 | L | R | M
+    auxmouse_process_byte(0x00)
+    auxmouse_process_byte(0x00)
+    _st_expect(0, 0, PKT_BTN_LEFT | PKT_BTN_RIGHT | PKT_BTN_MIDDLE)
+
+    # Case 6: resync. A spurious byte WITHOUT the always-1 bit should
+    # be dropped, and the next valid byte0 (with always-1) starts a
+    # fresh packet. Feed: 0x00 (bogus byte0 — bit 3 clear), then a
+    # full valid packet.
+    _st_reset()
+    auxmouse_process_byte(0x00)        # dropped (no always-1)
+    auxmouse_process_byte(0x08)        # real byte 0
+    auxmouse_process_byte(0x03)        # X = +3
+    auxmouse_process_byte(0x00)        # Y = 0 -> screen-dy = 0
+    _st_expect(3, 0, 0)
+
+    # Case 7: overflow flag set -> drop entire packet. After dropping,
+    # next valid packet must still parse cleanly.
+    _st_reset()
+    auxmouse_process_byte(0x48)        # ALWAYS_1 | X_OVER
+    auxmouse_process_byte(0x7F)
+    auxmouse_process_byte(0x00)
+    # Ring must be empty here.
+    if mouse_ring_head != mouse_ring_tail:
+        mouse_selftest_fail = mouse_selftest_fail + 1
+        printk0("auxmouse: self-test FAIL: overflow packet not dropped\n")
+    # Now a clean follow-up packet, dx=2.
+    auxmouse_process_byte(0x08)
+    auxmouse_process_byte(0x02)
+    auxmouse_process_byte(0x00)
+    _st_expect(2, 0, 0)
+
+    # Drain remaining (shouldn't be any).
+    while mouse_ring_head != mouse_ring_tail:
+        mouse_ring_head = (mouse_ring_head + 1) % MOUSE_RING_SIZE
+
+    # Restore the phase machine to a clean state for real packets.
+    mouse_phase = 0
+    mouse_pkt_count = 0
+    mouse_dropped = 0
+
+    if mouse_selftest_fail == 0:
+        printk1("auxmouse: self-test PASS (%d cases)\n",
+                cast[uint64](mouse_selftest_pass))
+    else:
+        printk1("auxmouse: self-test FAIL (%d failures)\n",
+                cast[uint64](mouse_selftest_fail))

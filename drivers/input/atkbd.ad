@@ -33,6 +33,7 @@
 # which uses the same intrinsics bare.
 
 from kernel.printk.printk import printk0, printk1
+from drivers.input.auxmouse import auxmouse_init
 
 # i8042 controller I/O ports — fixed by the ISA PC/AT spec.
 KBD_DATA_PORT:   int32 = 0x60      # read scancodes, write commands/data
@@ -753,4 +754,14 @@ def atkbd_init() -> int32:
     if drained > 0:
         printk1("atkbd: drained %d stale bytes\n", cast[uint64](drained))
     printk0("atkbd: ready (Set 1 + ext + modifiers)\n")
+
+    # Bring up the sibling auxiliary device (PS/2 mouse) on the same
+    # i8042 controller. We chain it from atkbd_init() rather than
+    # calling it directly from init/main.ad because the two drivers
+    # share controller state — running auxmouse_init() AFTER the
+    # keyboard drain step above guarantees we don't race the stale-
+    # byte flush with the AUX-port enable. The mouse driver is
+    # independent enough that a failure there (e.g. no physical
+    # mouse attached) doesn't fail keyboard init.
+    auxmouse_init()
     return 0

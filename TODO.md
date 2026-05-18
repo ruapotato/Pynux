@@ -879,8 +879,27 @@ it has to honour.
   needed for English-only install; standard X11-shape compose
   tables plus a 2-byte pending-deadkey state in `kbd_state`
   would cover the European-Latin set.
-- PS/2 mouse (the other channel on the 8042). Same controller,
-  different port; needed once `hamwd` window-server lands.
+- ~~PS/2 mouse (the other channel on the 8042). Same controller,
+  different port; needed once `hamwd` window-server lands.~~
+  M16.121: `drivers/input/auxmouse.ad` brings up the i8042 second
+  port (CCB IRQ12-enable + AUX-clock-enable RMW), resets the mouse
+  (0xFF -> ACK + BAT 0xAA + ID 0x00), enables streaming (0xF4),
+  registers IRQ 12 -> vector 0x45 via IOAPIC pin 12, and decodes
+  the 3-byte protocol into a 64-event ring (`MouseEvent {dx, dy,
+  buttons}`). Boot-time decoder self-test asserts 7 cases (signed
+  delta extraction, button-bitmap, Y-flip for screen-down, resync,
+  overflow drop). See `scripts/test_mouse.sh`. Follow-ups:
+    - `/dev/mouse` cdev path (mirror M16.94 /dev/cons shape;
+      `mouse_rx_pop()` accessor already in place).
+    - 4-byte protocol with scroll wheel — the
+      `0xF3 200, 0xF3 100, 0xF3 80` knock pattern enables it;
+      decoder needs a phase-3 byte for Z + extra buttons.
+    - `hamwd` input dispatch — Layer-3 GUI consumer that maps
+      events to per-window cursor coordinates.
+    - MADT IRQ-override consumption — today we accept the default
+      level-triggered active-low IOAPIC redirection; ISA IRQ 12 is
+      really edge-triggered active-high and a future ACPI-driven
+      override pass would program it correctly.
 
 ## Toolchain & install
 
