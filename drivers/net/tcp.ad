@@ -19,9 +19,10 @@
 #
 # Connection table: static 8-entry TCB array. Ephemeral source ports
 # 50000..50007 (one per slot, so the slot index is also the port
-# offset; saves a separate allocator). Single-shot — no retransmit,
-# no congestion control beyond cwnd=1 segment, no SACK, no
-# timestamps, no window scaling. Fine for SLIRP, which doesn't drop.
+# offset; saves a separate allocator). M16.108 added per-segment
+# retransmission (RFC 6298 RTO + exponential backoff, capped at 5
+# retries). Still no congestion control beyond cwnd=1 segment, no
+# SACK, no timestamps, no window scaling.
 #
 # Checksum uses the IPv4 pseudo-header (src_ip, dst_ip, 0, proto=6,
 # tcp_length) prepended to the TCP header + payload — same 1's
@@ -124,6 +125,41 @@ tcp_slot_rx_len:    Array[8, uint64]
 # Per-slot flag: did we observe a FIN from the peer? Latched the
 # first time we see it; cleared on tcp_close completion.
 tcp_slot_saw_fin:   Array[8, uint8]
+
+
+# --- Retransmission state (M16.108, RFC 6298) ---
+#
+# Each slot tracks the most-recent segment we sent that needs an ACK
+# back (SYN, FIN, or data — pure ACKs don't get retransmitted). The
+# polling loops in tcp_connect / tcp_send / tcp_recv call
+# _tcp_check_retrans on every iteration to fire a retransmit when
+# `(get_jiffies() - last_send_jiffies) > rto_jiffies` and we still
+# don't have the ACK.
+#
+# RTT estimation follows RFC 6298 with integer math. Initial RTO is
+# 100 jiffies (= 1 s @ HZ=100). After the first RTT sample lands,
+# RTO collapses to `srtt + 4 * rttvar` clamped to a 10-jiffy floor
+# (100 ms — anything smaller is below SLIRP's turn-around jitter).
+# Exponential backoff doubles RTO on every retransmit (§5.5). After
+# 5 retries we give up and signal the caller via -1.
+TCP_RTO_INITIAL: uint64 = 100               # 100 jiffies = 1 s
+TCP_RTO_MIN:     uint64 = 10                # floor 100 ms
+TCP_MAX_RETRIES: uint64 = 5
+
+tcp_slot_last_send:  Array[8, uint64]       # jiffies of last (re)tx
+tcp_slot_rto:        Array[8, uint64]       # current RTO in jiffies
+tcp_slot_retries:    Array[8, uint64]       # retransmits for current seg
+tcp_slot_srtt:       Array[8, uint64]       # smoothed RTT (jiffies)
+tcp_slot_rttvar:     Array[8, uint64]       # RTT variance (jiffies)
+tcp_slot_have_rtt:   Array[8, uint8]        # 0 until first RTT sample
+tcp_slot_unacked:    Array[8, uint8]        # 1 if pending seg awaits ACK
+tcp_slot_pend_flags: Array[8, uint8]        # flags of pending segment
+tcp_slot_pend_seq:   Array[8, uint32]       # seq for retransmit
+tcp_slot_pend_len:   Array[8, uint64]       # payload length
+# Per-slot pending-payload snapshot. One MSS per slot — caller writes
+# the segment into this scratch buffer in _tcp_build_and_send and the
+# retransmit path re-reads it from here.
+tcp_slot_pend_data:  Array[4288, uint8]     # 8 * TCP_MSS (= 8 * 536)
 
 
 # Counters bumped by tcp_rx / tcp_tx. Mirrors a couple of fields in
@@ -291,9 +327,170 @@ def _tcp_find_slot(remote_b0: uint8, remote_b1: uint8,
     return -1
 
 
+def _tcp_update_rto(slot: uint64, rtt: uint64):
+    # RFC 6298 §2 RTT estimator with integer arithmetic.
+    #   First sample : SRTT = R; RTTVAR = R / 2.
+    #   Subsequent   : RTTVAR = (3*RTTVAR + |SRTT - R|) / 4
+    #                  SRTT   = (7*SRTT + R) / 8
+    # Then RTO = max(SRTT + 4*RTTVAR, TCP_RTO_MIN). No upper bound
+    # (the backoff path in _tcp_check_retrans can grow RTO, but
+    # successful samples reset to the smoothed value).
+    if tcp_slot_have_rtt[slot] == 0:
+        tcp_slot_srtt[slot] = rtt
+        tcp_slot_rttvar[slot] = rtt / 2
+        tcp_slot_have_rtt[slot] = 1
+    else:
+        srtt: uint64 = tcp_slot_srtt[slot]
+        rttvar: uint64 = tcp_slot_rttvar[slot]
+        diff: uint64 = 0
+        if srtt >= rtt:
+            diff = srtt - rtt
+        else:
+            diff = rtt - srtt
+        rttvar = (3 * rttvar + diff) / 4
+        srtt = (7 * srtt + rtt) / 8
+        tcp_slot_srtt[slot] = srtt
+        tcp_slot_rttvar[slot] = rttvar
+    rto: uint64 = tcp_slot_srtt[slot] + 4 * tcp_slot_rttvar[slot]
+    if rto < TCP_RTO_MIN:
+        rto = TCP_RTO_MIN
+    tcp_slot_rto[slot] = rto
+
+
+def _tcp_arm_retrans(slot: uint64, flags: uint8,
+                     seq: uint32, payload: Ptr[uint8],
+                     payload_len: uint64):
+    # Snapshot the in-flight segment so the polling-loop retransmit
+    # path can rebuild it without help from the original caller.
+    # Pure ACKs (no SYN/FIN/data) are NOT armed — they don't need
+    # retransmission; a lost ACK is recovered by the peer's own RTO.
+    is_syn: uint8 = flags & TCP_SYN
+    is_fin: uint8 = flags & TCP_FIN
+    needs_ack: uint8 = 0
+    if is_syn != 0:
+        needs_ack = 1
+    if is_fin != 0:
+        needs_ack = 1
+    if payload_len > 0:
+        needs_ack = 1
+    if needs_ack == 0:
+        return
+    tcp_slot_unacked[slot] = 1
+    tcp_slot_pend_flags[slot] = flags
+    tcp_slot_pend_seq[slot] = seq
+    tcp_slot_pend_len[slot] = payload_len
+    tcp_slot_last_send[slot] = get_jiffies()
+    if payload_len > 0:
+        base: uint64 = slot * TCP_MSS
+        i: uint64 = 0
+        cap: uint64 = payload_len
+        if cap > TCP_MSS:
+            cap = TCP_MSS
+        while i < cap:
+            tcp_slot_pend_data[base + i] = payload[i]
+            i = i + 1
+
+
+def _tcp_clear_pending(slot: uint64, acked_seq: uint32):
+    # Called from tcp_rx when an ACK advances snd_una past the
+    # pending segment's seq+len. Measures RTT (only on first send —
+    # Karn's algorithm: don't sample on a retransmitted segment) and
+    # clears the per-slot retransmission state.
+    if tcp_slot_unacked[slot] == 0:
+        return
+    pend_seq: uint32 = tcp_slot_pend_seq[slot]
+    pend_len: uint64 = tcp_slot_pend_len[slot]
+    pend_flags: uint8 = tcp_slot_pend_flags[slot]
+    seq_consumed: uint32 = pend_seq + cast[uint32](pend_len)
+    if (pend_flags & TCP_SYN) != 0:
+        seq_consumed = seq_consumed + 1
+    if (pend_flags & TCP_FIN) != 0:
+        seq_consumed = seq_consumed + 1
+    # Did this ACK cover our pending segment?
+    if acked_seq < seq_consumed:
+        return
+    # Karn: only sample RTT when retries == 0 (the segment wasn't
+    # retransmitted). Otherwise we can't tell which copy the ACK is
+    # for and an erroneous sample would skew SRTT badly.
+    if tcp_slot_retries[slot] == 0:
+        rtt: uint64 = get_jiffies() - tcp_slot_last_send[slot]
+        if rtt == 0:
+            rtt = 1
+        _tcp_update_rto(slot, rtt)
+    tcp_slot_unacked[slot] = 0
+    tcp_slot_retries[slot] = 0
+    tcp_slot_pend_len[slot] = 0
+    tcp_slot_pend_flags[slot] = 0
+
+
+def _tcp_retransmit(slot: uint64) -> int32:
+    # Rebuild and resend the pending segment using the snapshotted
+    # flags / seq / payload. Bumps tcp_slot_retries; the caller (the
+    # polling loop) bumps RTO via exponential backoff. Returns 0 on
+    # successful tx, -1 on send failure.
+    flags: uint8 = tcp_slot_pend_flags[slot]
+    seq: uint32 = tcp_slot_pend_seq[slot]
+    payload_len: uint64 = tcp_slot_pend_len[slot]
+    # Temporarily roll snd_nxt back to the pending segment's seq so
+    # _tcp_build_and_send stamps the wire-correct sequence number;
+    # restore after the call.
+    saved_snd_nxt: uint32 = tcp_slot_snd_nxt[slot]
+    tcp_slot_snd_nxt[slot] = seq
+    rc: int32 = 0
+    if payload_len > 0:
+        base: uint64 = slot * TCP_MSS
+        pl_ptr: Ptr[uint8] = cast[Ptr[uint8]](&tcp_slot_pend_data[base])
+        rc = _tcp_send_segment(slot, flags, pl_ptr, payload_len, 1)
+    else:
+        rc = _tcp_send_segment(slot, flags, cast[Ptr[uint8]](0), 0, 1)
+    tcp_slot_snd_nxt[slot] = saved_snd_nxt
+    return rc
+
+
+def _tcp_check_retrans(slot: uint64) -> int32:
+    # Polling-loop helper. Returns:
+    #   0   nothing to do (no pending segment, or RTO not yet expired)
+    #   1   retransmit fired this iteration
+    #  -1   exceeded TCP_MAX_RETRIES — caller should give up
+    if tcp_slot_unacked[slot] == 0:
+        return 0
+    now: uint64 = get_jiffies()
+    elapsed: uint64 = now - tcp_slot_last_send[slot]
+    rto: uint64 = tcp_slot_rto[slot]
+    if elapsed < rto:
+        return 0
+    if tcp_slot_retries[slot] >= TCP_MAX_RETRIES:
+        # Convert jiffies to ms for the log line (HZ=100 -> *10).
+        rto_ms: uint64 = rto * 10
+        printk2("[tcp] connect timeout after %d retries (rto=%dms)\n",
+                tcp_slot_retries[slot], rto_ms)
+        return -1
+    tcp_slot_retries[slot] = tcp_slot_retries[slot] + 1
+    # Exponential backoff (RFC 6298 §5.5).
+    tcp_slot_rto[slot] = rto * 2
+    rto_ms: uint64 = rto * 10
+    printk2("[tcp] retrans #%d rto=%dms\n",
+            tcp_slot_retries[slot], rto_ms)
+    _tcp_retransmit(slot)
+    # last_send refreshed by _tcp_send_segment via the same code
+    # path the original tx used. Stash now for safety.
+    tcp_slot_last_send[slot] = get_jiffies()
+    return 1
+
+
 def _tcp_build_and_send(slot: uint64, flags: uint8,
                         payload: Ptr[uint8],
                         payload_len: uint64) -> int32:
+    # Public-shaped wrapper: build, transmit, and arm retransmission
+    # state. is_retrans=0 here means "first send — record this seq
+    # in the pending slot and start the RTO clock".
+    return _tcp_send_segment(slot, flags, payload, payload_len, 0)
+
+
+def _tcp_send_segment(slot: uint64, flags: uint8,
+                      payload: Ptr[uint8],
+                      payload_len: uint64,
+                      is_retrans: uint64) -> int32:
     # Build the pseudo-header + TCP header + payload, compute the
     # checksum, and hand the segment to ip_send. The pseudo-header
     # is laid down at tcp_tx_buf[0..12); the segment proper starts
@@ -376,7 +573,19 @@ def _tcp_build_and_send(slot: uint64, flags: uint8,
     if (flags & TCP_RST) != 0:
         tcp_resets_out = tcp_resets_out + 1
     tcp_slot_last_act[slot] = get_jiffies()
-    return ip_send(r0, r1, r2, r3, IPPROTO_TCP, seg_ptr, seg_total)
+    rc: int32 = ip_send(r0, r1, r2, r3, IPPROTO_TCP, seg_ptr, seg_total)
+    # First-send-only: snapshot the segment for retransmission. We
+    # use snd_nxt as the seq because that's what we just wrote into
+    # the header. Pure ACKs (no SYN/FIN/no payload) skip arming
+    # inside _tcp_arm_retrans.
+    if is_retrans == 0:
+        if rc == 0:
+            _tcp_arm_retrans(slot, flags, snd_nxt, payload, payload_len)
+    else:
+        # Retransmit path — refresh the timer; retries already bumped
+        # by _tcp_check_retrans.
+        tcp_slot_last_send[slot] = get_jiffies()
+    return rc
 
 
 def tcp_rx(payload: Ptr[uint8], length: uint64,
@@ -455,6 +664,8 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
                             cast[uint64](expected_ack))
                     return
                 tcp_slot_snd_una[slot] = ack32
+                # RTT sample + clear pending-SYN retransmission state.
+                _tcp_clear_pending(slot, ack32)
                 # rcv_nxt = peer's ISN + 1 (the SYN consumes one
                 # sequence number even though it carries no data).
                 tcp_slot_rcv_nxt[slot] = seq32 + 1
@@ -511,6 +722,8 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
             # only ever has one segment in flight.
             if ack32 > tcp_slot_snd_una[slot]:
                 tcp_slot_snd_una[slot] = ack32
+            # RTT sample + clear retransmission for the data segment.
+            _tcp_clear_pending(slot, ack32)
         return
 
     # FIN_WAIT_1: we sent FIN; expect ACK (-> FIN_WAIT_2) and/or
@@ -520,6 +733,7 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
         if (flags & TCP_ACK) != 0:
             if ack32 >= tcp_slot_snd_nxt[slot]:
                 tcp_slot_snd_una[slot] = ack32
+                _tcp_clear_pending(slot, ack32)
                 tcp_slot_state[slot] = TCP_FIN_WAIT_2
                 printk1("[tcp] slot=%d -> FIN_WAIT_2\n", slot)
         if (flags & TCP_FIN) != 0:
@@ -550,6 +764,7 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
     if state == TCP_CLOSING:
         if (flags & TCP_ACK) != 0:
             if ack32 >= tcp_slot_snd_nxt[slot]:
+                _tcp_clear_pending(slot, ack32)
                 tcp_slot_state[slot] = TCP_TIME_WAIT
                 printk1("[tcp] slot=%d -> TIME_WAIT\n", slot)
         return
@@ -557,6 +772,7 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
     if state == TCP_LAST_ACK:
         if (flags & TCP_ACK) != 0:
             if ack32 >= tcp_slot_snd_nxt[slot]:
+                _tcp_clear_pending(slot, ack32)
                 tcp_slot_state[slot] = TCP_CLOSED
                 printk1("[tcp] slot=%d -> CLOSED (last-ack)\n", slot)
         return
@@ -610,6 +826,18 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
     tcp_slot_rcv_nxt[slot] = 0
     tcp_slot_rx_len[slot] = 0
     tcp_slot_saw_fin[slot] = 0
+    # Fresh per-slot retransmission state. The first SYN we send
+    # gets armed by _tcp_send_segment; if no SYN-ACK comes back the
+    # connect-side polling loop fires _tcp_check_retrans.
+    tcp_slot_unacked[slot] = 0
+    tcp_slot_retries[slot] = 0
+    tcp_slot_rto[slot] = TCP_RTO_INITIAL
+    tcp_slot_have_rtt[slot] = 0
+    tcp_slot_srtt[slot] = 0
+    tcp_slot_rttvar[slot] = 0
+    tcp_slot_pend_flags[slot] = 0
+    tcp_slot_pend_len[slot] = 0
+    tcp_slot_pend_seq[slot] = 0
     # The SYN segment we transmit needs seq=ISN. We temporarily set
     # snd_nxt back to ISN for the build, then restore +1.
     tcp_slot_snd_nxt[slot] = isn
@@ -624,6 +852,8 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
         return -1
 
     # Poll until ESTABLISHED or timeout. tcp_rx flips the state.
+    # On each iteration also nudge _tcp_check_retrans so the SYN
+    # gets retransmitted when its RTO expires — RFC 6298 §5 path.
     start: uint64 = get_jiffies()
     deadline: uint64 = start + timeout_jiffies
     while get_jiffies() < deadline:
@@ -633,6 +863,11 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
         if tcp_slot_state[slot] == TCP_CLOSED:
             # Got a RST while waiting for SYN-ACK.
             printk0("[tcp] connect refused\n")
+            return -1
+        rtx: int32 = _tcp_check_retrans(slot)
+        if rtx < 0:
+            # Exceeded TCP_MAX_RETRIES — give up early.
+            tcp_slot_state[slot] = TCP_CLOSED
             return -1
     printk1("[tcp] connect timeout on slot=%d\n", slot)
     tcp_slot_state[slot] = TCP_CLOSED
@@ -665,20 +900,28 @@ def tcp_send(slot_signed: int32, buf: Ptr[uint8],
         return -1
     tcp_slot_snd_nxt[slot] = target_ack
     # Poll for the ACK. SLIRP turns segments around in well under
-    # 10 ms; 100 jiffies (1 s) is overkill but cheap.
+    # 10 ms; on real wires _tcp_check_retrans fires the RFC 6298
+    # retransmit when the per-slot RTO expires. Deadline runs long
+    # enough to cover the full exponential backoff cap of 5 retries
+    # (1+2+4+8+16+32 = 63 RTOs ≈ 63 s in the worst case); 1200
+    # jiffies = 12 s is a compromise that catches the first 4..5
+    # backoff bounces without dragging the smoke test under SLIRP.
     start: uint64 = get_jiffies()
-    deadline: uint64 = start + 100
+    deadline: uint64 = start + 1200
     while get_jiffies() < deadline:
         virtio_net_poll()
         if tcp_slot_snd_una[slot] >= target_ack:
             return cast[int64](length)
         if tcp_slot_state[slot] == TCP_CLOSED:
             return -1
-    # Timed out waiting for ACK. We DON'T retransmit (per the
-    # M16.102 scope — single-shot is fine for SLIRP). Return what
-    # we sent so the caller can decide whether to consider it lost.
+        rtx: int32 = _tcp_check_retrans(slot)
+        if rtx < 0:
+            # Exceeded TCP_MAX_RETRIES — peer has gone dark.
+            return -1
+    # Even with retransmit we couldn't get an ACK. Return -1 so the
+    # caller can distinguish a lost segment from a clean send.
     printk1("[tcp] send ACK timeout slot=%d\n", slot)
-    return cast[int64](length)
+    return -1
 
 
 def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
@@ -715,6 +958,13 @@ def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
             if tcp_slot_rx_len[slot] == 0:
                 return 0
         if tcp_slot_state[slot] == TCP_CLOSED:
+            return -1
+        # If a previous tcp_send still has an unacked segment in
+        # flight when the user dropped into tcp_recv, fire the RTO
+        # path from here too — otherwise a server that ACKs only
+        # after responding would starve our retransmit.
+        rtx: int32 = _tcp_check_retrans(slot)
+        if rtx < 0:
             return -1
     return 0                              # treat timeout-with-no-data as 0
 
@@ -765,6 +1015,11 @@ def tcp_close(slot_signed: int32) -> int32:
             tcp_slot_state[slot] = TCP_CLOSED
             printk1("[tcp] closed slot=%d\n", slot)
             return 0
+        rtx: int32 = _tcp_check_retrans(slot)
+        if rtx < 0:
+            # Peer dropped off the wire — slot is dead.
+            tcp_slot_state[slot] = TCP_CLOSED
+            return 0
     # Timed out. Force CLOSED so the slot is reusable — the peer's
     # FIN may arrive later and will get dropped by _tcp_find_slot.
     printk1("[tcp] close timeout on slot=%d (forcing CLOSED)\n", slot)
@@ -792,6 +1047,16 @@ def tcp_init():
         tcp_slot_last_act[i] = 0
         tcp_slot_rx_len[i] = 0
         tcp_slot_saw_fin[i] = 0
+        tcp_slot_last_send[i] = 0
+        tcp_slot_rto[i] = TCP_RTO_INITIAL
+        tcp_slot_retries[i] = 0
+        tcp_slot_srtt[i] = 0
+        tcp_slot_rttvar[i] = 0
+        tcp_slot_have_rtt[i] = 0
+        tcp_slot_unacked[i] = 0
+        tcp_slot_pend_flags[i] = 0
+        tcp_slot_pend_seq[i] = 0
+        tcp_slot_pend_len[i] = 0
         i = i + 1
     j: uint64 = 0
     while j < 32:
