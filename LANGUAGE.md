@@ -9,6 +9,7 @@ and userland binaries (`user/*.ad` and `tests/test_*.ad`). See
 `docs/architecture.md` for how those pieces fit together.
 
 ## Table of Contents
+- [Lexical Grammar](#lexical-grammar)
 - [Types](#types)
 - [Variables](#variables)
 - [Functions](#functions)
@@ -20,6 +21,56 @@ and userland binaries (`user/*.ad` and `tests/test_*.ad`). See
 - [Hardware Intrinsics](#hardware-intrinsics)
 - [Inline Assembly](#inline-assembly)
 - [Decorators](#decorators)
+
+---
+
+## Lexical Grammar
+
+### Identifiers
+
+An identifier is a maximal run of `[A-Za-z0-9_]` that is NOT a valid
+numeric literal under the rule below. Identifiers MAY start with a
+digit — `9P2000`, `9foo`, `100abc` are all legal identifier names.
+The classic Python rule "identifiers can't start with a digit" was
+relaxed so Plan 9 / 9P names (`9P2000`, `lib/9p/...`, `sys/src/9/...`)
+can be expressed verbatim, matching the spelling in the Plan 9 source
+tree and the underlying 9P2000 protocol RFC.
+
+### Numeric literals
+
+When the lexer encounters a token starting with a digit, it greedily
+reads `[A-Za-z0-9_]+` and then checks whether the assembled word
+matches one of the numeric forms below. If yes, the token is a
+`NUMBER`; otherwise it is an `IDENT`. After the greedy alnum read, the
+lexer also extends the word through a `.digits` fractional part (only
+if the next char is `.` followed by a digit — `9.foo` still tokenizes
+as `9` `.` `foo`) and through a signed `[eE][+-]?digits` exponent tail
+(the `+`/`-` isn't alnum, so the greedy first pass would otherwise
+stop short of `1.5e-3`).
+
+| Form                              | Example     | Token       |
+|-----------------------------------|-------------|-------------|
+| `0x[0-9A-Fa-f_]+`                 | `0x1F`      | `NUMBER`    |
+| `0b[01_]+`                        | `0b1010`    | `NUMBER`    |
+| `0o[0-7_]+`                       | `0o755`     | `NUMBER`    |
+| `[0-9_]+`                         | `1_000_000` | `NUMBER`    |
+| `[0-9_]+\.[0-9_]+([eE][+-]?[0-9_]+)?` | `1.5e-3`    | `NUMBER`    |
+| `[0-9_]+[eE][+-]?[0-9_]+`         | `9e5`       | `NUMBER`    |
+| anything else with a digit prefix | `9P2000`    | `IDENT`     |
+| `0x` followed by non-hex          | `0xZZ`      | `IDENT`     |
+
+Underscores act as digit separators inside numeric literals (matching
+the existing pre-2026-05 behavior) and are stripped before value
+parsing — `1_000_000` evaluates to `1000000`.
+
+Examples:
+
+```python
+9P2000: int32 = 100        # IDENT: 9P2000 is a digit-leading identifier
+mode: uint32 = 0o755       # NUMBER: octal literal
+shift: float64 = 1.5e-3    # NUMBER: float with signed exponent
+x = 9.foo                  # NUMBER(9), DOT, IDENT(foo) — three tokens
+```
 
 ---
 

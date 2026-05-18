@@ -1,0 +1,79 @@
+# tests/test_lex_digit_idents.ad
+#
+# Userland fixture proving the Adder lexer accepts digit-leading
+# identifiers (9P2000, 9foo, ...) without losing the ability to parse
+# numeric literals that overlap the same start (0x1F, 9.5e-3, 9, etc.).
+#
+# This file's primary job is to COMPILE at all: if the lexer rejected
+# digit-leading idents, `9P2000` on line 28 below would raise a
+# LexerError and the test_lex_digit_idents.sh build step would fail
+# before QEMU ever boots. Beyond compiling, the fixture also runs and
+# checks each digit-leading identifier holds the right value, so the
+# pipeline catches a hypothetical regression where the lexer swallowed
+# trailing digits into an identifier when they should have been a
+# separate NUMBER, or vice versa.
+#
+# Driven by scripts/test_lex_digit_idents.sh: builds this .ad as a
+# userland x86_64 ELF, plants it at /bin/test_lex_digit_idents in the
+# cpio initramfs, boots QEMU + hamsh, runs the binary, then asserts on
+# the serial log for the [lex_digit_idents] PASS banner. Same shape as
+# scripts/test_9p_codec.sh / test_mkfs.sh.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_exit(code: uint64)
+
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def emit(msg: Ptr[uint8]):
+    sys_write(1, msg, strlen(msg))
+
+
+def fail(msg: Ptr[uint8]):
+    emit("[lex_digit_idents] FAIL ")
+    emit(msg)
+    emit("\n")
+    sys_exit(1)
+
+
+def main():
+    emit("[lex_digit_idents] start\n")
+
+    # The headline case: a digit-leading identifier in a declaration.
+    # If the lexer regressed, this line wouldn't even parse.
+    9P2000: int32 = 100
+    if 9P2000 != 100:
+        fail("9P2000 != 100")
+
+    # Digit-leading ident next to a hex literal — proves the lexer
+    # still classifies 0x1F as NUMBER, not as another ident.
+    9foo: int32 = 0x1F
+    if 9foo != 31:
+        fail("9foo != 0x1F")
+
+    # Identifier with trailing digits (legacy, must still work).
+    var9: int32 = 9
+    if var9 != 9:
+        fail("var9 != 9")
+
+    # Pure-integer with underscore separator (existing numeric form).
+    big: uint64 = 1_000_000
+    if big != 1000000:
+        fail("1_000_000 != 1000000")
+
+    # Binary and octal literals (existing numeric forms — must not be
+    # swept up as digit-leading idents).
+    bits: uint32 = 0b1010
+    if bits != 10:
+        fail("0b1010 != 10")
+    oct755: uint32 = 0o755
+    if oct755 != 493:
+        fail("0o755 != 493")
+
+    emit("[lex_digit_idents] PASS\n")
+    sys_exit(0)

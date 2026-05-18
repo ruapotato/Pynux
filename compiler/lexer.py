@@ -557,6 +557,151 @@ class Lexer:
         return Token(TokenType.IDENT, name, start_line, start_col,
                     self.line, self.column)
 
+    def read_alnum_word(self) -> str:
+        """Greedy read of [A-Za-z0-9_]+. Returns the raw word."""
+        value = []
+        while self.current_char() and (self.current_char().isalnum()
+                                       or self.current_char() == '_'):
+            value.append(self.advance())
+        return ''.join(value)
+
+    def _try_classify_number(self, word: str):
+        """If `word` is a valid numeric literal, return its parsed value.
+
+        Returns None if the word is not a number (so the caller should emit
+        an identifier). Supports:
+          - 0x[0-9A-Fa-f_]+ hex
+          - 0b[01_]+ binary
+          - 0o[0-7_]+ octal
+          - [0-9_]+ integer
+          - [0-9_]+\\.[0-9_]+ float (with optional [eE][+-]?[0-9_]+ exp)
+          - [0-9_]+[eE][+-]?[0-9_]+ float with exponent only
+
+        Underscores are accepted as digit separators (e.g. 1_000_000)
+        matching the existing read_number behavior.
+        """
+        if not word or not word[0].isdigit():
+            return None
+
+        # Strip leading-only prefix `0x`/`0b`/`0o`.
+        if len(word) >= 3 and word[0] == '0' and word[1] in 'xXbBoO':
+            prefix = word[1].lower()
+            rest = word[2:].replace('_', '')
+            if not rest:
+                return None
+            if prefix == 'x':
+                if all(c in '0123456789abcdefABCDEF' for c in rest):
+                    try:
+                        return int(rest, 16)
+                    except ValueError:
+                        return None
+                return None
+            if prefix == 'b':
+                if all(c in '01' for c in rest):
+                    try:
+                        return int(rest, 2)
+                    except ValueError:
+                        return None
+                return None
+            if prefix == 'o':
+                if all(c in '01234567' for c in rest):
+                    try:
+                        return int(rest, 8)
+                    except ValueError:
+                        return None
+                return None
+
+        # Pure integer: digits + underscores only.
+        stripped = word.replace('_', '')
+        if stripped.isdigit():
+            return int(stripped)
+
+        # Float with optional exponent. Allowed alphabet: digits, '.', 'e', 'E',
+        # '+', '-', '_'. The '+'/'-' may only appear immediately after e/E.
+        # Underscores are stripped before parsing.
+        # Validate shape: [0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)? with _ separators
+        # allowed inside the digit runs. (No leading dot — first char is digit.)
+        i = 0
+        n = len(word)
+        # integer part
+        had_digit = False
+        while i < n and (word[i].isdigit() or word[i] == '_'):
+            if word[i].isdigit():
+                had_digit = True
+            i += 1
+        if not had_digit:
+            return None
+        # optional .frac
+        if i < n and word[i] == '.':
+            i += 1
+            had_digit = False
+            while i < n and (word[i].isdigit() or word[i] == '_'):
+                if word[i].isdigit():
+                    had_digit = True
+                i += 1
+            if not had_digit:
+                return None
+        # optional exponent
+        if i < n and word[i] in 'eE':
+            i += 1
+            if i < n and word[i] in '+-':
+                i += 1
+            had_digit = False
+            while i < n and (word[i].isdigit() or word[i] == '_'):
+                if word[i].isdigit():
+                    had_digit = True
+                i += 1
+            if not had_digit:
+                return None
+        if i != n:
+            return None
+        try:
+            return float(word.replace('_', ''))
+        except ValueError:
+            return None
+
+    def read_digit_token(self) -> Token:
+        """Read a token starting with a digit.
+
+        Greedy reads [A-Za-z0-9_]+, then optionally extends through a
+        `.digits` fractional part and/or an `[eE][+-]?digits` exponent so
+        that floats like `9.5e-3` (which contain a `-` that isn't alnum)
+        are lexed as a single NUMBER. After assembly, classifies the word
+        as either a numeric literal (if it matches a numeric form) or an
+        identifier (anything else, e.g. `9P2000`, `100abc`, `0xZZ`).
+        """
+        start_line = self.line
+        start_col = self.column
+        word = self.read_alnum_word()
+
+        # If the word so far looks like a pure decimal integer (digits +
+        # optional `_`), try to extend it with `.digits` for a float
+        # fractional part. We only extend if the next char is a literal
+        # `.` AND the char after is a digit — `9.foo` and `9..` keep
+        # parsing as `9` then `.` then the rest.
+        def _is_decimal_int(w: str) -> bool:
+            return bool(w) and all(c.isdigit() or c == '_' for c in w)
+
+        if _is_decimal_int(word) and self.current_char() == '.' and self.peek_char().isdigit():
+            word += self.advance()  # consume '.'
+            word += self.read_alnum_word()
+
+        # Extend with `[+-]digits` exponent tail if the greedy word ended
+        # on `e` or `E` and the next char is `+`/`-` followed by a digit.
+        # (Plain `e5` is already captured by the first greedy read; only
+        # the signed-exponent form leaks out because `-`/`+` aren't alnum.)
+        if word and word[-1] in 'eE' and self.current_char() in '+-' and self.peek_char().isdigit():
+            word += self.advance()  # consume sign
+            word += self.read_alnum_word()
+
+        # Classify.
+        num_value = self._try_classify_number(word)
+        if num_value is not None:
+            return Token(TokenType.NUMBER, num_value, start_line, start_col,
+                         self.line, self.column)
+        return Token(TokenType.IDENT, word, start_line, start_col,
+                     self.line, self.column)
+
     def read_char_literal(self) -> Token:
         """Read a character literal 'x'."""
         start_line = self.line
@@ -712,9 +857,12 @@ class Lexer:
                 self.tokens.append(token)
                 continue
 
-            # Numbers
+            # Digit-leading token: either a numeric literal (123, 0x1F,
+            # 9.5e-3, etc.) or a digit-leading identifier (9P2000,
+            # 100abc). Disambiguated by read_digit_token via
+            # post-classification of a greedy [A-Za-z0-9_]+ word.
             if ch.isdigit():
-                self.tokens.append(self.read_number())
+                self.tokens.append(self.read_digit_token())
                 continue
 
             # Identifiers and keywords
