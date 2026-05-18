@@ -181,21 +181,113 @@ def build_archive() -> bytes:
     # privatised namespace's /etc. Real debootstrap-style trees are
     # too large to commit here — this is purely the smoke-test
     # fixture for scripts/test_distro_namespace.sh.
+    #
+    # SIZE GATE for real debootstrap'd backings:
+    # `tests/distros/debian-minbase/rootfs/` is ~80-150 MB of real
+    # Debian binaries (see tests/distros/debian-minbase/HOWTO.md).
+    # Embedding it by default would inflate fs/initramfs_blob.S past
+    # GitHub's 100 MB push limit, AND blow past fs/cpio.ad's NR_FILES
+    # cap (currently 192, well under debootstrap's ~5000 files). Mirror
+    # the HAMNIX_EMBED_UBIN opt-in pattern: only embed
+    # `debian-minbase/rootfs/` (and any sibling distro whose root is a
+    # `rootfs/` subdir) when HAMNIX_EMBED_DEBIAN is set, and gate the
+    # embed scope by the env var's value:
+    #
+    #     HAMNIX_EMBED_DEBIAN=minimal   (default if set)
+    #         Curated subset that fits under NR_FILES + initramfs_blob.S
+    #         size sanity: /etc/debian_version, /etc/os-release,
+    #         /etc/passwd, /etc/group. Enough to prove the namespace
+    #         bind grafts the REAL debootstrap'd /etc/ over Hamnix's,
+    #         which is what test_distro_debian.sh asserts.
+    #     HAMNIX_EMBED_DEBIAN=full
+    #         Walk every file in rootfs/. Currently exceeds NR_FILES;
+    #         lands when fs/cpio.ad bumps the cap and the kernel
+    #         build path can ingest a ~250 MB cpio archive without
+    #         turning fs/initramfs_blob.S into a multi-GB .S file.
+    #     HAMNIX_EMBED_DEBIAN=1
+    #         Backward-compatible alias for `minimal`.
+    #
+    # Tiny synthetic fixtures (e.g. tests/distros/testdistro/) without
+    # a `rootfs/` layer are always embedded.
+    embed_debian_raw = os.environ.get("HAMNIX_EMBED_DEBIAN", "0")
+    if embed_debian_raw in ("0", "", "off", "no"):
+        embed_debian_mode: str | None = None
+    elif embed_debian_raw in ("1", "minimal", "min"):
+        embed_debian_mode = "minimal"
+    elif embed_debian_raw in ("full", "all"):
+        embed_debian_mode = "full"
+    else:
+        raise SystemExit(
+            f"HAMNIX_EMBED_DEBIAN={embed_debian_raw!r}: "
+            f"expected one of {{0, 1, minimal, full}}")
+
+    # Curated minimal embed set: relative paths under rootfs/ that
+    # the test_distro_debian.sh assertions actually touch. Keep this
+    # short — every entry consumes one of NR_FILES slots in
+    # fs/cpio.ad and adds ~6x its byte size to fs/initramfs_blob.S.
+    DEBIAN_MINIMAL_PATHS = [
+        "etc/debian_version",
+        "etc/os-release",
+        "etc/passwd",
+        "etc/group",
+        "etc/hostname",
+        "usr/lib/os-release",  # /etc/os-release symlink target
+    ]
+
     distros_dir = here / "tests" / "distros"
     if distros_dir.is_dir():
         for distro_root in sorted(distros_dir.iterdir()):
             if not distro_root.is_dir():
                 continue
-            for src in sorted(distro_root.rglob("*")):
-                if not src.is_file():
+            # If the distro stages its tree under a `rootfs/` subdir
+            # (debootstrap convention: BUILD.sh emits ./rootfs/), use
+            # that subdir as the embed source and gate it behind
+            # HAMNIX_EMBED_DEBIAN. Tiny fixtures without rootfs/
+            # (testdistro) embed unconditionally as before.
+            rootfs_sub = distro_root / "rootfs"
+            if rootfs_sub.is_dir():
+                if embed_debian_mode is None:
+                    print(f"  skipped tests/distros/{distro_root.name}/rootfs/ "
+                          f"(set HAMNIX_EMBED_DEBIAN=1 to embed)")
                     continue
-                rel = src.relative_to(distro_root)
+                embed_root = rootfs_sub
+                if embed_debian_mode == "minimal":
+                    src_iter = []
+                    for rel in DEBIAN_MINIMAL_PATHS:
+                        p = embed_root / rel
+                        if p.is_file():
+                            src_iter.append(p)
+                else:  # full
+                    src_iter = [p for p in sorted(embed_root.rglob("*"))
+                                if p.is_file()]
+            else:
+                embed_root = distro_root
+                src_iter = [p for p in sorted(embed_root.rglob("*"))
+                            if p.is_file()]
+            n_embedded = 0
+            n_bytes = 0
+            for src in src_iter:
+                rel = src.relative_to(embed_root)
                 name = ("/var/lib/distros/" + distro_root.name
                         + "/" + str(rel))
-                data = src.read_bytes()
+                try:
+                    data = src.read_bytes()
+                except (OSError, PermissionError):
+                    # Some debootstrap'd files (e.g. /etc/shadow, mode
+                    # 0640 root:shadow) are unreadable by the calling
+                    # user. Skip with a note rather than fail the build.
+                    print(f"  skipped {name} (unreadable)")
+                    continue
                 blob += cpio_entry(name, data)
-                print(f"  embedded {name} ({len(data)} bytes from "
-                      f"tests/distros/{distro_root.name}/{rel})")
+                n_embedded += 1
+                n_bytes += len(data)
+            if rootfs_sub.is_dir():
+                print(f"  embedded {n_embedded} files ({n_bytes} bytes) "
+                      f"from tests/distros/{distro_root.name}/rootfs/ "
+                      f"[HAMNIX_EMBED_DEBIAN={embed_debian_mode}]")
+            else:
+                print(f"  embedded {n_embedded} files ({n_bytes} bytes) "
+                      f"from tests/distros/{distro_root.name}/")
 
     # Kernel modules: anything in build/mod/ gets embedded as /<stem>
     # so module_load() can fetch by path. Convention is to start the

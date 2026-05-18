@@ -94,3 +94,9 @@ tests/u-binary/src/musl_thread_many/hello
 tests/u-binary/src/musl_thread_cond/hello
 tests/u-binary/src/musl_thread_join_many/hello
 tests/u-binary/src/musl_syscalls/syscalls
+
+# Debian minbase rootfs staged by tests/distros/debian-minbase/BUILD.sh
+# (~80-150 MB of real Debian binaries — too large to commit, and
+# upstream archive is the source of truth). BUILD.sh + MANIFEST.txt +
+# HOWTO.md stay tracked.
+tests/distros/debian-minbase/rootfs/

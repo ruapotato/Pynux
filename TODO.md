@@ -214,11 +214,25 @@ it has to honour.
   `user/runtime.S` grew thin `sys_bind`/`sys_mount`/`sys_unmount`
   wrappers (Plan 9 syscall numbers 257/258/259) mirroring the
   existing `sys_chdir` shape.~~ Follow-ups:
-    * Debootstrap workflow doc — how to populate
-      `/var/lib/distros/debian-trixie/` from a host Debian box
-      (probably `debootstrap --variant=minbase trixie
-      ./debian-trixie http://deb.debian.org/debian`, then a script
-      that `dd`'s the tree into a Hamnix-mounted disk image).
+    * ~~Debootstrap'd Debian backing — landed via
+      `tests/distros/debian-minbase/{BUILD.sh,MANIFEST.txt,HOWTO.md}`
+      + `scripts/test_distro_debian.sh`. `BUILD.sh` runs
+      `debootstrap --variant=minbase --include=bash,coreutils
+      stable ./rootfs http://deb.debian.org/debian` (one-time host
+      step, ~80-150 MB, gitignored). `scripts/build_initramfs.py`
+      learned a `HAMNIX_EMBED_DEBIAN={1,minimal,full}` opt-in:
+      `minimal` (default when set) embeds a curated subset
+      (`/etc/{debian_version,os-release,passwd,group,hostname}` +
+      `/usr/lib/os-release`) sized to fit `fs/cpio.ad`'s
+      `NR_FILES=192` cap; `full` walks every file in `rootfs/`
+      (currently overflows the cap; lands when `NR_FILES` bumps +
+      the cpio archive can ingest ~250 MB without inflating
+      `fs/initramfs_blob.S` past GitHub's 100 MB push limit).
+      End-to-end:
+      `/bin/distrorun debian-minbase /bin/cat /etc/debian_version`
+      reads the REAL Debian release token ("13.5" for trixie) from
+      the debootstrap'd backing while the parent's namespace still
+      reads "hamnix/0.1".~~
     * Convenience aliases at `/bin/deb`, `/bin/ubuntu`, `/bin/suse`
       that pre-translate the distro name. Each is a 200-byte
       wrapper around `distrorun <fixed-distro-name> ...argv`.
@@ -227,10 +241,27 @@ it has to honour.
       #2). Replaces disk-backed `/var/lib/distros/<name>/` with an
       on-demand 9P-served FHS view assembled from a `.deb` package
       store. Layer 3 service; lands after Phase F.
-    * First real Debian binary running inside a namespace — e.g.
-      `deb cat /etc/debian_version` from an actual debootstrap'd
-      `/var/lib/distros/debian-trixie/`, with the Linux ABI loader
-      taking over for the exec'd binary.
+    * Real Debian BINARY (not just /etc/* file) running inside a
+      namespace — `deb /bin/true` actually exec'ing the Debian-
+      shipped `/bin/true`. Blocked on:
+        - `fs/cpio.ad` `NR_FILES` bump (192 -> 8192+) so the full
+          debootstrap'd tree (~5000 files) fits in the cpio archive.
+        - Dynamic linker — Debian's `/bin/true` is a dynamic ELF with
+          interp=`/lib64/ld-linux-x86-64.so.2`. Hamnix's U-track
+          loader handles static-pie only; bringing up Debian's glibc
+          ld.so as a real ELF interpreter is a separate, larger lift.
+        - Linux-ABI execve: `linux_abi/u_syscalls.ad`'s execve has
+          to follow PT_INTERP and load ld-linux for the dynamic
+          case (today it returns the static-pie code path).
+    * `apt update` inside a namespace — needs (a) the dynamic linker
+      above so `/usr/bin/apt` runs, (b) networking inside the
+      namespace (today /net is the shared bind so this works), and
+      (c) `/var/lib/dpkg/` write-through, which requires the
+      debootstrap tree to be writable from inside the cpio archive
+      (today it's read-only — we'd need to copy `/var/lib/dpkg/` onto
+      a tmpfs overlay during distrorun bring-up).
+    * `/bin/python3` from Debian — exact same shape as `/bin/bash`:
+      land the dynamic linker, run any dynamic Debian binary.
     * Phase D follow-up: once `chan_attach` speaks 9P (Phase D's
       hamwd), replace the four per-subdir binds in `distrorun.ad`
       with a single `mount(srvfd, -1, "/", MREPL, "")` call that

@@ -1,0 +1,63 @@
+tests/distros/debian-minbase/MANIFEST.txt
+==========================================
+
+Expected key paths inside tests/distros/debian-minbase/rootfs/ after a
+successful run of BUILD.sh (`debootstrap --variant=minbase
+--include=bash,coreutils stable ./rootfs http://deb.debian.org/debian`).
+
+The rootfs tree itself is gitignored (the binary content is too large
+to commit and contains GPL/LGPL packages with their own distribution
+rules); this MANIFEST is the in-git record of what BUILD.sh should
+deliver, so that a future agent / CI run can sanity-check the host's
+output even without inspecting it manually.
+
+A successful build provides AT LEAST the following:
+
+  Binaries (coreutils + bash):
+    /bin/true                            — exit 0
+    /bin/false                           — exit 1
+    /bin/cat                             — concatenate files
+    /bin/ls                              — directory listing
+    /bin/echo                            — print args
+    /bin/bash                            — Bourne-Again shell
+    /bin/dash                            — Debian Almquist shell (/bin/sh)
+
+  Dynamic loader + libc:
+    /lib64/ld-linux-x86-64.so.2          — glibc dynamic linker (ELF interp)
+    /lib/x86_64-linux-gnu/libc.so.6      — glibc shared library
+    /lib/x86_64-linux-gnu/libdl.so.2     — dynamic-loading shim
+    /lib/x86_64-linux-gnu/libpthread.so.0 — POSIX threads
+    /lib/x86_64-linux-gnu/libm.so.6      — math library
+
+  Distro identity files:
+    /etc/debian_version                  — single-line release id
+                                           (currently "13.0" / "trixie/sid"
+                                           for stable; varies by Debian
+                                           archive snapshot at build time)
+    /etc/os-release                      — KEY=VALUE Debian metadata
+    /etc/passwd                          — Debian user table
+
+  Package-management state:
+    /var/lib/dpkg/status                 — installed-package database
+    /var/lib/dpkg/info/                  — per-package metadata
+
+  Misc filesystem skeleton:
+    /usr/                                — FHS userland tree
+    /var/                                — variable state
+    /etc/apt/                            — APT configuration
+    /tmp/                                — empty
+    /root/                               — root's home
+
+Sanity check (post-BUILD.sh):
+
+  for p in /bin/true /bin/cat /bin/bash \
+           /lib/x86_64-linux-gnu/libc.so.6 \
+           /lib64/ld-linux-x86-64.so.2 \
+           /etc/debian_version; do
+      test -e "tests/distros/debian-minbase/rootfs${p}" \
+          && echo "OK ${p}" \
+          || echo "MISS ${p}"
+  done
+
+Expected total size: ~80-150 MB (minbase + bash + coreutils only).
+Adding --include= packages (apt, python3, ...) grows this.
