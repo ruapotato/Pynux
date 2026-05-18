@@ -170,6 +170,33 @@ def build_archive() -> bytes:
                 print(f"  embedded {name} ({len(data)} bytes from "
                       f"etc/{ef.name})")
 
+    # Phase C.5 / distrorun: per-distro backing trees. Walk every
+    # subdirectory under tests/distros/ and embed each file at
+    # /var/lib/distros/<distro>/<rel-path>. Mirrors the etc/ glob's
+    # shape but recurses, so a tiny test fixture like
+    #   tests/distros/testdistro/etc/debian_version
+    # lands at
+    #   /var/lib/distros/testdistro/etc/debian_version
+    # in the cpio archive, ready for `bind` to splice it under a
+    # privatised namespace's /etc. Real debootstrap-style trees are
+    # too large to commit here — this is purely the smoke-test
+    # fixture for scripts/test_distro_namespace.sh.
+    distros_dir = here / "tests" / "distros"
+    if distros_dir.is_dir():
+        for distro_root in sorted(distros_dir.iterdir()):
+            if not distro_root.is_dir():
+                continue
+            for src in sorted(distro_root.rglob("*")):
+                if not src.is_file():
+                    continue
+                rel = src.relative_to(distro_root)
+                name = ("/var/lib/distros/" + distro_root.name
+                        + "/" + str(rel))
+                data = src.read_bytes()
+                blob += cpio_entry(name, data)
+                print(f"  embedded {name} ({len(data)} bytes from "
+                      f"tests/distros/{distro_root.name}/{rel})")
+
     # Kernel modules: anything in build/mod/ gets embedded as /<stem>
     # so module_load() can fetch by path. Convention is to start the
     # binary names with "kmod_" so the cpio entries read /kmod_X.

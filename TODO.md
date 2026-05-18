@@ -193,6 +193,49 @@ it has to honour.
         paths. ext4 needs `ext4_dir_remove` + `ext4_dir_insert` in
         the same transaction; lands alongside the L-track ext4
         write expansion.~~
+- ~~**Phase C.5** — distro-shape namespaces (`docs/distro-namespaces.md`).
+  Shipped as `user/distrorun.ad` + `scripts/test_distro_namespace.sh`.
+  `distrorun <distro> <cmd> [args...]` opens
+  `/var/lib/distros/<distro>` for the srvfd, `rfork(RFNAMEG)`s in
+  place, `mount(srvfd, -1, "/", MREPL, "")`s the backing at root
+  (inert in Phase C — recorded as CHAN_KIND_SRV; resolve_path falls
+  through), then `bind`s the distro-shape subdirs `/etc /usr /lib
+  /var` onto `backing/{etc,usr,lib,var}` so the bind prefix matcher
+  actually rewrites lookups, then re-binds the shared paths (`/home
+  /net /srv /dev /proc`) onto themselves, and finally `exec`s
+  argv[2..]. The test fixture lives at
+  `tests/distros/testdistro/etc/{debian_version,os-release}`
+  (`build_initramfs.py` walks `tests/distros/<name>/` and embeds at
+  `/var/lib/distros/<name>/`). End-to-end markers: `[distrorun]
+  bound /etc -> backing/etc ok` + `[distrorun] entered namespace
+  ok` + `[testdistro] /etc/debian_version=12.0` (inside namespace)
+  + `[native(-post)] /etc/debian_version=hamnix/0.1` (outside,
+  unchanged before AND after the namespace child exits).
+  `user/runtime.S` grew thin `sys_bind`/`sys_mount`/`sys_unmount`
+  wrappers (Plan 9 syscall numbers 257/258/259) mirroring the
+  existing `sys_chdir` shape.~~ Follow-ups:
+    * Debootstrap workflow doc — how to populate
+      `/var/lib/distros/debian-trixie/` from a host Debian box
+      (probably `debootstrap --variant=minbase trixie
+      ./debian-trixie http://deb.debian.org/debian`, then a script
+      that `dd`'s the tree into a Hamnix-mounted disk image).
+    * Convenience aliases at `/bin/deb`, `/bin/ubuntu`, `/bin/suse`
+      that pre-translate the distro name. Each is a 200-byte
+      wrapper around `distrorun <fixed-distro-name> ...argv`.
+      Defer until at least one real backing tree exists.
+    * `debfs` 9P server (`docs/distro-namespaces.md` Backing stores
+      #2). Replaces disk-backed `/var/lib/distros/<name>/` with an
+      on-demand 9P-served FHS view assembled from a `.deb` package
+      store. Layer 3 service; lands after Phase F.
+    * First real Debian binary running inside a namespace — e.g.
+      `deb cat /etc/debian_version` from an actual debootstrap'd
+      `/var/lib/distros/debian-trixie/`, with the Linux ABI loader
+      taking over for the exec'd binary.
+    * Phase D follow-up: once `chan_attach` speaks 9P (Phase D's
+      hamwd), replace the four per-subdir binds in `distrorun.ad`
+      with a single `mount(srvfd, -1, "/", MREPL, "")` call that
+      actually grafts the backing at /. The chain-of-binds today
+      is a Phase C workaround for the inert SRV-kind mount.
 - **Phase D** prerequisite — `srvfd` channels at `/srv/<name>`.
   `mount` needs `srvfd` to come from somewhere; without it the
   Phase C `mount` body has nothing to consume.

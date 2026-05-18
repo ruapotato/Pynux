@@ -1,0 +1,309 @@
+# user/distrorun.ad
+#
+# Phase C.5 / Hamnix: distro-shape namespace entry point.
+#
+# Usage:
+#   distrorun <distro-name> <command> [args...]
+#
+# Constructs a per-process Layer-1 namespace that grafts the contents
+# of /var/lib/distros/<distro-name>/ onto the FHS-Linux paths
+# (/etc, /usr, /lib, /var) while leaving the shared paths (/home,
+# /net, /srv, /dev, /proc) bound back to the native namespace, then
+# exec's the target command. See docs/distro-namespaces.md for the
+# architectural spec and boundary rules.
+#
+# Spec pseudocode (docs/distro-namespaces.md):
+#
+#   backing = "/var/lib/distros/" + distro
+#   rfork(RFNAMEG)
+#   mount(backing, "/")              # graft backing at /
+#   bind("/home", "/home", MREPL)    # re-expose shared paths
+#   bind("/net",  "/net",  MREPL)
+#   bind("/srv",  "/srv",  MREPL)
+#   bind("/dev",  "/dev",  MREPL)
+#   bind("/proc", "/proc", MREPL)
+#   exec(argv[0], argv)
+#
+# Phase C limitation + concrete workaround:
+#
+#   The literal spec calls mount(srvfd_for_backing, "/", MREPL, "")
+#   to graft the backing store as an overlay at /. Phase C's
+#   sys/src/9/port/chan.ad records SRV-kind mounts but treats them
+#   as inert during path resolution (CHAN_KIND_SRV is skipped in
+#   chan_resolve_prefix because no 9P client lives behind the srvfd
+#   yet — that's Phase D's hamwd job). On top of that, Phase C's
+#   `bind` prefix matcher requires the byte after the matched prefix
+#   to be NUL or '/', so a bind of literal "/" never matches any
+#   sub-path. Both of those make the spec's literal calls a no-op
+#   for actual file lookups.
+#
+#   To make Phase C.5 observable end-to-end today, distrorun ALSO
+#   binds the distro-shape subdirectories that the layout table in
+#   docs/distro-namespaces.md says live inside the namespace:
+#     /etc, /usr, /lib, /var  -> backing/{etc,usr,lib,var}
+#   Each is a bind() with a concrete from_path that the Phase C
+#   resolve_path hook can match. The shared paths (/home, /net,
+#   /srv, /dev, /proc) are then re-bound onto themselves per the
+#   spec — at Phase C those re-binds are effectively no-ops (the
+#   distro-shape binds above don't cover those prefixes anyway), but
+#   we emit them so the call shape is in place and a future agent
+#   wiring Phase D's chan dispatch can swap the local binds for the
+#   spec's single mount() with zero callsite churn.
+#
+# Build: handled by scripts/build_user.sh, which auto-discovers
+# user/distrorun.ad and emits build/user/distrorun.elf. Lands at
+# /bin/distrorun via build_initramfs.py's build/user/*.elf glob.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_rfork(flags: int32) -> int32
+extern def sys_bind(new_path: Ptr[uint8], old_path: Ptr[uint8],
+                    flag: int32) -> int32
+extern def sys_mount(srvfd: int32, afd: int32, old_path: Ptr[uint8],
+                     flag: int32, spec: Ptr[uint8]) -> int32
+extern def sys_execve(path: Ptr[char], argv: Ptr[uint64],
+                      envp: Ptr[uint64]) -> int32
+extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
+extern def sys_exit(code: uint64)
+
+
+# Plan 9 rfork flag (docs/native-api.md). RFNAMEG alone (no RFPROC)
+# mutates the CURRENT task in place — privatises the namespace
+# without spawning a child. Exactly what we want before grafting
+# backing-store binds.
+RFNAMEG: int32 = 0x008
+
+# Plan 9 bind/mount flag bits. MREPL replaces any existing binding
+# at the target path; that's the only sub-flag Phase C honours
+# (MBEFORE / MAFTER union semantics are a Phase D follow-up).
+MREPL: int32 = 0
+
+
+# A 256-byte buffer for assembling backing-path + subdir strings.
+# Sized for: prefix "/var/lib/distros/" (17) + distro name (<= 64) +
+# "/" + subdir name (<= 16) + NUL. We bound the distro name length
+# below; longer names error out cleanly rather than scribbling past
+# the buffer.
+path_buf: Array[256, uint8]
+
+
+def _prefix() -> Ptr[uint8]:
+    # Adder rejects `PREFIX: Ptr[uint8] = "..."` as a global (globals
+    # need an integer initializer — strings come in as
+    # StringLiteral). Wrapping the literal in a function returns the
+    # rodata pointer, matching the pattern hamsh.ad uses for its
+    # _path_dir() PATH-segment table.
+    return "/var/lib/distros/"
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def write_errstr_line(prefix: Ptr[uint8]):
+    # Pull the kernel's per-process error string into a local buffer
+    # and emit "prefix: <errstr>\n" to stderr. The Plan 9 contract
+    # (docs/native-api.md, sys_errstr) lets us pass a buffer with
+    # buf[0]==0 to get pure read semantics; the kernel NUL-terminates
+    # the message, so a follow-up write_str walk is safe.
+    buf: Array[128, uint8]
+    buf[0] = 0
+    sys_errstr(&buf[0], 128)
+    write_str(2, prefix)
+    write_str(2, ": ")
+    write_str(2, &buf[0])
+    write_str(2, "\n")
+
+
+def build_backing(distro: Ptr[uint8]) -> int32:
+    # Compose path_buf = "/var/lib/distros/<distro>" + NUL. Returns 0
+    # on success, -1 if the assembled string would overflow path_buf.
+    # Leaves enough room (16 bytes) for callers to append a "/etc"
+    # / "/usr" / etc. via build_backing_subdir below.
+    prefix: Ptr[uint8] = _prefix()
+    plen: uint64 = strlen_u8(prefix)
+    dlen: uint64 = strlen_u8(distro)
+    if plen + dlen + 16 + 1 >= 256:
+        return -1
+    i: uint64 = 0
+    while i < plen:
+        path_buf[i] = prefix[i]
+        i = i + 1
+    j: uint64 = 0
+    while j < dlen:
+        path_buf[plen + j] = distro[j]
+        j = j + 1
+    path_buf[plen + dlen] = 0
+    return 0
+
+
+def build_backing_subdir(distro: Ptr[uint8], subdir: Ptr[uint8]) -> int32:
+    # path_buf = "/var/lib/distros/<distro><subdir>" + NUL.
+    # `subdir` is expected to start with '/' (e.g. "/etc"). Returns 0
+    # on success, -1 on overflow.
+    if build_backing(distro) < 0:
+        return -1
+    base_len: uint64 = strlen_u8(&path_buf[0])
+    slen: uint64 = strlen_u8(subdir)
+    if base_len + slen + 1 >= 256:
+        return -1
+    k: uint64 = 0
+    while k < slen:
+        path_buf[base_len + k] = subdir[k]
+        k = k + 1
+    path_buf[base_len + slen] = 0
+    return 0
+
+
+def bind_into_namespace(distro: Ptr[uint8], subdir: Ptr[uint8]) -> int32:
+    # Bind `subdir` (e.g. "/etc") onto backing+subdir. After this,
+    # opens of `subdir/x` in the calling namespace resolve through
+    # the cpio archive at `/var/lib/distros/<distro><subdir>/x`.
+    # Per chan.ad's mnttab_bind contract: arg 0 (new) is the visible
+    # path; arg 1 (old) is the resolution target. The Hamnix-shipped
+    # bind ABI differs subtly from native-api.md's prose ("new" in
+    # the docs is the resolution side); we follow the in-tree ABI
+    # so the kernel's prefix matcher behaves correctly. See
+    # sys/src/9/port/syschan.ad::do_bind and tests/test_p9mount.ad.
+    if build_backing_subdir(distro, subdir) < 0:
+        write_str(2, "distrorun: backing path too long\n")
+        return -1
+    rc: int32 = sys_bind(subdir, &path_buf[0], MREPL)
+    if rc < 0:
+        write_errstr_line("distrorun: bind failed")
+        return -1
+    return 0
+
+
+def reexpose_shared(path: Ptr[uint8]) -> int32:
+    # Bind a shared path (/home, /net, /srv, /dev, /proc) onto itself.
+    # Per the spec these stay native — a Debian-shape process should
+    # see the same /home/$user as a native process. At Phase C this
+    # call is a structural no-op (no distro-shape bind ever shadows
+    # these prefixes since we only bind /etc, /usr, /lib, /var), but
+    # we emit the call so a future Phase D rewrite that switches to
+    # mount("/", srvfd) can drop the per-subdir binds without
+    # changing the shared-path call sites.
+    rc: int32 = sys_bind(path, path, MREPL)
+    if rc < 0:
+        # MREPL-rebinding a path onto itself can fail benignly when
+        # the mount table is full of prior bindings; log + continue.
+        # The cost of a missing shared-path rebind at Phase C is
+        # zero (the underlying path still resolves natively), so we
+        # don't propagate the failure.
+        write_errstr_line("distrorun: shared rebind failed (non-fatal)")
+        return 0
+    return 0
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 3:
+        write_str(2,
+            "distrorun: usage: distrorun <distro-name> <cmd> [args...]\n")
+        return 1
+
+    distro: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+
+    # 1) Verify the backing tree exists. sys_open on a directory
+    # returns a valid fd in Hamnix's cpio archive — every embedded
+    # path is openable, including the directory-ish prefixes. We
+    # also keep the fd open as the candidate srvfd for the spec's
+    # mount() call below.
+    if build_backing(distro) < 0:
+        write_str(2, "distrorun: distro name too long\n")
+        return 1
+    backing_fd: int32 = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if backing_fd < 0:
+        write_str(2, "distrorun: unknown distro: ")
+        write_str(2, distro)
+        write_str(2, "\n")
+        write_errstr_line("distrorun: open backing failed")
+        return 1
+
+    # 2) Privatise the namespace. rfork(RFNAMEG) without RFPROC
+    # mutates the CURRENT task — no child is forked, the existing
+    # task gets a fresh namespace id. Subsequent bind calls land
+    # only in this task's view; the calling hamsh's namespace is
+    # untouched. (Phase C's chan.ad has a single global mount table
+    # with namespace-id filtering rather than per-ns tables; the
+    # semantics are equivalent for our use case.)
+    rc: int32 = sys_rfork(RFNAMEG)
+    if rc < 0:
+        write_errstr_line("distrorun: rfork(RFNAMEG) failed")
+        sys_close(backing_fd)
+        return 1
+
+    # 3) Spec call: mount the backing fd at "/". Phase C records the
+    # SRV-kind chan but resolve_path skips it (no 9P client yet —
+    # that's Phase D's hamwd). We emit the call so the architectural
+    # shape is in place + a future agent can swap the four per-
+    # subdir binds below for this one call once the chan dispatch
+    # lands. afd = -1 ("no auth"), spec = "" (default tree).
+    rc = sys_mount(backing_fd, -1, "/", MREPL, "")
+    if rc < 0:
+        write_errstr_line("distrorun: mount(/) failed")
+        sys_close(backing_fd)
+        return 1
+
+    # 4) Phase C workaround: bind distro-shape subdirs onto the
+    # backing tree's matching subdirs. These are the paths the
+    # layout table in docs/distro-namespaces.md marks as
+    # "namespace-owned" — they should show distro contents, not
+    # Hamnix's. /bin is deliberately left native at this milestone:
+    # binding it onto backing/bin would shadow Hamnix's coreutils
+    # AND the test command we're about to exec (/bin/cat). Once
+    # the backing tree carries a real /bin (e.g. debootstrap's),
+    # add the bind here.
+    if bind_into_namespace(distro, "/etc") < 0:
+        sys_close(backing_fd)
+        return 1
+    write_str(1, "[distrorun] bound /etc -> backing/etc ok\n")
+    bind_into_namespace(distro, "/usr")
+    bind_into_namespace(distro, "/lib")
+    bind_into_namespace(distro, "/var")
+
+    # 5) Re-expose shared paths per the spec. These are bind(path,
+    # path, MREPL) — a self-binding that keeps the path resolving
+    # natively. Structural no-ops at Phase C; placeholder for the
+    # Phase D rewrite (see comment in reexpose_shared).
+    reexpose_shared("/home")
+    reexpose_shared("/net")
+    reexpose_shared("/srv")
+    reexpose_shared("/dev")
+    reexpose_shared("/proc")
+
+    # 6) The srvfd has been recorded in the mount table; the fd
+    # itself can be closed (the kernel keeps the mount entry alive
+    # via the table slot, independent of the user fd). do_execve
+    # reuses the calling task's fd table modulo OCEXEC; closing
+    # before exec keeps the child's fd table clean.
+    sys_close(backing_fd)
+
+    write_str(1, "[distrorun] entered namespace ok\n")
+
+    # 7) Exec the target binary. argv[2..argc-1] becomes the new
+    # image's argv; envp is forwarded as 0 (native exec path
+    # ignores it — see arch/x86/kernel/syscall.ad::do_execve). The
+    # kernel's initramfs_data_ptr lookup is namespace-agnostic, so
+    # /bin/<cmd> still finds Hamnix's binary even though /etc/* now
+    # reads from the backing — which is exactly the property we
+    # want a real `deb cat /etc/debian_version` to demonstrate.
+    target: Ptr[char] = cast[Ptr[char]](argv[2])
+    new_argv: Ptr[uint64] = cast[Ptr[uint64]](
+        cast[uint64](argv) + cast[uint64](16))     # &argv[2]
+    sys_execve(target, new_argv, cast[Ptr[uint64]](0))
+
+    # Only reached on exec failure. Report + propagate.
+    write_errstr_line("distrorun: exec failed")
+    write_str(2, "distrorun: target was: ")
+    write_str(2, cast[Ptr[uint8]](target))
+    write_str(2, "\n")
+    return 1

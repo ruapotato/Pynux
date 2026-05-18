@@ -1,0 +1,5 @@
+NAME="Debian GNU/Linux"
+VERSION_ID="12"
+VERSION="12 (bookworm)"
+ID=debian
+PRETTY_NAME="Debian GNU/Linux 12 (bookworm) [testdistro fixture]"

@@ -321,6 +321,65 @@ sys_errstr:
     .size sys_errstr, .-sys_errstr
 
 
+    /* --- sys_bind(new, old, flag) -> int32 --------------------------
+     * Phase C / M16.107: Plan 9-shape namespace primitive. Graft
+     * path `new` onto path `old` in the calling task's namespace;
+     * after this, opens of `new/x` look up `old/x` via the kernel's
+     * resolve_path -> chan_resolve_prefix hook (`fs/vfs.ad`).
+     *
+     * flag = MREPL (0) / MBEFORE / MAFTER / MCREATE / MCACHE bits per
+     * docs/native-api.md; Phase C records the bit but only MREPL is
+     * honoured at resolve time (union mounts come in Phase D).
+     *
+     * Returns 0 on success, -1 on failure with the per-process error
+     * string set by syschan.ad (`bind failed: ...`).  SysV first
+     * three arg regs (%rdi/%rsi/%rdx) align with the syscall ABI's
+     * a0/a1/a2 — no shuffle needed. */
+    .globl sys_bind
+    .type sys_bind, @function
+sys_bind:
+    movq    $257, %rax              /* SYS_BIND */
+    syscall
+    ret
+    .size sys_bind, .-sys_bind
+
+
+    /* --- sys_mount(srvfd, afd, old, flag, spec) -> int32 ------------
+     * Phase C / M16.107: attach a 9P file server (reachable over the
+     * open `srvfd`) at path `old`. `afd` is the fauth(2) channel, or
+     * -1 to skip auth (the only shape Hamnix supports today — fauth
+     * itself doesn't exist yet). `spec` is the server-specific attach
+     * string ("" for the default tree).
+     *
+     * 5-arg syscall. SysV places arg 4 in %rcx, arg 5 in %r8; the
+     * syscall ABI reserves %rcx for the user RIP and uses %r10 for
+     * arg 4. Shuffle %rcx -> %r10 before SYSCALL; %r8 (arg 5: spec)
+     * already aligns between the two ABIs. Returns 0 on success or
+     * -1 with errstr set (`mount failed: ...`). */
+    .globl sys_mount
+    .type sys_mount, @function
+sys_mount:
+    movq    %rcx, %r10              /* arg 4: flag -> r10 for syscall ABI */
+    movq    $258, %rax              /* SYS_MOUNT */
+    syscall
+    ret
+    .size sys_mount, .-sys_mount
+
+
+    /* --- sys_unmount(new, old) -> int32 -----------------------------
+     * Phase C / M16.107: remove a binding. `new == NULL` (0) unbinds
+     * every entry visible at `old`; otherwise removes the specific
+     * `new -> old` edge from a union mount. Returns 0 on success
+     * (>= 1 entry removed) or -1 with errstr `not mounted`. */
+    .globl sys_unmount
+    .type sys_unmount, @function
+sys_unmount:
+    movq    $259, %rax              /* SYS_UNMOUNT */
+    syscall
+    ret
+    .size sys_unmount, .-sys_unmount
+
+
     /* --- sys_rfork(flags) -> int32 ----------------------------------
      * Phase C / M16.98: Plan 9-shape process / namespace primitive.
      * SysV passes `flags` in %rdi (also the syscall a0 slot). do_rfork
