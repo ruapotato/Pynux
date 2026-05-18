@@ -47,6 +47,13 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 # Linux ABI side.
 extern def write_msr(index: uint32, value: uint64)
 
+# V2.5: Pgrp lifecycle entry-points implemented in sys/src/9/port/chan.ad.
+# Declared extern here so task_exit_current can call pgrp_ref_dec without
+# creating a kernel.sched.core -> sys.src.port9.port.chan import cycle
+# (chan.ad already imports current_pgrp_idx / task_pgrp_idx from this
+# file). Adder's flat-merge linker resolves the symbol at codegen time.
+extern def pgrp_ref_dec(idx: int32) -> int32
+
 # U27: IA32_FS_BASE — MSR 0xC0000100. Mirrored from u_syscalls.ad's
 # constant of the same name; duplicated here so core.ad doesn't pull in
 # the linux_abi side just for a number.
@@ -170,11 +177,17 @@ class TaskStruct:
     # sharing, mount tables, note delivery) don't exist yet — but the
     # accessors are wired through so sys/src/9/port/sysproc.ad can
     # already model the right invariants. Defaults: refcount=1
-    # (table is private to this task), namespace_id=0 (shared default),
+    # (table is private to this task), pgrp_idx=0 (the root Pgrp),
     # note_group=0 (default group). See `sys/src/9/port/sysproc.ad` for
     # the rules each bit honours.
+    #
+    # V2.5 rename: `namespace_id` -> `pgrp_idx`. The field stays at
+    # offset 1388 with the same width and zero-default; it's now an
+    # index into chan.ad's `pgrp_pool` array (a "pointer" to a Pgrp,
+    # Plan 9-style) rather than a bare monotonic handle. do_exit calls
+    # pgrp_ref_dec(pgrp_idx) so freed Pgrps return to the pool.
     fd_table_refcount: int32          # offset 1384
-    namespace_id:      int32          # offset 1388
+    pgrp_idx:          int32          # offset 1388 (was namespace_id pre-V2.5)
     note_group:        int32          # offset 1392
     # 4 bytes implicit pad to next 8-byte boundary.
     # M16.104: per-task SYS_brk state. Replaces the legacy linux_brk
@@ -273,15 +286,19 @@ task_table:  Array[16, TaskStruct]
 next_pid:    uint64 = 1
 current_idx: uint64 = 0                  # index into task_table
 
-# Phase C / M16.98: monotonic id allocators for Plan 9 rfork namespace
-# and note-group handles. Each call to alloc_namespace_id /
-# alloc_note_group_id hands back the next int32 and increments. There
-# is no recycling — at NTASKS=16 the address space is effectively
-# unbounded relative to live tasks. The starting value (1) reserves 0
-# for "shared default namespace / default note group", which is the
-# state every freshly-created task is in until rfork(RFNAMEG / RFNOTEG)
+# Phase C / M16.98: monotonic id allocator for the Plan 9 rfork
+# note-group handle. Each call to alloc_note_group_id hands back the
+# next int32 and increments. There is no recycling — at NTASKS=16 the
+# address space is effectively unbounded relative to live tasks. The
+# starting value (1) reserves 0 for "default note group", which is
+# the state every freshly-created task is in until rfork(RFNOTEG)
 # decides otherwise.
-next_namespace_id: int32 = 1
+#
+# V2.5 dropped `next_namespace_id` / `alloc_namespace_id`: pgrp_idx
+# is now a real pool index produced by `pgrp_alloc` in chan.ad, not
+# a monotonic int handle. The namespace allocator and the note-group
+# allocator had identical V2 shape; only the namespace half got the
+# Plan 9-style pool-of-Pgrps lift in V2.5.
 next_note_group:   int32 = 1
 
 
@@ -446,9 +463,9 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
         kei = kei + 1
     # Phase C / M16.98: rfork sharing-state fields. Kernel threads
     # don't speak Plan 9 anything, but a stale slot reclaim could
-    # otherwise carry a previous tenant's namespace_id forward.
+    # otherwise carry a previous tenant's pgrp_idx forward.
     task_table[s].fd_table_refcount = 1
-    task_table[s].namespace_id      = 0
+    task_table[s].pgrp_idx          = 0
     task_table[s].note_group        = 0
     # M16.104: kernel threads never call SYS_brk (they don't have a
     # userspace, never mind a glibc heap), but zero defensively so a
@@ -595,7 +612,7 @@ def create_user_thread(entry: uint64, name0: uint64,
     # whichever of these the flag bits ask for after the child is
     # created — see sys/src/9/port/sysproc.ad.
     task_table[s].fd_table_refcount = 1
-    task_table[s].namespace_id      = 0
+    task_table[s].pgrp_idx          = 0
     task_table[s].note_group        = 0
     # M16.104: per-task SYS_brk state. Two cases:
     #
@@ -736,6 +753,13 @@ def task_exit_current(code: int64):
     # consumed by a parent in SYS_WAITPID; with no parent the value
     # is simply unread.
     task_close_all_fds(current_idx)
+    # V2.5: drop our reference to the per-process group. If we were
+    # the last referer, pgrp_ref_dec frees the Pgrp slot back to the
+    # pool (mtab zeroed, ref=0) so a future rfork(RFNAMEG) can
+    # reclaim it. Root (slot 0) refuses to underflow inside
+    # pgrp_ref_dec, so init's call here is a no-op even if init
+    # ever exits.
+    pgrp_ref_dec(task_table[current_idx].pgrp_idx)
     task_table[current_idx].exit_code = code
     # U27: CLONE_CHILD_CLEARTID handshake. If this task (typically a
     # pthread created via clone(CLONE_CHILD_CLEARTID, ctid=&desc->tid))
@@ -1486,12 +1510,15 @@ def set_task_fd_table_refcount(slot: int32, v: int32):
     task_table[cast[uint64](slot)].fd_table_refcount = v
 
 
-def task_namespace_id(slot: int32) -> int32:
-    return task_table[cast[uint64](slot)].namespace_id
+def task_pgrp_idx(slot: int32) -> int32:
+    # V2.5: replaces V2's task_namespace_id. Same field offset (1388),
+    # same width (int32); the rename reflects that the value is now
+    # an index into chan.ad's pgrp_pool, not a monotonic id handle.
+    return task_table[cast[uint64](slot)].pgrp_idx
 
 
-def set_task_namespace_id(slot: int32, v: int32):
-    task_table[cast[uint64](slot)].namespace_id = v
+def set_task_pgrp_idx(slot: int32, v: int32):
+    task_table[cast[uint64](slot)].pgrp_idx = v
 
 
 def task_note_group(slot: int32) -> int32:
@@ -1502,19 +1529,19 @@ def set_task_note_group(slot: int32, v: int32):
     task_table[cast[uint64](slot)].note_group = v
 
 
-def current_namespace_id() -> int32:
-    return task_table[current_idx].namespace_id
+def current_pgrp_idx() -> int32:
+    return task_table[current_idx].pgrp_idx
 
 
-def set_current_namespace_id(v: int32):
-    task_table[current_idx].namespace_id = v
+def set_current_pgrp_idx(v: int32):
+    task_table[current_idx].pgrp_idx = v
 
 
-def alloc_namespace_id() -> int32:
-    v: int32 = next_namespace_id
-    next_namespace_id = next_namespace_id + 1
-    return v
-
+# V2.5 dropped alloc_namespace_id — pgrp_alloc in chan.ad replaces it.
+# The note-group allocator below is kept verbatim; it's still a bare
+# monotonic int handle (no backing table) and will get its own
+# "real object pool" lift the day note(2)/noted(2) groups grow
+# membership semantics.
 
 def alloc_note_group_id() -> int32:
     v: int32 = next_note_group

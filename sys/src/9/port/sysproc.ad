@@ -29,10 +29,10 @@ from kernel.sched.core import (
     set_linux_userspace_mode,
     set_task_cwd, get_cwd_buf,
     copy_fd_entry, dup_fd_to_child,
-    task_namespace_id, set_task_namespace_id,
+    task_pgrp_idx, set_task_pgrp_idx,
     task_note_group, set_task_note_group,
     task_fd_table_refcount, set_task_fd_table_refcount,
-    current_namespace_id, set_current_namespace_id,
+    current_pgrp_idx, set_current_pgrp_idx,
     alloc_note_group_id,
     task_table_size,
     set_current_errstr,
@@ -45,13 +45,15 @@ from kernel.sched.core import (
 from kernel.sched.core import task_initial_sp
 from mm.page_alloc import alloc_page
 from kernel.printk.printk import printk0, printk1
-# V2: per-namespace mount tables. ns_clone() deep-copies the parent's
-# row into a fresh slot; ns_inc_ref() / ns_alloc_empty() handle the
-# share + RFCNAMEG paths. Replaces sysproc.ad's previous use of
-# alloc_namespace_id() (which was just a monotonic int handle with
-# no backing table) for the rfork(RFNAMEG) lift.
+# V2.5: per-process group (Pgrp) lifecycle. pgrp_clone() deep-copies
+# the parent's mtab into a fresh slot (ref=1); pgrp_alloc() hands back
+# a fresh empty Pgrp (ref=1); pgrp_ref_inc() bumps the share path's
+# refcount; pgrp_ref_dec() unwinds the in-place RFNAMEG / RFCNAMEG
+# transitions when they replace the running task's existing Pgrp.
+# do_exit calls pgrp_ref_dec(self) directly from core.ad so the
+# slot returns to the pool when the last referer drops it.
 from sys.src.port9.port.chan import (
-    ns_clone, ns_alloc_empty, ns_inc_ref,
+    pgrp_clone, pgrp_alloc, pgrp_ref_inc, pgrp_ref_dec,
 )
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -138,46 +140,52 @@ def _rfork_setup_namespace(child_slot: int32, parent: Ptr[TaskStruct],
     # Plan 9 RFCNAMEG dominates RFNAMEG (per rfork(2)): if both are
     # set, the empty-namespace bit wins. We follow.
     #
-    # V2: namespace_id is now an INDEX into chan.ad's ns_pool, not a
-    # monotonic handle. ns_clone deep-copies the parent's row into a
-    # fresh pool slot; ns_alloc_empty hands back a zero-cleared row.
-    # On allocation failure (pool full) we surface as "share parent's
-    # namespace" — the child still works, it just doesn't get
-    # isolation. A more precise -EAGAIN would require unwinding the
-    # already-created task, which is a heavier lift than this commit
-    # carries; the test fixture stays well under NS_MAX=8 anyway.
+    # V2.5: pgrp_idx is an INDEX into chan.ad's pgrp_pool (a "pointer"
+    # to a real Pgrp struct). pgrp_clone deep-copies the parent's mtab
+    # into a fresh Pgrp (ref=1); pgrp_alloc hands back a fresh empty
+    # Pgrp (ref=1). The default share path simply ref_inc's the parent's
+    # Pgrp so the count reflects child + parent both holding it. On
+    # pool exhaustion we fall back to "share parent's Pgrp" so the
+    # child still works, just without isolation — a precise -EAGAIN
+    # would require unwinding the already-created task, heavier lift
+    # than this commit carries; PGRP_POOL_CAP=64 makes exhaustion
+    # vanishingly unlikely.
+    #
+    # Important: create_user_task_argv() already wrote 0 into the
+    # child's pgrp_idx slot. We unconditionally overwrite below; no
+    # caller observes the transient 0 value.
     cur: int32 = cast[int32](current_idx_get())
-    parent_ns: int32 = task_namespace_id(cur)
+    parent_idx: int32 = task_pgrp_idx(cur)
     if (flags & RFCNAMEG) != 0:
-        empty: int32 = ns_alloc_empty()
+        empty: int32 = pgrp_alloc()
         if empty < 0:
-            # Pool full; fall through to share — same defensive shape
-            # as fd-table refcount below. A debug printk would help
-            # diagnose but we keep the syscall path quiet.
-            set_task_namespace_id(child_slot, parent_ns)
-            ns_inc_ref(parent_ns)
+            # Pool full; share parent's Pgrp instead. Same defensive
+            # shape as fd-table refcount below.
+            set_task_pgrp_idx(child_slot, parent_idx)
+            pgrp_ref_inc(parent_idx)
             return
-        set_task_namespace_id(child_slot, empty)
+        set_task_pgrp_idx(child_slot, empty)
         return
     if (flags & RFNAMEG) != 0:
-        # Deep-copy parent's bindings into a fresh ns slot. After
-        # this call, parent + child rows are independent — bind()
-        # in either is invisible to the other. This is the literal
-        # Plan 9 "namespaces diverge" semantic.
-        copy: int32 = ns_clone(parent_ns)
+        # Deep-copy parent's bindings into a fresh Pgrp. After this
+        # call, parent + child Pgrps are independent — bind() in
+        # either is invisible to the other. Parent's refcount is
+        # unchanged (parent still references its own Pgrp; only the
+        # CHILD has the new ref=1 Pgrp).
+        copy: int32 = pgrp_clone(parent_idx)
         if copy < 0:
-            set_task_namespace_id(child_slot, parent_ns)
-            ns_inc_ref(parent_ns)
+            set_task_pgrp_idx(child_slot, parent_idx)
+            pgrp_ref_inc(parent_idx)
             return
-        set_task_namespace_id(child_slot, copy)
+        set_task_pgrp_idx(child_slot, copy)
         return
-    # Default: share parent's namespace. Bump the refcount so the
-    # slot doesn't get reclaimed if the parent exits before the
-    # child. The shared-row contract: subsequent bind() in either
-    # task is visible to BOTH (because both index into the same
-    # ns_pool row).
-    set_task_namespace_id(child_slot, parent_ns)
-    ns_inc_ref(parent_ns)
+    # Default: share parent's Pgrp. Bump its refcount so the slot
+    # doesn't get freed if the parent exits before the child. The
+    # shared-Pgrp contract: subsequent bind() in either task is
+    # visible to BOTH (because both pgrp_idx values resolve to the
+    # same pool slot).
+    set_task_pgrp_idx(child_slot, parent_idx)
+    pgrp_ref_inc(parent_idx)
 
 
 def _rfork_setup_note_group(child_slot: int32, parent: Ptr[TaskStruct],
@@ -229,24 +237,34 @@ def do_rfork(flags: int32, user_rbp: uint64) -> int32:
         # isolated copy. This is the load-bearing V2 entrypoint —
         # tests/test_ns_isolation.ad's child uses this exact shape.
         cur_in: int32 = cast[int32](current_idx_get())
+        old_idx: int32 = task_pgrp_idx(cur_in)
         if (f & RFCNAMEG) != 0:
-            empty: int32 = ns_alloc_empty()
+            empty: int32 = pgrp_alloc()
             if empty < 0:
                 set_current_errstr("rfork: namespace pool full")
                 return -11                    # -EAGAIN
-            # Drop our reference to the old ns; we don't see it any
-            # more. ns_dec_ref is exported by chan.ad but we delay
-            # its import (the dec path runs from do_exit ideally —
-            # see V3 follow-up). Today the leak is bounded by
-            # NS_MAX, which the test fixture stays well under.
-            set_current_namespace_id(empty)
+            # V2.5: drop our reference to the old Pgrp. If we were
+            # the last referer, pgrp_ref_dec frees the slot back to
+            # the pool. Then point at the freshly-allocated empty
+            # Pgrp. Order is important: ref_dec FIRST so the slot is
+            # reclaimable before the next alloc — but we already
+            # alloc'd above, so the order is "alloc new, switch
+            # pointer, drop old ref" to keep at least one ref alive
+            # at every instant. We did alloc; now switch + drop.
+            set_current_pgrp_idx(empty)
+            pgrp_ref_dec(old_idx)
         elif (f & RFNAMEG) != 0:
-            old_ns: int32 = task_namespace_id(cur_in)
-            copy: int32 = ns_clone(old_ns)
+            copy: int32 = pgrp_clone(old_idx)
             if copy < 0:
                 set_current_errstr("rfork: namespace pool full")
                 return -11                    # -EAGAIN
-            set_current_namespace_id(copy)
+            # V2.5: same dance as RFCNAMEG — switch first, then
+            # ref_dec the old Pgrp. The clone produced a divergent
+            # copy whose mtab matches what we used to see; the old
+            # Pgrp is still referenced by anyone else we used to
+            # share with (its refcount drops by exactly our share).
+            set_current_pgrp_idx(copy)
+            pgrp_ref_dec(old_idx)
         # RFNOTEG, RFMEM, RFENVG, RFCFDG without RFPROC are accepted
         # silently — they exist on the userland-API surface but the
         # in-place forms only make sense once the matching subsystems

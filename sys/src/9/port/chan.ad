@@ -1,69 +1,76 @@
 # sys/src/9/port/chan.ad
 #
-# Phase C / M16.107 + V2 — Plan 9 channel + per-namespace mount table.
-# Mirrors the data structures at the top of 9front's chan.c (`Chan`,
-# `Mhead`, `Mount`) plus the per-process namespace machinery that lets
-# `rfork(RFNAMEG)` give the child a divergent view.
+# Phase C / M16.107 + V2.5 — Plan 9 channel + per-process group (Pgrp)
+# mount table. Mirrors the data structures at the top of 9front's
+# chan.c (`Chan`, `Mhead`, `Mount`) plus the Plan 9 `Pgrp` struct —
+# the process group whose primary content is a mount table and a
+# refcount. Two tasks pointing at the same Pgrp share their mount
+# view; rfork(RFNAMEG) gives the child a CLONED Pgrp whose mount
+# view diverges from then on.
 #
-# V0 (codec) and V1 (in-kernel 9P client) used ONE global 32-entry
-# mount table with a per-entry `namespace_id` that was "visible to
-# everyone whose namespace_id matches OR is zero". That was enough
-# for a single root namespace; it does NOT actually isolate two
-# tasks because both still wrote into the same global table.
+# History:
 #
-# V2 replaces the global with a POOL OF PER-NAMESPACE TABLES:
+#   V0 (codec) + V1 (in-kernel 9P client) used ONE global 32-entry
+#   mount table — fine for a single root namespace, did not isolate
+#   per-task views.
 #
-#   ns_pool[NS_MAX][MNTTAB_PER_NS] entries
-#   ns_alloc[NS_MAX] = refcount per slot
+#   V2 lifted the table into a pool indexed by a per-task
+#   `namespace_id`: ns_pool[NS_MAX * MNTTAB_PER_NS] plus a parallel
+#   ns_alloc[NS_MAX] refcount array. The semantics were Plan 9-correct
+#   (per-task divergent views) but the data shape was Linux-flavoured:
+#   a bare int handle into two parallel arrays.
 #
-# `namespace_id` (carried in TaskStruct.namespace_id and surfaced via
-# current_namespace_id()) is the FIRST dimension index. Two tasks
-# with different namespace_ids look at completely different rows of
-# the pool — that's the literal Plan 9 semantic: `bind` in the child
-# does not perturb the parent's view.
+# V2.5 lifts the shape to true Plan 9: a real `Pgrp` struct owns
+# its inline mount table and refcount. Processes reference a Pgrp by
+# pool-index (`TaskStruct.pgrp_idx`) because Adder doesn't yet give
+# us a heap allocator — but the index is *semantically* a pointer to
+# a Pgrp, and `pgrp_pool[idx]` is the only way to dereference it.
+# Lifecycle (alloc / clone / ref_inc / ref_dec / free) is bundled
+# onto the Pgrp; do_exit calls pgrp_ref_dec(self) which frees the
+# slot when the last referer drops it.
 #
 # Inheritance contract (matches Plan 9's rfork(2)):
 #
-#   * Default (no RFNAMEG): child shares the parent's namespace_id
-#     and therefore sees the EXACT same row. Subsequent bind() in
-#     either task is visible to both.
+#   * Default (no RFNAMEG): child inherits the parent's pgrp_idx
+#     and we ref_inc the Pgrp. Both tasks see the EXACT same row.
+#     Subsequent bind() in either task is visible to both.
 #
-#   * RFNAMEG: ns_clone() allocates a fresh slot, deep-copies the
-#     parent's row into it byte-for-byte, and returns the new id.
-#     The child's namespace_id is set to that. After the fork, the
-#     two rows are independent — bind() in the child doesn't touch
-#     the parent's row, and vice versa. Same shape as 9front's
-#     Pgrp/Mhead split on rfork.
+#   * RFNAMEG: pgrp_clone() allocates a fresh Pgrp, deep-copies the
+#     parent's mtab into it byte-for-byte, ref=1 on the new slot.
+#     Parent's Pgrp refcount is unchanged (parent keeps its own
+#     reference; only the child's idx pointer is replaced).
 #
-#   * RFCNAMEG: child gets a fresh, EMPTY namespace. Cleared row.
+#   * RFCNAMEG: child gets a fresh, EMPTY Pgrp. Cleared mtab.
 #
 # Adder quirks honoured here:
 #
 #   * 2-D arrays inside nested frames mis-codegen — we keep the pool
-#     as a 1-D Array at TOP LEVEL and index manually with
-#     `ns * MNTTAB_PER_NS + slot`. Same pattern p9_client.ad uses for
-#     its component path storage.
+#     as a top-level `Array[PGRP_POOL_CAP, Pgrp]`. The inline
+#     `Pgrp.mtab` is itself a top-level field of the struct (not in
+#     a nested frame), so the array bug doesn't apply.
 #
-#   * NS_MAX = 8 namespaces, MNTTAB_PER_NS = 8 entries per namespace.
-#     Total pool footprint ~17 KB (each MountEntry inlines two 128-
-#     byte paths). This is generous for V2's test fixture (init +
-#     one child + plenty of headroom); V3 can grow either dimension
-#     when distrorun-shape workloads start nesting more deeply.
+#   * PGRP_POOL_CAP = 64 distinct Pgrps. V2 capped at NS_MAX=8.
+#     64 is far above any realistic distinct-namespace count for
+#     this milestone's workloads (init + hamsh + a handful of
+#     distrorun children); the cap can grow further or move to a
+#     real malloc-style allocator when one lands.
+#
+#   * MNT_CAP = 32 entries per Pgrp. V2 capped at MNTTAB_PER_NS=8.
+#     32 covers the distro-shape namespace fixture (which currently
+#     plants 9 bindings during the bind /etc /usr /lib /var + re-bind
+#     /home /net /srv /dev /proc dance) with headroom for nested
+#     binds inside a distro shell session. Each Pgrp now costs
+#     ~9 KB inline (32 entries * ~280 bytes) so the pool total is
+#     ~580 KB — still well under the kernel's BSS budget.
 #
 # What we deliberately punt to V3+:
 #
-#   * Refcount-based GC of empty namespaces. We bump a refcount on
-#     share/inherit and decrement on do_exit, but freed slots stay
-#     pinned at refcount 0 until the next ns_clone reclaims them
-#     (which it does — the allocator scans for refcount==0 slots
-#     and overwrites). Effectively LRU; sufficient for V2.
-#
-#   * Union-mount flag bits (MBEFORE / MAFTER). V2 honours MREPL
-#     only — same as V1.
+#   * Union-mount flag bits (MBEFORE / MAFTER). V2.5 honours MREPL
+#     only — same as V1 / V2.
 
 from kernel.sched.core import (
     TaskStruct, current_task, current_idx_get,
-    task_namespace_id, current_namespace_id,
+    task_pgrp_idx, current_pgrp_idx,
 )
 
 
@@ -94,10 +101,9 @@ class Chan:
 # Array[uint8] is the same shape sysfile.ad uses for its synthetic
 # /dev/<name> bookkeeping).
 #
-# Note: as of V2, MountEntry no longer carries a per-entry namespace_id
-# field — the namespace dimension lives in the OUTER pool index (the
-# row this entry sits in). The slot is identified by (ns, idx)
-# coordinates, and visibility is the row, not a tag.
+# Note: as of V2 the per-entry namespace_id field is gone — the
+# namespace dimension lives in the OUTER Pgrp that owns this entry.
+# Visibility is "is this entry in MY Pgrp's mtab", not a tag check.
 class MountEntry:
     in_use:        int32                 # 0 = free slot, 1 = live
     flag:          int32                 # MREPL / MBEFORE / MAFTER
@@ -108,27 +114,50 @@ class MountEntry:
     to_path:       Array[128, uint8]     # path it resolves to (the "old" arg)
 
 
-# Per-namespace table cap. 8 namespaces, 8 entries each. The 2-D
-# semantics are baked into manual indexing — see _entry_at(ns, slot).
-NS_MAX:          uint64 = 8
-MNTTAB_PER_NS:   uint64 = 8
-MNTTAB_TOTAL:    uint64 = 64                  # NS_MAX * MNTTAB_PER_NS
+# --- Pgrp: per-process group, the Plan 9 "namespace object" --------
+#
+# Owns its mount table inline + a refcount. Two TaskStructs whose
+# `pgrp_idx` fields point at the same pool slot SHARE this Pgrp;
+# bind/unmount by either is visible to both. rfork(RFNAMEG) clones
+# the Pgrp so the child can diverge without touching the parent's
+# slot. A Pgrp with ref==0 is free for re-allocation; ref==0 + a
+# non-cleared mtab is fine (the next allocator pass zeroes it
+# before re-using).
+class Pgrp:
+    ref:       int32                   # refcount; 0 = slot free
+    mnt_count: int32                   # live entries in mtab (cached)
+    mtab:      Array[32, MountEntry]   # the inline bindings
 
-# Flattened 2-D pool. ns_pool[ns * MNTTAB_PER_NS + slot] picks an
-# entry. Stored at top level to dodge Adder's nested-frame Array bug.
-ns_pool: Array[64, MountEntry]
 
-# Per-namespace refcount. ns_alloc[n] == 0 means the slot is free for
-# ns_clone() to reclaim; >0 means at least one task references it.
-# Slot 0 is the root namespace, pinned by init at boot.
-ns_alloc: Array[8, int32]
+# Pool cap. V2 had NS_MAX=8; V2.5 bumps to 64 so distrorun nesting
+# and Phase D's per-server-mount inflation have headroom. PGRP_POOL_CAP
+# is a top-level constant so it doesn't propagate as a magic number.
+PGRP_POOL_CAP: uint64 = 64
 
-# Boot-time initialisation flag for the root namespace. Set on the
-# first chan_init / first ns_get_or_init_root call. We can't bump
-# ns_alloc[0] from a top-level statement (Adder runs no static
-# initialisers beyond zero-fill), so we lazily mark root live on the
-# first taskful reference.
-ns_root_pinned: int32 = 0
+# Per-Pgrp mount-table cap. V2 had MNTTAB_PER_NS=8; V2.5 bumps to 32.
+# The distro-shape fixture plants 9 entries (4 backing binds + 5 self
+# binds); 32 leaves comfortable headroom for nested shell sessions.
+# Must MATCH the literal in `Pgrp.mtab: Array[32, MountEntry]` above —
+# Adder doesn't evaluate constants inside array dimensions.
+MNT_CAP: uint64 = 32
+
+# The pool itself. Top-level Array dodges Adder's nested-frame bug.
+# Each Pgrp is ~9 KB (32 MountEntry, ~280 bytes each); 64 slots is
+# ~580 KB of BSS, well under the kernel image budget.
+pgrp_pool: Array[64, Pgrp]
+
+# Boot-time initialisation flag for the root Pgrp at slot 0. Lazy-
+# pinned on the first taskful reference if pgrp_init wasn't called.
+pgrp_root_pinned: int32 = 0
+
+
+# Legacy aliases for callers that haven't switched to the new names.
+# devmounts.ad and a couple of comment sites still reference MNTTAB_*
+# values; expose them as constants computed from the new caps so
+# nothing has to change downstream when MNT_CAP / PGRP_POOL_CAP grow.
+MNTTAB_PER_NS:  uint64 = 32                  # == MNT_CAP
+NS_MAX:         uint64 = 64                  # == PGRP_POOL_CAP
+MNTTAB_TOTAL:   uint64 = 2048                # NS_MAX * MNTTAB_PER_NS
 
 
 # --- string helpers -------------------------------------------------
@@ -171,83 +200,187 @@ def _path_eq_u8(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
         i = i + 1
 
 
-# --- pool indexing --------------------------------------------------
+# --- pool / Pgrp helpers --------------------------------------------
 
-def _entry_idx(ns: uint64, slot: uint64) -> uint64:
-    # Manual 2-D flatten. ns < NS_MAX, slot < MNTTAB_PER_NS.
-    return ns * MNTTAB_PER_NS + slot
-
-
-def _ns_valid(ns: int32) -> int32:
-    if ns < 0:
+def _pgrp_idx_valid(idx: int32) -> int32:
+    if idx < 0:
         return 0
-    if cast[uint64](ns) >= NS_MAX:
+    if cast[uint64](idx) >= PGRP_POOL_CAP:
         return 0
     return 1
 
 
-def _zero_entry(ns: uint64, slot: uint64):
-    idx: uint64 = _entry_idx(ns, slot)
-    ns_pool[idx].in_use            = 0
-    ns_pool[idx].flag              = 0
-    ns_pool[idx].chan.kind         = CHAN_KIND_NONE
-    ns_pool[idx].chan.srvfd        = -1
-    ns_pool[idx].chan.flags        = 0
-    ns_pool[idx].chan.p9_root_fid  = -1
-    ns_pool[idx].from_path[0]      = 0
-    ns_pool[idx].to_path[0]        = 0
+def _zero_entry_at(g: uint64, s: uint64):
+    pgrp_pool[g].mtab[s].in_use            = 0
+    pgrp_pool[g].mtab[s].flag              = 0
+    pgrp_pool[g].mtab[s].chan.kind         = CHAN_KIND_NONE
+    pgrp_pool[g].mtab[s].chan.srvfd        = -1
+    pgrp_pool[g].mtab[s].chan.flags        = 0
+    pgrp_pool[g].mtab[s].chan.p9_root_fid  = -1
+    pgrp_pool[g].mtab[s].from_path[0]      = 0
+    pgrp_pool[g].mtab[s].to_path[0]        = 0
 
 
-def _zero_ns_row(ns: uint64):
+def _zero_pgrp(g: uint64):
     s: uint64 = 0
-    while s < MNTTAB_PER_NS:
-        _zero_entry(ns, s)
+    while s < MNT_CAP:
+        _zero_entry_at(g, s)
         s = s + 1
+    pgrp_pool[g].mnt_count = 0
 
 
-def _copy_entry(src_ns: uint64, src_slot: uint64,
-                dst_ns: uint64, dst_slot: uint64):
-    # Field-by-field deep copy. Both `from_path` and `to_path` are
-    # inline 128-byte buffers so a memcpy-style loop is correct.
-    si: uint64 = _entry_idx(src_ns, src_slot)
-    di: uint64 = _entry_idx(dst_ns, dst_slot)
-    ns_pool[di].in_use            = ns_pool[si].in_use
-    ns_pool[di].flag              = ns_pool[si].flag
-    ns_pool[di].chan.kind         = ns_pool[si].chan.kind
-    ns_pool[di].chan.srvfd        = ns_pool[si].chan.srvfd
-    ns_pool[di].chan.flags        = ns_pool[si].chan.flags
-    ns_pool[di].chan.p9_root_fid  = ns_pool[si].chan.p9_root_fid
-    i: uint64 = 0
-    while i < 128:
-        ns_pool[di].from_path[i] = ns_pool[si].from_path[i]
-        ns_pool[di].to_path[i]   = ns_pool[si].to_path[i]
-        i = i + 1
+def _copy_mtab(src: uint64, dst: uint64):
+    # Field-by-field deep copy of the source Pgrp's mtab into the
+    # destination. Both `from_path` and `to_path` are inline 128-byte
+    # buffers so a memcpy-style loop is correct.
+    s: uint64 = 0
+    while s < MNT_CAP:
+        pgrp_pool[dst].mtab[s].in_use           = pgrp_pool[src].mtab[s].in_use
+        pgrp_pool[dst].mtab[s].flag             = pgrp_pool[src].mtab[s].flag
+        pgrp_pool[dst].mtab[s].chan.kind        = pgrp_pool[src].mtab[s].chan.kind
+        pgrp_pool[dst].mtab[s].chan.srvfd       = pgrp_pool[src].mtab[s].chan.srvfd
+        pgrp_pool[dst].mtab[s].chan.flags       = pgrp_pool[src].mtab[s].chan.flags
+        pgrp_pool[dst].mtab[s].chan.p9_root_fid = pgrp_pool[src].mtab[s].chan.p9_root_fid
+        i: uint64 = 0
+        while i < 128:
+            pgrp_pool[dst].mtab[s].from_path[i] = pgrp_pool[src].mtab[s].from_path[i]
+            pgrp_pool[dst].mtab[s].to_path[i]   = pgrp_pool[src].mtab[s].to_path[i]
+            i = i + 1
+        s = s + 1
+    pgrp_pool[dst].mnt_count = pgrp_pool[src].mnt_count
 
 
-# --- public surface --------------------------------------------------
+# --- Pgrp lifecycle API ---------------------------------------------
 
-def chan_init():
-    # Idempotent: zero the entire pool and mark the root namespace
-    # live. Called by start_kernel before the first task ever runs;
-    # subsequent calls re-zero (useful for a future warm-reset path).
-    n: uint64 = 0
-    while n < NS_MAX:
-        _zero_ns_row(n)
-        ns_alloc[n] = 0
-        n = n + 1
-    # Pin the root namespace (slot 0) with refcount 1. init's task
-    # starts with namespace_id == 0; that's the slot we reserve.
-    ns_alloc[0] = 1
-    ns_root_pinned = 1
+def pgrp_init():
+    # Idempotent: zero the entire pool, then pin slot 0 (the root
+    # Pgrp) at ref=1. Called by start_kernel before the first task
+    # ever runs; subsequent calls re-zero — useful for a future warm-
+    # reset path. Root never exits, so its refcount never drops to 0.
+    g: uint64 = 0
+    while g < PGRP_POOL_CAP:
+        _zero_pgrp(g)
+        pgrp_pool[g].ref = 0
+        g = g + 1
+    pgrp_pool[0].ref = 1
+    pgrp_root_pinned = 1
 
 
 def _ensure_root_pinned():
-    # Defensive: if chan_init was never called (BSS still zero from
-    # boot), the root namespace's refcount is 0 even though task 0
-    # references it. Lazy-fix on the first chan.ad call from a task.
-    if ns_root_pinned == 0:
-        ns_alloc[0] = 1
-        ns_root_pinned = 1
+    # Defensive: if pgrp_init was never called (BSS still zero from
+    # boot), root's refcount is 0 even though task 0 references it.
+    # Lazy-fix on the first chan.ad call from a task.
+    if pgrp_root_pinned == 0:
+        pgrp_pool[0].ref = 1
+        pgrp_root_pinned = 1
+
+
+def pgrp_alloc() -> int32:
+    # Find a refcount=0 slot, set ref=1, return its index. -1 on
+    # pool exhaustion. Skips slot 0 (the root Pgrp, pinned for life).
+    _ensure_root_pinned()
+    g: uint64 = 1
+    while g < PGRP_POOL_CAP:
+        if pgrp_pool[g].ref == 0:
+            _zero_pgrp(g)
+            pgrp_pool[g].ref = 1
+            return cast[int32](g)
+        g = g + 1
+    return -1
+
+
+def pgrp_clone(src_idx: int32) -> int32:
+    # Allocate a fresh slot, deep-copy src's mtab into it. New slot
+    # gets ref=1; src's ref is UNCHANGED (we're not adding a new
+    # reference to src — we're producing a divergent copy). Returns
+    # the new slot index, or -1 if the pool is full / src is invalid.
+    if _pgrp_idx_valid(src_idx) == 0:
+        return -1
+    new_idx: int32 = pgrp_alloc()
+    if new_idx < 0:
+        return -1
+    _copy_mtab(cast[uint64](src_idx), cast[uint64](new_idx))
+    return new_idx
+
+
+def pgrp_ref_inc(idx: int32) -> int32:
+    # Bump refcount when a fresh task inherits an existing Pgrp
+    # (rfork without RFNAMEG). Returns the new refcount or -1 if
+    # the idx is out of range.
+    if _pgrp_idx_valid(idx) == 0:
+        return -1
+    gu: uint64 = cast[uint64](idx)
+    pgrp_pool[gu].ref = pgrp_pool[gu].ref + 1
+    return pgrp_pool[gu].ref
+
+
+def pgrp_ref_dec(idx: int32) -> int32:
+    # Drop refcount on task exit. When refcount hits 0, the slot is
+    # freed (mtab zeroed, mnt_count cleared) and immediately eligible
+    # for pgrp_alloc to reuse. Returns the new refcount, or -1 on
+    # oob / underflow. Root (slot 0) refuses to decrement below 1
+    # because init never exits.
+    if _pgrp_idx_valid(idx) == 0:
+        return -1
+    gu: uint64 = cast[uint64](idx)
+    if gu == 0:
+        return pgrp_pool[0].ref
+    if pgrp_pool[gu].ref <= 0:
+        return -1
+    pgrp_pool[gu].ref = pgrp_pool[gu].ref - 1
+    if pgrp_pool[gu].ref == 0:
+        _zero_pgrp(gu)
+    return pgrp_pool[gu].ref
+
+
+def pgrp_current_idx() -> int32:
+    # Current task's pgrp_idx, clamped to a valid pool slot. Tasks
+    # in a bad state collapse to root (slot 0) — same defensive
+    # behaviour as V2's _current_ns_safe.
+    _ensure_root_pinned()
+    raw: int32 = current_pgrp_idx()
+    if _pgrp_idx_valid(raw) == 0:
+        return 0
+    return raw
+
+
+def pgrp_root() -> int32:
+    # The pinned root Pgrp. Useful for boot-time setup paths that
+    # want an explicit "use the root" rather than reading the
+    # current task's idx (which during boot may not be sensible).
+    return 0
+
+
+# --- legacy wrappers kept for compatibility with downstream calls --
+#
+# sysproc.ad and a couple of other sites still spell the V2 names
+# (ns_clone / ns_alloc_empty / ns_inc_ref / ns_dec_ref). We rewrite
+# those callers as part of V2.5, but keep thin wrappers here in
+# case anything outside the rewritten set still calls the old names
+# — the wrappers delegate to the Pgrp API.
+
+def ns_clone(parent_idx: int32) -> int32:
+    return pgrp_clone(parent_idx)
+
+
+def ns_alloc_empty() -> int32:
+    return pgrp_alloc()
+
+
+def ns_inc_ref(idx: int32) -> int32:
+    return pgrp_ref_inc(idx)
+
+
+def ns_dec_ref(idx: int32) -> int32:
+    return pgrp_ref_dec(idx)
+
+
+# --- public Chan surface --------------------------------------------
+
+def chan_init():
+    # Backwards-compatible name for callers (init/main.ad) that still
+    # spell `chan_init`. Delegates to pgrp_init.
+    pgrp_init()
 
 
 def chan_attach(srvfd: int32, spec: Ptr[uint8],
@@ -255,9 +388,6 @@ def chan_attach(srvfd: int32, spec: Ptr[uint8],
     # Phase C stub: produce a Chan that wraps the supplied srvfd.
     # Phase D grows this into a real 9P Tversion + Tattach exchange
     # over the srvfd; for now we just record the fd and return.
-    # `spec` is ignored at this milestone (the Plan 9 attach spec
-    # selects which file tree a multi-tree server exposes; Hamnix
-    # has no 9P server, no trees, no spec to honour).
     if out == cast[Ptr[Chan]](0):
         return -1
     out[0].kind        = CHAN_KIND_SRV
@@ -270,124 +400,29 @@ def chan_attach(srvfd: int32, spec: Ptr[uint8],
 def chan_walk(c: Ptr[Chan], path: Ptr[uint8]) -> Ptr[Chan]:
     # Phase C stub: no walking. The mount table maps prefixes, not
     # paths, so resolve_path's longest-prefix match is the only
-    # walking we need at this milestone. Phase D's 9P Twalk lands
-    # here once chan_attach knows how to speak the wire.
+    # walking we need at this milestone.
     return c
-
-
-# --- namespace allocation / lifecycle -------------------------------
-
-def _current_ns_safe() -> uint64:
-    # Fetch the calling task's namespace_id and clamp it into the
-    # valid pool range. A task that ended up with a negative id
-    # (RFCNAMEG -> -1 today, until V2's empty-ns slot machinery
-    # below replaces that) is mapped to a private freshly-allocated
-    # ns the FIRST TIME it bind/mount/unmounts something. Until
-    # then, reads against it surface as "no visible entries" — the
-    # right shape because the task explicitly asked for empty.
-    _ensure_root_pinned()
-    raw: int32 = current_namespace_id()
-    if _ns_valid(raw) == 0:
-        return 0                              # collapse oob to root for reads
-    return cast[uint64](raw)
-
-
-def ns_clone(parent_ns: int32) -> int32:
-    # Allocate a fresh namespace slot, deep-copy every entry from
-    # `parent_ns` into it. Returns the new slot id (0..NS_MAX-1) on
-    # success or -1 if the pool is full.
-    #
-    # The new slot starts with refcount 1 — the caller (sysproc's
-    # _rfork_setup_namespace) is the sole referer until we observe
-    # additional rfork-share calls.
-    _ensure_root_pinned()
-    # Find a free slot (refcount == 0). Skip 0 — that's root, pinned.
-    n: uint64 = 1
-    new_slot: int32 = -1
-    while n < NS_MAX:
-        if ns_alloc[n] == 0:
-            new_slot = cast[int32](n)
-            break
-        n = n + 1
-    if new_slot < 0:
-        return -1
-    new_ns: uint64 = cast[uint64](new_slot)
-    # Zero the destination row before copy — slots reclaimed from a
-    # previous tenant may carry stale entries.
-    _zero_ns_row(new_ns)
-    # Deep-copy when parent is a valid in-range ns. RFCNAMEG-style
-    # callers will pass -1 here; we honour that as "clone an empty
-    # namespace" by skipping the copy.
-    if _ns_valid(parent_ns) != 0:
-        pns: uint64 = cast[uint64](parent_ns)
-        s: uint64 = 0
-        while s < MNTTAB_PER_NS:
-            if ns_pool[_entry_idx(pns, s)].in_use != 0:
-                _copy_entry(pns, s, new_ns, s)
-            s = s + 1
-    ns_alloc[new_ns] = 1
-    return new_slot
-
-
-def ns_alloc_empty() -> int32:
-    # RFCNAMEG-shape: fresh namespace with NO inherited entries.
-    # Equivalent to ns_clone(<any source>) followed by zeroing the
-    # row, but expressed as a separate entrypoint so the caller
-    # doesn't have to fabricate a fake parent.
-    return ns_clone(-1)
-
-
-def ns_inc_ref(ns: int32) -> int32:
-    # Bump refcount when a fresh task inherits an existing ns
-    # (rfork without RFNAMEG). Returns the new refcount or -1 if
-    # the ns id is out of range.
-    if _ns_valid(ns) == 0:
-        return -1
-    nu: uint64 = cast[uint64](ns)
-    ns_alloc[nu] = ns_alloc[nu] + 1
-    return ns_alloc[nu]
-
-
-def ns_dec_ref(ns: int32) -> int32:
-    # Drop refcount on task exit. When refcount hits 0, the slot is
-    # eligible for ns_clone() reuse — we leave the entries in place
-    # (a fresh ns_clone zeroes them before re-populating) so the GC
-    # has no extra cost. Returns the new refcount, or -1 on oob, or
-    # -1 if the refcount was already 0 (programming error: more
-    # exits than inherits).
-    if _ns_valid(ns) == 0:
-        return -1
-    nu: uint64 = cast[uint64](ns)
-    # Refuse to underflow root. The root namespace is pinned for the
-    # life of the kernel; init never exits.
-    if nu == 0:
-        return ns_alloc[0]
-    if ns_alloc[nu] <= 0:
-        return -1
-    ns_alloc[nu] = ns_alloc[nu] - 1
-    return ns_alloc[nu]
 
 
 # --- mount-table operations -----------------------------------------
 
-def _mnttab_find_free(ns: uint64) -> int32:
-    # Linear scan within the namespace's row for an in_use==0 slot.
-    # Returns -1 if the row is full.
+def _current_ns_safe() -> uint64:
+    # Resolve the calling task's Pgrp index for mtab access. Same
+    # name as V2's helper so downstream comments still make sense.
+    return cast[uint64](pgrp_current_idx())
+
+
+def _mtab_find_free(g: uint64) -> int32:
     s: uint64 = 0
-    while s < MNTTAB_PER_NS:
-        if ns_pool[_entry_idx(ns, s)].in_use == 0:
+    while s < MNT_CAP:
+        if pgrp_pool[g].mtab[s].in_use == 0:
             return cast[int32](s)
         s = s + 1
     return -1
 
 
-def _entry_visible(ns: uint64, slot: uint64) -> int32:
-    # In V2, an entry is visible iff it lives in the caller's
-    # namespace row AND is in_use. Pre-V2 the global table also
-    # surfaced "shared" entries (namespace_id == 0) to every task;
-    # that "shared default" semantic is gone now — each namespace
-    # is its own row, no implicit overlay.
-    if ns_pool[_entry_idx(ns, slot)].in_use == 0:
+def _entry_visible(g: uint64, s: uint64) -> int32:
+    if pgrp_pool[g].mtab[s].in_use == 0:
         return 0
     return 1
 
@@ -395,47 +430,43 @@ def _entry_visible(ns: uint64, slot: uint64) -> int32:
 def mnttab_bind(new_path: Ptr[uint8], old_path: Ptr[uint8],
                 flag: int32) -> int32:
     # Add a `new_path -> old_path` binding into the calling task's
-    # namespace row. Returns 0 on success, -1 if the row is full.
-    ns: uint64 = _current_ns_safe()
-    slot: int32 = _mnttab_find_free(ns)
+    # Pgrp mtab. Returns 0 on success, -1 if the mtab is full.
+    g: uint64 = _current_ns_safe()
+    slot: int32 = _mtab_find_free(g)
     if slot < 0:
         return -1
     su: uint64 = cast[uint64](slot)
-    idx: uint64 = _entry_idx(ns, su)
-    if _copy_path_into(&ns_pool[idx].from_path[0], 128, new_path) < 0:
+    if _copy_path_into(&pgrp_pool[g].mtab[su].from_path[0], 128, new_path) < 0:
         return -1
-    if _copy_path_into(&ns_pool[idx].to_path[0], 128, old_path) < 0:
+    if _copy_path_into(&pgrp_pool[g].mtab[su].to_path[0], 128, old_path) < 0:
         return -1
-    ns_pool[idx].in_use       = 1
-    ns_pool[idx].flag         = flag
-    ns_pool[idx].chan.kind    = CHAN_KIND_FILE
-    ns_pool[idx].chan.srvfd   = -1
-    ns_pool[idx].chan.flags   = flag
-    ns_pool[idx].chan.p9_root_fid = -1
+    pgrp_pool[g].mtab[su].in_use       = 1
+    pgrp_pool[g].mtab[su].flag         = flag
+    pgrp_pool[g].mtab[su].chan.kind    = CHAN_KIND_FILE
+    pgrp_pool[g].mtab[su].chan.srvfd   = -1
+    pgrp_pool[g].mtab[su].chan.flags   = flag
+    pgrp_pool[g].mtab[su].chan.p9_root_fid = -1
+    pgrp_pool[g].mnt_count = pgrp_pool[g].mnt_count + 1
     return 0
 
 
 def mnttab_mount(srvfd: int32, old_path: Ptr[uint8],
                  flag: int32, spec: Ptr[uint8]) -> int32:
     # Same shape as mnttab_bind, but the "from" side is a SRV chan
-    # wrapping srvfd, not a path. Resolves under `old_path` dispatch
-    # through the chan once Phase D wires the 9P client; for this
-    # milestone the SRV-mount path lives in fs/vfs.ad.
-    ns: uint64 = _current_ns_safe()
-    slot: int32 = _mnttab_find_free(ns)
+    # wrapping srvfd, not a path.
+    g: uint64 = _current_ns_safe()
+    slot: int32 = _mtab_find_free(g)
     if slot < 0:
         return -1
     su: uint64 = cast[uint64](slot)
-    idx: uint64 = _entry_idx(ns, su)
-    if _copy_path_into(&ns_pool[idx].from_path[0], 128, old_path) < 0:
+    if _copy_path_into(&pgrp_pool[g].mtab[su].from_path[0], 128, old_path) < 0:
         return -1
-    # Clear to_path so a future chan walk doesn't accidentally hit
-    # a stale fall-through buffer.
-    ns_pool[idx].to_path[0] = 0
-    if chan_attach(srvfd, spec, &ns_pool[idx].chan) < 0:
+    pgrp_pool[g].mtab[su].to_path[0] = 0
+    if chan_attach(srvfd, spec, &pgrp_pool[g].mtab[su].chan) < 0:
         return -1
-    ns_pool[idx].in_use       = 1
-    ns_pool[idx].flag         = flag
+    pgrp_pool[g].mtab[su].in_use       = 1
+    pgrp_pool[g].mtab[su].flag         = flag
+    pgrp_pool[g].mnt_count = pgrp_pool[g].mnt_count + 1
     return 0
 
 
@@ -448,33 +479,27 @@ def mnttab_unmount(new_path: Ptr[uint8],
     #                          resolve to).
     #   * new_path != NULL  -> remove the specific
     #                          new_path -> old_path edge.
-    #
-    # Returns 0 on success (>= 1 entry removed) or -1 if no match.
-    ns: uint64 = _current_ns_safe()
+    g: uint64 = _current_ns_safe()
     removed: int32 = 0
     s: uint64 = 0
-    while s < MNTTAB_PER_NS:
-        if _entry_visible(ns, s) != 0:
+    while s < MNT_CAP:
+        if _entry_visible(g, s) != 0:
             keep: int32 = 1
-            idx: uint64 = _entry_idx(ns, s)
             if new_path == cast[Ptr[uint8]](0):
-                # Unmount-all-at: from_path matches old_path.
-                if _path_eq_u8(&ns_pool[idx].from_path[0], old_path) != 0:
+                if _path_eq_u8(&pgrp_pool[g].mtab[s].from_path[0], old_path) != 0:
                     keep = 0
             else:
-                # Specific edge: from_path == new AND to_path == old.
-                # SRV mounts (chan.kind == CHAN_KIND_SRV) have an
-                # empty stored to_path; treat that as a match against
-                # any old_path for the rare "unmount-one-srv" call.
-                if _path_eq_u8(&ns_pool[idx].from_path[0], new_path) != 0:
-                    if ns_pool[idx].chan.kind == CHAN_KIND_SRV \
-                            and ns_pool[idx].to_path[0] == 0:
+                if _path_eq_u8(&pgrp_pool[g].mtab[s].from_path[0], new_path) != 0:
+                    if pgrp_pool[g].mtab[s].chan.kind == CHAN_KIND_SRV \
+                            and pgrp_pool[g].mtab[s].to_path[0] == 0:
                         keep = 0
-                    elif _path_eq_u8(&ns_pool[idx].to_path[0], old_path) != 0:
+                    elif _path_eq_u8(&pgrp_pool[g].mtab[s].to_path[0], old_path) != 0:
                         keep = 0
             if keep == 0:
-                _zero_entry(ns, s)
+                _zero_entry_at(g, s)
                 removed = removed + 1
+                if pgrp_pool[g].mnt_count > 0:
+                    pgrp_pool[g].mnt_count = pgrp_pool[g].mnt_count - 1
         s = s + 1
     if removed == 0:
         return -1
@@ -482,20 +507,9 @@ def mnttab_unmount(new_path: Ptr[uint8],
 
 
 # --- resolve_path hook ----------------------------------------------
-#
-# fs/vfs.ad calls chan_resolve_prefix() before its cpio / tmpfs /
-# procfs / ext4 routing. We walk the live mount entries in the
-# calling task's namespace row, find the LONGEST `from_path` that
-# is a prefix of `input` followed by either NUL or '/' (so /sysroot
-# doesn't spuriously match /sysroot2), and rewrite the prefix to
-# the entry's `to_path`. The rewritten path replaces `input` in
-# `output[0..]` and we return 1; on no-match the caller writes its
-# own normalized output and we return 0.
 
-def _prefix_match_len(idx: uint64, input: Ptr[uint8]) -> uint64:
-    # If entry's from_path is a prefix of input (followed by NUL or
-    # '/' in input), return the prefix length. Else return 0.
-    fp: Ptr[uint8] = &ns_pool[idx].from_path[0]
+def _prefix_match_len_at(g: uint64, s: uint64, input: Ptr[uint8]) -> uint64:
+    fp: Ptr[uint8] = &pgrp_pool[g].mtab[s].from_path[0]
     flen: uint64 = _strlen_u8(fp)
     if flen == 0:
         return 0
@@ -506,7 +520,6 @@ def _prefix_match_len(idx: uint64, input: Ptr[uint8]) -> uint64:
         if input[i] != fp[i]:
             return 0
         i = i + 1
-    # Byte at position flen must be NUL or '/'.
     next_byte: uint8 = input[flen]
     if next_byte == 0 or next_byte == 47:        # '/'
         return flen
@@ -518,33 +531,22 @@ def chan_resolve_prefix(input: Ptr[uint8],
                         cap: uint64) -> int32:
     # Returns 1 if a mount entry rewrote the prefix into `output`,
     # 0 if no match, -1 if the rewrite would exceed `cap` bytes.
-    #
-    # Picks the longest from_path prefix among entries visible in
-    # the calling task's namespace row. Ties (two entries with the
-    # same from_path) are resolved in favour of the most recently
-    # bound — naturally the higher slot index, since _mnttab_find_free
-    # scans low-to-high.
-    ns: uint64 = _current_ns_safe()
+    g: uint64 = _current_ns_safe()
     best_slot: int32 = -1
     best_len: uint64 = 0
     s: uint64 = 0
-    while s < MNTTAB_PER_NS:
-        if _entry_visible(ns, s) != 0:
-            idx: uint64 = _entry_idx(ns, s)
-            # Skip SRV mounts — their on-disk fall-through doesn't
-            # exist (no 9P client yet from the resolve_path side).
-            # SRV lookups go through chan_find_srv_prefix instead.
-            if ns_pool[idx].chan.kind == CHAN_KIND_FILE:
-                m: uint64 = _prefix_match_len(idx, input)
+    while s < MNT_CAP:
+        if _entry_visible(g, s) != 0:
+            if pgrp_pool[g].mtab[s].chan.kind == CHAN_KIND_FILE:
+                m: uint64 = _prefix_match_len_at(g, s, input)
                 if m > best_len:
                     best_len = m
                     best_slot = cast[int32](s)
         s = s + 1
     if best_slot < 0:
         return 0
-    # Build output = to_path + (input + best_len).
-    bu: uint64 = _entry_idx(ns, cast[uint64](best_slot))
-    tp: Ptr[uint8] = &ns_pool[bu].to_path[0]
+    bu: uint64 = cast[uint64](best_slot)
+    tp: Ptr[uint8] = &pgrp_pool[g].mtab[bu].to_path[0]
     tplen: uint64 = _strlen_u8(tp)
     if tplen >= cap:
         return -1
@@ -564,85 +566,71 @@ def chan_resolve_prefix(input: Ptr[uint8],
 
 
 # --- SRV-mount lookup for the VFS dispatcher ----------------------
-#
-# fs/vfs.ad consults these on every open / read / write / close to
-# decide whether a path lives behind a 9P SRV chan. Returns the
-# (srvfd, root_fid, prefix_len) triple via output pointers so the
-# caller can compute the relative path from the absolute one.
 
 def chan_find_srv_prefix(input: Ptr[uint8],
                          out_srvfd: Ptr[int32],
                          out_root_fid: Ptr[int32],
                          out_prefix_len: Ptr[uint64]) -> int32:
-    # Walk the calling task's namespace row for the longest SRV-kind
-    # from_path prefix of `input`. Returns 1 on hit, 0 on miss.
-    ns: uint64 = _current_ns_safe()
+    g: uint64 = _current_ns_safe()
     best_slot: int32 = -1
     best_len: uint64 = 0
     s: uint64 = 0
-    while s < MNTTAB_PER_NS:
-        if _entry_visible(ns, s) != 0:
-            idx: uint64 = _entry_idx(ns, s)
-            if ns_pool[idx].chan.kind == CHAN_KIND_SRV:
-                m: uint64 = _prefix_match_len(idx, input)
+    while s < MNT_CAP:
+        if _entry_visible(g, s) != 0:
+            if pgrp_pool[g].mtab[s].chan.kind == CHAN_KIND_SRV:
+                m: uint64 = _prefix_match_len_at(g, s, input)
                 if m > best_len:
                     best_len = m
                     best_slot = cast[int32](s)
         s = s + 1
     if best_slot < 0:
         return 0
-    bu: uint64 = _entry_idx(ns, cast[uint64](best_slot))
-    out_srvfd[0]      = ns_pool[bu].chan.srvfd
-    out_root_fid[0]   = ns_pool[bu].chan.p9_root_fid
+    bu: uint64 = cast[uint64](best_slot)
+    out_srvfd[0]      = pgrp_pool[g].mtab[bu].chan.srvfd
+    out_root_fid[0]   = pgrp_pool[g].mtab[bu].chan.p9_root_fid
     out_prefix_len[0] = best_len
     return 1
 
 
 def chan_set_p9_root_fid_by_srvfd(srvfd: int32, root_fid: int32) -> int32:
-    # Locate the SRV-kind mount entry in the calling task's namespace
-    # whose srvfd matches and stamp its p9_root_fid. Returns 0 on
-    # success, -1 if no entry matched. syschan.ad calls this right
-    # after a successful p9c_attach_run so subsequent VFS lookups see
-    # the live fid.
-    ns: uint64 = _current_ns_safe()
+    g: uint64 = _current_ns_safe()
     s: uint64 = 0
-    while s < MNTTAB_PER_NS:
-        idx: uint64 = _entry_idx(ns, s)
-        if ns_pool[idx].in_use != 0 \
-                and ns_pool[idx].chan.kind == CHAN_KIND_SRV \
-                and ns_pool[idx].chan.srvfd == srvfd:
-            ns_pool[idx].chan.p9_root_fid = root_fid
+    while s < MNT_CAP:
+        if pgrp_pool[g].mtab[s].in_use != 0 \
+                and pgrp_pool[g].mtab[s].chan.kind == CHAN_KIND_SRV \
+                and pgrp_pool[g].mtab[s].chan.srvfd == srvfd:
+            pgrp_pool[g].mtab[s].chan.p9_root_fid = root_fid
             return 0
         s = s + 1
     return -1
 
 
 # --- introspection / debug -----------------------------------------
-#
-# Tiny helpers used by tests + future /proc/mounts renderer. Kept
-# minimal so chan.ad stays focused on the data model.
 
 def mnttab_entry_count() -> uint64:
-    # Total live entries across ALL namespaces. Used by tests that
+    # Total live entries across ALL Pgrps. Used by tests that
     # validate "the table cleared after unmount".
     n: uint64 = 0
-    i: uint64 = 0
-    while i < MNTTAB_TOTAL:
-        if ns_pool[i].in_use != 0:
-            n = n + 1
-        i = i + 1
+    g: uint64 = 0
+    while g < PGRP_POOL_CAP:
+        s: uint64 = 0
+        while s < MNT_CAP:
+            if pgrp_pool[g].mtab[s].in_use != 0:
+                n = n + 1
+            s = s + 1
+        g = g + 1
     return n
 
 
-def mnttab_entry_count_ns(ns: int32) -> uint64:
-    # Live entries visible to `ns`. -1 maps to "empty namespace" -> 0.
-    if _ns_valid(ns) == 0:
+def mnttab_entry_count_ns(idx: int32) -> uint64:
+    # Live entries visible to Pgrp `idx`. Out-of-range -> 0.
+    if _pgrp_idx_valid(idx) == 0:
         return 0
-    nu: uint64 = cast[uint64](ns)
+    gu: uint64 = cast[uint64](idx)
     n: uint64 = 0
     s: uint64 = 0
-    while s < MNTTAB_PER_NS:
-        if ns_pool[_entry_idx(nu, s)].in_use != 0:
+    while s < MNT_CAP:
+        if pgrp_pool[gu].mtab[s].in_use != 0:
             n = n + 1
         s = s + 1
     return n
