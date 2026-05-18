@@ -54,7 +54,14 @@ from kernel.sched.core import (
 from sys.src.port9.port.chan import (
     Chan, MountEntry,
     chan_init, chan_attach,
+    chan_set_p9_root_fid_by_srvfd,
     mnttab_bind, mnttab_mount, mnttab_unmount,
+)
+# V1: the 9P client surface that turns mount(srvfd, ...) from "store
+# the fd" into "speak Tversion + Tattach over the fd". After this
+# import, do_mount below runs the real handshake.
+from sys.src.port9.port.p9_client import (
+    p9c_attach, p9c_attach_run,
 )
 
 
@@ -177,6 +184,39 @@ def do_mount(srvfd: int32, afd: int32, old_user: uint64,
     rc: int32 = mnttab_mount(srvfd, &old_buf[0], flag, spec_ptr)
     if rc < 0:
         set_current_errstr("mount failed: mount table full")
+        return cast[int64](-1)
+    # V1: the chan exists; run the 9P attach handshake over srvfd so
+    # subsequent opens through this mount can dispatch through the
+    # client API. spec is used as the `aname` (Plan 9 file-tree
+    # selector) — V4 servers may serve multiple trees on one
+    # connection; V1 smoke server ignores it. uname is "" (no users
+    # database yet — once /etc/passwd lands we lift the per-task
+    # identity into here).
+    empty_uname: Array[1, uint8]
+    empty_uname[0] = 0
+    aname_arg: Ptr[char] = cast[Ptr[char]](spec_ptr)
+    if spec_ptr == cast[Ptr[uint8]](0):
+        aname_arg = cast[Ptr[char]](&empty_uname[0])
+    cslot: int32 = p9c_attach(srvfd, aname_arg,
+                              cast[Ptr[char]](&empty_uname[0]))
+    if cslot < 0:
+        # Roll back the mnttab entry so userland sees the gap; the
+        # mount slot would otherwise be reserved with a half-attached
+        # connection.
+        mnttab_unmount(cast[Ptr[uint8]](0), &old_buf[0])
+        set_current_errstr("mount failed: p9c_attach (conn alloc)")
+        return cast[int64](-1)
+    root_fid: int32 = p9c_attach_run(cslot, aname_arg,
+                                     cast[Ptr[char]](&empty_uname[0]))
+    if root_fid < 0:
+        mnttab_unmount(cast[Ptr[uint8]](0), &old_buf[0])
+        set_current_errstr("mount failed: Tversion/Tattach")
+        return cast[int64](-1)
+    # Stamp the root fid onto the mount entry so VFS dispatch can
+    # find it on subsequent opens.
+    if chan_set_p9_root_fid_by_srvfd(srvfd, root_fid) != 0:
+        mnttab_unmount(cast[Ptr[uint8]](0), &old_buf[0])
+        set_current_errstr("mount failed: chan stamp")
         return cast[int64](-1)
     return 0
 

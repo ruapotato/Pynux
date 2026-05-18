@@ -89,7 +89,17 @@ from sys.src.port9.port.devproc import (
 # the per-task namespace before the existing cpio / tmpfs / ext4
 # routing so a successful bind() of "/sysroot" -> "/etc" makes
 # /sysroot/motd open the same bytes /etc/motd would have.
-from sys.src.port9.port.chan import chan_resolve_prefix
+from sys.src.port9.port.chan import (
+    chan_resolve_prefix, chan_find_srv_prefix,
+)
+# V1: in-kernel 9P client surface — vfs.ad dispatches FD_P9_MARK fds
+# through these. p9_client.ad's FD_P9_MARK lives next to the dev*.ad
+# trio's marks (same pattern, see comment above the devstat import).
+from sys.src.port9.port.p9_client import (
+    p9c_walk_open_path, p9c_read, p9c_write, p9c_clunk,
+    p9c_encode_fd_buf, p9c_decode_srvfd, p9c_decode_fid,
+    FD_P9_MARK,
+)
 from fs.cpio import (
     cpio_init,
     initramfs_entry_count, initramfs_entry_name,
@@ -414,6 +424,16 @@ def vfs_open(name: Ptr[char]) -> int32:
     # currently ship one, but the layering is the right way round).
     if is_proc_path(name) != 0:
         return _open_proc(name)
+    # V1: 9P SRV-kind mount probe. Plan 9's mount(srvfd, ..., /n/foo)
+    # binds an in-kernel 9P client at /n/foo; opens of /n/foo/... walk
+    # through the client and return a FD_P9_MARK fd. We probe BEFORE
+    # the local-FS routes so a mount at /n/foo doesn't get shadowed by
+    # a hypothetical local /n/foo. chan_find_srv_prefix surfaces
+    # (srvfd, root_fid, prefix_len) — we compute the relative path
+    # past the prefix and hand it to p9c_walk_open_path.
+    p9_fd: int32 = _try_open_p9(name)
+    if p9_fd != -10000:
+        return p9_fd
     if is_tmpfs_path(name) != 0:
         return _open_tmpfs_read(name)
     if is_fat_path(name) != 0:
@@ -572,6 +592,16 @@ def vfs_open_write(name: Ptr[char]) -> int32:
         if rc < 0:
             return ENOENT
         return _install_proc_fd(cast[uint32](rc & 0xFFFFFFFF))
+    # V1: 9P SRV-kind mount probe on the OWRITE side. Same shape as
+    # vfs_open's probe above. Today we open with mode=OWRITE (1); the
+    # underlying p9c_open passes the byte through verbatim. Write-side
+    # opens on a 9P-mounted path don't truncate-or-create yet (V2);
+    # they just walk + Topen-OWRITE, which matches Plan 9 semantics
+    # for an existing file. Create-on-open lands when V2 adds Tcreate
+    # routing through this entry point.
+    p9_wfd: int32 = _try_open_p9_write(name)
+    if p9_wfd != -10000:
+        return p9_wfd
     if is_tmpfs_path(name) != 0:
         slot: int32 = tmpfs_open_for_write(name)
         if slot < 0:
@@ -947,6 +977,64 @@ def _open_dev_marked(mark: uint32) -> int32:
     return fd
 
 
+# --- V1: 9P-mount path opener -------------------------------------
+#
+# Probes the SRV-kind mount table for the longest from_path prefix
+# of `name`. On a hit, walks + opens through the in-kernel 9P client
+# and installs a FD_P9_MARK fd whose fd_buf carries (srvfd << 32 |
+# fid). Returns the fd on success, an errno on failure, or the
+# sentinel -10000 to mean "no SRV-mount matched this path; let the
+# caller fall through to the local-FS routing". The sentinel is
+# outside the errno range (EROFS=-30 etc.) so callers can branch on
+# the equality test without aliasing real errors.
+
+P9_NO_MOUNT: int32 = -10000
+
+
+def _try_open_p9(name: Ptr[char]) -> int32:
+    return _try_open_p9_with_mode(name, 0)        # OREAD
+
+
+def _try_open_p9_write(name: Ptr[char]) -> int32:
+    return _try_open_p9_with_mode(name, 1)        # OWRITE
+
+
+def _try_open_p9_with_mode(name: Ptr[char], mode: int32) -> int32:
+    srvfd: int32 = -1
+    root_fid: int32 = -1
+    prefix_len: uint64 = 0
+    hit: int32 = chan_find_srv_prefix(cast[Ptr[uint8]](name),
+                                      &srvfd, &root_fid, &prefix_len)
+    if hit == 0:
+        return P9_NO_MOUNT
+    if root_fid < 0:
+        # Mount entry exists but attach hasn't completed -- surface
+        # ENOENT rather than fall through, otherwise we'd hit the
+        # local-FS routes for a path the user explicitly bound to
+        # the (broken) 9P server.
+        return ENOENT
+    # Compute the relative path: bytes past the mount prefix. e.g.
+    # name = "/n/loop/hello", prefix_len = 7  (== len("/n/loop")) →
+    # rel = "/hello". An exact prefix-match (name length == prefix
+    # length, /n/loop alone) → rel = "" → root walk.
+    rel: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](name) + prefix_len)
+    new_fid: int32 = p9c_walk_open_path(srvfd, root_fid, rel, mode)
+    if new_fid < 0:
+        return ENOENT
+    # Install the fd.
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        p9c_clunk(srvfd, new_fid)
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu]    = FD_P9_MARK
+    task[0].fd_pos[fdu]    = 0
+    task[0].fd_buf[fdu]    = p9c_encode_fd_buf(srvfd, new_fid)
+    task[0].fd_buflen[fdu] = 0
+    return fd
+
+
 def _install_proc_fd(encoded_mark: uint32) -> int32:
     # /proc/<pid>/<file> fds carry the marker tag PLUS the encoded
     # pid + file_kind in their fd_idx slot — devproc_read uses the
@@ -1040,6 +1128,19 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
 
     if file_idx == FD_CLOSED_MARK:
         return cast[int64](EBADF)
+    if file_idx == FD_P9_MARK:
+        # V1: 9P-mounted file. fd_buf packs (srvfd << 32 | fid).
+        # Dispatch through the in-kernel 9P client; treat fd_pos as
+        # the offset so seq reads see expected stream semantics.
+        p9_packed: uint64 = task[0].fd_buf[fdu]
+        srvfd_p9: int32 = p9c_decode_srvfd(p9_packed)
+        fid_p9:   int32 = p9c_decode_fid(p9_packed)
+        off:      uint64 = task[0].fd_pos[fdu]
+        n: int64 = p9c_read(srvfd_p9, fid_p9, off, buf,
+                            cast[uint32](count))
+        if n > 0:
+            task[0].fd_pos[fdu] = off + cast[uint64](n)
+        return n
     if file_idx == FD_DEVNULL_MARK:
         # /dev/null reads always return EOF.
         return 0
@@ -1271,6 +1372,17 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
 
     if file_idx == FD_CLOSED_MARK:
         return cast[int64](EBADF)
+    if file_idx == FD_P9_MARK:
+        # V1: 9P-mounted file write. Mirror the read-side dispatch.
+        p9_packed: uint64 = task[0].fd_buf[fdu]
+        srvfd_p9: int32 = p9c_decode_srvfd(p9_packed)
+        fid_p9:   int32 = p9c_decode_fid(p9_packed)
+        off:      uint64 = task[0].fd_pos[fdu]
+        n: int64 = p9c_write(srvfd_p9, fid_p9, off, buf,
+                             cast[uint32](count))
+        if n > 0:
+            task[0].fd_pos[fdu] = off + cast[uint64](n)
+        return n
     if file_idx == FD_DEVNULL_MARK or file_idx == FD_DEVZERO_MARK:
         # /dev/null and /dev/zero swallow writes silently — the
         # full `count` is returned as bytes-written.
@@ -1469,6 +1581,17 @@ def vfs_close(fd: int32) -> int32:
     file_idx: uint32 = task[0].fd_idx[fdu]
     if file_idx == FD_CLOSED_MARK:
         return EBADF
+    # V1: 9P fd — issue Tclunk before the slot is reclaimed. We DO
+    # fall through to close_fd_in_task afterwards so the per-task
+    # slot is zeroed by the same cleanup path every other backend
+    # uses (otherwise dup'd FD_P9_MARK fds would double-clunk on
+    # second close, since close_fd_in_task doesn't know about the
+    # 9P refcounting story yet — V2 lifts that).
+    if file_idx == FD_P9_MARK:
+        p9_packed: uint64 = task[0].fd_buf[fdu]
+        srvfd_p9: int32 = p9c_decode_srvfd(p9_packed)
+        fid_p9:   int32 = p9c_decode_fid(p9_packed)
+        p9c_clunk(srvfd_p9, fid_p9)
     # /proc/<pid>/<file> fds carry no per-fd backing — devproc_close
     # is a no-op success today (kept as a hook so future per-fd
     # snapshot support can land without re-plumbing the close path).
@@ -1560,6 +1683,25 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
         elif whence == SEEK_END:
             new_pos = cast[int64](size) + offset
         else:
+            return cast[int64](EINVAL)
+        if new_pos < 0:
+            return cast[int64](EINVAL)
+        task[0].fd_pos[fdu] = cast[uint64](new_pos)
+        return new_pos
+    if file_idx == FD_P9_MARK:
+        # V1: 9P seek. SEEK_SET / SEEK_CUR just adjust fd_pos --
+        # subsequent vfs_read passes the new offset through to
+        # p9c_read's Tread. SEEK_END would need a Tstat round-trip
+        # to discover the server-side length; V2 wires that. For V1
+        # we surface EINVAL on SEEK_END so callers can fall back
+        # cleanly.
+        new_pos: int64 = 0
+        if whence == SEEK_SET:
+            new_pos = offset
+        elif whence == SEEK_CUR:
+            new_pos = cast[int64](task[0].fd_pos[fdu]) + offset
+        else:
+            # SEEK_END or unknown whence.
             return cast[int64](EINVAL)
         if new_pos < 0:
             return cast[int64](EINVAL)

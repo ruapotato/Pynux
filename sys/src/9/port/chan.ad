@@ -79,14 +79,17 @@ CHAN_KIND_SRV:  int32 = 2                # mount() — wraps a srvfd
 
 
 class Chan:
-    kind:   int32                        # CHAN_KIND_*
-    srvfd:  int32                        # fd handed to mount(); -1 for FILE
+    kind:        int32                   # CHAN_KIND_*
+    srvfd:       int32                   # fd handed to mount(); -1 for FILE
     # Reserved for Phase D: qid, version, offset, ops vtable, refcount.
     # We grow this struct alongside the 9P client; for now keep it
     # minimal so the field offsets don't shift under sysfile.ad's
     # _write_dir_record consumers.
-    flags:  int32                        # mirror of MREPL/MBEFORE/MAFTER
-    # 4 bytes implicit pad to next 8-byte boundary.
+    flags:       int32                   # mirror of MREPL/MBEFORE/MAFTER
+    # V1: post-attach root fid handed back by p9c_attach_run. -1 for
+    # FILE-kind (bind) entries; populated for SRV-kind (mount) entries
+    # after a successful Tversion + Tattach handshake.
+    p9_root_fid: int32                   # 0..31 on success, -1 otherwise
 
 
 # Mount-table entry. `from_path` and `to_path` are inlined fixed-size
@@ -173,6 +176,7 @@ def chan_init():
         mnttab[i].chan.kind = CHAN_KIND_NONE
         mnttab[i].chan.srvfd = -1
         mnttab[i].chan.flags = 0
+        mnttab[i].chan.p9_root_fid = -1
         i = i + 1
 
 
@@ -186,9 +190,10 @@ def chan_attach(srvfd: int32, spec: Ptr[uint8],
     # has no 9P server, no trees, no spec to honour).
     if out == cast[Ptr[Chan]](0):
         return -1
-    out[0].kind  = CHAN_KIND_SRV
-    out[0].srvfd = srvfd
-    out[0].flags = 0
+    out[0].kind        = CHAN_KIND_SRV
+    out[0].srvfd       = srvfd
+    out[0].flags       = 0
+    out[0].p9_root_fid = -1                  # populated by syschan after Tattach
     return 0
 
 
@@ -267,6 +272,7 @@ def mnttab_bind(new_path: Ptr[uint8], old_path: Ptr[uint8],
     mnttab[su].chan.kind    = CHAN_KIND_FILE
     mnttab[su].chan.srvfd   = -1
     mnttab[su].chan.flags   = flag
+    mnttab[su].chan.p9_root_fid = -1
     return 0
 
 
@@ -340,6 +346,7 @@ def mnttab_unmount(new_path: Ptr[uint8],
                 mnttab[i].chan.kind    = CHAN_KIND_NONE
                 mnttab[i].chan.srvfd   = -1
                 mnttab[i].chan.flags   = 0
+                mnttab[i].chan.p9_root_fid = -1
                 mnttab[i].namespace_id = 0
                 mnttab[i].flag         = 0
                 # Zero the stored paths defensively so a later prefix
@@ -447,6 +454,58 @@ def chan_resolve_prefix(input: Ptr[uint8],
         return -1
     output[j] = 0
     return 1
+
+
+# --- SRV-mount lookup for the VFS dispatcher ----------------------
+#
+# fs/vfs.ad consults these on every open / read / write / close to
+# decide whether a path lives behind a 9P SRV chan. Returns the
+# (srvfd, root_fid, prefix_len) triple via output pointers so the
+# caller can compute the relative path from the absolute one.
+
+def chan_find_srv_prefix(input: Ptr[uint8],
+                         out_srvfd: Ptr[int32],
+                         out_root_fid: Ptr[int32],
+                         out_prefix_len: Ptr[uint64]) -> int32:
+    # Walk the mount table for the longest SRV-kind from_path prefix
+    # of `input`. Returns 1 on hit (out_* populated), 0 on miss.
+    # Match shape mirrors chan_resolve_prefix — the path either
+    # equals the from_path or is followed by '/'.
+    ns: int32 = _current_ns()
+    best_idx: int32 = -1
+    best_len: uint64 = 0
+    i: uint64 = 0
+    while i < MNTTAB_MAX:
+        if _entry_visible(i, ns) != 0:
+            if mnttab[i].chan.kind == CHAN_KIND_SRV:
+                m: uint64 = _prefix_match_len(i, input)
+                if m > best_len:
+                    best_len = m
+                    best_idx = cast[int32](i)
+        i = i + 1
+    if best_idx < 0:
+        return 0
+    bu: uint64 = cast[uint64](best_idx)
+    out_srvfd[0]      = mnttab[bu].chan.srvfd
+    out_root_fid[0]   = mnttab[bu].chan.p9_root_fid
+    out_prefix_len[0] = best_len
+    return 1
+
+
+def chan_set_p9_root_fid_by_srvfd(srvfd: int32, root_fid: int32) -> int32:
+    # Locate the SRV-kind mount entry whose srvfd matches and stamp
+    # its p9_root_fid. Returns 0 on success, -1 if no entry matched.
+    # syschan.ad calls this immediately after a successful
+    # p9c_attach_run so subsequent VFS lookups see the live fid.
+    i: uint64 = 0
+    while i < MNTTAB_MAX:
+        if mnttab[i].in_use != 0 \
+                and mnttab[i].chan.kind == CHAN_KIND_SRV \
+                and mnttab[i].chan.srvfd == srvfd:
+            mnttab[i].chan.p9_root_fid = root_fid
+            return 0
+        i = i + 1
+    return -1
 
 
 # --- introspection / debug -----------------------------------------

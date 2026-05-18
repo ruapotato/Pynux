@@ -152,14 +152,16 @@ def main() -> int32:
     write_str(1, "[p9mount] open /sysroot/motd after unmount fails (expected)\n")
 
     # ----------------------------------------------------------------
-    # 6) mount() shape. Use an existing fd as the srvfd (Phase C
-    # records it; Phase D will speak 9P over it). /etc/motd is in
-    # the cpio archive so opening it is free; we then mount that
-    # fd at /srvmnt. The mount table records the SRV-chan binding.
-    # For Phase C the binding is inert for opens (resolve_path skips
-    # SRV-kind mounts because there's no 9P client yet) — what we
-    # test here is that mount() ACCEPTS the call shape without
-    # erroring. Phase D's hamwd will exercise the dispatch.
+    # 6) mount() shape. Phase C accepted any in-range srvfd because
+    # the stub just stored the int. V1 (sys/src/9/port/p9_client.ad)
+    # turns mount() into "Tversion + Tattach over the supplied fd"
+    # — so a non-9P-speaking fd (like /etc/motd) MUST now return -1
+    # rather than silently succeeding. We assert the rejection.
+    # The kernel-side smoke responder lives in init/p9_smoke.ad and
+    # runs at boot before this fixture even loads, so an in-kernel
+    # PASS lands separately on the serial log; this user-side test
+    # only validates that userland mount() of a bad fd surfaces the
+    # error cleanly.
     sfd: int32 = sys_open("/etc/motd")
     if sfd < 0:
         write_str(1, "[p9mount] FAIL: open /etc/motd for srvfd returned ")
@@ -173,27 +175,27 @@ def main() -> int32:
                   cast[uint64](MREPL),
                   cast[uint64](&""[0]),   # spec = ""
                   0)
-    if rc != 0:
-        write_str(1, "[p9mount] FAIL: mount returned ")
-        write_dec(1, cast[uint64](rc))
-        write_str(1, "\n")
+    # V1: a non-9P fd MUST fail. Pre-V1 expected rc == 0 here.
+    if rc == 0:
+        write_str(1, "[p9mount] FAIL: V1 mount() should reject bad srvfd\n")
         sys_close(sfd)
         return 7
     write_str(1, "[p9mount] mount srvfd ok\n")
+    sys_close(sfd)
 
-    # 7) unmount the srv mount too. Specific edge: new=NULL, old=/srvmnt.
+    # 7) unmount the srv mount path. Even though the mount() above
+    # failed, we attempt the unmount to ensure the failure path
+    # didn't leave a stale entry — V1's do_mount rolls back the
+    # mnttab entry on attach failure. The unmount MUST report "not
+    # mounted" (rc != 0).
     rc = syscall6(SYS_UNMOUNT,
                   0,
                   cast[uint64](&"/srvmnt"[0]),
                   0, 0, 0, 0)
-    if rc != 0:
-        write_str(1, "[p9mount] FAIL: unmount srv returned ")
-        write_dec(1, cast[uint64](rc))
-        write_str(1, "\n")
-        sys_close(sfd)
+    if rc == 0:
+        write_str(1, "[p9mount] FAIL: V1 unmount should report not-mounted\n")
         return 8
     write_str(1, "[p9mount] unmount srv ok\n")
-    sys_close(sfd)
 
     write_str(1, "[p9mount] PASS\n")
     return 0

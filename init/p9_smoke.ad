@@ -1,0 +1,463 @@
+# init/p9_smoke.ad
+#
+# V1 boot-time self-test for the in-kernel 9P client. Spins up a tiny
+# kernel-side responder over two pipe slots, calls mount() to bind it
+# at /n/loop, opens /n/loop/hello, reads its bytes, asserts they match
+# "world\n", and prints `[p9smoke] PASS` (or a FAIL marker). The
+# responder synthesises a single-file FS:
+#
+#   /          QTDIR  qid.path=1
+#   /hello     QTFILE qid.path=2  ->  "world\n"
+#
+# It handles:
+#   Tversion -> Rversion ("9P2000", msize echoed back)
+#   Tattach  -> Rattach  (qid for root)
+#   Twalk    -> Rwalk    (recognises a single-component "hello" walk;
+#                         otherwise replies with Rwalk(0 qids) which
+#                         the client treats as a failed walk)
+#   Topen    -> Ropen    (iounit = 0, no per-fid bookkeeping)
+#   Tread    -> Rread    ("world\n" from offset 0, EOF afterwards)
+#   Tclunk   -> Rclunk   (silently accepts every fid)
+#
+# Anything else surfaces as an Rerror. Tags are echoed verbatim.
+#
+# The responder is throwaway scaffolding -- it doesn't track per-fid
+# state because V1 only exercises one (root) + one (hello) fid path.
+# V4's real userspace server obsoletes this entire file.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from fs.pipe import (
+    pipe_alloc, pipe_read, pipe_write,
+)
+from lib.p9.codec import (
+    P9Cursor, p9_cursor_init,
+    p9_decode_header,
+    p9_decode_tversion, p9_emit_rversion,
+    p9_decode_tattach,  p9_emit_rattach,
+    p9_decode_twalk,    p9_emit_rwalk,
+    p9_decode_topen,    p9_emit_ropen,
+    p9_decode_tread,    p9_emit_rread,
+    p9_decode_tclunk,   p9_emit_rclunk,
+    p9_emit_rerror,
+    P9_QTDIR, P9_QTFILE,
+    P9_TVERSION, P9_TATTACH, P9_TWALK, P9_TOPEN,
+    P9_TREAD, P9_TCLUNK, P9_TWRITE, P9_TSTAT,
+)
+from sys.src.port9.port.p9_client import (
+    p9c_attach, p9c_attach_run,
+    p9c_register_smoke_pipes, p9c_register_smoke_pump,
+    p9c_walk_open_path, p9c_read, p9c_clunk,
+    P9C_MSIZE,
+)
+from sys.src.port9.port.chan import (
+    chan_set_p9_root_fid_by_srvfd,
+    mnttab_bind, mnttab_mount,
+)
+
+
+# Shared responder scratch buffer. Same default msize as the client.
+p9smoke_buf: Array[8192, uint8]
+
+# Pipe slot pair (set by p9_smoke_test before triggering the run).
+p9smoke_tx_slot: int32 = -1     # client writes T-msgs, responder reads
+p9smoke_rx_slot: int32 = -1     # responder writes R-msgs, client reads
+
+# Tracking the connection slot index registered for the smoke run so
+# the pump knows which conn record to drive. Not strictly needed (the
+# pump is called with the slot as arg) but useful for diagnostics.
+p9smoke_conn_slot: int32 = -1
+
+# Mount-point path. Kept in a top-level Array per the Adder
+# nested-frame quirk.
+p9smoke_mount_path: Array[16, uint8]
+p9smoke_relpath_hello: Array[16, uint8]
+
+# "world\n" payload — 6 bytes.
+p9smoke_world: Array[8, uint8]
+
+
+# --- low-level header peek helpers --------------------------------
+
+def _peek_type(buf: Ptr[uint8]) -> uint8:
+    return buf[4]
+
+
+def _peek_size(buf: Ptr[uint8]) -> uint32:
+    b0: uint64 = cast[uint64](buf[0])
+    b1: uint64 = cast[uint64](buf[1])
+    b2: uint64 = cast[uint64](buf[2])
+    b3: uint64 = cast[uint64](buf[3])
+    return cast[uint32](b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
+
+# --- responder body -----------------------------------------------
+#
+# Drains one whole T-msg out of the tx pipe slot, builds the matching
+# R-msg, and writes it into the rx pipe slot. Returns 0 on success,
+# -1 on any failure (which surfaces back through the client's
+# _p9_send → _smoke_pump_call path as a Tversion/Tattach/etc. error).
+
+def _drain_tmsg() -> int32:
+    # Read 4-byte size, then the rest.
+    got: uint64 = 0
+    while got < 7:
+        n: int64 = pipe_read(p9smoke_tx_slot, &p9smoke_buf[got],
+                             7 - got)
+        if n <= 0:
+            return -1
+        got = got + cast[uint64](n)
+    sz: uint32 = _peek_size(&p9smoke_buf[0])
+    if cast[uint64](sz) > 8192:
+        return -1
+    while got < cast[uint64](sz):
+        n: int64 = pipe_read(p9smoke_tx_slot, &p9smoke_buf[got],
+                             cast[uint64](sz) - got)
+        if n <= 0:
+            return -1
+        got = got + cast[uint64](n)
+    return cast[int32](got)
+
+
+def _send_rmsg(n: int32) -> int32:
+    if n <= 0:
+        return -1
+    sent: int64 = pipe_write(p9smoke_rx_slot, &p9smoke_buf[0],
+                             cast[uint64](n))
+    if sent != cast[int64](n):
+        return -1
+    return 0
+
+
+# Most R-messages share the same "write into the same buffer we
+# decoded from, swap the type byte, send" shape. We re-use
+# p9smoke_buf for both directions -- decode + re-encode, then send.
+
+def _serve_one() -> int32:
+    nT: int32 = _drain_tmsg()
+    if nT < 0:
+        return -1
+    t: uint8 = _peek_type(&p9smoke_buf[0])
+    # Dispatch.
+    if t == P9_TVERSION:
+        return _serve_tversion(cast[uint64](nT))
+    if t == P9_TATTACH:
+        return _serve_tattach(cast[uint64](nT))
+    if t == P9_TWALK:
+        return _serve_twalk(cast[uint64](nT))
+    if t == P9_TOPEN:
+        return _serve_topen(cast[uint64](nT))
+    if t == P9_TREAD:
+        return _serve_tread(cast[uint64](nT))
+    if t == P9_TCLUNK:
+        return _serve_tclunk(cast[uint64](nT))
+    # Anything else -> Rerror with the same tag.
+    return _serve_unsupported(cast[uint64](nT))
+
+
+def _take_tag(in_len: uint64) -> uint16:
+    # tag at offset 5..6.
+    lo: uint64 = cast[uint64](p9smoke_buf[5])
+    hi: uint64 = cast[uint64](p9smoke_buf[6])
+    return cast[uint16](lo | (hi << 8))
+
+
+def _serve_tversion(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    ms: uint32 = 0
+    ver_ptr: Ptr[uint8] = cast[Ptr[uint8]](0)
+    ver_len: uint64 = 0
+    rc: int64 = p9_decode_tversion(&p9smoke_buf[0], in_len,
+                                   &tg, &ms, &ver_ptr, &ver_len)
+    if rc < cast[int64](0):
+        return -1
+    # Cap at our buffer's msize.
+    reply_ms: uint32 = ms
+    if reply_ms > P9C_MSIZE:
+        reply_ms = P9C_MSIZE
+    # Echo "9P2000" — V0 codec's only supported dialect.
+    ver: Array[8, uint8]
+    ver[0] = 57  # '9'
+    ver[1] = 80  # 'P'
+    ver[2] = 50  # '2'
+    ver[3] = 48  # '0'
+    ver[4] = 48
+    ver[5] = 48
+    c: P9Cursor
+    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    n: int32 = p9_emit_rversion(&c, tg, reply_ms, &ver[0], 6)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+def _serve_tattach(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    afid: uint32 = 0
+    uname_p: Ptr[uint8] = cast[Ptr[uint8]](0)
+    uname_l: uint64 = 0
+    aname_p: Ptr[uint8] = cast[Ptr[uint8]](0)
+    aname_l: uint64 = 0
+    rc: int64 = p9_decode_tattach(&p9smoke_buf[0], in_len,
+                                  &tg, &fid, &afid,
+                                  &uname_p, &uname_l,
+                                  &aname_p, &aname_l)
+    if rc < cast[int64](0):
+        return -1
+    # Rattach with root qid (type=DMDIR, vers=0, path=1).
+    c: P9Cursor
+    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    n: int32 = p9_emit_rattach(&c, tg, P9_QTDIR, 0, 1)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+def _serve_twalk(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    newfid: uint32 = 0
+    nwname: uint16 = 0
+    wnames: Array[16, Ptr[uint8]]
+    wlens:  Array[16, uint64]
+    rc: int64 = p9_decode_twalk(&p9smoke_buf[0], in_len,
+                                &tg, &fid, &newfid,
+                                &nwname, &wnames[0], &wlens[0])
+    if rc < cast[int64](0):
+        return -1
+    # Clone (nwname == 0) → just succeed, no qids.
+    qtypes: Array[16, uint8]
+    qvers:  Array[16, uint32]
+    qpaths: Array[16, uint64]
+    if nwname == 0:
+        c: P9Cursor
+        p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+        nout: int32 = p9_emit_rwalk(&c, tg, 0,
+                                    &qtypes[0], &qvers[0], &qpaths[0])
+        if nout < 0:
+            return -1
+        return _send_rmsg(nout)
+    # Single-component walk: must be "hello".
+    if nwname != 1:
+        return _emit_rerror(tg, "unknown path")
+    name_p: Ptr[uint8] = wnames[0]
+    if wlens[0] != 5:
+        return _emit_rerror(tg, "unknown name")
+    if name_p[0] != 104 or name_p[1] != 101 or name_p[2] != 108 \
+            or name_p[3] != 108 or name_p[4] != 111:
+        # not "hello"
+        return _emit_rerror(tg, "unknown name")
+    qtypes[0] = P9_QTFILE
+    qvers[0]  = 0
+    qpaths[0] = 2                        # /hello
+    c: P9Cursor
+    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    nout: int32 = p9_emit_rwalk(&c, tg, 1,
+                                &qtypes[0], &qvers[0], &qpaths[0])
+    if nout < 0:
+        return -1
+    return _send_rmsg(nout)
+
+
+def _serve_topen(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    mode: uint8 = 0
+    rc: int64 = p9_decode_topen(&p9smoke_buf[0], in_len,
+                                &tg, &fid, &mode)
+    if rc < cast[int64](0):
+        return -1
+    # Ropen — file qid (we don't validate fid; V1 smoke responder is
+    # stateless). iounit = 0 → use msize-headers.
+    c: P9Cursor
+    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    n: int32 = p9_emit_ropen(&c, tg, P9_QTFILE, 0, 2, 0)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+def _serve_tread(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    offset: uint64 = 0
+    count: uint32 = 0
+    rc: int64 = p9_decode_tread(&p9smoke_buf[0], in_len,
+                                &tg, &fid, &offset, &count)
+    if rc < cast[int64](0):
+        return -1
+    # Hand back "world\n" from offset 0; offset >= 6 → EOF.
+    available: uint32 = 0
+    if offset < 6:
+        available = 6 - cast[uint32](offset)
+    if available > count:
+        available = count
+    payload: Array[6, uint8]
+    payload[0] = 119   # 'w'
+    payload[1] = 111   # 'o'
+    payload[2] = 114   # 'r'
+    payload[3] = 108   # 'l'
+    payload[4] = 100   # 'd'
+    payload[5] = 10    # '\n'
+    # Adder ternary `a if c else b` is post-933216d. Using a separate
+    # local for clarity (and to dodge any ternary corner-case).
+    data_ptr: Ptr[uint8] = &payload[0]
+    if offset > 0 and offset < 6:
+        data_ptr = &payload[cast[uint64](offset)]
+    c: P9Cursor
+    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    n: int32 = p9_emit_rread(&c, tg, data_ptr, available)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+def _serve_tclunk(in_len: uint64) -> int32:
+    tg: uint16 = 0
+    fid: uint32 = 0
+    rc: int64 = p9_decode_tclunk(&p9smoke_buf[0], in_len, &tg, &fid)
+    if rc < cast[int64](0):
+        return -1
+    c: P9Cursor
+    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    n: int32 = p9_emit_rclunk(&c, tg)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+def _serve_unsupported(in_len: uint64) -> int32:
+    # We could try to decode the tag from the header; the codec
+    # exposes p9_decode_header for that.
+    sz: uint32 = 0
+    ty: uint8 = 0
+    tg: uint16 = 0
+    rc: int32 = p9_decode_header(&p9smoke_buf[0], in_len, &sz, &ty, &tg)
+    if rc != 0:
+        return -1
+    return _emit_rerror(tg, "unsupported")
+
+
+def _emit_rerror(tg: uint16, msg: Ptr[uint8]) -> int32:
+    # msg is a NUL-terminated bag of bytes; measure inline.
+    mlen: uint64 = 0
+    while msg[mlen] != 0:
+        mlen = mlen + 1
+    c: P9Cursor
+    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    n: int32 = p9_emit_rerror(&c, tg, msg, mlen)
+    if n < 0:
+        return -1
+    return _send_rmsg(n)
+
+
+# --- pump hook called from p9_client.ad ---------------------------
+#
+# Signature: (slot: int32) -> int32. Adder's indirect-call idiom
+# expects a Ptr[uint8] callee; the codegen plants %rdi = slot at the
+# call site and ignores the formal type. So we declare the function
+# normally and register its address through asm-style address-of.
+
+def p9smoke_pump(slot: int32) -> int32:
+    return _serve_one()
+
+
+# --- top-level test runner ----------------------------------------
+
+def p9_smoke_test():
+    printk0("[p9smoke] start\n")
+    # 1) Allocate two pipe slots.
+    tx: int32 = pipe_alloc()
+    if tx < 0:
+        printk0("[p9smoke] FAIL: pipe_alloc tx\n")
+        return
+    rx: int32 = pipe_alloc()
+    if rx < 0:
+        printk0("[p9smoke] FAIL: pipe_alloc rx\n")
+        return
+    p9smoke_tx_slot = tx
+    p9smoke_rx_slot = rx
+    printk2("[p9smoke] pipes tx=%d rx=%d\n",
+            cast[uint64](tx), cast[uint64](rx))
+    # 2) Register the pump hook with p9_client.
+    p9c_register_smoke_pump(cast[uint64](&p9smoke_pump))
+    # 3) Construct a synthetic srvfd value. We pick something in the
+    # range do_mount accepts (0..15) that isn't otherwise live; fd 5
+    # is well past stdin/stdout/stderr and well clear of any real fd
+    # the boot path might be holding.
+    synth_srvfd: int32 = 5
+    # 4) Allocate the connection record + smoke-wire it before the
+    # first byte hits the wire. We bypass do_mount here and drive the
+    # primitives directly, then stamp the mnttab to mimic what do_mount
+    # would have done. This is the smoke-test contract — V4 lifts it
+    # by attaching a real srvfd that vfs_read/vfs_write can drive.
+    cslot: int32 = p9c_attach(synth_srvfd,
+                              cast[Ptr[char]](&p9smoke_mount_path[0]),
+                              cast[Ptr[char]](&p9smoke_mount_path[0]))
+    if cslot < 0:
+        printk0("[p9smoke] FAIL: p9c_attach conn-alloc\n")
+        return
+    p9smoke_conn_slot = cslot
+    p9c_register_smoke_pipes(cslot, tx, rx)
+    # 5) Run the actual Tversion + Tattach handshake.
+    p9smoke_mount_path[0] = 47    # '/'
+    p9smoke_mount_path[1] = 110   # 'n'
+    p9smoke_mount_path[2] = 47    # '/'
+    p9smoke_mount_path[3] = 108   # 'l'
+    p9smoke_mount_path[4] = 111   # 'o'
+    p9smoke_mount_path[5] = 111   # 'o'
+    p9smoke_mount_path[6] = 112   # 'p'
+    p9smoke_mount_path[7] = 0
+    root_fid: int32 = p9c_attach_run(
+        cslot,
+        cast[Ptr[char]](&p9smoke_mount_path[0]),
+        cast[Ptr[char]](&p9smoke_mount_path[0]))
+    if root_fid < 0:
+        printk0("[p9smoke] FAIL: attach_run (Tversion/Tattach)\n")
+        return
+    printk1("[p9smoke] attach ok, root_fid=%d\n", cast[uint64](root_fid))
+    # 6) Stamp a SRV-kind mount entry pointing at synth_srvfd at
+    # /n/loop. mnttab_mount calls chan_attach which would set
+    # p9_root_fid = -1; we then patch it via chan_set_p9_root_fid_*
+    # below to mirror what syschan.ad's do_mount does in production.
+    if mnttab_mount(synth_srvfd, &p9smoke_mount_path[0], 0,
+                    cast[Ptr[uint8]](0)) < 0:
+        printk0("[p9smoke] FAIL: mnttab_mount\n")
+        return
+    if chan_set_p9_root_fid_by_srvfd(synth_srvfd, root_fid) != 0:
+        printk0("[p9smoke] FAIL: chan_set_p9_root_fid\n")
+        return
+    printk0("[p9smoke] mount /n/loop ok\n")
+    # 7) Walk + open /hello (relative to the mount point).
+    p9smoke_relpath_hello[0] = 47   # '/'
+    p9smoke_relpath_hello[1] = 104  # 'h'
+    p9smoke_relpath_hello[2] = 101  # 'e'
+    p9smoke_relpath_hello[3] = 108  # 'l'
+    p9smoke_relpath_hello[4] = 108  # 'l'
+    p9smoke_relpath_hello[5] = 111  # 'o'
+    p9smoke_relpath_hello[6] = 0
+    new_fid: int32 = p9c_walk_open_path(synth_srvfd, root_fid,
+                                        &p9smoke_relpath_hello[0], 0)
+    if new_fid < 0:
+        printk0("[p9smoke] FAIL: walk+open /hello\n")
+        return
+    printk1("[p9smoke] walk+open /hello -> fid=%d\n",
+            cast[uint64](new_fid))
+    # 8) Read 16 bytes from offset 0; expect 6 bytes "world\n".
+    rbuf: Array[16, uint8]
+    n: int64 = p9c_read(synth_srvfd, new_fid, 0, &rbuf[0], 16)
+    if n != cast[int64](6):
+        printk1("[p9smoke] FAIL: read returned %d bytes\n",
+                cast[uint64](n))
+        return
+    if rbuf[0] != 119 or rbuf[1] != 111 or rbuf[2] != 114 \
+            or rbuf[3] != 108 or rbuf[4] != 100 or rbuf[5] != 10:
+        printk0("[p9smoke] FAIL: payload mismatch\n")
+        return
+    printk0("[p9smoke] read /hello -> 'world\\n' ok\n")
+    # 9) Clunk the file fid.
+    if p9c_clunk(synth_srvfd, new_fid) < 0:
+        printk0("[p9smoke] FAIL: clunk\n")
+        return
+    printk0("[p9smoke] clunk ok\n")
+    printk0("[p9smoke] PASS\n")

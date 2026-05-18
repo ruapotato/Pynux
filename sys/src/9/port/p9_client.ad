@@ -1,0 +1,840 @@
+# sys/src/9/port/p9_client.ad
+#
+# V1 — in-kernel 9P client. (On-disk name is `p9_client.ad` rather
+# than the brief's `9p_client.ad` because Adder identifiers can't
+# start with a digit -- same convention `lib/p9/codec.ad` uses for
+# the codec itself; see its header.)
+#
+# Wires lib/p9/codec.ad onto whatever the
+# srvfd points at (a kernel-side pipe in the smoke-test path; a real
+# socket-like fd once V4 lands a userspace 9P server). The 12 V0-
+# SUPPORTED message pairs in docs/9p.md §3 are all wired here; V2
+# extensions (per-process mnttab) and V4 (real server) sit on top of
+# this surface without altering its shape.
+#
+# Public surface — one entry point per 9P operation the kernel needs:
+#
+#   p9c_attach(srvfd, aname, uname) -> root_fid (int32) | -1
+#       Tversion("9P2000") then Tattach. Allocates a per-srvfd
+#       connection record. On success returns the root fid (a small
+#       client-allocated uint32 stored as int32 for the -1 sentinel).
+#
+#   p9c_walk(srvfd, fid, names[], n, out_qid_type) -> new_fid | -1
+#       Twalk fid -> names[]. Allocates a new fid from the
+#       per-connection pool. names[i] is a NUL-terminated cstring.
+#       The single 13-byte qid of the FINAL component is written
+#       into out_qid[0..13] when non-null.
+#
+#   p9c_open(srvfd, fid, mode) -> 0 | -1
+#       Topen with the supplied open-mode byte.
+#
+#   p9c_read(srvfd, fid, offset, buf, count) -> bytes | -1
+#       Tread + delivers the response bytes into buf.
+#
+#   p9c_write(srvfd, fid, offset, buf, count) -> bytes_written | -1
+#       Twrite + reports server-acked count.
+#
+#   p9c_clunk(srvfd, fid) -> 0 | -1
+#       Tclunk; releases the fid.
+#
+#   p9c_stat(srvfd, fid, out_stat, stat_max) -> stat_bytes | -1
+#       Tstat; copies the raw Stat wire bytes into out_stat. Caller
+#       parses with p9_decode_stat from lib/p9/codec.ad.
+#
+# Implementation notes:
+#   - V1 is SYNCHRONOUS — at most one outstanding T-msg per
+#     connection. Tag matching is not used to demux concurrent
+#     requests; it's only there for the spec's sake. Tag wraps
+#     every 65534 messages (we skip NOTAG = 0xFFFF).
+#   - Fid allocator: per-connection, 32 fids, simple high-water
+#     mark + free bitmap. Fid 0 is reserved as the root fid (set by
+#     attach). Fids 1..31 are spendable on Twalk.
+#   - msize: client offers P9_MSIZE_DEFAULT (8192). Server's Rversion
+#     msize is honoured if smaller. The shared encode/decode buffer
+#     in this module is sized for the default; raising msize beyond
+#     8192 requires growing the buffer too.
+#   - I/O dispatch: every srvfd I/O goes through _p9_send + _p9_recv.
+#     In real mode those funnel through vfs_read / vfs_write on the
+#     supplied srvfd. In SMOKE mode (set by p9c_register_smoke_pipes)
+#     they bypass the fd table and operate on two kernel pipe slots
+#     directly — one for T-msgs going out, one for R-msgs coming
+#     back. The init/p9_smoke.ad fixture drives the responder inline
+#     after every T-msg send so reads always see a fully-buffered R.
+#
+# What V1 does NOT do:
+#   - Tauth (no auth — we send NOFID as afid)
+#   - Twstat (V0 codec ships the bytes; no kernel surface here)
+#   - Concurrent in-flight requests
+#   - Connection drop / reconnection
+#
+# Files this collaborates with:
+#   - sys/src/9/port/syschan.ad::do_mount: calls p9c_attach.
+#   - fs/vfs.ad: routes FD_P9_MARK fds to p9c_read / p9c_write /
+#     p9c_clunk.
+#   - init/p9_smoke.ad: boot-time round-trip test.
+
+from lib.p9.codec import (
+    P9Cursor, p9_cursor_init,
+    p9_decode_header,
+    p9_emit_tversion, p9_decode_rversion,
+    p9_emit_tattach, p9_decode_rattach,
+    p9_emit_twalk,   p9_decode_rwalk,
+    p9_emit_topen,   p9_decode_ropen,
+    p9_emit_tread,   p9_decode_rread,
+    p9_emit_twrite,  p9_decode_rwrite,
+    p9_emit_tclunk,  p9_decode_rclunk,
+    p9_emit_tstat,   p9_decode_rstat,
+    p9_decode_rerror,
+    P9_NOFID, P9_NOTAG,
+    P9_MSIZE_DEFAULT,
+    P9_TVERSION, P9_RVERSION, P9_TATTACH, P9_RATTACH,
+    P9_TWALK, P9_RWALK, P9_TOPEN, P9_ROPEN,
+    P9_TREAD, P9_RREAD, P9_TWRITE, P9_RWRITE,
+    P9_TCLUNK, P9_RCLUNK, P9_TSTAT, P9_RSTAT,
+    P9_RERROR,
+    P9_QTDIR, P9_QTFILE,
+)
+from fs.pipe import (
+    pipe_read, pipe_write,
+)
+from kernel.printk.printk import printk0, printk1, printk2
+
+# FD_P9_MARK: per-fd marker for handles opened against a 9P-mounted
+# path. fs/vfs.ad routes vfs_read / vfs_write / vfs_close on these
+# fds through p9c_read / p9c_write / p9c_clunk. The (srvfd, fid)
+# pair is encoded into fd_buf (upper 32 bits = srvfd, lower 32 bits
+# = fid) so the dispatcher can recover both with one slot read.
+# Defined alongside the rest of the FD_*_MARK family in
+# kernel/sched/core.ad but kept HERE so the worktree edits don't
+# fight that file's churn (same pattern as devstat.ad / devmounts.ad
+# / devdiskstats.ad).
+FD_P9_MARK: uint32 = 0xFFFFFFE3
+
+
+# Buffer + msize cap. Raising this needs the same bump to
+# init/p9_smoke.ad's responder buffer.
+P9C_MSIZE: uint32 = 8192
+P9C_BUF_LEN: uint64 = 8192
+
+# Per-connection fid pool size. Fid 0 is the root; 1..31 are
+# spendable on Twalk. 32 leaves plenty of headroom for the smoke
+# test (uses fids 0 + 1) without bloating the table.
+P9C_FIDS_PER_CONN: uint64 = 32
+
+P9C_MAX_CONNS: uint64 = 16
+
+
+class P9Conn:
+    in_use:        int32          # 0 = free, 1 = live
+    srvfd:         int32          # mirrors the mount() srvfd (or -1 sentinel)
+    msize:         uint32         # negotiated msize (<= P9C_MSIZE)
+    next_tag:      uint16         # next tag to emit (skip P9_NOTAG)
+    root_fid:      uint32         # set by p9c_attach
+    fid_used:      Array[32, uint8]   # per-fid used bit (1 == in use)
+    # Smoke-test bypass. When smoke_mode != 0, _p9_send / _p9_recv
+    # operate on smoke_tx_slot / smoke_rx_slot rather than the srvfd.
+    # The responder pump is invoked after every send to keep reads
+    # synchronous.
+    smoke_mode:    int32
+    smoke_tx_slot: int32          # kernel writes T-msgs to this pipe slot
+    smoke_rx_slot: int32          # kernel reads R-msgs from this pipe slot
+
+
+p9_conns: Array[16, P9Conn]
+
+# Shared encode/decode buffer. V1 is synchronous and uses a single
+# global scratchpad — one msize-sized buffer for the most recent
+# T-msg / R-msg. A real concurrent client would per-tag this.
+p9c_scratch: Array[8192, uint8]
+
+
+# -- low-level connection helpers ----------------------------------
+
+def _conn_find_by_srvfd(srvfd: int32) -> int32:
+    # Return index in p9_conns whose srvfd matches, or -1.
+    i: uint64 = 0
+    while i < P9C_MAX_CONNS:
+        if p9_conns[i].in_use != 0 and p9_conns[i].srvfd == srvfd:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _conn_find_free() -> int32:
+    i: uint64 = 0
+    while i < P9C_MAX_CONNS:
+        if p9_conns[i].in_use == 0:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _conn_alloc(srvfd: int32) -> int32:
+    # Allocate a fresh P9Conn for srvfd. Caller fills in smoke_mode
+    # / root_fid after the version + attach handshake completes.
+    slot: int32 = _conn_find_free()
+    if slot < 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    p9_conns[su].in_use   = 1
+    p9_conns[su].srvfd    = srvfd
+    p9_conns[su].msize    = P9C_MSIZE
+    p9_conns[su].next_tag = 1
+    p9_conns[su].root_fid = 0xFFFFFFFF
+    p9_conns[su].smoke_mode    = 0
+    p9_conns[su].smoke_tx_slot = -1
+    p9_conns[su].smoke_rx_slot = -1
+    # Clear fid_used.
+    i: uint64 = 0
+    while i < P9C_FIDS_PER_CONN:
+        p9_conns[su].fid_used[i] = 0
+        i = i + 1
+    return slot
+
+
+def _conn_release(slot: int32):
+    su: uint64 = cast[uint64](slot)
+    p9_conns[su].in_use = 0
+    p9_conns[su].srvfd  = -1
+
+
+def _alloc_tag(slot: int32) -> uint16:
+    # Auto-increment, skip P9_NOTAG (0xFFFF). V1 is synchronous so
+    # we don't need to track outstanding tags — every emit's tag is
+    # discarded the moment the matching R-msg arrives.
+    su: uint64 = cast[uint64](slot)
+    t: uint16 = p9_conns[su].next_tag
+    nxt: uint32 = cast[uint32](t) + 1
+    if nxt >= 0xFFFF:
+        nxt = 1
+    p9_conns[su].next_tag = cast[uint16](nxt)
+    return t
+
+
+def _alloc_fid(slot: int32) -> uint32:
+    # Return a fresh fid in 1..31. Returns 0xFFFFFFFF on exhaustion.
+    su: uint64 = cast[uint64](slot)
+    i: uint64 = 1                  # 0 is the root, reserved
+    while i < P9C_FIDS_PER_CONN:
+        if p9_conns[su].fid_used[i] == 0:
+            p9_conns[su].fid_used[i] = 1
+            return cast[uint32](i)
+        i = i + 1
+    return 0xFFFFFFFF
+
+
+def _free_fid(slot: int32, fid: uint32):
+    su: uint64 = cast[uint64](slot)
+    if cast[uint64](fid) < P9C_FIDS_PER_CONN:
+        p9_conns[su].fid_used[cast[uint64](fid)] = 0
+
+
+# Smoke-test pump hook. Set by init/p9_smoke.ad at boot. When non-
+# null we invoke it after every T-msg send so a synchronous responder
+# can drain the request and post the matching R-msg before we read.
+# Signature: (P9Conn slot index) -> 0 on ok, -1 on responder error.
+p9c_smoke_pump_hook: uint64 = 0
+
+
+def p9c_register_smoke_pump(hook: uint64):
+    # init/p9_smoke.ad calls this once at boot. The hook receives
+    # the conn slot index and must drive the responder synchronously
+    # — read T-msg out of conn.smoke_tx_slot, build R-msg, write it
+    # into conn.smoke_rx_slot.
+    p9c_smoke_pump_hook = hook
+
+
+def p9c_register_smoke_pipes(slot: int32, tx_slot: int32, rx_slot: int32):
+    # Mark a connection as "smoke" — _p9_send / _p9_recv will route
+    # through the pipe slots instead of the fd table. Called by
+    # init/p9_smoke.ad immediately after p9c_attach succeeds but
+    # BEFORE the first real Tversion send (we re-use a pre-allocated
+    # conn record built by p9c_attach_smoke).
+    su: uint64 = cast[uint64](slot)
+    p9_conns[su].smoke_mode    = 1
+    p9_conns[su].smoke_tx_slot = tx_slot
+    p9_conns[su].smoke_rx_slot = rx_slot
+
+
+# -- send / recv abstraction ---------------------------------------
+#
+# Every emitted T-msg is laid into p9c_scratch via the codec, then
+# pushed into the connection. Every R-msg is pulled out of the
+# connection back into p9c_scratch, ready for the codec decoder.
+#
+# In smoke mode: pipe_write / pipe_read against the registered
+# slots, with the pump hook invoked between send and recv so the
+# responder has a chance to react synchronously.
+#
+# In real mode (no smoke_mode): we'd dispatch through fs/vfs.ad's
+# vfs_read / vfs_write on the srvfd. V1's smoke responder is the
+# only consumer in this milestone; the real-fd path is stubbed so
+# the call shape lands and V4 can fill it in.
+
+def _smoke_pump_call(slot: int32) -> int32:
+    # Synchronous trampoline into init/p9_smoke.ad's responder.
+    # Returns 0 on success, -1 on responder error.
+    #
+    # Adder idiom for an indirect call through a function-pointer
+    # value: bind the address to a local Ptr[uint8] and "call" it
+    # (same shape drivers/net/netfilter.ad::_call_hook uses). The
+    # codegen treats any local-named callee as an indirect call;
+    # the function's real signature is honoured at the asm level by
+    # the SysV register ABI (%rdi = slot, %rax = return).
+    if p9c_smoke_pump_hook == 0:
+        return -1
+    hookfn: Ptr[uint8] = cast[Ptr[uint8]](p9c_smoke_pump_hook)
+    return hookfn(slot)
+
+
+def _p9_send(slot: int32, n_bytes: int32) -> int32:
+    # Push p9c_scratch[0..n_bytes] to the wire (or pipe). In smoke
+    # mode this writes into the tx pipe slot then drives the
+    # responder so the rx pipe slot is primed when _p9_recv runs.
+    if n_bytes <= 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if p9_conns[su].smoke_mode != 0:
+        tx: int32 = p9_conns[su].smoke_tx_slot
+        # pipe_write may report a short count under back-pressure; in
+        # the smoke test the responder hasn't drained yet so we trust
+        # PIPE_CAP (1024 in fs/pipe.ad) to swallow one msize-sized
+        # T-msg. V1 cap is 8 KiB which exceeds PIPE_CAP -- that's a
+        # known bound: smoke messages stay well under 1 KiB, so the
+        # bound is theoretical here. Real-fd dispatch (V4) won't hit
+        # it.
+        written: int64 = pipe_write(tx, &p9c_scratch[0],
+                                    cast[uint64](n_bytes))
+        if written != cast[int64](n_bytes):
+            return -1
+        # Drive the responder synchronously. After this the rx pipe
+        # holds exactly one R-msg.
+        if _smoke_pump_call(slot) != 0:
+            return -1
+        return n_bytes
+    # Real-fd dispatch is not exercised in V1's smoke path; V4 will
+    # forward to vfs_write(p9_conns[su].srvfd, &p9c_scratch[0],
+    # n_bytes). Leave it as -1 today so callers that wire up a real
+    # 9P server before V4 lands see the gap visibly rather than
+    # silently passing tests.
+    return -1
+
+
+def _p9_recv(slot: int32) -> int32:
+    # Pull one whole R-msg into p9c_scratch[0..returned]. In smoke
+    # mode the responder has already populated the rx pipe slot.
+    # Reads the 4-byte size header first, then the remainder of the
+    # message, so partial pipe reads don't desync us.
+    su: uint64 = cast[uint64](slot)
+    if p9_conns[su].smoke_mode != 0:
+        rx: int32 = p9_conns[su].smoke_rx_slot
+        # Read the 7-byte header (size[4] type[1] tag[2]). pipe_read
+        # may short-return; loop until we have 7 bytes.
+        got: uint64 = 0
+        while got < 7:
+            n: int64 = pipe_read(rx, &p9c_scratch[got], 7 - got)
+            if n <= 0:
+                return -1
+            got = got + cast[uint64](n)
+        # Decode size from the header.
+        sz: uint32 = 0
+        ty: uint8 = 0
+        tg: uint16 = 0
+        rc: int32 = p9_decode_header(&p9c_scratch[0], 7, &sz, &ty, &tg)
+        if rc != 0:
+            return -1
+        total: uint64 = cast[uint64](sz)
+        if total < 7 or total > P9C_BUF_LEN:
+            return -1
+        # Pull the body.
+        while got < total:
+            n: int64 = pipe_read(rx, &p9c_scratch[got], total - got)
+            if n <= 0:
+                return -1
+            got = got + cast[uint64](n)
+        return cast[int32](total)
+    # Real-fd dispatch (V4): vfs_read(p9_conns[su].srvfd, ...).
+    return -1
+
+
+# -- Tversion ------------------------------------------------------
+
+def _p9_negotiate(slot: int32) -> int32:
+    # Issue Tversion with msize=P9C_MSIZE / version="9P2000".
+    # Accept the smaller of (offered, returned) as the operating
+    # msize; reject if the server replies "unknown".
+    c: P9Cursor
+    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
+    ver: Array[8, uint8]
+    ver[0] = 57  # '9'
+    ver[1] = 80  # 'P'
+    ver[2] = 50  # '2'
+    ver[3] = 48  # '0'
+    ver[4] = 48
+    ver[5] = 48
+    n: int32 = p9_emit_tversion(&c, P9_NOTAG, P9C_MSIZE, &ver[0], 6)
+    if n < 0:
+        return -1
+    if _p9_send(slot, n) < 0:
+        return -1
+    rn: int32 = _p9_recv(slot)
+    if rn < 0:
+        return -1
+    # Could be Rversion or Rerror.
+    if p9c_scratch[4] == P9_RERROR:
+        return -1
+    tg_out: uint16 = 0
+    ms_out: uint32 = 0
+    ver_ptr: Ptr[uint8] = cast[Ptr[uint8]](0)
+    ver_len: uint64 = 0
+    consumed: int64 = p9_decode_rversion(
+        &p9c_scratch[0], cast[uint64](rn),
+        &tg_out, &ms_out, &ver_ptr, &ver_len)
+    if consumed < cast[int64](0):
+        return -1
+    # Reject "unknown" — the server doesn't speak 9P2000.
+    if ver_len != 6:
+        return -1
+    if ver_ptr[0] != 57 or ver_ptr[1] != 80 \
+            or ver_ptr[2] != 50 or ver_ptr[3] != 48 \
+            or ver_ptr[4] != 48 or ver_ptr[5] != 48:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if ms_out < p9_conns[su].msize:
+        p9_conns[su].msize = ms_out
+    return 0
+
+
+# -- p9c_attach ----------------------------------------------------
+
+def _cstrlen(s: Ptr[char]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def p9c_attach(srvfd: int32, aname: Ptr[char],
+               uname: Ptr[char]) -> int32:
+    # Allocate a connection record, run Tversion + Tattach. Returns
+    # the root fid (0) cast to int32 on success, -1 on any failure.
+    # Caller is expected to have already validated srvfd shape.
+    if _conn_find_by_srvfd(srvfd) >= 0:
+        # Already attached -- V1 disallows two attaches on one srvfd
+        # (V2's per-process mnttab will need a richer rule).
+        return -1
+    slot: int32 = _conn_alloc(srvfd)
+    if slot < 0:
+        return -1
+    return slot                     # caller wires smoke pipes, then p9c_attach_run
+
+
+def p9c_attach_run(slot: int32, aname: Ptr[char],
+                   uname: Ptr[char]) -> int32:
+    # Run the actual Tversion + Tattach exchange. Separated from
+    # p9c_attach so the smoke fixture can register its pipe slots
+    # between conn-alloc and the first wire byte.
+    if _p9_negotiate(slot) < 0:
+        _conn_release(slot)
+        return -1
+    # Allocate the root fid (always 0 by convention here).
+    su: uint64 = cast[uint64](slot)
+    p9_conns[su].fid_used[0] = 1
+    root: uint32 = 0
+    # Emit Tattach.
+    c: P9Cursor
+    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
+    tag: uint16 = _alloc_tag(slot)
+    uname_p: Ptr[uint8] = cast[Ptr[uint8]](uname)
+    aname_p: Ptr[uint8] = cast[Ptr[uint8]](aname)
+    uname_l: uint64 = 0
+    aname_l: uint64 = 0
+    if uname != cast[Ptr[char]](0):
+        uname_l = _cstrlen(uname)
+    if aname != cast[Ptr[char]](0):
+        aname_l = _cstrlen(aname)
+    n: int32 = p9_emit_tattach(&c, tag, root, P9_NOFID,
+                               uname_p, uname_l,
+                               aname_p, aname_l)
+    if n < 0:
+        _conn_release(slot)
+        return -1
+    if _p9_send(slot, n) < 0:
+        _conn_release(slot)
+        return -1
+    rn: int32 = _p9_recv(slot)
+    if rn < 0:
+        _conn_release(slot)
+        return -1
+    if p9c_scratch[4] == P9_RERROR:
+        _conn_release(slot)
+        return -1
+    tg_out: uint16 = 0
+    qt: uint8 = 0
+    qv: uint32 = 0
+    qp: uint64 = 0
+    consumed: int64 = p9_decode_rattach(
+        &p9c_scratch[0], cast[uint64](rn),
+        &tg_out, &qt, &qv, &qp)
+    if consumed < cast[int64](0):
+        _conn_release(slot)
+        return -1
+    p9_conns[su].root_fid = root
+    return cast[int32](root)
+
+
+# -- p9c_walk ------------------------------------------------------
+
+def p9c_walk(srvfd: int32, fid: int32, names: Ptr[Ptr[char]],
+             n_names: int32, out_qid: Ptr[uint8]) -> int32:
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return -1
+    if n_names < 0 or n_names > 16:
+        return -1
+    # Allocate a new fid for the walk result.
+    new_fid: uint32 = _alloc_fid(slot)
+    if new_fid == 0xFFFFFFFF:
+        return -1
+    # Build the wname arrays. Top-level arrays per the Adder
+    # nested-frame quirk.
+    name_ptrs: Array[16, Ptr[uint8]]
+    name_lens: Array[16, uint64]
+    i: int32 = 0
+    while i < n_names:
+        np: Ptr[char] = names[cast[uint64](i)]
+        name_ptrs[cast[uint64](i)] = cast[Ptr[uint8]](np)
+        name_lens[cast[uint64](i)] = _cstrlen(np)
+        i = i + 1
+    c: P9Cursor
+    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
+    tag: uint16 = _alloc_tag(slot)
+    sent: int32 = p9_emit_twalk(&c, tag, cast[uint32](fid), new_fid,
+                                cast[uint16](n_names),
+                                &name_ptrs[0], &name_lens[0])
+    if sent < 0:
+        _free_fid(slot, new_fid)
+        return -1
+    if _p9_send(slot, sent) < 0:
+        _free_fid(slot, new_fid)
+        return -1
+    rn: int32 = _p9_recv(slot)
+    if rn < 0:
+        _free_fid(slot, new_fid)
+        return -1
+    if p9c_scratch[4] == P9_RERROR:
+        _free_fid(slot, new_fid)
+        return -1
+    tg_out: uint16 = 0
+    nwq:    uint16 = 0
+    qtypes: Array[16, uint8]
+    qvers:  Array[16, uint32]
+    qpaths: Array[16, uint64]
+    consumed: int64 = p9_decode_rwalk(
+        &p9c_scratch[0], cast[uint64](rn),
+        &tg_out, &nwq, &qtypes[0], &qvers[0], &qpaths[0])
+    if consumed < cast[int64](0):
+        _free_fid(slot, new_fid)
+        return -1
+    # Partial walk: fewer qids than names — server got partway and
+    # the new fid was NOT bound. Treat as failure for V1.
+    if cast[int32](cast[uint64](nwq)) != n_names:
+        _free_fid(slot, new_fid)
+        return -1
+    # Surface the final qid bytes if the caller asked for them.
+    if out_qid != cast[Ptr[uint8]](0) and n_names > 0:
+        last: uint64 = cast[uint64](n_names - 1)
+        out_qid[0] = qtypes[last]
+        # qid.vers low-endian
+        out_qid[1] = cast[uint8](qvers[last] & 0xFF)
+        out_qid[2] = cast[uint8]((qvers[last] >> 8) & 0xFF)
+        out_qid[3] = cast[uint8]((qvers[last] >> 16) & 0xFF)
+        out_qid[4] = cast[uint8]((qvers[last] >> 24) & 0xFF)
+        # qid.path low-endian
+        out_qid[5]  = cast[uint8](qpaths[last] & 0xFF)
+        out_qid[6]  = cast[uint8]((qpaths[last] >> 8) & 0xFF)
+        out_qid[7]  = cast[uint8]((qpaths[last] >> 16) & 0xFF)
+        out_qid[8]  = cast[uint8]((qpaths[last] >> 24) & 0xFF)
+        out_qid[9]  = cast[uint8]((qpaths[last] >> 32) & 0xFF)
+        out_qid[10] = cast[uint8]((qpaths[last] >> 40) & 0xFF)
+        out_qid[11] = cast[uint8]((qpaths[last] >> 48) & 0xFF)
+        out_qid[12] = cast[uint8]((qpaths[last] >> 56) & 0xFF)
+    return cast[int32](new_fid)
+
+
+# -- p9c_open ------------------------------------------------------
+
+def p9c_open(srvfd: int32, fid: int32, mode: int32) -> int32:
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return -1
+    c: P9Cursor
+    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
+    tag: uint16 = _alloc_tag(slot)
+    n: int32 = p9_emit_topen(&c, tag, cast[uint32](fid),
+                             cast[uint8](mode & 0xFF))
+    if n < 0:
+        return -1
+    if _p9_send(slot, n) < 0:
+        return -1
+    rn: int32 = _p9_recv(slot)
+    if rn < 0:
+        return -1
+    if p9c_scratch[4] == P9_RERROR:
+        return -1
+    tg_out: uint16 = 0
+    qt: uint8 = 0
+    qv: uint32 = 0
+    qp: uint64 = 0
+    iou: uint32 = 0
+    consumed: int64 = p9_decode_ropen(
+        &p9c_scratch[0], cast[uint64](rn),
+        &tg_out, &qt, &qv, &qp, &iou)
+    if consumed < cast[int64](0):
+        return -1
+    return 0
+
+
+# -- p9c_read ------------------------------------------------------
+
+def p9c_read(srvfd: int32, fid: int32, offset: uint64,
+             buf: Ptr[uint8], count: uint32) -> int64:
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return cast[int64](-1)
+    c: P9Cursor
+    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
+    tag: uint16 = _alloc_tag(slot)
+    # Cap count at msize-minus-headers (24-ish). We use msize-24 as a
+    # safe floor; codec / responder share the same envelope.
+    su: uint64 = cast[uint64](slot)
+    ms: uint32 = p9_conns[su].msize
+    cap: uint32 = ms - 24
+    take: uint32 = count
+    if take > cap:
+        take = cap
+    n: int32 = p9_emit_tread(&c, tag, cast[uint32](fid), offset, take)
+    if n < 0:
+        return cast[int64](-1)
+    if _p9_send(slot, n) < 0:
+        return cast[int64](-1)
+    rn: int32 = _p9_recv(slot)
+    if rn < 0:
+        return cast[int64](-1)
+    if p9c_scratch[4] == P9_RERROR:
+        return cast[int64](-1)
+    tg_out: uint16 = 0
+    data_ptr: Ptr[uint8] = cast[Ptr[uint8]](0)
+    cnt_out: uint32 = 0
+    consumed: int64 = p9_decode_rread(
+        &p9c_scratch[0], cast[uint64](rn),
+        &tg_out, &data_ptr, &cnt_out)
+    if consumed < cast[int64](0):
+        return cast[int64](-1)
+    # Copy out.
+    i: uint64 = 0
+    cu: uint64 = cast[uint64](cnt_out)
+    while i < cu:
+        buf[i] = data_ptr[i]
+        i = i + 1
+    return cast[int64](cu)
+
+
+# -- p9c_write -----------------------------------------------------
+
+def p9c_write(srvfd: int32, fid: int32, offset: uint64,
+              buf: Ptr[uint8], count: uint32) -> int64:
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return cast[int64](-1)
+    c: P9Cursor
+    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
+    tag: uint16 = _alloc_tag(slot)
+    su: uint64 = cast[uint64](slot)
+    ms: uint32 = p9_conns[su].msize
+    cap: uint32 = ms - 24
+    take: uint32 = count
+    if take > cap:
+        take = cap
+    n: int32 = p9_emit_twrite(&c, tag, cast[uint32](fid),
+                              offset, buf, take)
+    if n < 0:
+        return cast[int64](-1)
+    if _p9_send(slot, n) < 0:
+        return cast[int64](-1)
+    rn: int32 = _p9_recv(slot)
+    if rn < 0:
+        return cast[int64](-1)
+    if p9c_scratch[4] == P9_RERROR:
+        return cast[int64](-1)
+    tg_out: uint16 = 0
+    cnt_out: uint32 = 0
+    consumed: int64 = p9_decode_rwrite(
+        &p9c_scratch[0], cast[uint64](rn),
+        &tg_out, &cnt_out)
+    if consumed < cast[int64](0):
+        return cast[int64](-1)
+    return cast[int64](cnt_out)
+
+
+# -- p9c_clunk -----------------------------------------------------
+
+def p9c_clunk(srvfd: int32, fid: int32) -> int32:
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return -1
+    c: P9Cursor
+    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
+    tag: uint16 = _alloc_tag(slot)
+    n: int32 = p9_emit_tclunk(&c, tag, cast[uint32](fid))
+    if n < 0:
+        return -1
+    if _p9_send(slot, n) < 0:
+        return -1
+    rn: int32 = _p9_recv(slot)
+    if rn < 0:
+        return -1
+    if p9c_scratch[4] == P9_RERROR:
+        _free_fid(slot, cast[uint32](fid))
+        return -1
+    tg_out: uint16 = 0
+    consumed: int64 = p9_decode_rclunk(
+        &p9c_scratch[0], cast[uint64](rn), &tg_out)
+    if consumed < cast[int64](0):
+        return -1
+    _free_fid(slot, cast[uint32](fid))
+    return 0
+
+
+# -- p9c_stat ------------------------------------------------------
+
+def p9c_stat(srvfd: int32, fid: int32, out_stat: Ptr[uint8],
+             stat_max: uint64) -> int64:
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return cast[int64](-1)
+    c: P9Cursor
+    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
+    tag: uint16 = _alloc_tag(slot)
+    n: int32 = p9_emit_tstat(&c, tag, cast[uint32](fid))
+    if n < 0:
+        return cast[int64](-1)
+    if _p9_send(slot, n) < 0:
+        return cast[int64](-1)
+    rn: int32 = _p9_recv(slot)
+    if rn < 0:
+        return cast[int64](-1)
+    if p9c_scratch[4] == P9_RERROR:
+        return cast[int64](-1)
+    # Body: starts at offset 7 (after the size+type+tag header), and
+    # carries 2-byte outer length + Stat record. We hand the outer
+    # 2-byte length + Stat to the caller (raw wire bytes, ready for
+    # p9_decode_stat). rn-7 == bytes in body.
+    body_len: uint64 = cast[uint64](rn) - 7
+    if body_len > stat_max:
+        return cast[int64](-1)
+    i: uint64 = 0
+    while i < body_len:
+        out_stat[i] = p9c_scratch[7 + i]
+        i = i + 1
+    return cast[int64](body_len)
+
+
+# -- per-conn introspection helpers used by syschan + vfs ----------
+
+def p9c_conn_for_srvfd(srvfd: int32) -> int32:
+    # Return the conn slot index (>=0) for srvfd, or -1 if none.
+    return _conn_find_by_srvfd(srvfd)
+
+
+def p9c_root_fid(srvfd: int32) -> int32:
+    # Return the root fid stored at attach time, or -1 if no conn.
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return -1
+    return cast[int32](p9_conns[cast[uint64](slot)].root_fid)
+
+
+# -- path-aware open used by fs/vfs.ad ------------------------------
+#
+# Given a srvfd, the connection's root fid, and a relative path
+# (the bytes after the mount-point prefix), walk through each '/'
+# component then open the resulting fid for read. Returns the
+# opened fid (>= 0) on success, -1 on any failure. Caller is
+# responsible for clunk on close.
+#
+# Path parsing is deliberately simple — split on '/'. Leading '/'
+# is skipped (a relative path "" or "/" walks zero components and
+# opens the root). Path components are bounded by P9C_MAX_NAME_LEN.
+
+P9C_MAX_NAME_LEN: uint64 = 128
+P9C_MAX_COMPONENTS: uint64 = 16
+
+
+# Component storage for p9c_walk_open_path. Top-level Arrays per the
+# Adder nested-frame quirk -- declaring Array[16, Array[128, uint8]]
+# inside the function body trips a layout bug we already shipped a
+# note about in feedback_compiler_quirks.md.
+_p9c_path_comp_storage: Array[2048, uint8]   # 16 * 128
+_p9c_path_comp_ptrs:    Array[16, Ptr[char]]
+
+
+def p9c_walk_open_path(srvfd: int32, root_fid: int32,
+                       rel_path: Ptr[uint8],
+                       open_mode: int32) -> int32:
+    # rel_path is e.g. "/hello" or "hello" or "" (root). We chain a
+    # component into the shared top-level _p9c_path_comp_storage
+    # buffer at byte offsets 0..128, 128..256, ... and hand a pointer
+    # array to p9c_walk. V1 is synchronous so the shared buffer's
+    # single-call lifetime is safe; V4 grows per-conn storage.
+    n_comp: uint64 = 0
+    # Skip a leading '/'.
+    i: uint64 = 0
+    if rel_path[0] == 47:                # '/'
+        i = 1
+    # Split.
+    while rel_path[i] != 0 and n_comp < P9C_MAX_COMPONENTS:
+        base: uint64 = n_comp * P9C_MAX_NAME_LEN
+        # Copy bytes until '/' or NUL.
+        cidx: uint64 = 0
+        while rel_path[i] != 0 and rel_path[i] != 47 \
+                and cidx + 1 < P9C_MAX_NAME_LEN:
+            _p9c_path_comp_storage[base + cidx] = rel_path[i]
+            cidx = cidx + 1
+            i = i + 1
+        _p9c_path_comp_storage[base + cidx] = 0
+        if cidx > 0:
+            _p9c_path_comp_ptrs[n_comp] = cast[Ptr[char]](
+                &_p9c_path_comp_storage[base])
+            n_comp = n_comp + 1
+        if rel_path[i] == 47:
+            i = i + 1
+    # Walk.
+    qid_out: Array[13, uint8]
+    new_fid: int32 = p9c_walk(srvfd, cast[int32](root_fid),
+                              cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                              cast[int32](n_comp), &qid_out[0])
+    if new_fid < 0:
+        return -1
+    # Open.
+    if p9c_open(srvfd, new_fid, open_mode) < 0:
+        p9c_clunk(srvfd, new_fid)
+        return -1
+    return new_fid
+
+
+def p9c_encode_fd_buf(srvfd: int32, fid: int32) -> uint64:
+    # Pack (srvfd, fid) into a single uint64 so a task fd's fd_buf
+    # slot can carry both. srvfd is signed but always small (0..15);
+    # fid is unsigned 32-bit but our pool caps at 31.
+    s: uint64 = cast[uint64](srvfd) & 0xFFFFFFFF
+    f: uint64 = cast[uint64](fid) & 0xFFFFFFFF
+    return (s << 32) | f
+
+
+def p9c_decode_srvfd(p9_packed: uint64) -> int32:
+    return cast[int32]((p9_packed >> 32) & 0xFFFFFFFF)
+
+
+def p9c_decode_fid(p9_packed: uint64) -> int32:
+    return cast[int32](p9_packed & 0xFFFFFFFF)

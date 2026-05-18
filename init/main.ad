@@ -58,6 +58,11 @@ from fs.vfs import (
     vfs_init, vfs_open, vfs_read, vfs_close,
     initramfs_data_ptr, initramfs_data_size,
 )
+# V1: in-kernel 9P client smoke test. Spawns two kernel-side pipe
+# slots, drives a synthetic responder that serves a one-file FS,
+# round-trips mount + open + read. Surfaces `[p9smoke] PASS` on the
+# serial log so scripts/test_9p_mount.sh can grep for the marker.
+from init.p9_smoke import p9_smoke_test
 from fs.elf import elf_load_blob
 from arch.x86.kernel.module import module_api_init, module_load
 from linux_abi.exports import linux_abi_exports_init
@@ -972,6 +977,14 @@ def start_kernel():
 
     # Initialise the VFS fd table BEFORE any user task issues SYS_OPEN.
     vfs_init()
+
+    # V1 9P self-test: drive a kernel-side responder over two pipe
+    # slots, run mount + walk + open + read end-to-end. Output:
+    # `[p9smoke] PASS` on success, `[p9smoke] FAIL: <what>` otherwise.
+    # The test allocates two pipe slots (fs/pipe.ad) and stamps a
+    # SRV-kind mnttab entry by hand; it doesn't touch user-task fd
+    # tables, so it can run before sched_init / create_user_task.
+    p9_smoke_test()
 
     # M16.32: bring the module loader API table online and demo-load
     # the hello module so we know the insmod-equivalent path works
