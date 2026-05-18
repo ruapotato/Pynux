@@ -58,7 +58,10 @@ def walk(path_len: uint64, depth: int32):
 
 
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    target: Ptr[uint8] = cast[Ptr[uint8]]("/mnt")
+    # Default starting point is "." (relative-to-cwd); the if-target-
+    # isn't-absolute branch below anchors with sys_getcwd. Old default
+    # was "/mnt" (legacy FAT mount, predates per-task CWD).
+    target: Ptr[uint8] = cast[Ptr[uint8]](".")
     if argc >= 2:
         target = cast[Ptr[uint8]](argv[1])
     n: uint64 = 0
