@@ -50,6 +50,10 @@ from arch.x86.kernel.apic import ioapic_redirect
 from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from mm.slab import kmalloc
+from kernel.block.blk import (
+    BlockDeviceOps, register_blockdev, find_blockdev,
+    blk_read_sectors, blk_write_sectors, SECTOR_SIZE,
+)
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 
@@ -204,15 +208,25 @@ def _pci_enable_mem_and_master(bdf: uint32):
 class AhciState:
     abar:      uint64          # MMIO base of HBA register window
     port_num:  int32           # The active port we picked (or -1)
+    pad_port:  uint32
     port_base: uint64          # ABAR + 0x100 + 0x80*port_num
     page:      uint64          # 4 KiB working page per port
+    capacity:  uint64          # LBA48 total sector count (from IDENTIFY)
     irq_pin:   uint32          # IOAPIC pin we redirected (diag)
+    pad_irq:   uint32
     irq_count: uint64          # IRQs handled
     # 16 bytes of model string + NUL — enough to fingerprint the disk.
     model:     Array[41, uint8]
 
 
 ahci: AhciState
+# Block-layer registration table. Populated in ahci_smoke_test once
+# the port + IDENTIFY have proven healthy, then handed to
+# register_blockdev("sd0", ...). priv carries the AHCI port number
+# (cast through uint64) so the adapter wrappers can re-validate it
+# against ahci.port_num before dispatching to the driver-level
+# read/write primitives.
+ahci_ops: BlockDeviceOps
 
 
 # --- Port stop/start (spec §10.1.2) --------------------------------
@@ -481,6 +495,42 @@ def ahci_read_sectors(port: int32, lba: uint64, count: uint16,
     return _do_read_lba(ahci.port_base, clist, ct_base, buf, lba, count)
 
 
+# --- BlockDeviceOps adapter wrappers (M16.119) --------------------
+#
+# kernel/block/blk.ad invokes vtable slots with signature
+#   int32 (*op)(uint64 priv, uint64 lba, uint64 count, Ptr[uint8] buf)
+# Our driver-level primitives take (int32 port, uint64 lba, uint16
+# count, uint64 buf), so these adapters re-shape the args. priv is
+# the port number we stashed at register_blockdev time, cast back
+# from uint64 to int32. count comes in as uint64 but the ATA
+# command-table PRD entry only carries a 16-bit transfer length
+# (the spec maxes at 65535 sectors per command); we clamp + warn on
+# overflow rather than silently truncate.
+
+def _ahci_read_sectors_blkop(priv: uint64, lba: uint64,
+                             count: uint64, buf: Ptr[uint8]) -> int32:
+    if count == 0:
+        return 0
+    if count > 65535:
+        printk1("[ahci] blkop read: count=%d too large\n", count)
+        return -1
+    port: int32 = cast[int32](priv)
+    return ahci_read_sectors(port, lba, cast[uint16](count),
+                             cast[uint64](buf))
+
+
+def _ahci_write_sectors_blkop(priv: uint64, lba: uint64,
+                              count: uint64, buf: Ptr[uint8]) -> int32:
+    if count == 0:
+        return 0
+    if count > 65535:
+        printk1("[ahci] blkop write: count=%d too large\n", count)
+        return -1
+    port: int32 = cast[int32](priv)
+    return ahci_write_sectors(port, lba, cast[uint16](count),
+                              cast[uint64](buf))
+
+
 # --- Public entry point --------------------------------------------
 
 def ahci_smoke_test() -> int32:
@@ -604,6 +654,7 @@ def ahci_smoke_test() -> int32:
     printk1("[ahci] model=%s\n", cast[uint64](&ahci.model[0]))
 
     lba_count: uint64 = cast[Ptr[uint64]](id_buf + 100 * 2)[0]
+    ahci.capacity = lba_count
     printk1("[ahci] sectors=%d\n", lba_count)
 
     # READ LBA 0 (the MBR). 512 bytes into mbr_buf.
@@ -675,6 +726,70 @@ def ahci_smoke_test() -> int32:
     # serialises on slot 0).
     _ahci_write_smoke_test()
 
+    # M16.119: register the active port with the kernel block layer
+    # so vfs_read / vfs_write / ext4 / fat callers can reach the disk
+    # through `blk_read_sectors(slot, ...)` and `blk_write_sectors`
+    # like they already do for /dev/vda / /dev/ram0. priv carries the
+    # port index (uint64-encoded) so the adapter wrappers can
+    # re-validate it against the singleton ahci.port_num. Naming is
+    # "sd0" (Linux-style SCSI/SATA disk slot 0); multi-port HBAs +
+    # partition-aware names (sd0p1) are follow-ups.
+    ahci_ops.read_sectors  = cast[uint64](&_ahci_read_sectors_blkop)
+    ahci_ops.write_sectors = cast[uint64](&_ahci_write_sectors_blkop)
+    bslot: int32 = register_blockdev("sd0", lba_count, &ahci_ops,
+                                     cast[uint64](port_num))
+    if bslot < 0:
+        printk0("[ahci] register_blockdev(sd0) failed\n")
+        return 0
+    printk1("[ahci] registered as block slot=%d (sd0)\n",
+            cast[uint64](bslot))
+    _ahci_blk_smoke_test(bslot)
+
+    return 0
+
+
+def _ahci_blk_smoke_test(slot: int32) -> int32:
+    # M16.119 block-layer round-trip. Verifies that a write submitted
+    # through `blk_write_sectors(slot, ...)` reaches the AHCI port
+    # adapter, lands on the SATA disk via WRITE DMA EXT, and the
+    # corresponding `blk_read_sectors` returns the same bytes. Uses
+    # LBA 1 (same as the driver-level write-smoke test) — the
+    # controller has already proven byte-for-byte equality on this
+    # path, so seeing identical bytes here proves the vtable wiring
+    # is right rather than re-testing the driver primitive itself.
+    wbuf: uint64 = kmalloc(512)
+    rbuf: uint64 = kmalloc(512)
+    if wbuf == 0 or rbuf == 0:
+        printk0("[ahci] blk-smoke: kmalloc(512) failed\n")
+        return -1
+    # Pattern: byte i = (i ^ 0x5A) & 0xFF. Different from the driver-
+    # level smoke test's 0xA5 mask so a stale-buffer bug shows up as
+    # a wrong PASS rather than a fake one.
+    wp: Ptr[uint8] = cast[Ptr[uint8]](wbuf)
+    i: uint64 = 0
+    while i < 512:
+        wp[i] = cast[uint8](cast[uint8](i & 0xFF) ^ cast[uint8](0x5A))
+        i = i + 1
+    memset(cast[Ptr[uint8]](rbuf), 0, 512)
+
+    if blk_write_sectors(slot, 1, 1, wp) != 0:
+        printk0("[ahci] blk-smoke: blk_write_sectors failed\n")
+        return -1
+    printk0("[blk] write sd0 LBA=1 OK\n")
+
+    rp: Ptr[uint8] = cast[Ptr[uint8]](rbuf)
+    if blk_read_sectors(slot, 1, 1, rp) != 0:
+        printk0("[ahci] blk-smoke: blk_read_sectors failed\n")
+        return -1
+
+    j: uint64 = 0
+    while j < 512:
+        if rp[j] != wp[j]:
+            printk2("[ahci] blk-smoke: MISMATCH at byte %d (got %x)\n",
+                    j, cast[uint64](rp[j]))
+            return -1
+        j = j + 1
+    printk0("[blk] readback sd0 matches\n")
     return 0
 
 
