@@ -46,13 +46,27 @@ As of M16.70 the BIOS and UEFI paths run **different code on the way in**:
 - **BIOS path (unchanged)**: SeaBIOS → GRUB (via grub-pc-bin) → multiboot1 →
   `build/hamnix-vmlinux.elf` → `start_kernel()`. Same as before.
 
-- **UEFI path (new)**: OVMF / firmware → **native Hamnix PE/COFF stub**
-  (`build/hamnix-bootx64.efi`, built from `arch/x86/boot/efi_stub.S`) →
-  marker + halt. No GRUB-EFI in the boot path. The stub today is a proof
-  point — it stashes the EFI ImageHandle and SystemTable, prints
-  `[hamnix] EFI entry reached` over COM1, and halts. A follow-up commit
-  chains the stub into a kernel ELF load + `start_kernel()` so UEFI also
-  reaches the full kernel without GRUB.
+- **UEFI path**: OVMF / firmware → **native Hamnix PE/COFF stub**
+  (`build/hamnix-bootx64.efi`, built from `arch/x86/boot/efi_stub.S`).
+  No GRUB-EFI in the boot path. The stub completes the full UEFI
+  handoff handshake: it stashes the EFI ImageHandle and SystemTable,
+  calls `BootServices->GetMemoryMap()` into a 16 KiB static buffer,
+  then `BootServices->ExitBootServices()` with the resulting MapKey
+  (retrying up to four times if firmware returned
+  `EFI_INVALID_PARAMETER` for a stale key), prints `[hamnix] EFI
+  entry reached` then `[hamnix] post-EFI handoff complete` over
+  COM1, and halts. The second marker proves firmware has
+  relinquished the platform — no more boot services, no firmware
+  timer interrupts, no behind-the-back memory allocator. The
+  remaining work to reach `start_kernel()` from this point (loading
+  the multiboot kernel ELF off the ESP via UEFI Simple File System
+  Protocol before ExitBootServices, OR merging the EFI stub + kernel
+  ELF into one hybrid binary) is a follow-up commit. The
+  `_x86_start_after_loader` symbol in `arch/x86/kernel/head_64.S`
+  is the kernel-side join point that follow-up will jump to; the
+  `boot_via_efi` flag + EFI-fallback memblock window in
+  `arch/x86/kernel/e820.ad` are the kernel-side pre-positions that
+  let the EFI path skip the multiboot mmap parser.
 
 ### Why two binaries instead of one hybrid file
 
@@ -117,11 +131,16 @@ This runs the ISO under QEMU twice:
 - **UEFI pass**: `qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd
   -cdrom build/hamnix.iso` — OVMF reads the ESP, launches
   `BOOTX64.EFI` directly (= our stub).
-  Banner check: `[hamnix] EFI entry reached`.
+  Banner checks (BOTH must appear, in order):
+  - `[hamnix] EFI entry reached`        — PE/COFF entry reached.
+  - `[hamnix] post-EFI handoff complete` — `ExitBootServices()`
+    returned `EFI_SUCCESS`; firmware is out of the boot path.
 
-The two passes look for different banners because the EFI stub currently
-halts before reaching `start_kernel()`. When the stub grows real kernel
-handoff, the UEFI banner check will move to `Hamnix kernel booting` too.
+The two passes look for different banners because the EFI stub
+currently halts after `ExitBootServices()` rather than reaching
+`start_kernel()`. When the stub grows real kernel handoff (load the
+multiboot ELF off the ESP, or merge into one hybrid binary), the
+UEFI banner check will move to `Hamnix kernel booting` too.
 
 If you only have OVMF locally, set `SKIP_UEFI=1` to skip that pass.
 
@@ -154,7 +173,7 @@ Tested-on / known-working list (extend as we verify on more machines):
 | Vendor / Model        | Mode | Result | Notes                |
 | --------------------- | ---- | ------ | -------------------- |
 | QEMU (SeaBIOS, 10.0)  | BIOS | works  | scripts/test_iso_qemu.sh |
-| QEMU (OVMF, edk2)     | UEFI | works  | direct PE/COFF stub, marker only |
+| QEMU (OVMF, edk2)     | UEFI | works  | direct PE/COFF stub, ExitBootServices handshake completes; halts pre-start_kernel |
 | _real hardware_       | _?_  | TBD    | needs validation     |
 
 When testing on real hardware:
@@ -172,10 +191,20 @@ When testing on real hardware:
 ## 4. Known limitations / next steps
 
 - **UEFI stub doesn't yet chain to start_kernel**. The native PE
-  entry path is wired up but currently halts after printing its
-  marker. Next commit: load the embedded kernel ELF, copy PT_LOADs,
-  jump to a new `start_kernel_efi_entry` symbol in `head_64.S` that
-  skips the .code32 prologue (UEFI is already in long mode).
+  entry path is wired up and the EFI handoff handshake
+  (GetMemoryMap + ExitBootServices) now completes; the stub halts
+  after firmware releases control. Reaching `start_kernel()` from
+  there requires either (a) using UEFI's Simple File System
+  Protocol from inside the stub BEFORE `ExitBootServices` to read
+  the multiboot kernel ELF off the ESP, parse it, and copy
+  PT_LOADs to their LMA, OR (b) merging the stub + kernel ELF
+  into one hybrid binary (PE header + multiboot1 header at the
+  same offset 0). The kernel-side join point already exists:
+  `_x86_start_after_loader` in `arch/x86/kernel/head_64.S` is
+  what the post-handoff path will `jmp` to. `boot_via_efi` +
+  the EFI-fallback memblock window in `arch/x86/kernel/e820.ad`
+  are pre-positioned for the EFI path to skip the multiboot mmap
+  parser.
 - **No graphical console under direct UEFI boot**. The EFI stub
   doesn't yet program GOP or hand the framebuffer info to the
   kernel; once it chain-loads start_kernel, it'll need to populate

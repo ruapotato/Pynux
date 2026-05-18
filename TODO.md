@@ -679,12 +679,35 @@ it has to honour.
   known limitations, and the issue-report template. Validation
   against actual physical machines is now a community ask — file
   reports at https://github.com/ruapotato/Hamnix/issues.
-- UEFI stub → start_kernel chain. The PE stub today prints a marker
-  and halts; next step is to ELF-load the embedded multiboot kernel
-  image and jump to a new `start_kernel_efi_entry` in head_64.S
-  (skips the 32-bit-mode prologue — UEFI is already in long mode).
-  Once that lands, UEFI boot reaches the full kernel without GRUB
-  anywhere in the path.
+- ~~UEFI handoff completion (GetMemoryMap + ExitBootServices).
+  The PE stub now completes the firmware handshake — calls
+  `BootServices->GetMemoryMap()` then `ExitBootServices()` with
+  bounded MapKey-staleness retries, prints `[hamnix] post-EFI
+  handoff complete` after success, then halts. Verified by the
+  UEFI half of `scripts/test_iso_qemu.sh`, which asserts BOTH
+  markers in order. Kernel-side `_x86_start_after_loader`
+  (arch/x86/kernel/head_64.S) is the merge point for the next
+  step; `boot_via_efi` + EFI-fallback memblock window
+  (arch/x86/kernel/e820.ad) are the kernel-side preposition.~~
+- UEFI stub → start_kernel chain. The EFI handshake is now done;
+  the stub halts after ExitBootServices. Reaching `start_kernel()`
+  needs either (a) using UEFI Simple File System Protocol from
+  inside the stub BEFORE ExitBootServices to read the multiboot
+  kernel ELF off the ESP, parse it, and copy PT_LOADs to their
+  LMA, OR (b) merging the stub + kernel ELF into one hybrid
+  binary (PE header + multiboot1 header at offset 0). Either
+  path then `jmp _x86_start_after_loader`. Sets `boot_via_efi`
+  via `set_boot_via_efi()` from kernel-side before the jump so
+  e820_init() takes the fallback branch.
+- Parse the real EFI memory map instead of the hardcoded
+  2..240 MiB fallback installed by `e820_init()` when
+  `boot_via_efi != 0`. The stub already saves a 16 KiB
+  EFI_MEMORY_DESCRIPTOR buffer at `efi_mmap_buf` plus the
+  observed `descsize` at `efi_mmap_descsize`; e820.ad needs a
+  descsize-stride walker that classifies each entry's Type
+  (EfiConventionalMemory = 7 is "free RAM") and feeds the
+  largest above kernel_image_end() to `memblock_set_region`.
+  Unblocks RAM above 240 MiB on UEFI boot.
 - EFI GOP graphical console. Under UEFI boot, GRUB-EFI doesn't
   program legacy VGA text mode, so `drivers/video/console/vga_text.ad`
   (writes to 0xB8000) is dark on the monitor — UEFI users see only

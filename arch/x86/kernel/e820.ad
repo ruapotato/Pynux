@@ -58,6 +58,63 @@ MMAP_TYPE_BAD:              uint64 = 5
 # floor no longer has to guess.
 E820_MIN_BASE: uint64 = 0x00100000
 
+# --- EFI direct-boot fallback range -------------------------------
+#
+# When the kernel is entered from the UEFI PE/COFF stub
+# (arch/x86/boot/efi_stub.S) rather than via multiboot1, the
+# multiboot info pointer is unavailable — UEFI hands us a memory
+# map in a completely different shape (EFI_MEMORY_DESCRIPTOR
+# records, packed back-to-back, with `descsize` stride). Parsing
+# the real EFI map is a follow-up: a 2-page descriptor sweep that
+# classifies each entry's Type (EfiConventionalMemory = 7 is "free
+# RAM" for our purposes).
+#
+# Until that parser lands, we install a conservative hardcoded
+# usable-RAM window in the EFI branch: 2 MiB..240 MiB. Reasoning:
+#   - Every modern x86_64 system advertises >= 256 MiB of free RAM
+#     in [2 MiB, top_of_low_memory). The reservation below the
+#     top gives safety margin for firmware-reserved holes (the
+#     framebuffer + ACPI reclaim + boot-services-data cluster that
+#     OVMF / real firmware typically packs in the 240..256 MiB
+#     range).
+#   - Above 2 MiB stays clear of low BIOS / EBDA / kernel-image
+#     real estate; kernel_image_end() further clamps the floor
+#     dynamically.
+#
+# Documented limitation: this fallback wastes any RAM above
+# 240 MiB. A real EFI map parser unlocks the rest. Tracked in
+# TODO.md.
+EFI_FALLBACK_BASE:   uint64 = 0x00200000     # 2 MiB
+EFI_FALLBACK_LIMIT:  uint64 = 0x0F000000     # 240 MiB
+
+
+# --- boot_via_efi flag --------------------------------------------
+#
+# Set to 1 by the EFI entry path BEFORE start_kernel() runs (today
+# the EFI stub halts post-ExitBootServices; a follow-up commit will
+# merge stub + kernel into one image and set this flag from the
+# stub before jumping to _x86_start_after_loader). Read by
+# e820_init() to choose between the multiboot1 mmap parser and the
+# EFI fallback above.
+#
+# Default 0 = "entered via multiboot1 / QEMU -kernel". The flag is
+# a .bss global, so the multiboot path naturally sees 0 with no
+# explicit init.
+boot_via_efi: int32 = 0
+
+
+def set_boot_via_efi():
+    # Callable from any path that has determined the boot was UEFI.
+    # Today's EFI stub halts before reaching kernel code so this is
+    # never invoked at runtime; exists so the follow-up handoff
+    # commit has a stable kernel-side API to flip the flag without
+    # touching e820 internals.
+    boot_via_efi = 1
+
+
+def is_boot_via_efi() -> int32:
+    return boot_via_efi
+
 
 def _type_name(t: uint64) -> Ptr[char]:
     # Short identifier for log lines. Keep these strings short so the
@@ -76,6 +133,29 @@ def _type_name(t: uint64) -> Ptr[char]:
 
 
 def e820_init():
+    # EFI direct-boot path: when the kernel arrives via UEFI rather
+    # than multiboot1, the multiboot info pointer is meaningless.
+    # The EFI stub (arch/x86/boot/efi_stub.S) sets boot_via_efi=1
+    # before transferring control. We can't yet parse the real EFI
+    # memory map (TODO follow-up), so install a conservative
+    # hardcoded usable-RAM window. The kernel-image-end clamp below
+    # still applies — kernel + initramfs blob never overlap the
+    # allocator pool.
+    if boot_via_efi != 0:
+        printk0("e820: EFI boot path; installing fallback RAM window\n")
+        efi_kern_end: uint64 = kernel_image_end()
+        efi_kern_end = (efi_kern_end + 4095) & ~cast[uint64](4095)
+        efi_base: uint64 = EFI_FALLBACK_BASE
+        if efi_kern_end > efi_base:
+            efi_base = efi_kern_end
+        if efi_base >= EFI_FALLBACK_LIMIT:
+            printk0("e820: EFI fallback: kernel image past 240 MiB; keeping memblock default\n")
+            return
+        printk2("e820: EFI fallback range %p..%p\n",
+                efi_base, EFI_FALLBACK_LIMIT)
+        memblock_set_region(efi_base, EFI_FALLBACK_LIMIT)
+        return
+
     # Validate that we were entered via multiboot. If not (the magic
     # in mb_magic doesn't match), fall back to the hardcoded memblock
     # range memblock_init() installed.

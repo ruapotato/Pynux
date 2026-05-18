@@ -6,11 +6,31 @@
 #      Banner = the regular kernel banner; we go all the way through
 #      GRUB → multiboot1 → start_kernel().
 #   2. UEFI via -bios /usr/share/ovmf/OVMF.fd (only if OVMF.fd exists).
-#      Banner = the native PE/COFF stub's serial marker. The stub is
-#      the FIRST piece of Hamnix that UEFI executes (no GRUB-EFI in the
-#      path) and currently halts after printing the marker — full
-#      kernel handoff from the EFI stub is a follow-up commit. The new
-#      marker proves the direct-UEFI boot path works.
+#      Banners = the native PE/COFF stub's TWO serial markers,
+#      asserted in order:
+#        a) "[hamnix] EFI entry reached"     — UEFI launched our PE
+#                                              stub (no GRUB-EFI in
+#                                              the path). Present
+#                                              since M16.111.
+#        b) "[hamnix] post-EFI handoff       — ExitBootServices()
+#            complete"                         returned EFI_SUCCESS.
+#                                              Proves firmware
+#                                              actually relinquished
+#                                              the platform; we are
+#                                              now running with no
+#                                              boot services behind
+#                                              us, no firmware-timer
+#                                              interrupts firing, no
+#                                              hidden memory-manager
+#                                              activity. New marker.
+#      Why two markers and not one: marker (a) ONLY proves the PE/COFF
+#      load worked. Marker (b) proves the full EFI exit handshake
+#      (GetMemoryMap + ExitBootServices + MapKey-staleness retry)
+#      went through. The stub halts after marker (b) — the full
+#      kernel handoff (loading the multiboot ELF + jumping to
+#      start_kernel) is a follow-up commit, blocked on either an
+#      in-stub Simple-File-System loader or merging the two
+#      binaries into one image so the stub can reach kernel symbols.
 #
 # Each pass runs for up to ISO_BOOT_TIMEOUT seconds (default 30). The
 # kernel (BIOS) or the EFI stub (UEFI) both halt the CPU after printing
@@ -24,12 +44,13 @@
 #                                                  not just "Hamnix", which
 #                                                  also appears in GRUB's
 #                                                  own menu text)
-#   UEFI_BANNER_RE     UEFI-pass banner regex    (default: EFI stub marker —
-#                                                  proves the native PE
-#                                                  entry path ran. Distinct
-#                                                  from BANNER_RE because
-#                                                  the EFI stub currently
-#                                                  halts before start_kernel)
+#   UEFI_BANNER_RE     UEFI-pass primary banner  (default: EFI stub
+#                                                  PE-entry marker)
+#   UEFI_HANDOFF_RE    UEFI-pass post-handoff    (default: post-
+#                       banner (REQUIRED)         ExitBootServices
+#                                                  marker — proves
+#                                                  firmware released
+#                                                  the platform)
 #   SKIP_UEFI=1        skip the UEFI pass even if OVMF.fd exists
 
 set -euo pipefail
@@ -44,6 +65,7 @@ HAMNIX_ISO="${HAMNIX_ISO:-build/hamnix.iso}"
 ISO_BOOT_TIMEOUT="${ISO_BOOT_TIMEOUT:-30}"
 BANNER_RE="${BANNER_RE:-Hamnix kernel booting}"
 UEFI_BANNER_RE="${UEFI_BANNER_RE:-\[hamnix\] EFI entry reached}"
+UEFI_HANDOFF_RE="${UEFI_HANDOFF_RE:-\[hamnix\] post-EFI handoff complete}"
 OVMF_FD="/usr/share/ovmf/OVMF.fd"
 
 if [ ! -f "$HAMNIX_ISO" ]; then
@@ -51,18 +73,35 @@ if [ ! -f "$HAMNIX_ISO" ]; then
     exit 1
 fi
 
-# run_qemu LABEL BANNER_REGEX -- QEMU_ARGS...
+# run_qemu LABEL BANNER_REGEX POST_REGEX -- QEMU_ARGS...
 #
-# Two named args (label + regex) then the QEMU argv. The regex is taken
-# explicitly because the two passes look for different banners now:
-#   BIOS pass: kernel banner (multiboot1 -> start_kernel())
-#   UEFI pass: EFI stub marker (direct PE/COFF entry)
+# Args:
+#   LABEL          short identifier used in log lines + filenames
+#   BANNER_REGEX   primary banner the pass must observe (required)
+#   POST_REGEX     OPTIONAL second marker that MUST appear AFTER the
+#                  primary banner. Used by the UEFI pass to assert
+#                  that ExitBootServices succeeded — not just that
+#                  PE/COFF entry was reached. Pass an empty string ""
+#                  to skip the secondary assertion.
+#   QEMU_ARGS...   the rest of qemu's argv
+#
+# Why two markers for UEFI:
+#   The first marker only proves the PE loader executed our entry
+#   point. The post-handoff marker only fires after the full
+#   GetMemoryMap + ExitBootServices handshake completes — including
+#   the MapKey-staleness retry loop. Catching it in the log proves
+#   the EFI exit path actually worked, not just that we reached it.
 run_qemu() {
     local label="$1"; shift
     local banner_re="$1"; shift
+    local post_re="$1"; shift
     local logfile
     logfile=$(mktemp --tmpdir hamnix-iso-${label}.XXXXXX.log)
-    echo "[test_iso_qemu] === $label boot (timeout ${ISO_BOOT_TIMEOUT}s, banner=\"$banner_re\") ==="
+    if [ -n "$post_re" ]; then
+        echo "[test_iso_qemu] === $label boot (timeout ${ISO_BOOT_TIMEOUT}s, banner=\"$banner_re\", post=\"$post_re\") ==="
+    else
+        echo "[test_iso_qemu] === $label boot (timeout ${ISO_BOOT_TIMEOUT}s, banner=\"$banner_re\") ==="
+    fi
     set +e
     timeout "${ISO_BOOT_TIMEOUT}s" qemu-system-x86_64 \
         "$@" \
@@ -80,18 +119,44 @@ run_qemu() {
         echo "[test_iso_qemu] $label: qemu exited rc=$rc" >&2
         return "$rc"
     fi
-    if grep -q -E "$banner_re" "$logfile"; then
-        echo "[test_iso_qemu] $label: banner detected (\"$banner_re\")."
-        rm -f "$logfile"
-        return 0
+    if ! grep -q -E "$banner_re" "$logfile"; then
+        echo "[test_iso_qemu] $label: primary banner NOT detected in serial log ($logfile)." >&2
+        return 1
     fi
-    echo "[test_iso_qemu] $label: banner NOT detected in serial log ($logfile)." >&2
-    return 1
+    echo "[test_iso_qemu] $label: primary banner detected (\"$banner_re\")."
+    if [ -n "$post_re" ]; then
+        # Enforce strict ORDER: post_re must appear AFTER banner_re
+        # in the log. Otherwise a stray log fragment that happens
+        # to match the post regex could falsely satisfy the
+        # assertion.
+        #
+        # Implementation: use `grep -n` to get line numbers of the
+        # first match of each pattern, then compare. Both regexes
+        # are written in grep ERE shape (this is how BANNER_RE +
+        # UEFI_HANDOFF_RE are documented) so reusing grep keeps
+        # the regex dialect consistent.
+        local banner_line post_line
+        banner_line=$(grep -n -E "$banner_re" "$logfile" | head -1 | cut -d: -f1)
+        post_line=$(grep -n -E "$post_re"  "$logfile" | head -1 | cut -d: -f1)
+        if [ -z "$post_line" ]; then
+            echo "[test_iso_qemu] $label: post-handoff marker (\"$post_re\") NOT detected ($logfile)." >&2
+            return 1
+        fi
+        if [ -z "$banner_line" ] || [ "$post_line" -le "$banner_line" ]; then
+            echo "[test_iso_qemu] $label: post-handoff marker (\"$post_re\") appears at or before primary banner — ordering violated ($logfile)." >&2
+            return 1
+        fi
+        echo "[test_iso_qemu] $label: post-handoff marker detected (\"$post_re\")."
+    fi
+    rm -f "$logfile"
+    return 0
 }
 
 # --- Pass 1: legacy BIOS ---
 # Goes through SeaBIOS -> grub-pc -> multiboot1 -> kernel banner.
-run_qemu "BIOS" "$BANNER_RE" -cdrom "$HAMNIX_ISO"
+# No post-handoff marker needed (BIOS path reaches full start_kernel()
+# already; the kernel banner subsumes "we got past the loader").
+run_qemu "BIOS" "$BANNER_RE" "" -cdrom "$HAMNIX_ISO"
 BIOS_OK=$?
 
 UEFI_OK=skipped
@@ -103,9 +168,13 @@ else
     # OVMF needs a writable copy because UEFI variables get persisted.
     OVMF_RW=$(mktemp --tmpdir ovmf.XXXXXX.fd)
     cp "$OVMF_FD" "$OVMF_RW"
-    # UEFI pass uses the EFI-stub-specific marker — direct PE/COFF entry,
-    # no GRUB-EFI in the boot path.
-    run_qemu "UEFI" "$UEFI_BANNER_RE" -bios "$OVMF_RW" -cdrom "$HAMNIX_ISO"
+    # UEFI pass: assert BOTH markers, in order. The first proves
+    # PE/COFF entry; the second proves ExitBootServices succeeded
+    # (firmware actually released control). Together they prove the
+    # EFI handoff path is complete end-to-end, modulo the pending
+    # kernel-symbol reach that requires the binary-merge follow-up.
+    run_qemu "UEFI" "$UEFI_BANNER_RE" "$UEFI_HANDOFF_RE" \
+        -bios "$OVMF_RW" -cdrom "$HAMNIX_ISO"
     UEFI_OK=$?
     rm -f "$OVMF_RW"
 fi

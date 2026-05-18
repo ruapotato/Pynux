@@ -7,22 +7,43 @@
  * long_mode_start, which jumps here once long mode is live, segments are
  * reloaded, and the boot stack is anchored.
  *
- * Responsibilities (minimal for M16.1):
- *   1. Zero the kernel BSS (the Hamnix compiler places globals there).
- *   2. Call the Hamnix-emitted start_kernel().
- *   3. If start_kernel ever returns, halt the CPU.
+ * Two entry points live here:
  *
- * Direct UEFI boot path (M16.70):
- *   Hamnix also ships a standalone PE/COFF EFI application built from
- *   arch/x86/boot/efi_stub.S — a separate binary (build/hamnix-bootx64.efi)
- *   that UEFI firmware launches directly from \EFI\BOOT\BOOTX64.EFI on
- *   the ESP. That stub does NOT currently chain into start_kernel_asm_entry;
- *   it prints a marker and halts. The full UEFI -> kernel handoff
- *   (ELF-load the multiboot kernel image, then jump here in 64-bit mode
- *   skipping the .code32 prologue in header.S) is a follow-up commit.
- *   When it lands, this file gets a second entry point that bypasses
- *   the BSS-zero loop (UEFI maps .bss as NOBITS, firmware already zeroed
- *   it) and goes straight to `call start_kernel`.
+ *   1. start_kernel_asm_entry — the multiboot1 entry. arch/x86/boot/
+ *      header.S's long_mode_start tail-jumps here after the 32-to-64-bit
+ *      transition. Performs BSS zeroing then falls through to the
+ *      common path below.
+ *
+ *   2. _x86_start_after_loader — the COMMON post-loader path. Any
+ *      future entry point that arrives in long mode with kernel
+ *      .bss already zeroed (UEFI: firmware NOBITS-zeroes our image's
+ *      .bss before transferring control; PE/COFF .bss is the same
+ *      NOBITS shape ELF uses) should `jmp _x86_start_after_loader`
+ *      INSTEAD of `jmp start_kernel_asm_entry` — otherwise the
+ *      BSS-zero loop will redundantly re-zero RAM the loader
+ *      already cleared.
+ *
+ * Why expose the common symbol explicitly:
+ *   The EFI direct-boot path (arch/x86/boot/efi_stub.S) needs a
+ *   stable kernel-side hook to merge into the post-loader-specific
+ *   work without re-doing the BSS-zero loop. Today the EFI stub is
+ *   a separate binary that halts after ExitBootServices; when a
+ *   follow-up commit merges the EFI stub + kernel ELF into one
+ *   image (so the stub can reach kernel symbols), that merge will
+ *   `jmp _x86_start_after_loader` from the post-ExitBootServices
+ *   site in efi_stub.S. This refactor pre-positions the symbol so
+ *   the merge commit is small and one-sided.
+ *
+ * Responsibilities of the common path:
+ *   1. Call the Hamnix-emitted start_kernel().
+ *   2. If start_kernel ever returns, halt the CPU.
+ *
+ *   GDT / CR3 / page tables are NOT (re)programmed in the common
+ *   path: each loader is responsible for arriving with a working
+ *   long-mode environment. The multiboot1 path's header.S already
+ *   loads the kernel GDT + builds the identity page tables; an
+ *   eventual UEFI path will reuse those same structures (they're
+ *   placed in .pgtables, NOBITS-zeroed identically).
  */
 
     .section .text, "ax"
@@ -30,9 +51,16 @@
 
     .globl  start_kernel_asm_entry
 start_kernel_asm_entry:
-    /* Zero kernel BSS: [__bss_start, __bss_end). Both symbols are defined
-     * by arch/x86/kernel/vmlinux.lds. Using `rep stosq` so we move 8 bytes
-     * at a time; the linker script aligns __bss_start/__bss_end to 8. */
+    /* Zero kernel BSS: [__bss_start, __bss_end). Both symbols are
+     * defined by arch/x86/kernel/vmlinux.lds. Using `rep stosq` so we
+     * move 8 bytes at a time; the linker script aligns __bss_start
+     * and __bss_end to 8.
+     *
+     * Only the multiboot1 path needs this: QEMU's `-kernel` loader
+     * and grub-mkrescue's multiboot1 path are supposed to NOBITS-load
+     * for us, but historically not every loader has zeroed reliably
+     * (some multiboot1 implementations skip NOBITS PT_LOAD segments
+     * and leave stale memory). The explicit clear is defensive. */
     leaq    __bss_start(%rip), %rdi
     leaq    __bss_end(%rip),   %rcx
     subq    %rdi, %rcx
@@ -41,7 +69,18 @@ start_kernel_asm_entry:
     cld
     rep stosq
 
-    /* Hand off to the Hamnix kernel. SysV AMD64: no args, no return value. */
+    /* Fall through to the common post-loader path. */
+
+    .globl  _x86_start_after_loader
+_x86_start_after_loader:
+    /* Common path joined by:
+     *   - start_kernel_asm_entry above (fall-through)
+     *   - the eventual EFI direct-boot path (jmp from efi_stub.S)
+     *
+     * Hand off to the Hamnix kernel. SysV AMD64: no args, no return
+     * value. start_kernel() walks the boot info (multiboot mmap via
+     * mb_info, or — in a future commit — the EFI memory map saved by
+     * efi_stub.S) and brings every subsystem up. */
     call    start_kernel
 
     /* If start_kernel returns (it shouldn't yet), halt forever. */
