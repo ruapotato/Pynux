@@ -609,7 +609,17 @@ def vfs_listdir(name: Ptr[char], buf: Ptr[uint8],
     #
     #   /mnt or /mnt/*     →  FAT
     #   /ext or /ext/*     →  EXT4 (root only for now)
+    #   /, /etc, /bin, ... →  cpio initramfs (implicit dirs)
     #   anything else      →  -EINVAL
+    #
+    # The cpio branch is what makes `ls /`, `ls /etc`, and (after
+    # `cd /etc`) bare `ls` work — pre-M16.135 those all returned
+    # -EINVAL because vfs_listdir only knew about FAT + ext4. The
+    # opendir/getdents path in vfs_open already routed cpio via
+    # _is_initramfs_dir, so this mirrors that dispatch — the
+    # asymmetry was the bug. Discovered on real-hardware GNOME
+    # Boxes testing where `ls` (no args) and `ls <any path>`
+    # showed "listdir failed".
     if is_fat_path(name) != 0:
         return fat_listdir(strip_mnt_prefix(name), buf, count)
     if is_ext_path(name) != 0:
@@ -618,6 +628,8 @@ def vfs_listdir(name: Ptr[char], buf: Ptr[uint8],
         return fat_listdir(cast[Ptr[char]](&_empty_str[0]), buf, count)
     if _path_eq_const(name, "/ext", 4) != 0:
         return ext4_listdir(cast[Ptr[char]](&_empty_str[0]), buf, count)
+    if _is_initramfs_dir(name) != 0:
+        return _cpio_listdir(name, buf, count)
     return cast[int64](EINVAL)
 
 

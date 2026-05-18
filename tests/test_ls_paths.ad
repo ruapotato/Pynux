@@ -1,0 +1,95 @@
+# tests/test_ls_paths.ad
+#
+# M16.x regression: vfs_listdir must route cpio-backed paths (the
+# root "/", "/etc", "/bin", etc.) through _cpio_listdir, not return
+# -EINVAL. Pre-fix, fresh-boot real-hardware testing on GNOME Boxes
+# saw `ls` (no args, cwd=/), `ls /`, and `ls /etc` all fail with
+# "listdir failed" — fix routes those to the cpio dispatch already
+# used by vfs_open's O_DIRECTORY path.
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       tests/test_ls_paths.ad -o build/user/test_ls_paths.elf
+#
+# Run via scripts/test_ls_paths.sh, which embeds this binary at
+# /bin/test_ls_paths inside the cpio initramfs and drives it via
+# hamsh.
+#
+# Contract:
+#   1. sys_listdir("/") returns > 0 (root has entries: /bin, /etc, ...)
+#   2. sys_listdir("/etc") returns > 0 (cpio /etc has /etc/motd, etc.)
+#   3. After sys_chdir("/etc"), sys_listdir("/etc") still works.
+#   4. After sys_chdir("/etc"), sys_listdir(".") resolves via cwd
+#      and returns the same content as #2.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_listdir(path: Ptr[char], buf: Ptr[uint8],
+                       count: uint64) -> int64
+extern def sys_chdir(path: Ptr[char]) -> int32
+extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def show_errstr():
+    ebuf: Array[128, uint8]
+    ebuf[0] = 0
+    sys_errstr(&ebuf[0], 128)
+    write_str(1, "[test_ls_paths] errstr=")
+    write_str(1, &ebuf[0])
+    write_str(1, "\n")
+
+
+def main() -> int32:
+    write_str(1, "[test_ls_paths] start\n")
+
+    buf: Array[1024, uint8]
+
+    # 1. ls "/" — root of cpio initramfs.
+    n: int64 = sys_listdir("/", &buf[0], 1024)
+    if n <= 0:
+        write_str(1, "[test_ls_paths] FAIL: listdir(/) returned <= 0\n")
+        show_errstr()
+        return 1
+    write_str(1, "[test_ls_paths] PASS: listdir(/) ok\n")
+
+    # 2. ls "/etc" — implicit cpio directory.
+    n = sys_listdir("/etc", &buf[0], 1024)
+    if n <= 0:
+        write_str(1, "[test_ls_paths] FAIL: listdir(/etc) returned <= 0\n")
+        show_errstr()
+        return 2
+    write_str(1, "[test_ls_paths] PASS: listdir(/etc) ok\n")
+
+    # 3. chdir + listdir absolute — cwd shouldn't interfere with
+    #    absolute-path listing.
+    rc: int32 = sys_chdir("/etc")
+    if rc != 0:
+        write_str(1, "[test_ls_paths] FAIL: chdir(/etc) rejected\n")
+        return 3
+    n = sys_listdir("/etc", &buf[0], 1024)
+    if n <= 0:
+        write_str(1, "[test_ls_paths] FAIL: listdir(/etc) after chdir\n")
+        show_errstr()
+        return 4
+    write_str(1, "[test_ls_paths] PASS: listdir(/etc) after chdir ok\n")
+
+    # 4. Relative "." — kernel resolve_path should expand to cwd.
+    n = sys_listdir(".", &buf[0], 1024)
+    if n <= 0:
+        write_str(1, "[test_ls_paths] FAIL: listdir(.) after chdir(/etc)\n")
+        show_errstr()
+        return 5
+    write_str(1, "[test_ls_paths] PASS: listdir(.) resolves via cwd ok\n")
+
+    write_str(1, "[test_ls_paths] done\n")
+    return 0
