@@ -95,7 +95,17 @@ from lib.9p.9p import (
     P9_QTDIR, P9_QTFILE,
 )
 from fs.pipe import (
-    pipe_read, pipe_write,
+    pipe_read, pipe_write, pipe_readers, pipe_writers,
+)
+# V4.1: real-fd dispatch needs current_task to translate the connection's
+# srvfd into a pipe slot, plus yield_to_others to block until the peer
+# (the userspace 9P server) has drained / posted bytes. The FD_PIPE_MARK_*
+# constants live in kernel/sched/core.ad alongside the rest of the fd-type
+# discriminators; we read them here purely to gate the pipe-slot decode
+# (any other fd kind falls back to the V1 stubbed -1 path).
+from kernel.sched.core import (
+    TaskStruct, current_task, yield_to_others,
+    FD_CLOSED_MARK, FD_PIPE_MARK_R, FD_PIPE_MARK_W,
 )
 from kernel.printk.printk import printk0, printk1, printk2
 
@@ -138,6 +148,18 @@ class P9Conn:
     smoke_mode:    int32
     smoke_tx_slot: int32          # kernel writes T-msgs to this pipe slot
     smoke_rx_slot: int32          # kernel reads R-msgs from this pipe slot
+    # V4.1 (real-fd dispatch): pipes in Hamnix are unidirectional, so a
+    # userspace 9P server that uses sys_pipe() for its transport actually
+    # needs TWO pipe slots — one for the T-msg direction (kernel→server)
+    # and one for the R-msg direction (server→kernel). srvfd above is the
+    # TX-side fd; rx_srvfd (if >= 0) is the RX-side fd. When rx_srvfd is
+    # -1 we fall back to srvfd for reads (which works iff the underlying
+    # transport really is bidirectional — e.g. a future socketpair).
+    # The fixture passes the rx_srvfd via the mount `spec` argument
+    # (see _parse_rx_prefix below); syschan.ad's do_mount forwards spec
+    # verbatim as the 9P attach aname, so we strip and consume the
+    # prefix here without touching syschan.ad.
+    rx_srvfd:      int32
 
 
 p9_conns: Array[16, P9Conn]
@@ -184,6 +206,7 @@ def _conn_alloc(srvfd: int32) -> int32:
     p9_conns[su].smoke_mode    = 0
     p9_conns[su].smoke_tx_slot = -1
     p9_conns[su].smoke_rx_slot = -1
+    p9_conns[su].rx_srvfd      = -1
     # Clear fid_used.
     i: uint64 = 0
     while i < P9C_FIDS_PER_CONN:
@@ -287,6 +310,33 @@ def _smoke_pump_call(slot: int32) -> int32:
     return hookfn(slot)
 
 
+def _fd_to_pipe_slot(srvfd: int32, want_writer: int32) -> int32:
+    # V4.1: translate an fd in the CURRENT task's fd table into the
+    # underlying pipe slot. Returns the slot index (>= 0) on success,
+    # -1 if the fd isn't a pipe (caller falls back to the legacy -1
+    # stub) or is closed / out of range. `want_writer` is advisory:
+    # the kernel writes/reads through pipe_write/pipe_read DIRECTLY by
+    # slot, bypassing the per-fd MARK_R / MARK_W discrimination that
+    # vfs_read / vfs_write enforce. So we accept BOTH marks on either
+    # direction — what matters is that the underlying slot exists. The
+    # `want_writer` argument is recorded only so a future tightening
+    # (refuse writes through a MARK_R fd, e.g. if the fixture got the
+    # post direction backwards) has a hook.
+    _ignored: int32 = want_writer
+    if srvfd < 0 or srvfd >= 16:
+        return -1
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](srvfd)
+    mark: uint32 = task[0].fd_idx[fdu]
+    if mark == FD_CLOSED_MARK:
+        return -1
+    if mark != FD_PIPE_MARK_R and mark != FD_PIPE_MARK_W:
+        return -1
+    # fd_buf carries the pipe slot index directly (see fs/vfs.ad's
+    # vfs_pipe -- task[0].fd_buf[fd] = cast[uint64](slot)).
+    return cast[int32](task[0].fd_buf[fdu])
+
+
 def _p9_send(slot: int32, n_bytes: int32) -> int32:
     # Push p9c_scratch[0..n_bytes] to the wire (or pipe). In smoke
     # mode this writes into the tx pipe slot then drives the
@@ -312,12 +362,41 @@ def _p9_send(slot: int32, n_bytes: int32) -> int32:
         if _smoke_pump_call(slot) != 0:
             return -1
         return n_bytes
-    # Real-fd dispatch is not exercised in V1's smoke path; V4 will
-    # forward to vfs_write(p9_conns[su].srvfd, &p9c_scratch[0],
-    # n_bytes). Leave it as -1 today so callers that wire up a real
-    # 9P server before V4 lands see the gap visibly rather than
-    # silently passing tests.
-    return -1
+    # V4.1: real-fd dispatch. Decode the connection's srvfd into a
+    # pipe slot and pipe_write the bytes directly. We deliberately
+    # bypass vfs_write to avoid re-entrancy on the per-task fd_buf /
+    # fd_pos state — _p9_send is called from inside vfs_open dispatch
+    # (the FD_P9_MARK route in fs/vfs.ad invokes p9c_walk_open_path,
+    # which lands here), and vfs_write on the same task's fd table
+    # would race the dispatcher's own pos accounting.
+    pipe_slot: int32 = _fd_to_pipe_slot(p9_conns[su].srvfd, 1)
+    if pipe_slot < 0:
+        # Not a pipe fd — preserve the V1 -1 stub so non-pipe srvfds
+        # (e.g. the /etc/motd fd test_p9mount.ad uses to assert the
+        # mount-srvfd-rejection path) still see a visible failure.
+        return -1
+    # Push the whole T-msg out. pipe_write reports a short count when
+    # the ring is full; we yield + retry. The PIPE_CAP is 1024 bytes
+    # (fs/pipe.ad) and our biggest V0 T-msg (Tversion + 6-byte version
+    # string) is ~25 bytes, so the loop is just defensive — but a
+    # future Twrite carrying a multi-KB payload could legitimately
+    # need it.
+    pushed: uint64 = 0
+    total: uint64 = cast[uint64](n_bytes)
+    while pushed < total:
+        n: int64 = pipe_write(pipe_slot, &p9c_scratch[pushed],
+                              total - pushed)
+        if n < 0:
+            return -1
+        if n == 0:
+            # Ring full. If readers == 0 the peer has hung up and we
+            # should give up (EPIPE-shape); otherwise yield and retry.
+            if pipe_readers(pipe_slot) == 0:
+                return -1
+            yield_to_others()
+        else:
+            pushed = pushed + cast[uint64](n)
+    return n_bytes
 
 
 def _p9_recv(slot: int32) -> int32:
@@ -353,8 +432,54 @@ def _p9_recv(slot: int32) -> int32:
                 return -1
             got = got + cast[uint64](n)
         return cast[int32](total)
-    # Real-fd dispatch (V4): vfs_read(p9_conns[su].srvfd, ...).
-    return -1
+    # V4.1: real-fd dispatch. R-msgs come back on the connection's
+    # rx_srvfd if it was set (the standard userspace-pipe-pair case);
+    # otherwise we fall back to srvfd (a future bidirectional
+    # transport like a socketpair). Same vfs.ad re-entrancy concern as
+    # _p9_send drives us through pipe_read directly.
+    rx_fd: int32 = p9_conns[su].rx_srvfd
+    if rx_fd < 0:
+        rx_fd = p9_conns[su].srvfd
+    rx_slot: int32 = _fd_to_pipe_slot(rx_fd, 0)
+    if rx_slot < 0:
+        return -1
+    # Block until we have a full 7-byte header. pipe_read returns 0
+    # for "ring empty right now"; we yield + retry. If writers == 0
+    # the peer has hung up before posting a complete R-msg → -1
+    # (mirrors vfs_read's EOF-vs-would-block discrimination on
+    # FD_PIPE_MARK_R, but we surface a hard error rather than a short
+    # read because a half-message would desync the codec).
+    got: uint64 = 0
+    while got < 7:
+        n: int64 = pipe_read(rx_slot, &p9c_scratch[got], 7 - got)
+        if n < 0:
+            return -1
+        if n == 0:
+            if pipe_writers(rx_slot) == 0:
+                return -1
+            yield_to_others()
+        else:
+            got = got + cast[uint64](n)
+    sz: uint32 = 0
+    ty: uint8 = 0
+    tg: uint16 = 0
+    rc: int32 = p9_decode_header(&p9c_scratch[0], 7, &sz, &ty, &tg)
+    if rc != 0:
+        return -1
+    total: uint64 = cast[uint64](sz)
+    if total < 7 or total > P9C_BUF_LEN:
+        return -1
+    while got < total:
+        n: int64 = pipe_read(rx_slot, &p9c_scratch[got], total - got)
+        if n < 0:
+            return -1
+        if n == 0:
+            if pipe_writers(rx_slot) == 0:
+                return -1
+            yield_to_others()
+        else:
+            got = got + cast[uint64](n)
+    return cast[int32](total)
 
 
 # -- Tversion ------------------------------------------------------
@@ -429,11 +554,87 @@ def p9c_attach(srvfd: int32, aname: Ptr[char],
     return slot                     # caller wires smoke pipes, then p9c_attach_run
 
 
+# V4.1 RX-pipe binding: pipes in Hamnix are unidirectional, so a
+# userspace 9P server reachable through sys_pipe(2) needs separate fds
+# for the T-msg and R-msg directions. The mount() syscall only carries
+# one srvfd; we smuggle the rx-side fd through the `spec` argument
+# (which syschan.ad's do_mount forwards verbatim as the 9P attach
+# aname). The magic prefix is "p9rx:<decimal-fd>:" — strip it and
+# record the fd before Tversion runs. The REST of the aname (after the
+# closing ':') becomes the real 9P attach aname.
+#
+# Example: spec = "p9rx:6:fileserver" → rx_srvfd = 6, aname =
+# "fileserver". Servers that don't care about aname (e.g.
+# user/p9srv_demo.ad) see the rump string unchanged.
+#
+# This keeps syschan.ad / chan.ad / devsrv.ad untouched (off-limits)
+# while still giving the test fixture a way to thread the second pipe
+# end through to the in-kernel client.
+
+P9_RX_PREFIX_LEN: uint64 = 5      # length of "p9rx:"
+
+
+def _ascii_to_i32(s: Ptr[char], start: uint64, end: uint64) -> int32:
+    # Parse [start..end) of s as a positive decimal int32. Returns -1
+    # on empty / non-digit / overflow. Used only by _parse_rx_prefix
+    # so we don't need negatives or sign handling.
+    if end <= start:
+        return -1
+    v: int32 = 0
+    i: uint64 = start
+    while i < end:
+        c: uint8 = cast[uint8](s[i])
+        if c < 48 or c > 57:
+            return -1
+        d: int32 = cast[int32](cast[uint32](c) - 48)
+        if v > 214748363:                            # would overflow int32
+            return -1
+        v = v * 10 + d
+        i = i + 1
+    return v
+
+
+def _parse_rx_prefix(slot: int32, aname: Ptr[char]) -> Ptr[char]:
+    # Strip the "p9rx:<fd>:" magic if present; record <fd> as the
+    # connection's rx_srvfd; return the pointer to the byte AFTER the
+    # closing ':'. If the magic isn't there, return aname unchanged.
+    # Malformed magic (no second ':', non-digit fd) is treated as
+    # "not magic" — the literal aname goes through verbatim. This is
+    # less strict than a "must validate" check, deliberately: we want
+    # callers that legitimately use "p9rx" as a literal aname prefix
+    # to not be wedged.
+    if aname == cast[Ptr[char]](0):
+        return aname
+    # Match "p9rx:"
+    if aname[0] != 112 or aname[1] != 57 or aname[2] != 114 \
+            or aname[3] != 120 or aname[4] != 58:
+        return aname
+    # Find the second ':'.
+    i: uint64 = P9_RX_PREFIX_LEN
+    while True:
+        c: uint8 = cast[uint8](aname[i])
+        if c == 0:
+            return aname                              # malformed -> no strip
+        if c == 58:                                   # ':'
+            break
+        i = i + 1
+    fd_val: int32 = _ascii_to_i32(aname, P9_RX_PREFIX_LEN, i)
+    if fd_val < 0 or fd_val >= 16:
+        return aname                                  # malformed -> no strip
+    su: uint64 = cast[uint64](slot)
+    p9_conns[su].rx_srvfd = fd_val
+    # Resume past the closing ':'.
+    return cast[Ptr[char]](cast[uint64](aname) + i + 1)
+
+
 def p9c_attach_run(slot: int32, aname: Ptr[char],
                    uname: Ptr[char]) -> int32:
     # Run the actual Tversion + Tattach exchange. Separated from
     # p9c_attach so the smoke fixture can register its pipe slots
     # between conn-alloc and the first wire byte.
+    # V4.1: peel any "p9rx:<fd>:" prefix off the aname so the user-
+    # space pipe-pair transport works (see _parse_rx_prefix above).
+    aname = _parse_rx_prefix(slot, aname)
     if _p9_negotiate(slot) < 0:
         _conn_release(slot)
         return -1
