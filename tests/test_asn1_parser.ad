@@ -1,0 +1,531 @@
+# tests/test_asn1_parser.ad
+#
+# ASN.1 DER parser (V0) round-trip regression. Builds a small synthetic
+# DER document in memory and verifies every primitive reader recovers
+# tags, lengths, and body bytes bit-identically. Then proves the
+# parser rejects four malformed inputs:
+#   - truncated body (length promises bytes the buffer doesn't have),
+#   - indefinite-length form (BER-only; DER must refuse),
+#   - length-of-length count > 8 (overflow guard),
+#   - wrong tag at a typed reader (e.g. asn1_read_integer on a SEQUENCE).
+#
+# Driven by scripts/test_asn1_parser.sh: builds this .ad as a userland
+# x86_64 ELF, plants it at /bin/test_asn1_parser in the cpio initramfs,
+# boots QEMU + hamsh, runs the binary, then greps the serial log for
+# the [asn1] PASS banner. Same shape as scripts/test_9p_codec.sh.
+#
+# Why userland? Same reason the 9P codec test ran in userland: the
+# parser is meant to be kernel-internals-free so it can be linked from
+# both spaces. If the parser ever reaches into a kernel symbol, the
+# x86_64-adder-user link will fail before we ever boot.
+
+from lib.asn1.asn1 import (
+    Asn1Cursor,
+    asn1_cursor_init,
+    asn1_remaining,
+    asn1_read_tlv,
+    asn1_read_sequence,
+    asn1_read_set,
+    asn1_read_integer,
+    asn1_read_oid,
+    asn1_read_octet_string,
+    asn1_read_bit_string,
+    asn1_read_utctime,
+    asn1_read_generalizedtime,
+    asn1_skip,
+    asn1_init_oids,
+    OID_BASIC_CONSTRAINTS,
+    OID_BASIC_CONSTRAINTS_LEN,
+    OID_RSA_ENCRYPTION,
+    OID_RSA_ENCRYPTION_LEN,
+    ASN1_TAG_SEQUENCE,
+    ASN1_TAG_INTEGER,
+    ASN1_TAG_OCTET_STRING,
+    ASN1_TAG_OID,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_exit(code: uint64)
+
+
+# -- tiny printer ------------------------------------------------------------
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _wstr(s: Ptr[uint8]):
+    sys_write(1, s, _strlen(s))
+
+
+def _wdec(value: uint64):
+    if value == 0:
+        sys_write(1, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(1, &out[0], i)
+
+
+# -- failure aggregator ------------------------------------------------------
+
+fail_count: int32 = 0
+
+
+def _check(cond: int32, label: Ptr[uint8]):
+    if cond == 0:
+        _wstr("[asn1] FAIL: ")
+        _wstr(label)
+        _wstr("\n")
+        fail_count = fail_count + 1
+
+
+def _check_eq_u64(a: uint64, b: uint64, label: Ptr[uint8]):
+    if a != b:
+        _wstr("[asn1] FAIL: ")
+        _wstr(label)
+        _wstr(" got=")
+        _wdec(a)
+        _wstr(" want=")
+        _wdec(b)
+        _wstr("\n")
+        fail_count = fail_count + 1
+
+
+def _check_eq_i64(a: int64, b: int64, label: Ptr[uint8]):
+    if a != b:
+        _wstr("[asn1] FAIL: ")
+        _wstr(label)
+        _wstr("\n")
+        fail_count = fail_count + 1
+
+
+def _check_neg_i64(v: int64, label: Ptr[uint8]):
+    if v >= cast[int64](0):
+        _wstr("[asn1] FAIL: ")
+        _wstr(label)
+        _wstr(" (expected negative)\n")
+        fail_count = fail_count + 1
+
+
+def _check_neg_i32(v: int32, label: Ptr[uint8]):
+    if v >= 0:
+        _wstr("[asn1] FAIL: ")
+        _wstr(label)
+        _wstr(" (expected negative)\n")
+        fail_count = fail_count + 1
+
+
+# -- bytewise compare --------------------------------------------------------
+
+def _bytes_eq(a: Ptr[uint8], a_len: uint64,
+              b: Ptr[uint8], b_len: uint64) -> int32:
+    if a_len != b_len:
+        return 0
+    i: uint64 = 0
+    while i < a_len:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# -- canonical test inputs (top-level Arrays per Adder quirk) ----------------
+
+# Synthetic DER document. Layout:
+#
+#   SEQUENCE (0x30) len = 0x14 (20)
+#     INTEGER (0x02) len = 0x01 = { 0x42 }
+#     OCTET STRING (0x04) len = 0x02 = { 'h', 'i' }
+#     OID (0x06) len = 0x03 = { 0x55, 0x1D, 0x13 }    -- 2.5.29.19
+#     BIT STRING (0x03) len = 0x03 = { 0x04, 0xF0, 0xA0 }  -- 4 unused bits
+#     UTCTime (0x17) len = 0x0D = "260518120000Z"
+#
+# Total: 2 (SEQUENCE tag+len) + 3 (INT) + 4 (OCT) + 5 (OID) + 5 (BIT) +
+# 15 (UTCT) = 34 bytes. SEQUENCE body length = 32. We size the buffer
+# generously.
+fixture_der: Array[64, uint8]
+fixture_der_len: uint64 = 0
+
+# Buffer for malformed-input tests (each test rebuilds it).
+bad_der: Array[64, uint8]
+
+
+# Out-buffers for primitive readers.
+int_out: Array[32, uint8]
+oct_out: Array[32, uint8]
+oid_out: Array[32, uint8]
+bit_out: Array[32, uint8]
+time_out: Array[32, uint8]
+
+
+def _build_fixture():
+    # SEQUENCE wrapper.
+    fixture_der[0] = 0x30                     # SEQUENCE tag
+    fixture_der[1] = 32                       # body length (short form)
+
+    # INTEGER { 0x42 }
+    fixture_der[2] = 0x02
+    fixture_der[3] = 1
+    fixture_der[4] = 0x42
+
+    # OCTET STRING { 'h', 'i' }
+    fixture_der[5] = 0x04
+    fixture_der[6] = 2
+    fixture_der[7] = 104   # 'h'
+    fixture_der[8] = 105   # 'i'
+
+    # OID { 0x55, 0x1D, 0x13 } — 2.5.29.19 basicConstraints
+    fixture_der[9] = 0x06
+    fixture_der[10] = 3
+    fixture_der[11] = 0x55
+    fixture_der[12] = 0x1D
+    fixture_der[13] = 0x13
+
+    # BIT STRING { unused=4, 0xF0, 0xA0 }
+    fixture_der[14] = 0x03
+    fixture_der[15] = 3
+    fixture_der[16] = 0x04
+    fixture_der[17] = 0xF0
+    fixture_der[18] = 0xA0
+
+    # UTCTime "260518120000Z" — 13 bytes
+    fixture_der[19] = 0x17
+    fixture_der[20] = 13
+    fixture_der[21] = 50   # '2'
+    fixture_der[22] = 54   # '6'
+    fixture_der[23] = 48   # '0'
+    fixture_der[24] = 53   # '5'
+    fixture_der[25] = 49   # '1'
+    fixture_der[26] = 56   # '8'
+    fixture_der[27] = 49   # '1'
+    fixture_der[28] = 50   # '2'
+    fixture_der[29] = 48   # '0'
+    fixture_der[30] = 48   # '0'
+    fixture_der[31] = 48   # '0'
+    fixture_der[32] = 48   # '0'
+    fixture_der[33] = 90   # 'Z'
+
+    fixture_der_len = 34
+
+
+# -- happy-path tests --------------------------------------------------------
+
+def _test_oid_constants():
+    # OID_BASIC_CONSTRAINTS = 0x55 0x1D 0x13
+    _check_eq_u64(OID_BASIC_CONSTRAINTS_LEN, 3, "OID_BASIC_CONSTRAINTS_LEN")
+    _check_eq_u64(cast[uint64](OID_BASIC_CONSTRAINTS[0]), 0x55,
+                  "OID_BASIC_CONSTRAINTS[0]")
+    _check_eq_u64(cast[uint64](OID_BASIC_CONSTRAINTS[1]), 0x1D,
+                  "OID_BASIC_CONSTRAINTS[1]")
+    _check_eq_u64(cast[uint64](OID_BASIC_CONSTRAINTS[2]), 0x13,
+                  "OID_BASIC_CONSTRAINTS[2]")
+    # OID_RSA_ENCRYPTION = 2A 86 48 86 F7 0D 01 01 01
+    _check_eq_u64(OID_RSA_ENCRYPTION_LEN, 9, "OID_RSA_ENCRYPTION_LEN")
+    _check_eq_u64(cast[uint64](OID_RSA_ENCRYPTION[0]), 0x2A,
+                  "OID_RSA_ENCRYPTION[0]")
+    _check_eq_u64(cast[uint64](OID_RSA_ENCRYPTION[8]), 0x01,
+                  "OID_RSA_ENCRYPTION[8]")
+
+
+def _test_read_tlv_raw():
+    # Drive asn1_read_tlv directly over the SEQUENCE wrapper and
+    # confirm we recover tag=0x30, len=32, and a body pointer at +2.
+    c: Asn1Cursor
+    asn1_cursor_init(&c, &fixture_der[0], fixture_der_len)
+
+    tag: uint8 = 0
+    body_len: uint64 = 0
+    body: Ptr[uint8] = &fixture_der[0]
+    rc: int32 = asn1_read_tlv(&c, &tag, &body_len, &body)
+    _check_eq_i64(cast[int64](rc), cast[int64](0), "tlv: rc==0")
+    _check_eq_u64(cast[uint64](tag), 0x30, "tlv: tag==SEQUENCE")
+    _check_eq_u64(body_len, 32, "tlv: body_len==32")
+    # Body should be the inner bytes (starts at fixture_der[2]).
+    _check_eq_u64(cast[uint64](body[0]), 0x02, "tlv: body[0]==INTEGER")
+    # Cursor pos should be past the whole TLV: 2 (header) + 32 (body) = 34.
+    _check_eq_u64(c.pos, 34, "tlv: cursor advanced")
+    _check_eq_u64(asn1_remaining(&c), 0, "tlv: remaining==0")
+
+
+def _test_sequence_walk():
+    # Walk the SEQUENCE body element by element.
+    outer: Asn1Cursor
+    asn1_cursor_init(&outer, &fixture_der[0], fixture_der_len)
+    inner: Asn1Cursor
+    rc: int32 = asn1_read_sequence(&outer, &inner)
+    _check_eq_i64(cast[int64](rc), cast[int64](0), "seq: rc==0")
+    _check_eq_u64(inner.len, 32, "seq: inner.len==32")
+    _check_eq_u64(inner.pos, 0, "seq: inner.pos==0")
+
+    # 1) INTEGER 0x42
+    int_len: uint64 = 0
+    n: int64 = asn1_read_integer(&inner, &int_out[0], &int_len,
+                                 cast[uint64](32))
+    _check_eq_i64(n, cast[int64](1), "int: count==1")
+    _check_eq_u64(int_len, 1, "int: len==1")
+    _check_eq_u64(cast[uint64](int_out[0]), 0x42, "int: body==0x42")
+
+    # 2) OCTET STRING "hi"
+    oct_len: uint64 = 0
+    n = asn1_read_octet_string(&inner, &oct_out[0], &oct_len,
+                               cast[uint64](32))
+    _check_eq_i64(n, cast[int64](2), "oct: count==2")
+    _check_eq_u64(oct_len, 2, "oct: len==2")
+    _check_eq_u64(cast[uint64](oct_out[0]), 104, "oct: body[0]=='h'")
+    _check_eq_u64(cast[uint64](oct_out[1]), 105, "oct: body[1]=='i'")
+
+    # 3) OID = basicConstraints
+    oid_len: uint64 = 0
+    n = asn1_read_oid(&inner, &oid_out[0], &oid_len, cast[uint64](32))
+    _check_eq_i64(n, cast[int64](3), "oid: count==3")
+    _check_eq_u64(oid_len, 3, "oid: len==3")
+    _check(_bytes_eq(&oid_out[0], oid_len,
+                     &OID_BASIC_CONSTRAINTS[0], OID_BASIC_CONSTRAINTS_LEN),
+           "oid: matches OID_BASIC_CONSTRAINTS")
+
+    # 4) BIT STRING { unused=4, 0xF0, 0xA0 }
+    bit_len: uint64 = 0
+    unused: uint8 = 0
+    n = asn1_read_bit_string(&inner, &bit_out[0], &bit_len,
+                             cast[uint64](32), &unused)
+    _check_eq_i64(n, cast[int64](2), "bit: count==2 (excludes prefix)")
+    _check_eq_u64(bit_len, 2, "bit: len==2")
+    _check_eq_u64(cast[uint64](unused), 4, "bit: unused==4")
+    _check_eq_u64(cast[uint64](bit_out[0]), 0xF0, "bit: body[0]==0xF0")
+    _check_eq_u64(cast[uint64](bit_out[1]), 0xA0, "bit: body[1]==0xA0")
+
+    # 5) UTCTime "260518120000Z"
+    n = asn1_read_utctime(&inner, &time_out[0], cast[uint64](32))
+    _check_eq_i64(n, cast[int64](13), "utctime: count==13")
+    _check_eq_u64(cast[uint64](time_out[0]), 50, "utctime: '2'")
+    _check_eq_u64(cast[uint64](time_out[12]), 90, "utctime: 'Z'")
+    _check_eq_u64(asn1_remaining(&inner), 0, "utctime: inner exhausted")
+
+    # Outer cursor should be fully consumed too.
+    _check_eq_u64(asn1_remaining(&outer), 0, "seq: outer exhausted")
+
+
+def _test_skip():
+    # Re-walk with asn1_skip and confirm cursor advances.
+    outer: Asn1Cursor
+    asn1_cursor_init(&outer, &fixture_der[0], fixture_der_len)
+    inner: Asn1Cursor
+    rc: int32 = asn1_read_sequence(&outer, &inner)
+    _check_eq_i64(cast[int64](rc), cast[int64](0), "skip: seq rc==0")
+
+    # Skip 4 of 5 elements.
+    rc = asn1_skip(&inner)
+    _check_eq_i64(cast[int64](rc), cast[int64](0), "skip: 1 rc==0")
+    rc = asn1_skip(&inner)
+    _check_eq_i64(cast[int64](rc), cast[int64](0), "skip: 2 rc==0")
+    rc = asn1_skip(&inner)
+    _check_eq_i64(cast[int64](rc), cast[int64](0), "skip: 3 rc==0")
+    rc = asn1_skip(&inner)
+    _check_eq_i64(cast[int64](rc), cast[int64](0), "skip: 4 rc==0")
+
+    # 5th element should still be UTCTime — verify by reading it.
+    n: int64 = asn1_read_utctime(&inner, &time_out[0], cast[uint64](32))
+    _check_eq_i64(n, cast[int64](13), "skip: utctime after 4 skips")
+
+
+def _test_set_tag():
+    # Build a SET (0x31) containing a single INTEGER and confirm
+    # asn1_read_set scopes the inner cursor.
+    bad_der[0] = 0x31                          # SET
+    bad_der[1] = 3
+    bad_der[2] = 0x02                          # INTEGER
+    bad_der[3] = 1
+    bad_der[4] = 0x77
+
+    c: Asn1Cursor
+    asn1_cursor_init(&c, &bad_der[0], cast[uint64](5))
+    inner: Asn1Cursor
+    rc: int32 = asn1_read_set(&c, &inner)
+    _check_eq_i64(cast[int64](rc), cast[int64](0), "set: rc==0")
+    _check_eq_u64(inner.len, 3, "set: inner.len==3")
+
+    int_len: uint64 = 0
+    n: int64 = asn1_read_integer(&inner, &int_out[0], &int_len,
+                                 cast[uint64](32))
+    _check_eq_i64(n, cast[int64](1), "set: int rc==1")
+    _check_eq_u64(cast[uint64](int_out[0]), 0x77, "set: int body==0x77")
+
+
+def _test_long_form_length():
+    # Long-form length: tag=0x04 (OCTET STRING), length-of-length=1,
+    # then 0x80 (=128 bytes). We build a 128-byte payload of 0xAB.
+    bad_der[0] = 0x04
+    bad_der[1] = 0x81      # long form, 1 length octet
+    bad_der[2] = 0x80      # length = 128
+
+    # We can't fit 128 bytes of body in our 64-byte bad_der; instead
+    # use the 130-byte synthetic via a fresh buffer. Cap the test to
+    # exercise the parser's long-form decoder on a *shorter* length
+    # we can fit: use length=40.
+    bad_der[1] = 0x81
+    bad_der[2] = 40
+    i: uint64 = 0
+    while i < 40:
+        bad_der[3 + i] = 0xAB
+        i = i + 1
+
+    c: Asn1Cursor
+    asn1_cursor_init(&c, &bad_der[0], cast[uint64](43))
+    oct_len: uint64 = 0
+    n: int64 = asn1_read_octet_string(&c, &oct_out[0], &oct_len,
+                                      cast[uint64](32))
+    # 32 < 40 → -2 (buffer too small) is the expected outcome here.
+    _check_eq_i64(n, cast[int64](-2), "longlen: buf-too-small rc==-2")
+
+    # Retry with a 64-byte out buffer. We don't have one as a global;
+    # asserting the malformed-buffer path is enough proof the long-form
+    # length decoder ran. (TLV decode already happened — we got past
+    # length parsing into the size check.)
+
+
+# -- malformed-input rejection -----------------------------------------------
+
+def _test_truncated_body():
+    # Tag=0x04, length=10, but only 3 body bytes follow.
+    bad_der[0] = 0x04
+    bad_der[1] = 10
+    bad_der[2] = 0xAA
+    bad_der[3] = 0xBB
+    bad_der[4] = 0xCC
+
+    c: Asn1Cursor
+    asn1_cursor_init(&c, &bad_der[0], cast[uint64](5))
+    tag: uint8 = 0
+    blen: uint64 = 0
+    body: Ptr[uint8] = &bad_der[0]
+    rc: int32 = asn1_read_tlv(&c, &tag, &blen, &body)
+    _check_neg_i32(rc, "truncated: tlv rc<0")
+
+
+def _test_indefinite_length():
+    # Tag=0x30, length byte=0x80 (indefinite-length BER form).
+    # DER must reject.
+    bad_der[0] = 0x30
+    bad_der[1] = 0x80
+    bad_der[2] = 0x00
+    bad_der[3] = 0x00
+
+    c: Asn1Cursor
+    asn1_cursor_init(&c, &bad_der[0], cast[uint64](4))
+    tag: uint8 = 0
+    blen: uint64 = 0
+    body: Ptr[uint8] = &bad_der[0]
+    rc: int32 = asn1_read_tlv(&c, &tag, &blen, &body)
+    _check_neg_i32(rc, "indefinite: tlv rc<0")
+
+
+def _test_oversize_loL():
+    # Length-of-length count = 9 (>8) → reject.
+    bad_der[0] = 0x04
+    bad_der[1] = 0x89   # long form, 9 octets — overflow
+    bad_der[2] = 0
+    bad_der[3] = 0
+    bad_der[4] = 0
+    bad_der[5] = 0
+    bad_der[6] = 0
+    bad_der[7] = 0
+    bad_der[8] = 0
+    bad_der[9] = 0
+    bad_der[10] = 0
+
+    c: Asn1Cursor
+    asn1_cursor_init(&c, &bad_der[0], cast[uint64](11))
+    tag: uint8 = 0
+    blen: uint64 = 0
+    body: Ptr[uint8] = &bad_der[0]
+    rc: int32 = asn1_read_tlv(&c, &tag, &blen, &body)
+    _check_neg_i32(rc, "loL-overflow: tlv rc<0")
+
+    # Also reject length-of-length count == 0 (`0x80` was checked
+    # above as indefinite-length; we also verify that's still -1).
+    bad_der[0] = 0x04
+    bad_der[1] = 0x80
+    asn1_cursor_init(&c, &bad_der[0], cast[uint64](2))
+    rc = asn1_read_tlv(&c, &tag, &blen, &body)
+    _check_neg_i32(rc, "loL-zero (indefinite again): tlv rc<0")
+
+
+def _test_wrong_tag():
+    # asn1_read_integer should reject a SEQUENCE tag.
+    bad_der[0] = 0x30           # SEQUENCE, not INTEGER
+    bad_der[1] = 1
+    bad_der[2] = 0x42
+
+    c: Asn1Cursor
+    asn1_cursor_init(&c, &bad_der[0], cast[uint64](3))
+    out_len: uint64 = 0
+    n: int64 = asn1_read_integer(&c, &int_out[0], &out_len,
+                                 cast[uint64](32))
+    _check_neg_i64(n, "wrong-tag: integer rejects SEQUENCE")
+
+    # asn1_read_sequence should reject an OCTET STRING tag.
+    bad_der[0] = 0x04
+    bad_der[1] = 0
+    asn1_cursor_init(&c, &bad_der[0], cast[uint64](2))
+    inner: Asn1Cursor
+    rc: int32 = asn1_read_sequence(&c, &inner)
+    _check_neg_i32(rc, "wrong-tag: sequence rejects OCTET STRING")
+
+
+def _test_buf_too_small():
+    # asn1_read_integer with out_max=0 must return -2.
+    bad_der[0] = 0x02
+    bad_der[1] = 1
+    bad_der[2] = 0x42
+
+    c: Asn1Cursor
+    asn1_cursor_init(&c, &bad_der[0], cast[uint64](3))
+    out_len: uint64 = 0
+    n: int64 = asn1_read_integer(&c, &int_out[0], &out_len,
+                                 cast[uint64](0))
+    _check_eq_i64(n, cast[int64](-2), "out-max=0: integer rc==-2")
+
+
+# -- driver -----------------------------------------------------------------
+
+def main() -> int32:
+    _wstr("[asn1] start\n")
+    asn1_init_oids()
+    _build_fixture()
+
+    _test_oid_constants()
+    _test_read_tlv_raw()
+    _test_sequence_walk()
+    _test_skip()
+    _test_set_tag()
+    _test_long_form_length()
+
+    _test_truncated_body()
+    _test_indefinite_length()
+    _test_oversize_loL()
+    _test_wrong_tag()
+    _test_buf_too_small()
+
+    _wstr("[asn1] failures=")
+    _wdec(cast[uint64](fail_count))
+    _wstr("\n")
+    if fail_count == 0:
+        _wstr("[asn1] PASS\n")
+        return 0
+    _wstr("[asn1] FAIL\n")
+    return 1

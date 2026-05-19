@@ -1,0 +1,470 @@
+# lib/asn1/asn1.ad
+#
+# ASN.1 DER parser (V0) — the foundation for Hamnix's TLS certificate
+# validation stack. Spec: ITU-T X.690 §8 (DER strictness rules).
+#
+# Self-contained, zero-heap, kernel-internals-free. Every read takes a
+# caller-supplied cursor over a caller-supplied buffer; every copy-out
+# call takes the destination buffer and its capacity. Importable from
+# both userspace ELFs (e.g. tests/test_asn1_parser.ad) and from the
+# bare-metal kernel (V1: drivers/net/tls.ad chain validation).
+#
+# WHY DER-ONLY: TLS 1.2/1.3 and X.509 (RFC 5280 §4.1) require DER
+# encoding. BER's looseness — indefinite-length, non-minimal length
+# octets — is forbidden by both, and accepting it would let attackers
+# smuggle ambiguous encodings past whichever validator parses the
+# cert. So this parser rejects:
+#   - Length byte 0x80 (indefinite-length form — BER only).
+#   - Length-of-length count == 0 or > 8 (X.690 §8.1.3.5).
+#   - Truncated TLVs (length promises bytes the buffer doesn't have).
+# It does NOT yet reject non-minimal long-form length encodings (e.g.
+# `81 05` for length=5 where short-form `05` would suffice). That's a
+# soft DER bug we'll tighten in V1 when we actually consume real certs
+# and can pin down what "minimal" means in the corner cases.
+#
+# RETURN-VALUE CONVENTIONS:
+#
+#   asn1_read_tlv -> int32
+#     0   success (out_tag / out_len / out_body populated, cursor advanced)
+#    -1   malformed: truncated, indefinite-length, or length-of-length
+#         overflow (>8 octets)
+#
+#   asn1_read_sequence / asn1_read_set -> int32
+#     0   success (out_inner is a cursor scoped to the body)
+#    -1   tag mismatch (not SEQUENCE 0x30 / SET 0x31) or underlying
+#         TLV malformed
+#
+#   asn1_read_integer / _oid / _octet_string / _utctime /
+#   _generalizedtime  -> int64
+#     >=0  byte count copied into out_bytes (== out_byte_len on success)
+#    -1    tag mismatch
+#    -2    body length exceeds out_max (caller buffer too small)
+#    -3    underlying TLV malformed
+#
+#   asn1_read_bit_string -> int64
+#     >=0  byte count copied (excludes the unused-bits prefix byte)
+#    -1   tag mismatch
+#    -2   buffer too small
+#    -3   malformed TLV or zero-length body (BIT STRING bodies must hold
+#         at least the unused-bits byte)
+#
+#   asn1_skip -> int32
+#     0   advanced past the next TLV
+#    -1   malformed
+#
+# CURSOR DISCIPLINE: Asn1Cursor wraps (buf, len, pos). Every read
+# advances pos past the consumed TLV's *end* (tag + length-prefix +
+# body). On error, pos is undefined; the caller should treat the
+# cursor as poisoned.
+
+# -- DER tag constants -------------------------------------------------------
+
+ASN1_TAG_BOOLEAN:          uint8 = 0x01
+ASN1_TAG_INTEGER:          uint8 = 0x02
+ASN1_TAG_BIT_STRING:       uint8 = 0x03
+ASN1_TAG_OCTET_STRING:     uint8 = 0x04
+ASN1_TAG_NULL:             uint8 = 0x05
+ASN1_TAG_OID:              uint8 = 0x06
+ASN1_TAG_UTF8_STRING:      uint8 = 0x0C
+ASN1_TAG_PRINTABLE_STRING: uint8 = 0x13
+ASN1_TAG_IA5_STRING:       uint8 = 0x16
+ASN1_TAG_UTCTIME:          uint8 = 0x17
+ASN1_TAG_GENERALIZEDTIME:  uint8 = 0x18
+ASN1_TAG_SEQUENCE:         uint8 = 0x30
+ASN1_TAG_SET:              uint8 = 0x31
+
+# Fixed time-string widths.
+ASN1_UTCTIME_LEN:          uint64 = 13
+ASN1_GENERALIZEDTIME_LEN:  uint64 = 15
+
+# -- Known-OID byte constants (declared for V1/V2 use) -----------------------
+#
+# Each OID below is stored as the *encoded value bytes* — the portion
+# *after* the tag(0x06) + length byte. Callers compare by reading the
+# OID via asn1_read_oid(out_bytes, ...) and bytewise-matching against
+# these constants. This keeps the parser ignorant of dotted-decimal
+# notation — purely a byte-equality story.
+
+# 1.2.840.113549.1.1.1 — rsaEncryption
+OID_RSA_ENCRYPTION_LEN: uint64 = 9
+OID_RSA_ENCRYPTION: Array[9, uint8]
+
+# 1.2.840.113549.1.1.10 — rsassa-pss
+OID_RSASSA_PSS_LEN: uint64 = 9
+OID_RSASSA_PSS: Array[9, uint8]
+
+# 1.2.840.10045.4.3.2 — ecdsa-with-SHA256
+OID_ECDSA_WITH_SHA256_LEN: uint64 = 8
+OID_ECDSA_WITH_SHA256: Array[8, uint8]
+
+# 1.2.840.10045.2.1 — id-ecPublicKey
+OID_EC_PUBLIC_KEY_LEN: uint64 = 7
+OID_EC_PUBLIC_KEY: Array[7, uint8]
+
+# 1.2.840.10045.3.1.7 — secp256r1 (a.k.a. prime256v1, NIST P-256)
+OID_SECP256R1_LEN: uint64 = 8
+OID_SECP256R1: Array[8, uint8]
+
+# 2.16.840.1.101.3.4.2.1 — id-sha256
+OID_SHA256_LEN: uint64 = 9
+OID_SHA256: Array[9, uint8]
+
+# 2.5.29.17 — subjectAltName
+OID_SUBJECT_ALT_NAME_LEN: uint64 = 3
+OID_SUBJECT_ALT_NAME: Array[3, uint8]
+
+# 2.5.29.19 — basicConstraints
+OID_BASIC_CONSTRAINTS_LEN: uint64 = 3
+OID_BASIC_CONSTRAINTS: Array[3, uint8]
+
+
+def asn1_init_oids():
+    # Initializer for the OID constant tables. Call once at startup
+    # (the kernel main path and userland test fixtures both do this).
+    # We populate from arrays rather than declaring with initializers
+    # because the Adder compiler's top-level Array initialization
+    # doesn't carry through to the linked image yet.
+
+    # 1.2.840.113549.1.1.1
+    OID_RSA_ENCRYPTION[0] = 0x2A
+    OID_RSA_ENCRYPTION[1] = 0x86
+    OID_RSA_ENCRYPTION[2] = 0x48
+    OID_RSA_ENCRYPTION[3] = 0x86
+    OID_RSA_ENCRYPTION[4] = 0xF7
+    OID_RSA_ENCRYPTION[5] = 0x0D
+    OID_RSA_ENCRYPTION[6] = 0x01
+    OID_RSA_ENCRYPTION[7] = 0x01
+    OID_RSA_ENCRYPTION[8] = 0x01
+
+    # 1.2.840.113549.1.1.10
+    OID_RSASSA_PSS[0] = 0x2A
+    OID_RSASSA_PSS[1] = 0x86
+    OID_RSASSA_PSS[2] = 0x48
+    OID_RSASSA_PSS[3] = 0x86
+    OID_RSASSA_PSS[4] = 0xF7
+    OID_RSASSA_PSS[5] = 0x0D
+    OID_RSASSA_PSS[6] = 0x01
+    OID_RSASSA_PSS[7] = 0x01
+    OID_RSASSA_PSS[8] = 0x0A
+
+    # 1.2.840.10045.4.3.2
+    OID_ECDSA_WITH_SHA256[0] = 0x2A
+    OID_ECDSA_WITH_SHA256[1] = 0x86
+    OID_ECDSA_WITH_SHA256[2] = 0x48
+    OID_ECDSA_WITH_SHA256[3] = 0xCE
+    OID_ECDSA_WITH_SHA256[4] = 0x3D
+    OID_ECDSA_WITH_SHA256[5] = 0x04
+    OID_ECDSA_WITH_SHA256[6] = 0x03
+    OID_ECDSA_WITH_SHA256[7] = 0x02
+
+    # 1.2.840.10045.2.1
+    OID_EC_PUBLIC_KEY[0] = 0x2A
+    OID_EC_PUBLIC_KEY[1] = 0x86
+    OID_EC_PUBLIC_KEY[2] = 0x48
+    OID_EC_PUBLIC_KEY[3] = 0xCE
+    OID_EC_PUBLIC_KEY[4] = 0x3D
+    OID_EC_PUBLIC_KEY[5] = 0x02
+    OID_EC_PUBLIC_KEY[6] = 0x01
+
+    # 1.2.840.10045.3.1.7
+    OID_SECP256R1[0] = 0x2A
+    OID_SECP256R1[1] = 0x86
+    OID_SECP256R1[2] = 0x48
+    OID_SECP256R1[3] = 0xCE
+    OID_SECP256R1[4] = 0x3D
+    OID_SECP256R1[5] = 0x03
+    OID_SECP256R1[6] = 0x01
+    OID_SECP256R1[7] = 0x07
+
+    # 2.16.840.1.101.3.4.2.1
+    OID_SHA256[0] = 0x60
+    OID_SHA256[1] = 0x86
+    OID_SHA256[2] = 0x48
+    OID_SHA256[3] = 0x01
+    OID_SHA256[4] = 0x65
+    OID_SHA256[5] = 0x03
+    OID_SHA256[6] = 0x04
+    OID_SHA256[7] = 0x02
+    OID_SHA256[8] = 0x01
+
+    # 2.5.29.17
+    OID_SUBJECT_ALT_NAME[0] = 0x55
+    OID_SUBJECT_ALT_NAME[1] = 0x1D
+    OID_SUBJECT_ALT_NAME[2] = 0x11
+
+    # 2.5.29.19
+    OID_BASIC_CONSTRAINTS[0] = 0x55
+    OID_BASIC_CONSTRAINTS[1] = 0x1D
+    OID_BASIC_CONSTRAINTS[2] = 0x13
+
+
+# -- Asn1Cursor --------------------------------------------------------------
+
+class Asn1Cursor:
+    buf: Ptr[uint8]   # caller-owned input buffer
+    len: uint64       # total bytes in buf
+    pos: uint64       # next byte to read (advances past consumed TLVs)
+
+
+def asn1_cursor_init(c: Ptr[Asn1Cursor], buf: Ptr[uint8], buf_len: uint64):
+    c[0].buf = buf
+    c[0].len = buf_len
+    c[0].pos = 0
+
+
+def asn1_remaining(c: Ptr[Asn1Cursor]) -> uint64:
+    if c[0].pos >= c[0].len:
+        return 0
+    return c[0].len - c[0].pos
+
+
+# -- Length-of-length decoder (X.690 §8.1.3) ---------------------------------
+#
+# Returns 0 on success and populates *out_len and *out_header_consumed
+# (the number of bytes used to encode the length, including the
+# leading length octet). Returns -1 on malformed input.
+
+def _asn1_read_length(buf: Ptr[uint8], buf_len: uint64, off: uint64,
+                      out_len: Ptr[uint64],
+                      out_header_consumed: Ptr[uint64]) -> int32:
+    if off >= buf_len:
+        return -1
+    first: uint8 = buf[off]
+    if first < 0x80:
+        # Short form: length is the byte value itself (0..127).
+        out_len[0] = cast[uint64](first)
+        out_header_consumed[0] = 1
+        return 0
+    if first == 0x80:
+        # Indefinite-length form is BER-only; DER forbids it.
+        return -1
+    # Long form: bits 0..6 are the count of subsequent length octets.
+    n: uint64 = cast[uint64](first) & 0x7F
+    if n == 0:
+        return -1
+    if n > 8:
+        # We refuse lengths that won't fit in a uint64.
+        return -1
+    if off + 1 + n > buf_len:
+        return -1
+    v: uint64 = 0
+    i: uint64 = 0
+    while i < n:
+        v = (v << 8) | cast[uint64](buf[off + 1 + i])
+        i = i + 1
+    out_len[0] = v
+    out_header_consumed[0] = 1 + n
+    return 0
+
+
+# -- asn1_read_tlv -----------------------------------------------------------
+#
+# Reads one Tag-Length-Value triple from the cursor. The body pointer
+# is returned as a pointer *into the source buffer* — no copy. The
+# cursor advances past the TLV's end (tag + length-prefix + body).
+
+def asn1_read_tlv(c: Ptr[Asn1Cursor],
+                  out_tag: Ptr[uint8],
+                  out_len: Ptr[uint64],
+                  out_body: Ptr[Ptr[uint8]]) -> int32:
+    p: uint64 = c[0].pos
+    if p >= c[0].len:
+        return -1
+    tag: uint8 = c[0].buf[p]
+    body_len: uint64 = 0
+    hdr_consumed: uint64 = 0
+    rc: int32 = _asn1_read_length(c[0].buf, c[0].len, p + 1,
+                                  &body_len, &hdr_consumed)
+    if rc != 0:
+        return -1
+    body_off: uint64 = p + 1 + hdr_consumed
+    # Truncation check: body_off + body_len must be in-buffer.
+    if body_off + body_len > c[0].len:
+        return -1
+    out_tag[0] = tag
+    out_len[0] = body_len
+    out_body[0] = &c[0].buf[body_off]
+    c[0].pos = body_off + body_len
+    return 0
+
+
+# -- asn1_skip ---------------------------------------------------------------
+
+def asn1_skip(c: Ptr[Asn1Cursor]) -> int32:
+    tag: uint8 = 0
+    body_len: uint64 = 0
+    body: Ptr[uint8] = c[0].buf  # initialize to silence; reassigned in TLV
+    return asn1_read_tlv(c, &tag, &body_len, &body)
+
+
+# -- Constructed types: SEQUENCE / SET ---------------------------------------
+
+def _asn1_read_constructed(c: Ptr[Asn1Cursor], expected_tag: uint8,
+                           out_inner: Ptr[Asn1Cursor]) -> int32:
+    tag: uint8 = 0
+    body_len: uint64 = 0
+    body: Ptr[uint8] = c[0].buf
+    rc: int32 = asn1_read_tlv(c, &tag, &body_len, &body)
+    if rc != 0:
+        return -1
+    if tag != expected_tag:
+        return -1
+    out_inner[0].buf = body
+    out_inner[0].len = body_len
+    out_inner[0].pos = 0
+    return 0
+
+
+def asn1_read_sequence(c: Ptr[Asn1Cursor],
+                       out_inner: Ptr[Asn1Cursor]) -> int32:
+    return _asn1_read_constructed(c, ASN1_TAG_SEQUENCE, out_inner)
+
+
+def asn1_read_set(c: Ptr[Asn1Cursor],
+                  out_inner: Ptr[Asn1Cursor]) -> int32:
+    return _asn1_read_constructed(c, ASN1_TAG_SET, out_inner)
+
+
+# -- Primitive readers (copy-out) --------------------------------------------
+#
+# Each of these:
+#   1. Reads a TLV.
+#   2. Asserts tag matches the expected one.
+#   3. Copies up to out_max bytes from the body into out_bytes.
+# On success returns the byte count (== body length for non-BIT-STRING
+# types). The cursor advances past the TLV regardless of copy outcome
+# only when the TLV is well-formed; on malformed input the cursor is
+# poisoned.
+
+def _asn1_copy_primitive(c: Ptr[Asn1Cursor], expected_tag: uint8,
+                         out_bytes: Ptr[uint8],
+                         out_byte_len: Ptr[uint64],
+                         out_max: uint64) -> int64:
+    tag: uint8 = 0
+    body_len: uint64 = 0
+    body: Ptr[uint8] = c[0].buf
+    rc: int32 = asn1_read_tlv(c, &tag, &body_len, &body)
+    if rc != 0:
+        return cast[int64](-3)
+    if tag != expected_tag:
+        return cast[int64](-1)
+    if body_len > out_max:
+        return cast[int64](-2)
+    i: uint64 = 0
+    while i < body_len:
+        out_bytes[i] = body[i]
+        i = i + 1
+    out_byte_len[0] = body_len
+    return cast[int64](body_len)
+
+
+def asn1_read_integer(c: Ptr[Asn1Cursor],
+                      out_bytes: Ptr[uint8],
+                      out_byte_len: Ptr[uint64],
+                      out_max: uint64) -> int64:
+    return _asn1_copy_primitive(c, ASN1_TAG_INTEGER,
+                                out_bytes, out_byte_len, out_max)
+
+
+def asn1_read_oid(c: Ptr[Asn1Cursor],
+                  out_oid_bytes: Ptr[uint8],
+                  out_oid_byte_len: Ptr[uint64],
+                  out_max: uint64) -> int64:
+    return _asn1_copy_primitive(c, ASN1_TAG_OID,
+                                out_oid_bytes, out_oid_byte_len, out_max)
+
+
+def asn1_read_octet_string(c: Ptr[Asn1Cursor],
+                           out_bytes: Ptr[uint8],
+                           out_byte_len: Ptr[uint64],
+                           out_max: uint64) -> int64:
+    return _asn1_copy_primitive(c, ASN1_TAG_OCTET_STRING,
+                                out_bytes, out_byte_len, out_max)
+
+
+# -- BIT STRING --------------------------------------------------------------
+#
+# Per X.690 §8.6.2.2, the first body byte is the count of unused bits
+# in the final octet (0..7). The remaining body bytes are the value.
+# We return the value bytes (excluding the leading unused-bits byte)
+# and surface the unused-bits count separately.
+
+def asn1_read_bit_string(c: Ptr[Asn1Cursor],
+                         out_bytes: Ptr[uint8],
+                         out_byte_len: Ptr[uint64],
+                         out_max: uint64,
+                         out_unused_bits: Ptr[uint8]) -> int64:
+    tag: uint8 = 0
+    body_len: uint64 = 0
+    body: Ptr[uint8] = c[0].buf
+    rc: int32 = asn1_read_tlv(c, &tag, &body_len, &body)
+    if rc != 0:
+        return cast[int64](-3)
+    if tag != ASN1_TAG_BIT_STRING:
+        return cast[int64](-1)
+    if body_len < 1:
+        # BIT STRING must hold at least the unused-bits prefix byte.
+        return cast[int64](-3)
+    unused: uint8 = body[0]
+    value_len: uint64 = body_len - 1
+    if value_len > out_max:
+        return cast[int64](-2)
+    out_unused_bits[0] = unused
+    i: uint64 = 0
+    while i < value_len:
+        out_bytes[i] = body[1 + i]
+        i = i + 1
+    out_byte_len[0] = value_len
+    return cast[int64](value_len)
+
+
+# -- Time strings ------------------------------------------------------------
+#
+# UTCTime is 13 ASCII bytes: YYMMDDHHMMSSZ.
+# GeneralizedTime is 15 ASCII bytes: YYYYMMDDHHMMSSZ.
+# Both must be terminated by 'Z' (Zulu) in DER — local-time forms are
+# BER-only. We don't enforce 'Z' here (V1 cert-validity check will);
+# the parser only enforces the fixed length.
+
+def asn1_read_utctime(c: Ptr[Asn1Cursor],
+                      out_bytes: Ptr[uint8],
+                      out_max: uint64) -> int64:
+    tag: uint8 = 0
+    body_len: uint64 = 0
+    body: Ptr[uint8] = c[0].buf
+    rc: int32 = asn1_read_tlv(c, &tag, &body_len, &body)
+    if rc != 0:
+        return cast[int64](-3)
+    if tag != ASN1_TAG_UTCTIME:
+        return cast[int64](-1)
+    if body_len != ASN1_UTCTIME_LEN:
+        return cast[int64](-3)
+    if body_len > out_max:
+        return cast[int64](-2)
+    i: uint64 = 0
+    while i < body_len:
+        out_bytes[i] = body[i]
+        i = i + 1
+    return cast[int64](body_len)
+
+
+def asn1_read_generalizedtime(c: Ptr[Asn1Cursor],
+                              out_bytes: Ptr[uint8],
+                              out_max: uint64) -> int64:
+    tag: uint8 = 0
+    body_len: uint64 = 0
+    body: Ptr[uint8] = c[0].buf
+    rc: int32 = asn1_read_tlv(c, &tag, &body_len, &body)
+    if rc != 0:
+        return cast[int64](-3)
+    if tag != ASN1_TAG_GENERALIZEDTIME:
+        return cast[int64](-1)
+    if body_len != ASN1_GENERALIZEDTIME_LEN:
+        return cast[int64](-3)
+    if body_len > out_max:
+        return cast[int64](-2)
+    i: uint64 = 0
+    while i < body_len:
+        out_bytes[i] = body[i]
+        i = i + 1
+    return cast[int64](body_len)
