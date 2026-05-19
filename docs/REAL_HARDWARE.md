@@ -16,6 +16,40 @@ runs the ISO on metal.
 > "tested". Filing an issue with what you tried is how we turn "should"
 > into "tested".
 
+## The 5-minute test
+
+If you have a build host with Hamnix checked out, a spare USB stick, and
+a target box you can power-cycle:
+
+```sh
+# On the build host:
+bash scripts/build_iso.sh                           # ~30s if cached, ~3 min cold
+bash scripts/write_iso_to_usb.sh /dev/sdX           # confirm /dev/sdX first!
+# (the wrapper prompts for an explicit "yes" before any write)
+```
+
+Then plug the stick into the target box, enter the firmware boot menu
+(see vendor key table in §4), pick the USB device, and watch the
+serial console — or screen, if no serial cable. You're looking for
+the marker sequence in §5. Total time after the first ISO build is
+< 5 min per attempt; report results to the GitHub issue tracker (§8).
+
+The rest of this doc unpacks each step.
+
+## Table of contents
+
+1. [What works today](#1-what-works-today)
+2. [What does NOT work today (the L40 caveats)](#2-what-does-not-work-today-the-l40-caveats)
+3. [Producing a bootable USB stick](#3-producing-a-bootable-usb-stick)
+4. [Booting from the USB stick](#4-booting-from-the-usb-stick)
+5. [What to expect on the serial console](#5-what-to-expect-on-the-serial-console)
+6. [Diagnostic dump cheat-sheet (no serial cable)](#6-diagnostic-dump-cheat-sheet-no-serial-cable)
+7. [Known broken hardware / firmware combos](#7-known-broken-hardware--firmware-combos)
+8. [Expected hardware coverage](#8-expected-hardware-coverage)
+9. [Test checklist](#9-test-checklist)
+10. [Reporting a real-hardware boot attempt](#10-reporting-a-real-hardware-boot-attempt)
+11. [Cross-references](#11-cross-references)
+
 
 ## 1. What works today
 
@@ -200,7 +234,7 @@ From a Linux build host:
 ```sh
 git clone https://github.com/ruapotato/Hamnix.git
 cd Hamnix
-bash scripts/build_iso.sh          # produces build/hamnix.iso (~45 MB)
+bash scripts/build_iso.sh          # produces build/hamnix.iso (~32 MB)
 file build/hamnix.iso              # should report:
                                    #   DOS/MBR boot sector ... ISO 9660 ...
 ```
@@ -222,30 +256,77 @@ via `bash scripts/test_uefi_boot.sh` before writing it to a stick.)
 > system disk. **Confirm the device first**, every time.
 
 ```sh
-lsblk -d -o NAME,SIZE,MODEL    # show only top-level devices with size + model
+lsblk -d -o NAME,SIZE,MODEL,TRAN    # TRAN=usb is a strong tell
 ```
 
-Pick the line whose `SIZE` and `MODEL` match your USB stick. The
-device path is `/dev/<NAME>` (typically `/dev/sdb` or `/dev/sdc` —
-**rarely `/dev/sda`**, since that's usually the system disk).
+Pick the line whose `SIZE` and `MODEL` (and ideally `TRAN=usb`) match
+your USB stick. The device path is `/dev/<NAME>` (typically `/dev/sdb`
+or `/dev/sdc` — **rarely `/dev/sda`**, since that's usually the system
+disk).
 
-### Write the ISO
+### Write the ISO — recommended (Linux, with guard-rails)
+
+```sh
+bash scripts/write_iso_to_usb.sh /dev/sdX           # replace sdX with the letter from lsblk
+```
+
+`scripts/write_iso_to_usb.sh` is a thin wrapper around `sudo dd` that:
+
+- refuses to run if `build/hamnix.iso` doesn't exist (and tells you to
+  run `bash scripts/build_iso.sh`),
+- refuses `/dev/sda` unless you also pass `--really-i-mean-sda`,
+- refuses targets bigger than 64 GiB unless you also pass `--force`
+  (HD-sized targets look more like an internal disk than a USB stick),
+- prints the device size + model + current partition table,
+- prompts for an explicit `yes` before doing anything destructive,
+- runs `sudo dd if=build/hamnix.iso of=/dev/sdX bs=4M conv=fsync
+  status=progress` followed by `sync`.
+
+It always uses `sudo`. Don't try to disable that — raw block-device
+writes need root. Run `bash scripts/write_iso_to_usb.sh --help` for the
+full flag list.
+
+### Write the ISO — manual (one-liners, copy-pastable)
+
+If you'd rather call `dd` directly:
+
+**Linux:**
 
 ```sh
 USB=/dev/sdX                       # replace X with the letter you confirmed above
-sudo umount ${USB}*                # unmount any auto-mounted partitions
+sudo umount ${USB}?* 2>/dev/null   # unmount any auto-mounted partitions
 sudo dd if=build/hamnix.iso of=$USB bs=4M conv=fsync status=progress
 sync
 ```
 
-### Windows / macOS
+**macOS:**
 
-- **Windows**: use **Rufus** in **DD Image mode** (NOT ISO mode — ISO
-  mode tries to treat `hamnix.iso` as a Windows installer image, which
-  it isn't). Etcher also works.
-- **macOS**: `diskutil list`, then `diskutil unmountDisk /dev/diskN`,
-  then the same `dd` command with `bs=4m` (lowercase) and
-  `of=/dev/rdiskN` for speed.
+```sh
+diskutil list                                          # find the USB diskN
+diskutil unmountDisk /dev/diskN
+sudo dd if=build/hamnix.iso of=/dev/rdiskN bs=4m       # lowercase 4m on BSD/Darwin;
+                                                       # /dev/rdiskN is the raw node (faster)
+sync
+diskutil eject /dev/diskN
+```
+
+**Windows:** use **Rufus** in **DD Image mode** (NOT "ISO mode" — that
+treats `hamnix.iso` as a Windows installer image, which it isn't).
+[balenaEtcher](https://etcher.balena.io/) also works. Power users:
+`dd for Windows` (from the [chrysocome.net distribution](http://www.chrysocome.net/dd))
+takes the same one-liner shape:
+
+```bat
+:: list devices: dd --list
+dd if=build\hamnix.iso of=\\.\PhysicalDrive2 bs=4M --progress
+```
+
+**FreeBSD / OpenBSD:** the GNU-style `bs=4M` flag is supported by the
+shipped `dd(1)`; the device node is `/dev/da0` etc., not `/dev/sd*`:
+
+```sh
+doas dd if=build/hamnix.iso of=/dev/da0 bs=4M conv=fsync status=progress
+```
 
 
 ## 4. Booting from the USB stick
@@ -286,34 +367,64 @@ if connected (115200 8N1, no flow control).
 
 ## 5. What to expect on the serial console
 
-### BIOS / legacy path
+The kernel writes everything to COM1 (16550A, 115200 8N1, no flow
+control) regardless of boot path or video state. On real hardware the
+fastest signal-of-life check is to plug in a USB-to-serial adapter and
+watch with `minicom -D /dev/ttyUSB0 -b 115200` (or `screen
+/dev/ttyUSB0 115200`).
+
+If you have NO serial cable: the same markers appear on the VGA text
+console (BIOS path) or the EFI GOP framebuffer (UEFI path) once the
+kernel reaches `vga_smoke_test()`. The earliest EFI-stub markers
+(`[hamnix] EFI entry reached` etc.) are serial-only — without a cable
+you'll see the screen jump from firmware splash straight to
+`Hamnix kernel booting`. See §6 for the no-serial-cable photo workflow.
+
+### Marker sequence — what "working" looks like
+
+These markers are emitted in this order on every successful boot. If
+the box hangs at marker `N`, the next marker `N+1` points at the next
+thing to look at.
+
+**UEFI path** (the more common modern path):
+
+| # | Marker                                                  | What it means                                                              |
+| - | ------------------------------------------------------- | -------------------------------------------------------------------------- |
+| 1 | `[hamnix] EFI entry reached`                            | PE/COFF stub got control from firmware. ESP + BOOTX64.EFI are intact.      |
+| 2 | `[hamnix] post-EFI handoff complete`                    | `ExitBootServices()` returned success; firmware is out of the boot path.   |
+| 3 | `Hamnix kernel booting...`                              | start_kernel() reached; multiboot info or EFI memory map parsed.           |
+| 4 | `Hamnix: trap_init done`                                | IDT installed; #PF / #GP / #DF handlers armed.                             |
+| 5 | smoke tests (`memblock_smoke_test`, `slab`, `ahci`, …)  | Core allocators + drivers self-checked.                                    |
+| 6 | `Hamnix: smp_processor_id() = 0`                        | per-CPU areas + LAPIC up; one CPU online (SMP is open work).               |
+| 7 | `cpio: registered N files from initramfs`               | initramfs unpacked; `/init` is visible.                                    |
+| 8 | `syscall MSRs armed` / `[sched]` markers                | TSS + GDT loaded, ring-3 transition is about to fire.                      |
+| 9 | `[eft] step1: post-rsp-load`                            | enter_first_task() entered; task stack switched.                           |
+|10 | `[eft] step2: pre-iretq`                                | About to drop to ring 3 via `iretq`. **NEXT marker MUST be hamsh.**        |
+|11 | `[hamsh] M16.35 shell ready. Type 'help' or '/hello'.`  | Ring 3 reached, userspace runs. **You are booted.**                        |
+
+If you ever see `[eft] step3: POST-iretq (impossible ...)` — that's
+the recorded diagnostic for `iretq` returning to ring 0 (something the
+CPU should never do). It's the artifact for the Asus laptop bug
+tracked in §7.
+
+**BIOS / legacy path** is the same from marker 3 onwards; markers 1 and
+2 are replaced with GRUB's own output:
 
 ```
 SeaBIOS / vendor BIOS POST
 GRUB menu (2-second timeout)
-Hamnix kernel booting
-...
-cpio: registered N files from initramfs
-...
+Loading Hamnix...
+[multiboot1 handoff — no Hamnix-specific marker until #3]
+Hamnix kernel booting...
+... (same as UEFI from #3 onward)
 [hamsh] M16.35 shell ready
 ```
 
-### UEFI path
+### What it looks like when it freezes
 
-```
-UEFI firmware boot manager
-[hamnix] EFI entry reached
-[hamnix] post-EFI handoff complete
-Hamnix kernel booting
-...
-cpio: registered N files from initramfs
-...
-[hamsh] M16.35 shell ready
-```
-
-If the box freezes at any point, capture the **last line** that
-appeared on serial (or a photo of the screen if no serial cable) and
-report. Common freeze points and likely causes:
+Capture the **last line** that appeared on serial (or a photo of the
+screen if no serial cable) and report. Common freeze points and
+likely causes:
 
 | Last line seen                              | Likely cause                                       |
 | ------------------------------------------- | -------------------------------------------------- |
@@ -323,13 +434,74 @@ report. Common freeze points and likely causes:
 | `[hamnix] post-EFI handoff complete` then silence | EFI memory map / page-table handoff failed on real silicon. New territory; capture the FULL serial log |
 | `Hamnix kernel booting` then triple-fault   | Almost certainly the M16.138 GDT path — should be fixed; if not, this is a regression |
 | `syscall MSRs armed` then silence           | Pre-M16.138 GDT bug. Update to a kernel ≥ M16.138 |
+| `[eft] step1` then triple-fault on `iretq`  | **Asus iretq triple-fault** (M16.151..M16.154 in flight). See §7.    |
 | `cpio: registered N files from initramfs` then silence | Userland init failed to find `/init`. Check the initramfs build |
 | `[xhci] HCRST timed out`                    | Likely SMM-owned controller. Try a USB 2.0 port; otherwise use PS/2 |
 | `[ahci] no port with ATA signature found`   | SATA controller is in RAID mode — flip to AHCI in firmware setup |
 | Kernel banner OK but no keystrokes echo     | PS/2 controller absent + xHCI HID didn't enumerate. Try a USB 2.0 port; serial-console input works for diagnostics |
 
+## 6. Diagnostic dump cheat-sheet (no serial cable)
 
-## 6. Expected hardware coverage
+Most laptops have no serial port. On a frozen box where the screen
+*is* the log, the workflow is:
+
+1. **Maximise the boot-time visible scrollback.** `Pause/Break` (where
+   present) freezes the screen mid-scroll on most firmware. If the kernel
+   has triple-faulted, the last screen is already static.
+2. **Take a clear photo of the entire screen** with a phone, including
+   the firmware vendor logo strip at the top. Phone cameras handle CRT
+   glow / LCD subpixels fine; aim for the screen to fill at least 60%
+   of the frame.
+3. **If output is scrolling too fast to capture**, take a *video* (most
+   phones do 60 fps) — then scrub through frame-by-frame later. Most
+   freeze-immediate-after-banner cases are < 200 lines total; one
+   landscape photo at 12 MP captures every glyph.
+4. **The serial-console-and-screen output are identical.** A photo is
+   sufficient; we don't need both for triage.
+5. **Read the last `[eft] stepN` / `[hamnix] ...` / `Hamnix: ...` line
+   off the photo and quote it verbatim in the issue** — that's the
+   single most useful triage datum.
+
+If you're investigating a repeatable hang, a $5 USB-to-serial adapter
+(CH340G / FTDI / Silicon Labs CP2102) clipped to the board's COM1
+header is worth it. Otherwise: phone camera, every time.
+
+## 7. Known broken hardware / firmware combos
+
+These are actively-tracked issues. If your box matches, comment on the
+existing issue rather than filing a new one.
+
+### Asus laptops — UEFI path triple-faults at `iretq` into ring 3
+
+- **Symptom:** boot reaches marker 10 (`[eft] step2: pre-iretq`),
+  then the CPU triple-faults instead of dropping cleanly to ring 3.
+  Marker 11 (`[hamsh] M16.35 shell ready`) never appears. The
+  diagnostic `[eft] step3: POST-iretq (impossible ...)` is the
+  smoking gun the next agent will look for.
+- **Models confirmed:** one Asus laptop (specific model in the issue
+  thread). Other Asus chassis may share the firmware quirk; data
+  welcome.
+- **Boot mode affected:** UEFI direct boot. BIOS legacy mode hits the
+  same fault — the bug is in the ring-3 transition, not in the EFI
+  stub.
+- **Tracked artifacts:** the M16.151..M16.154 diagnostic block in
+  `arch/x86/kernel/sched_asm.S` (search for `[eft] step1`, `[eft]
+  step2`, `[eft] step3`), `arch/x86/mm/pgtable.ad` (live-PDPT
+  force-stamp), and the EFI stub PDPT-fill in
+  `arch/x86/boot/efi_stub.S` (M16.152). Separate diag agents are
+  investigating; this doc is not the authoritative pathology.
+- **Workaround:** none today. Hamnix is unbootable on the affected
+  Asus until M16.151..M16.154 closes.
+
+### Anything in §2 still applies
+
+The "what does NOT work today" list in §2 is the broader set of
+real-hardware risks that QEMU + OVMF don't exercise. Most failures
+on a fresh physical box will land in one of those categories before
+they hit the Asus class above. Read §2 first.
+
+
+## 8. Expected hardware coverage
 
 The classes of machine that **should** boot today, given the drivers
 shipped. Untested unless an issue says otherwise — file one with what
@@ -355,7 +527,7 @@ be flipped in firmware); any NVMe SSD with a PCIe class match.
 | ARM hardware (Raspberry Pi, M1, ...)                         | **NO**                    | Hamnix is x86_64 only                                                   |
 
 
-## 7. Test checklist
+## 9. Test checklist
 
 After the box reaches the hamsh prompt, run through this sequence and
 note which step fails first:
@@ -379,7 +551,7 @@ note which step fails first:
    most LE-signed mirrors work, some don't yet.)
 
 
-## 8. Reporting a real-hardware boot attempt
+## 10. Reporting a real-hardware boot attempt
 
 If you tried Hamnix on a physical box, please file an issue at
 <https://github.com/ruapotato/Hamnix/issues> with the following
@@ -406,7 +578,7 @@ NIC: Intel I219-V / Realtek RTL8168 / ... — PCI ID if known
 Boot mode used: BIOS legacy / UEFI
 Secure Boot: disabled (confirmed)
 Last serial line seen: <verbatim>
-Got to: <kernel banner / hamsh prompt / froze at step N from §7>
+Got to: <kernel banner / hamsh prompt / froze at step N from §9>
 ```
 
 Easiest sources for the hardware lines if the box already runs Linux:
@@ -421,11 +593,15 @@ as a file. If you don't have a serial cable, a clear photo of the
 screen at the point of failure is the next-best thing.
 
 
-## 9. Cross-references
+## 11. Cross-references
 
 - [`BOOT.md`](BOOT.md) — boot pipeline (QEMU + ISO build + UEFI stub
   internals).
 - [`x86-backend.md`](x86-backend.md) — codegen + ABI details.
+- [`../scripts/write_iso_to_usb.sh`](../scripts/write_iso_to_usb.sh)
+  — guard-railed `dd` wrapper (§3 calls this).
+- [`../scripts/build_iso.sh`](../scripts/build_iso.sh) — produces
+  `build/hamnix.iso`.
 - [`../README.md`](../README.md) — top-level project status, MVP gates.
 - [`../STATUS.md`](../STATUS.md) — full milestone log (M16.x entries
   referenced throughout this document).

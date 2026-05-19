@@ -176,6 +176,23 @@ Both test scripts force-rebuild the ISO every invocation so stale-artifact
 silent-PASS is impossible (M16.141 fixed the boot-test trap). Set
 `HAMNIX_SKIP_BUILD=1` to reuse a cached `build/hamnix.iso`.
 
+### Test on your hardware
+
+Flash the ISO to a USB stick and try the boot on a real x86_64 box:
+
+```bash
+bash scripts/build_iso.sh                       # build/hamnix.iso
+bash scripts/write_iso_to_usb.sh /dev/sdX       # guard-railed sudo dd wrapper
+```
+
+`scripts/write_iso_to_usb.sh` refuses `/dev/sda` by default, refuses
+targets > 64 GiB by default, and prompts for explicit confirmation.
+See [`docs/REAL_HARDWARE.md`](docs/REAL_HARDWARE.md) for the full
+real-hardware boot procedure — firmware setup per vendor, expected
+serial-console marker sequence, diagnostic-dump cheat-sheet for boxes
+without a serial cable, and the known Asus iretq triple-fault
+tracked under M16.151..M16.154.
+
 ### Run the M1..M15 stock-Linux .ko regression suite
 
 ```bash
