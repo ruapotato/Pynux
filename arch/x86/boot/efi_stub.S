@@ -51,9 +51,13 @@
  *      ExitBootServices).
  *   7. Write "[hamnix] post-EFI handoff complete\r\n" to COM1.
  *   8. Build identity-mapped page tables in the stub's own .bss:
- *      PML4[0]->PDPT, PDPT[0..3]->1 GiB pages covering [0, 4 GiB).
- *      Mirrors arch/x86/boot/header.S's 1 GiB-page approach so the
+ *      PML4[0]->PDPT, PDPT[0..511]->1 GiB pages covering [0, 512 GiB).
+ *      Mirrors arch/x86/boot/header.S's 1 GiB-page approach but extends
+ *      it to the full PDPT instead of just the first 4 entries. The
  *      kernel runs with the same identity map regardless of boot path.
+ *      (M16.152: extended from 4 → 512 entries to cover real-hardware
+ *      Asus UEFI allocations above 4 GiB — see "[pgtable] EFI/no-mb:
+ *      pdpt[4..7]=0" smoking-gun diagnostic from M16.151.)
  *   9. Load the kernel's OWN gdt64 (M16.126). We pick up its address
  *      from the handoff table's +60 slot (planted by header.S). This
  *      is the same 7-entry GDT the multiboot path runs with (null,
@@ -648,35 +652,69 @@ efi_main:
     call    efi_serial_puts
 
     /* =================================================================
-     * STEP 8: Build identity-mapped page tables (1 GiB pages, 4 GiB).
-     * Mirrors arch/x86/boot/header.S's PML4[0]->PDPT, PDPT[0..3]->1GiB
-     * arrangement. Tables live in this stub's .bss (efi_pml4 / efi_pdpt
-     * — 4 KiB aligned via .align 4096).
+     * STEP 8: Build identity-mapped page tables (1 GiB pages, 512 GiB).
+     * Mirrors arch/x86/boot/header.S's PML4[0]->PDPT arrangement but
+     * stamps the FULL 512-entry PDPT instead of just the first 4 — the
+     * pre-M16.152 4-GiB window left Asus UEFI allocs above 4 GiB
+     * unmapped, which silent-hung real hardware (M16.151 diagnostic
+     * confirmed pdpt[4..7]=0 at the smoking-gun moment). Tables live
+     * in this stub's .bss (efi_pml4 / efi_pdpt — 4 KiB aligned via
+     * .align 4096; efi_pdpt is exactly 4 KiB = 512*8 B so the full
+     * loop never overruns the page).
      *
      * PML4[0] = &efi_pdpt | (RW | P) = &efi_pdpt | 0x3
-     * PDPT[i] = (i << 30) | (PS | RW | P) = (i << 30) | 0x83
+     * PDPT[i] = (i << 30) | (PS | US | RW | P) = (i << 30) | 0x87
+     *          for i in [0, 512).
      *
-     * NOTE: We don't set US (User/Supervisor=1) on these PTEs because
-     *       the kernel runs at CPL=0 and the kernel-side code does
-     *       NOT expect supervisor-only enforcement on the bootstrap
-     *       map. Header.S sets US=1 too — kept identical for
-     *       compatibility.
+     * NOTE on US=1: header.S sets US=1 (0x87) on its 4 GiB stamp, and
+     *       arch/x86/mm/pgtable.ad's PGT_NEW_FLAGS = 0x87 matches that
+     *       when extending the map past 4 GiB on the multiboot path.
+     *       We use the same flags here so all three sites agree.
+     *       The kernel runs at CPL=0 either way — US=1 is a no-op for
+     *       supervisor accesses but lets identity-mapped CPL=3
+     *       instruction fetches resolve when a user task lands above
+     *       4 GiB (see the long comment in pgtable.ad on why ET_DYN
+     *       user binaries share the BSP PML4 today).
      * ================================================================= */
     leaq    efi_pdpt(%rip), %rax
     orq     $0x7, %rax
     leaq    efi_pml4(%rip), %rdi
     movq    %rax, (%rdi)
 
-    /* PDPT entries 0..3: 1 GiB pages at 0, 1G, 2G, 3G. */
+    /* PDPT entries 0..511: 1 GiB pages spanning [0, 512 GiB).
+     *
+     * M16.152 (Asus UEFI real-hw fix): the prior version of this loop
+     * stamped only PDPT[0..3], covering [0, 4 GiB). On QEMU `-m 256M`
+     * that's fine (every alloc lands below 4 GiB), but Asus firmware
+     * lays out the EFI memory map so that kernel allocations land at
+     * e.g. 0x100404000 — above 4 GiB. The M16.151 diagnostic
+     * ("[pgtable] EFI/no-mb: pdpt[4..7]=0") confirmed those slots
+     * were unmapped at the moment of the silent hang; the first kernel
+     * store into the above-4-GiB allocation traps #PF with no
+     * productive handler in early boot, the CPU triple-faults, and
+     * the firmware resets — "silent" from the serial console.
+     *
+     * Fix: extend the stamp to fill all 512 PDPT entries up front.
+     * 512 * 8 B = 4 KiB, exactly the size of the efi_pdpt page in
+     * .bss; firmware NOBITS-zeroes the page at image-map time so any
+     * untouched bytes would have been 0 (i.e. P=0, unmapped) anyway.
+     * The cost is one tight 512-iteration loop at boot, well under a
+     * microsecond. Same flags as the prior 4-entry stamp
+     * (0x87 = PS|US|RW|P) — matches header.S and pgtable.ad's
+     * PGT_NEW_FLAGS so a side-by-side diff is clean.
+     *
+     * Linux's early boot does the same thing (arch/x86/kernel/head_64.S
+     * level5_kernel_pgt / level4_kernel_pgt fill the full PDPT for
+     * the kernel half of the address space); we mirror the pattern. */
     leaq    efi_pdpt(%rip), %rdi
     movq    $0x87, %rax                     /* PS|US|RW|P, phys=0 */
-    movq    %rax, 0(%rdi)
-    addq    $0x40000000, %rax
-    movq    %rax, 8(%rdi)
-    addq    $0x40000000, %rax
-    movq    %rax, 16(%rdi)
-    addq    $0x40000000, %rax
-    movq    %rax, 24(%rdi)
+    movq    $512, %rcx                      /* loop counter */
+1:
+    movq    %rax, (%rdi)
+    addq    $0x40000000, %rax               /* next 1 GiB phys base */
+    addq    $8, %rdi                        /* next PDPT slot */
+    decq    %rcx
+    jnz     1b
 
     /* Debug marker: page tables built. */
     leaq    efi_msg_pgtab(%rip), %rsi
