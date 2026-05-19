@@ -87,15 +87,16 @@ Concretely this means closing four named gates:
    El Torito quirk) are in place, but **L40 is Pending** — no T480
    / Dell / HP physical box has run the ISO yet.
 2. **TLS-CERT — X.509 + RSA-PSS / ECDSA verify with a baked CA store.**
-   **Structurally closed** in V0..V5 (commits `f47449e` → `f678649`):
-   ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify with bigint modexp,
-   ECDSA-P256 verify with binary-GCD modular inverse, chain builder with
-   8-anchor CA store, validity-window check, all wired into
-   `drivers/net/tls.ad::tls_handshake`. Banner replaced with real
-   `[tls] cert chain validated`. **Real-world `apt update` still blocked**
-   on two residuals: PKCS#1 v1.5 dispatch (ISRG Root X1 uses v1.5;
-   we currently only dispatch PSS) and CertificateVerify transcript-
-   binding (RFC 8446 §4.4.3). Both bounded follow-ups.
+   **Closed** in V0..V6 + V5.1 (commits `f47449e` → `563e23f`).
+   ASN.1 parser, X.509 walker, RSA-PSS-SHA256, ECDSA-P256 (binary-GCD
+   modular inverse — ~1s verify in QEMU), PKCS#1 v1.5 SHA-256 dispatch,
+   chain builder with 8-anchor CA store, validity window, CertificateVerify
+   transcript binding. Apt-over-HTTPS against LE-signed mirrors is now
+   MITM-resistant for the common path. Remaining fragilities are
+   smaller in scope: multi-record handshake stitching unsupported
+   (chains > ~1.4 KB split across two AEAD records will trip);
+   CRL/OCSP intentionally out of scope; primitives are not const-time
+   yet (V6+ hardening).
 3. **USB HID V2 — interrupt-IN poll** so real `sendkey x` keystrokes
    reach hamsh stdin. M16.139 V0+V1 ship the controller + transfer
    engine end-to-end on `qemu-xhci + usb-kbd`; the continuous polling
@@ -115,7 +116,7 @@ beyond MVP.
 
 | Gate | Status | Impact |
 |--|--|--|
-| **TLS cert validation** | **Closed structurally** — `apt over HTTPS` still gated on residuals below | Full chain validation against a baked-in trust store ships in V0..V5 (`lib/asn1/`, `lib/x509/`, `lib/rsa/`, `lib/ec/`, `lib/ecdsa/`, `drivers/net/tls.ad`). PSS-SHA256 + ECDSA-P256 dispatch wired into the handshake; warning banner replaced with real `[tls] cert chain validated`. **Real-world `apt update` still blocked** on **PKCS#1 v1.5 signature dispatch** (ISRG Root X1 is RSA v1.5; we only dispatch PSS today) and on **CertificateVerify transcript-binding** (RFC 8446 §4.4.3 — defense-in-depth). |
+| **TLS cert validation** | **Closed** — apt-over-HTTPS against LE-signed mirrors is MITM-resistant for chains that fit one AEAD record | Full chain validation V0..V6 + V5.1: ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify, ECDSA-P256 verify, PKCS#1 v1.5 verify (`ba2d9dc`), chain builder + CA store + validity window, CertificateVerify transcript binding per RFC 8446 §4.4.3 (`563e23f`). The two V5-disclosed residuals both landed. Remaining real-world fragilities are smaller: (a) multi-record handshake stitching is unsupported — LE chains > ~1.4 KB across two AEAD records will trip; (b) no CRL/OCSP (intentional per RFC 5280 §6 — out of scope); (c) timing-channel hardening pending in V2/V3 primitives; (d) `_tls_now_unix` falls back to a build epoch when RTC is unavailable, opening a clock-rolled-back attack on expired certs. |
 | **L40: real T480 boot** | Pending | "Real hardware" verification is QEMU+OVMF today; no physical box has been booted yet. The cron-priority claim is **structurally** complete, not **physically** verified. |
 | **USB HID V2 polling** | Closed structurally; wire-side verification in QEMU `sendkey` pending `socat` install | Continuous interrupt-IN poll wired into the timer tick; synthetic Transfer Events round-trip through `kbd_rx_push`. Real keypress on `qemu sendkey x` would now go through the same path but the harness can't inject without `socat`. |
 | **Inbound SSH** | Not yet started | Needed for "useful server OS" but no SSH protocol code exists. Crypto primitives are in place (ChaCha20-Poly1305, X25519, SHA-256, ECDSA-P256, RSA-PSS); the SSH layer itself isn't. |
