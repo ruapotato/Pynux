@@ -415,3 +415,45 @@ def rtc_init():
         printk0("rtc: boot epoch = 0 (RTC unreadable)\n")
         return
     _print_banner(e)
+
+
+# --- V5.2 wall-clock public API ------------------------------------
+#
+# `rtc_read_unix_time()` is the signed-int64 wrapper around
+# rtc_read_epoch() that callers in security-sensitive paths (TLS cert
+# validity, key-rotation timers) consume. The int64 surface lets us
+# distinguish "RTC unavailable" (-1) from "wall clock = epoch 0",
+# which the original uint64 surface conflated. -1 is wide enough
+# under int64 that no plausible future wall clock collides with it.
+#
+# `rtc_probe()` is the cached presence test: it reads Status Register
+# B and treats an all-ones response (the bus-floats-high pattern an
+# absent chip would yield on real hardware) as "no RTC". Returns 0
+# on success, -1 on absence. Pure presence test — the result lets
+# callers avoid the busy-spin in rtc_read_epoch when there's nothing
+# to read.
+
+def rtc_probe() -> int32:
+    # Status Register B holds the BCD/binary + 12/24-hour mode bits
+    # plus a fixed-low bit pattern at the top. Real chips clear the
+    # upper nibble (set-interrupt-enable bits) at boot; a floating
+    # bus reads 0xFF. Accept anything that isn't all-ones.
+    b: uint8 = cmos_read(CMOS_REG_STATUS_B)
+    if b == 0xFF:
+        return -1
+    # Also reject 0x00 — a fully-zeroed Register B means the chip
+    # has no update cycle armed, which kills the UIP wait.
+    if b == 0x00:
+        return -1
+    return 0
+
+
+def rtc_read_unix_time() -> int64:
+    # Returns Unix epoch seconds, or -1 if the RTC is absent /
+    # unreadable. Wraps rtc_read_epoch() so callers that want a
+    # signed sentinel don't have to repeat the rtc_boot_epoch_get()
+    # vs rtc_read_epoch() decision tree.
+    e: uint64 = rtc_read_epoch()
+    if e == 0:
+        return -1
+    return cast[int64](e)

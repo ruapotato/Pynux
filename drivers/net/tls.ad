@@ -118,7 +118,7 @@ from fs.cpio import (
     initramfs_entry_count, initramfs_entry_name,
     initramfs_entry_data, initramfs_entry_size,
 )
-from drivers.rtc.cmos import rtc_read_epoch
+from drivers.rtc.cmos import rtc_read_epoch, rtc_read_unix_time, rtc_probe
 
 
 # -- TLS 1.3 wire constants -------------------------------------------------
@@ -2411,7 +2411,20 @@ _tls_val_init_ran:   int32 = 0
 # validity-window check stays meaningful. Picked roughly "now" at V5
 # landing time (2026-05-18 00:00:00 UTC). Once a real RTC reader works
 # end-to-end on every test target this fallback gets retired.
+#
+# V5.2 SECURITY NOTE: a falling-back-to-the-build-epoch path is a
+# clock-rolled-back window for adversaries presenting expired certs.
+# We now prefer rtc_read_unix_time() which talks to CMOS on every
+# call; the fallback only fires when rtc_probe() reports no RTC,
+# and we log a WARNING line so it shows up in serial logs.
 TLS_BUILD_EPOCH_FALLBACK: uint64 = 1779667200
+
+# Lazy one-shot RTC probe cache. _rtc_probed flips to 1 after the
+# first _tls_now_unix() call; _rtc_avail caches the rtc_probe()
+# verdict (0 = present, -1 = absent) so subsequent calls skip the
+# Status Register B re-read.
+_tls_rtc_probed: int32 = 0
+_tls_rtc_avail:  int32 = 0
 
 
 # -- V5.1 CertificateVerify globals ----------------------------------------
@@ -2465,17 +2478,34 @@ _tls_leaf_ecdsa:      EcdsaPubkey
 
 def _tls_now_unix() -> uint64:
     # Walltime in unix seconds for the chain validator. Prefer the live
-    # RTC read (drivers/rtc/cmos.ad reads the CMOS chip on every call and
-    # is good to ~1 s); if that returns 0 (no RTC / unreadable) fall back
-    # to the build epoch. Hardcoded fallback is intentional so a kernel
-    # booted on a target with a stale or absent RTC still validates
-    # certs against a sensible window.
-    e: uint64 = rtc_read_epoch()
-    if e == 0:
-        printk1("[tls] RTC unreadable; using build epoch %d\n",
-                TLS_BUILD_EPOCH_FALLBACK)
+    # RTC read (drivers/rtc/cmos.ad reads the CMOS chip on every call,
+    # good to ~1 s). The build epoch is only used when rtc_probe() says
+    # there is no RTC OR a live read fails for some transient reason.
+    #
+    # V5.2 closed a clock-rollback hole: previously every failure fell
+    # straight through to TLS_BUILD_EPOCH_FALLBACK without any signal
+    # in the serial log, so an attacker who pinned a target with no
+    # RTC (or stalled the chip) could present a cert expired six months
+    # ago and we'd happily accept it. The fallback still exists for
+    # boards without an RTC at all, but each fallback fires a WARNING.
+
+    # Lazy probe — cached so we don't re-walk Status Register B on
+    # every handshake. rtc_init() also ran at boot from init/main.ad,
+    # so this is belt-and-braces.
+    if _tls_rtc_probed == 0:
+        _tls_rtc_probed = 1
+        _tls_rtc_avail = rtc_probe()
+        if _tls_rtc_avail < 0:
+            printk0("[tls] WARNING: RTC unavailable, using build epoch\n")
+
+    if _tls_rtc_avail < 0:
         return TLS_BUILD_EPOCH_FALLBACK
-    return e
+
+    e: int64 = rtc_read_unix_time()
+    if e < 0:
+        printk0("[tls] WARNING: RTC unavailable, using build epoch\n")
+        return TLS_BUILD_EPOCH_FALLBACK
+    return cast[uint64](e)
 
 
 def _tls_name_eq(name: Ptr[char], target: Ptr[uint8],
