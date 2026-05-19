@@ -52,9 +52,18 @@ that describes the driver). Anything not in this list is not supported.
 
 ### Storage
 
-- **AHCI SATA** — PCI class 0x01/0x06/0x01, IDENTIFY + READ DMA EXT.
-  SATA disks on real consumer hardware ~2008+. Read-only; no write
-  path yet. (M16.89.)
+- **AHCI SATA** — PCI class 0x01/0x06/0x01, IDENTIFY + READ DMA EXT
+  + WRITE DMA EXT (LBA48). Registered with the block layer as `sd0`.
+  Multi-port HBA enumeration: every implemented port is probed for
+  link + signature, the first ATA-signature port wins (a real board
+  with the boot disk on port 2 will still come up). PxIS error
+  decoding (TFES / HBFS / IFS) reports task-file and host-bus errors
+  via dmesg so a wedged drive fails the I/O cleanly instead of
+  stalling on a stuck CI bit. SATA disks on real consumer hardware
+  ~2008+. Single-slot polled I/O (no NCQ); single port driven at a
+  time (multi-port detection works, but only one disk is exposed to
+  the kernel today). (M16.89, M16.118, M16.119, M16.123, M16.124
+  audit.)
 - **NVMe PCIe** — PCI class 0x01/0x08/0x02, IDENTIFY controller +
   namespace, I/O READ. M.2 and U.2 SSDs on modern machines ~2014+.
   Read-only; no write path yet. (M16.92.)
@@ -224,9 +233,15 @@ been done yet.
 - **Battery / power management** — no ACPI battery readout, no CPU
   frequency scaling, no thermal throttling.
 - **Multi-core / SMP** — single-CPU boot only; APs are not brought up.
-- **AHCI / NVMe write** — both controllers are read-only; the install
-  ISO is not yet truly "installable" onto local storage. A live-boot
-  image only.
+- **Multi-port AHCI** — multiple SATA disks on the same controller
+  are enumerated + logged, but only the first ATA-signature port is
+  bound to the block layer. Real install scenarios needing the OS
+  disk on port 1 / 2 / 3 (port 0 empty hot-swap bay) require the
+  multi-controller follow-up.
+- **AHCI / NVMe RAID mode** — some real boards (esp. Dell / Lenovo
+  consumer) ship with the SATA controller in "RAID" mode (progIF
+  0x04/0x06) by default. Hamnix only matches AHCI mode (progIF
+  0x01) — flip the firmware setting to AHCI before booting.
 
 
 ## 7. How to test

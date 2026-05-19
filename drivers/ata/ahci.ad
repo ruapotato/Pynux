@@ -8,7 +8,10 @@
 #   3. Set GHC.AE (AHCI Enable) so the HBA exposes AHCI semantics.
 #   4. For every port advertised in PI (Ports Implemented) check SSTS;
 #      det==3 && ipm==1 means an active SATA drive is plugged into
-#      that port at a live PHY layer.
+#      that port at a live PHY layer. Then read PORT_SIG and pick the
+#      FIRST port whose signature is 0x101 (ATA disk) — this is what
+#      lets us boot from a board whose OS disk lives on port 1 or 2
+#      while port 0 is an empty hot-swap bay.
 #   5. Allocate one 4 KiB page per active port and carve out:
 #         0x000..0x3FF  command list (32 entries × 32 bytes)
 #         0x400..0x4FF  received-FIS area (256 bytes)
@@ -37,6 +40,16 @@
 #
 # AHCI spec (Intel rev 1.3.1) is the canonical reference — see
 # section 3.1 (HBA Memory Registers) and 4.2 (Command List structure).
+#
+# M16.124 spec-conformance audit closed the following lowest-risk
+# gaps that would have prevented real-hardware boot:
+#   - PORT_SIG-aware port enumeration (first ATA-signature port wins,
+#     not first link-active port; CAP.NP logged).
+#   - PxIS error decoding (TFES / HBFS / IFS / HBDS) on CI-poll path
+#     so a wedged drive fails the I/O instead of stalling on a stuck
+#     CI bit. PxSERR captured + acked.
+# Still missing for full real-hardware boot: see docs/REAL_HARDWARE.md
+# "Known limitations" and the gap list in the M16.124 commit.
 
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.pci.pci import (
@@ -80,6 +93,13 @@ AHCI_LAPIC_ID:   uint32 = 0
 AHCI_CLASS:    uint32 = 0x01
 AHCI_SUBCLASS: uint32 = 0x06
 AHCI_PROGIF:   uint32 = 0x01
+# AHCI 1.0 (single command slot) is also valid hardware. AHCI 1.3 spec
+# §2.1.11 says the AHCI-detection path must match progIF 0x01; a 0x00
+# variant exists only on early prototype HBAs and is not seen on real
+# silicon. We hardcode the 0x01 case but explicitly reject the SAS
+# subclass / RAID-mode progIFs in the scan loop below — those need
+# vendor-specific drivers and the wrong driver claiming the port
+# will hang at port_start.
 
 # Generic Host Control register offsets (relative to ABAR).
 HBA_CAP:   uint64 = 0x00
@@ -87,6 +107,10 @@ HBA_GHC:   uint64 = 0x04
 HBA_IS:    uint64 = 0x08
 HBA_PI:    uint64 = 0x0C
 HBA_VS:    uint64 = 0x10
+
+# CAP register bits we care about. Low 5 bits = NP (Number of Ports,
+# zero-based — value 0 means 1 port, value 31 means 32 ports).
+HBA_CAP_NP_MASK: uint32 = 0x1F
 
 GHC_AE:    uint32 = 0x80000000        # bit 31 — AHCI Enable
 GHC_HR:    uint32 = 0x00000001        # bit  0 — HBA Reset
@@ -121,6 +145,22 @@ PORT_CMD_CR:   uint32 = 0x8000        # bit 15 — Command List Running
 PORT_TFD_BSY: uint32 = 0x80
 PORT_TFD_DRQ: uint32 = 0x08
 PORT_TFD_ERR: uint32 = 0x01
+
+# PxIS error bits (spec §3.3.5). PxIS is the per-port interrupt status
+# register; even with polled I/O we read it after each command so a
+# Task-File Error or Host-Bus Fatal Error can be reported instead of
+# silently masquerading as a successful CI clear.
+#   TFES (bit 30) — Task File Error Status
+#   HBFS (bit 29) — Host Bus Fatal Error Status
+#   HBDS (bit 28) — Host Bus Data Error Status
+#   IFS  (bit 27) — Interface Fatal Error Status
+#   INFS (bit 26) — Interface Non-fatal Error Status
+PORT_IS_TFES: uint32 = 0x40000000
+PORT_IS_HBFS: uint32 = 0x20000000
+PORT_IS_HBDS: uint32 = 0x10000000
+PORT_IS_IFS:  uint32 = 0x08000000
+PORT_IS_INFS: uint32 = 0x04000000
+PORT_IS_ERR_MASK: uint32 = 0x7C000000
 
 # Per-page layout we carve out per port (4 KiB page).
 CL_OFFSET:   uint64 = 0x000     # command list   (1024 bytes)
@@ -324,12 +364,26 @@ def _build_prdt(ct_base: uint64, dba: uint64, bytecount: uint32):
 
 
 def _wait_ci_clear(port_base: uint64, slot_mask: uint32) -> int32:
-    # Poll the CI register until our slot's bit clears. Bail out
-    # with -1 on excessive busy-spin so a wedged HBA doesn't hang
-    # the whole kernel — 10 M iterations is several seconds on QEMU
-    # TCG, plenty for any single sector transfer.
+    # Poll the CI register until our slot's bit clears, OR a fatal
+    # PxIS error bit fires (TFES / HBFS / IFS / HBDS) — on real
+    # hardware, hot-unplug / a wedged drive can latch one of those
+    # bits without ever clearing CI, and a 10 M-iteration spin loop
+    # would otherwise hang the kernel for several seconds before
+    # giving up. We sample PxIS on every poll and short-circuit on
+    # error so the upper layer can fail the I/O cleanly.
     spin: uint64 = 0
     while spin < 10000000:
+        is_reg: uint32 = _mmio_r32(port_base + PORT_IS)
+        if (is_reg & PORT_IS_ERR_MASK) != 0:
+            tfd: uint32 = _mmio_r32(port_base + PORT_TFD)
+            serr: uint32 = _mmio_r32(port_base + PORT_SERR)
+            printk2("[ahci] error PxIS=%x PxTFD=%x\n",
+                    cast[uint64](is_reg), cast[uint64](tfd))
+            printk1("[ahci] error PxSERR=%x\n", cast[uint64](serr))
+            # Ack the error so the next command can be issued cleanly.
+            _mmio_w32(port_base + PORT_IS, is_reg)
+            _mmio_w32(port_base + PORT_SERR, 0xFFFFFFFF)
+            return -1
         ci: uint32 = _mmio_r32(port_base + PORT_CI)
         if (ci & slot_mask) == 0:
             tfd: uint32 = _mmio_r32(port_base + PORT_TFD)
@@ -557,10 +611,18 @@ def ahci_smoke_test() -> int32:
     ahci.abar = abar
     printk1("[ahci] abar=%p\n", abar)
 
-    # Enable AHCI mode. Some firmware leaves the HBA in legacy IDE
-    # emulation; flipping GHC.AE forces AHCI semantics. We don't
-    # bother with a full HBA reset (GHC.HR) — QEMU's HBA comes up
-    # clean already.
+    # AHCI spec §10.4.3 — enable AHCI mode (GHC.AE) so the HBA exposes
+    # AHCI semantics. Some firmware leaves the HBA in legacy IDE
+    # emulation; flipping GHC.AE forces AHCI. We deliberately do NOT
+    # issue a Global HBA Reset (GHC.HR) here — HR re-COMRESETs every
+    # port and clears the device signature, so we'd have to re-init
+    # the entire port (CLB/FB/FRE/ST) and wait for the device-to-host
+    # register FIS to land before PORT_SIG is meaningful again. That
+    # work is a follow-up. Real firmware that boots in AHCI mode
+    # (the only mode we match on, progIF 0x01) leaves the HBA in a
+    # usable state; users on boards that came up via legacy IDE or
+    # RAID mode need to flip the firmware setting first (see
+    # docs/REAL_HARDWARE.md).
     ghc: uint32 = _mmio_r32(abar + HBA_GHC)
     _mmio_w32(abar + HBA_GHC, ghc | GHC_AE)
 
@@ -571,8 +633,25 @@ def ahci_smoke_test() -> int32:
             cast[uint64](vs))
     printk1("[ahci] ports implemented = %x\n", cast[uint64](pi))
 
-    # Walk port bits. The first port with an active link wins —
-    # we only drive one disk for the smoke test.
+    # CAP.NP (low 5 bits) is zero-based: value 0 means 1 port supported,
+    # value 31 means 32. We still walk all 32 PI bits (PI is the truth
+    # for which ports exist), but log NP so a real-hardware mismatch
+    # (BIOS forgot to set a PI bit) is visible.
+    cap_np: uint32 = (cap & HBA_CAP_NP_MASK) + 1
+    printk1("[ahci] CAP.NP supports %d ports\n", cast[uint64](cap_np))
+
+    # Walk every implemented port. We want the FIRST port that hosts
+    # an ATA disk (signature 0x101) — not just the first link-active
+    # port, because a board might have port 0 wired to an empty
+    # hot-swap bay (det=1) and port 2 to the OS disk (det=3). We log
+    # each port's SSTS + SIG so multi-port hardware shows up in the
+    # boot log even if we only end up driving one of them.
+    #
+    # PORT_SIG is meaningful only when the firmware has already
+    # initialized the port (BIOS does this for the BIOS boot disk on
+    # all boards we care about). If we ever issue GHC.HR ourselves,
+    # PORT_SIG reads 0xFFFFFFFF until the port is re-init'd; the
+    # post-HR re-init path is a Phase-2 follow-up.
     port_num: int32 = -1
     i: uint32 = 0
     while i < 32:
@@ -583,14 +662,22 @@ def ahci_smoke_test() -> int32:
             det: uint32 = ssts & 0xF
             ipm: uint32 = (ssts >> 8) & 0xF
             if det == 3 and ipm == 1:
-                printk1("[ahci] port %d link active\n",
-                        cast[uint64](i))
-                if port_num < 0:
+                psig: uint32 = _mmio_r32(pb + PORT_SIG)
+                printk2("[ahci] port %d link active sig=%x\n",
+                        cast[uint64](i), cast[uint64](psig))
+                if port_num < 0 and psig == PORT_SIG_ATA:
                     port_num = cast[int32](i)
+            else:
+                if det != 0:
+                    # det=1 (present, no link) / det=4 (offline). Log
+                    # so a real-hardware boot-from-wrong-port mystery
+                    # is visible in dmesg; don't latch as our port.
+                    printk2("[ahci] port %d det=%d (skipped)\n",
+                            cast[uint64](i), cast[uint64](det))
         i = i + 1
 
     if port_num < 0:
-        printk0("[ahci] no active port found\n")
+        printk0("[ahci] no active ATA port found\n")
         return -1
     ahci.port_num = port_num
 
