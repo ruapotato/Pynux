@@ -1,0 +1,732 @@
+# lib/x509/x509.ad
+#
+# X.509 v3 certificate walker (V1) — builds on lib/asn1/asn1.ad to parse
+# a DER-encoded Certificate per RFC 5280 §4.1 into a flat X509Cert
+# struct. No cryptographic verify here (V2/V3), no chain-building (V4),
+# no TLS wiring (V5). What this layer ships is a faithful decode of a
+# real cert into byte-comparable fields plus a recorded byte range for
+# the TBSCertificate (V2 needs that exact range to hash for RSA-PSS /
+# ECDSA verification).
+#
+#   Certificate ::= SEQUENCE {
+#     tbsCertificate     TBSCertificate,
+#     signatureAlgorithm AlgorithmIdentifier,
+#     signatureValue     BIT STRING
+#   }
+#   TBSCertificate ::= SEQUENCE {
+#     version          [0] EXPLICIT Version DEFAULT v1,
+#     serialNumber     CertificateSerialNumber,
+#     signature        AlgorithmIdentifier,
+#     issuer           Name,
+#     validity         Validity,
+#     subject          Name,
+#     subjectPublicKeyInfo SubjectPublicKeyInfo,
+#     issuerUniqueID  [1] IMPLICIT UniqueIdentifier OPTIONAL,
+#     subjectUniqueID [2] IMPLICIT UniqueIdentifier OPTIONAL,
+#     extensions      [3] EXPLICIT Extensions OPTIONAL
+#   }
+#
+# DESIGN NOTES:
+#
+# - The walker never copies the TBSCertificate. It records the offset
+#   and length into the caller's input buffer (tbs_bytes / tbs_len).
+#   V2's RSA-PSS-SHA256 and V3's ECDSA-P256 both hash that exact byte
+#   range. Copying would mean kilobytes of needless heap pressure and
+#   would also invite hash-of-the-wrong-bytes bugs.
+#
+# - Name (issuer / subject DN) is stored as the *entire DER SEQUENCE
+#   bytes* (tag + length-prefix + body). RFC 5280 §7.1 says DN
+#   comparison "MAY be performed using exact match" of the DER
+#   encoding; V4's chain builder will compare issuer DN of the child
+#   against subject DN of the parent. Both are captured the same way,
+#   so the comparison is straight memcmp.
+#
+# - subjectPublicKey bytes are stored as the BIT STRING value bytes
+#   (excluding the unused-bits prefix). For RSA this is the DER
+#   SEQUENCE { modulus INTEGER, publicExponent INTEGER }; V2 re-parses
+#   that with asn1_read_sequence. For ECDSA-P256 it's the SEC1
+#   uncompressed point (0x04 || X || Y), 65 bytes; V3 uses it raw.
+#
+# - Version handling: the [0] EXPLICIT tag is context-specific
+#   constructed (0xA0). If absent the cert is implicitly v1 (version
+#   field == 1). Real TLS certs are always v3; we accept v1..v3.
+#
+# - basicConstraints CA flag: scanned only when the extension OID is
+#   2.5.29.19. The extension body is OCTET STRING wrapping a SEQUENCE
+#   { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }.
+#
+# - subjectAltName: scanned only when extension OID is 2.5.29.17. The
+#   body is OCTET STRING wrapping SEQUENCE OF GeneralName. We pick
+#   off only the dNSName entries ([2] IMPLICIT IA5String); the other
+#   alternatives (rfc822Name, URI, IP, etc.) are skipped. V1 captures
+#   up to 8 names of up to 128 bytes each — enough for every real
+#   Let's Encrypt leaf.
+#
+# - x509_match_dns: case-insensitive ASCII match. Wildcards
+#   ('*.example.com') match exactly one DNS label (RFC 6125 §6.4.3) —
+#   'a.example.com' matches but 'a.b.example.com' does NOT.
+
+from lib.asn1.asn1 import (
+    Asn1Cursor,
+    asn1_cursor_init,
+    asn1_remaining,
+    asn1_read_tlv,
+    asn1_read_sequence,
+    asn1_read_set,
+    asn1_read_integer,
+    asn1_read_oid,
+    asn1_read_octet_string,
+    asn1_read_bit_string,
+    asn1_read_utctime,
+    asn1_read_generalizedtime,
+    asn1_skip,
+    OID_SUBJECT_ALT_NAME,
+    OID_SUBJECT_ALT_NAME_LEN,
+    OID_BASIC_CONSTRAINTS,
+    OID_BASIC_CONSTRAINTS_LEN,
+    ASN1_TAG_SEQUENCE,
+    ASN1_TAG_INTEGER,
+    ASN1_TAG_OID,
+    ASN1_TAG_OCTET_STRING,
+    ASN1_TAG_BOOLEAN,
+    ASN1_TAG_UTCTIME,
+    ASN1_TAG_GENERALIZEDTIME,
+    ASN1_TAG_BIT_STRING,
+)
+
+# -- Context-specific constructed tags used in X.509 -------------------------
+#
+# X.690 §8.1.2: bits 8..7 = class (10 = context-specific), bit 6 = P/C
+# (1 = constructed). So [n] EXPLICIT becomes 0xA0 | n.
+
+X509_TAG_VERSION:    uint8 = 0xA0   # [0] EXPLICIT version
+X509_TAG_EXTENSIONS: uint8 = 0xA3   # [3] EXPLICIT extensions
+
+# subjectAltName GeneralName choices we care about. [2] IMPLICIT
+# IA5String dNSName = primitive context-specific tag 2 = 0x82.
+X509_GN_DNS:         uint8 = 0x82
+
+
+# -- X509Cert ---------------------------------------------------------------
+
+class X509Cert:
+    version: int32
+    serial: Array[20, uint8]
+    serial_len: uint64
+    sig_alg_oid: Array[16, uint8]
+    sig_alg_oid_len: uint64
+    issuer_dn: Array[256, uint8]
+    issuer_dn_len: uint64
+    subject_dn: Array[256, uint8]
+    subject_dn_len: uint64
+    not_before: Array[16, uint8]
+    not_before_len: uint64
+    not_after: Array[16, uint8]
+    not_after_len: uint64
+    pubkey_alg_oid: Array[16, uint8]
+    pubkey_alg_oid_len: uint64
+    pubkey_bytes: Array[512, uint8]
+    pubkey_bytes_len: uint64
+    sig_bytes: Array[512, uint8]
+    sig_bytes_len: uint64
+    is_ca: int32
+    san_dns_names: Array[8, Array[128, uint8]]
+    san_dns_lens: Array[8, uint64]
+    san_dns_count: int32
+    # Recorded into the caller's input buffer; not copied. Valid for the
+    # lifetime of the buffer the caller passed to x509_parse.
+    tbs_bytes: Ptr[uint8]
+    tbs_len: uint64
+
+
+# -- helpers ----------------------------------------------------------------
+
+def _copy_bytes(dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
+    i: uint64 = 0
+    while i < n:
+        dst[i] = src[i]
+        i = i + 1
+
+
+def _bytes_eq(a: Ptr[uint8], a_len: uint64,
+              b: Ptr[uint8], b_len: uint64) -> int32:
+    if a_len != b_len:
+        return 0
+    i: uint64 = 0
+    while i < a_len:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def _to_lower(c: uint8) -> uint8:
+    # ASCII A..Z (0x41..0x5A) → a..z (0x61..0x7A).
+    if c >= 0x41:
+        if c <= 0x5A:
+            return c + 0x20
+    return c
+
+
+def _ascii_eq_ci(a: Ptr[uint8], a_len: uint64,
+                 b: Ptr[uint8], b_len: uint64) -> int32:
+    if a_len != b_len:
+        return 0
+    i: uint64 = 0
+    while i < a_len:
+        if _to_lower(a[i]) != _to_lower(b[i]):
+            return 0
+        i = i + 1
+    return 1
+
+
+def _strlen_c(s: Ptr[char]) -> uint64:
+    n: uint64 = 0
+    sb: Ptr[uint8] = cast[Ptr[uint8]](s)
+    while sb[n] != 0:
+        n = n + 1
+    return n
+
+
+# -- "raw TLV with full slice" helper ---------------------------------------
+#
+# Reads the next TLV at the cursor and returns:
+#   - the expected tag (for caller-side assertion)
+#   - a pointer to the *full* TLV bytes (tag + length prefix + body)
+#   - the total length (tag + length-prefix + body)
+# The cursor advances past the TLV's end. This is how we capture the
+# TBSCertificate byte range and the issuer/subject Name DER blobs.
+
+def _asn1_read_raw(c: Ptr[Asn1Cursor],
+                   out_full: Ptr[Ptr[uint8]],
+                   out_full_len: Ptr[uint64]) -> int32:
+    start_pos: uint64 = c[0].pos
+    tag: uint8 = 0
+    body_len: uint64 = 0
+    body: Ptr[uint8] = c[0].buf
+    rc: int32 = asn1_read_tlv(c, &tag, &body_len, &body)
+    if rc != 0:
+        return -1
+    end_pos: uint64 = c[0].pos
+    out_full[0] = &c[0].buf[start_pos]
+    out_full_len[0] = end_pos - start_pos
+    return 0
+
+
+# -- TBS sub-parsers --------------------------------------------------------
+#
+# Each takes the TBS cursor positioned just before the field it owns and
+# advances the cursor past that field on success. They write into the
+# X509Cert struct directly to avoid the nested-Array argument-passing
+# quirk noted in feedback_compiler_quirks.md.
+
+def _parse_version(tbs: Ptr[Asn1Cursor], out: Ptr[X509Cert]) -> int32:
+    # The version field is OPTIONAL with DEFAULT v1. If absent the next
+    # TLV is the serial INTEGER. Peek at the next tag without committing.
+    if asn1_remaining(tbs) == 0:
+        return -1
+    p: uint64 = tbs[0].pos
+    next_tag: uint8 = tbs[0].buf[p]
+    if next_tag != X509_TAG_VERSION:
+        # Default v1 — leave cursor at serial.
+        out[0].version = 1
+        return 0
+    # Consume the [0] EXPLICIT wrapper.
+    tag: uint8 = 0
+    body_len: uint64 = 0
+    body: Ptr[uint8] = tbs[0].buf
+    rc: int32 = asn1_read_tlv(tbs, &tag, &body_len, &body)
+    if rc != 0:
+        return -1
+    # Inside is a plain INTEGER 0..2 (where 2 == v3, the DER encoding
+    # of "version - 1" — RFC 5280 §4.1.2.1).
+    inner: Asn1Cursor
+    asn1_cursor_init(&inner, body, body_len)
+    int_buf: Array[8, uint8]
+    int_len: uint64 = 0
+    n: int64 = asn1_read_integer(&inner, &int_buf[0], &int_len,
+                                 cast[uint64](8))
+    if n < cast[int64](0):
+        return -1
+    if int_len < 1:
+        return -1
+    # Cert version is v1=0, v2=1, v3=2 on the wire; expose as 1/2/3.
+    v: int32 = cast[int32](int_buf[0]) + 1
+    if v < 1:
+        return -1
+    if v > 3:
+        return -1
+    out[0].version = v
+    return 0
+
+
+def _parse_serial(tbs: Ptr[Asn1Cursor], out: Ptr[X509Cert]) -> int32:
+    int_len: uint64 = 0
+    n: int64 = asn1_read_integer(tbs, &out[0].serial[0], &int_len,
+                                 cast[uint64](20))
+    if n < cast[int64](0):
+        return -1
+    out[0].serial_len = int_len
+    return 0
+
+
+def _parse_algorithm_identifier(c: Ptr[Asn1Cursor],
+                                out_oid: Ptr[uint8],
+                                out_oid_len: Ptr[uint64],
+                                out_oid_max: uint64) -> int32:
+    # AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY }
+    inner: Asn1Cursor
+    rc: int32 = asn1_read_sequence(c, &inner)
+    if rc != 0:
+        return -1
+    n: int64 = asn1_read_oid(&inner, out_oid, out_oid_len, out_oid_max)
+    if n < cast[int64](0):
+        return -1
+    # Skip parameters (if any). Could be NULL, ECParameters, or absent.
+    # We don't validate them at this layer.
+    return 0
+
+
+def _parse_name(tbs: Ptr[Asn1Cursor],
+                out_dn: Ptr[uint8],
+                out_dn_len: Ptr[uint64],
+                out_dn_max: uint64) -> int32:
+    # Name is a SEQUENCE OF RDN; we capture the entire DER blob
+    # (tag + length-prefix + body) so V4 can compare issuer/subject by
+    # exact bytes. _asn1_read_raw advances the cursor.
+    full: Ptr[uint8] = tbs[0].buf
+    full_len: uint64 = 0
+    rc: int32 = _asn1_read_raw(tbs, &full, &full_len)
+    if rc != 0:
+        return -1
+    # Sanity-check it's actually a SEQUENCE.
+    if full_len < 1:
+        return -1
+    if full[0] != ASN1_TAG_SEQUENCE:
+        return -1
+    if full_len > out_dn_max:
+        return -1
+    _copy_bytes(out_dn, full, full_len)
+    out_dn_len[0] = full_len
+    return 0
+
+
+def _parse_validity(tbs: Ptr[Asn1Cursor], out: Ptr[X509Cert]) -> int32:
+    # Validity ::= SEQUENCE { notBefore Time, notAfter Time }
+    # Time ::= CHOICE { utcTime UTCTime, generalTime GeneralizedTime }
+    inner: Asn1Cursor
+    rc: int32 = asn1_read_sequence(tbs, &inner)
+    if rc != 0:
+        return -1
+    # notBefore
+    rc2: int32 = _parse_time(&inner,
+                             &out[0].not_before[0],
+                             &out[0].not_before_len,
+                             cast[uint64](16))
+    if rc2 != 0:
+        return -1
+    # notAfter
+    return _parse_time(&inner,
+                       &out[0].not_after[0],
+                       &out[0].not_after_len,
+                       cast[uint64](16))
+
+
+def _parse_time(c: Ptr[Asn1Cursor],
+                out_bytes: Ptr[uint8],
+                out_len: Ptr[uint64],
+                out_max: uint64) -> int32:
+    # Peek at tag to dispatch UTCTime vs GeneralizedTime.
+    if asn1_remaining(c) == 0:
+        return -1
+    p: uint64 = c[0].pos
+    t: uint8 = c[0].buf[p]
+    if t == ASN1_TAG_UTCTIME:
+        n: int64 = asn1_read_utctime(c, out_bytes, out_max)
+        if n < cast[int64](0):
+            return -1
+        out_len[0] = cast[uint64](n)
+        return 0
+    if t == ASN1_TAG_GENERALIZEDTIME:
+        n2: int64 = asn1_read_generalizedtime(c, out_bytes, out_max)
+        if n2 < cast[int64](0):
+            return -1
+        out_len[0] = cast[uint64](n2)
+        return 0
+    return -1
+
+
+def _parse_spki(tbs: Ptr[Asn1Cursor], out: Ptr[X509Cert]) -> int32:
+    # SubjectPublicKeyInfo ::= SEQUENCE {
+    #   algorithm        AlgorithmIdentifier,
+    #   subjectPublicKey BIT STRING
+    # }
+    inner: Asn1Cursor
+    rc: int32 = asn1_read_sequence(tbs, &inner)
+    if rc != 0:
+        return -1
+    rc = _parse_algorithm_identifier(&inner,
+                                     &out[0].pubkey_alg_oid[0],
+                                     &out[0].pubkey_alg_oid_len,
+                                     cast[uint64](16))
+    if rc != 0:
+        return -1
+    bit_len: uint64 = 0
+    unused: uint8 = 0
+    n: int64 = asn1_read_bit_string(&inner,
+                                    &out[0].pubkey_bytes[0],
+                                    &bit_len,
+                                    cast[uint64](512),
+                                    &unused)
+    if n < cast[int64](0):
+        return -1
+    out[0].pubkey_bytes_len = bit_len
+    return 0
+
+
+# -- Extensions -------------------------------------------------------------
+
+def _parse_basic_constraints(ext_value: Ptr[uint8], ext_value_len: uint64,
+                             out: Ptr[X509Cert]) -> int32:
+    # The extnValue is OCTET STRING wrapping
+    #   BasicConstraints ::= SEQUENCE {
+    #     cA BOOLEAN DEFAULT FALSE,
+    #     pathLenConstraint INTEGER OPTIONAL }
+    c: Asn1Cursor
+    asn1_cursor_init(&c, ext_value, ext_value_len)
+    inner: Asn1Cursor
+    rc: int32 = asn1_read_sequence(&c, &inner)
+    if rc != 0:
+        return -1
+    # Peek for BOOLEAN; if absent cA defaults to FALSE.
+    if asn1_remaining(&inner) == 0:
+        out[0].is_ca = 0
+        return 0
+    p: uint64 = inner.pos
+    next_tag: uint8 = inner.buf[p]
+    if next_tag != ASN1_TAG_BOOLEAN:
+        out[0].is_ca = 0
+        return 0
+    # Read the BOOLEAN raw — its body is one byte (0x00 false, anything
+    # else true; in DER specifically 0xFF for true).
+    tag: uint8 = 0
+    body_len: uint64 = 0
+    body: Ptr[uint8] = inner.buf
+    rc = asn1_read_tlv(&inner, &tag, &body_len, &body)
+    if rc != 0:
+        return -1
+    if body_len < 1:
+        return -1
+    if body[0] == 0:
+        out[0].is_ca = 0
+    else:
+        out[0].is_ca = 1
+    return 0
+
+
+def _parse_subject_alt_name(ext_value: Ptr[uint8], ext_value_len: uint64,
+                            out: Ptr[X509Cert]) -> int32:
+    # extnValue is OCTET STRING wrapping
+    #   GeneralNames ::= SEQUENCE OF GeneralName
+    # We harvest only the dNSName ([2] IMPLICIT IA5String, tag 0x82)
+    # entries; up to 8 of them, ignoring URI/IP/email/etc.
+    c: Asn1Cursor
+    asn1_cursor_init(&c, ext_value, ext_value_len)
+    inner: Asn1Cursor
+    rc: int32 = asn1_read_sequence(&c, &inner)
+    if rc != 0:
+        return -1
+    out[0].san_dns_count = 0
+    while asn1_remaining(&inner) > 0:
+        tag: uint8 = 0
+        body_len: uint64 = 0
+        body: Ptr[uint8] = inner.buf
+        rc = asn1_read_tlv(&inner, &tag, &body_len, &body)
+        if rc != 0:
+            return -1
+        if tag == X509_GN_DNS:
+            # Append if room.
+            slot: int32 = out[0].san_dns_count
+            if slot < 8:
+                if body_len <= cast[uint64](128):
+                    # Copy via base-address arithmetic to dodge the
+                    # nested-Array address-of quirk on some toolchains.
+                    base: uint64 = cast[uint64](&out[0].san_dns_names)
+                    row: Ptr[uint8] = cast[Ptr[uint8]](
+                        base + (cast[uint64](slot) * cast[uint64](128)))
+                    _copy_bytes(row, body, body_len)
+                    out[0].san_dns_lens[slot] = body_len
+                    out[0].san_dns_count = slot + 1
+        # else: skip other GeneralName choices silently.
+    return 0
+
+
+def _parse_extensions(tbs: Ptr[Asn1Cursor], out: Ptr[X509Cert]) -> int32:
+    # The remaining TBS content is optionally [3] EXPLICIT Extensions,
+    # which wraps SEQUENCE OF Extension. issuerUniqueID / subjectUniqueID
+    # ([1] / [2] IMPLICIT) are theoretically possible between SPKI and
+    # extensions but never occur in real CA-issued certs; if present we
+    # silently skip.
+    while asn1_remaining(tbs) > 0:
+        p: uint64 = tbs[0].pos
+        t: uint8 = tbs[0].buf[p]
+        if t == X509_TAG_EXTENSIONS:
+            tag: uint8 = 0
+            body_len: uint64 = 0
+            body: Ptr[uint8] = tbs[0].buf
+            rc: int32 = asn1_read_tlv(tbs, &tag, &body_len, &body)
+            if rc != 0:
+                return -1
+            ext_cur: Asn1Cursor
+            asn1_cursor_init(&ext_cur, body, body_len)
+            ext_seq: Asn1Cursor
+            rc = asn1_read_sequence(&ext_cur, &ext_seq)
+            if rc != 0:
+                return -1
+            # Iterate Extension entries.
+            while asn1_remaining(&ext_seq) > 0:
+                rc = _parse_one_extension(&ext_seq, out)
+                if rc != 0:
+                    return -1
+            return 0
+        # Other context tags (issuerUniqueID / subjectUniqueID) — skip.
+        rc2: int32 = asn1_skip(tbs)
+        if rc2 != 0:
+            return -1
+    return 0
+
+
+def _parse_one_extension(ext_seq: Ptr[Asn1Cursor],
+                         out: Ptr[X509Cert]) -> int32:
+    # Extension ::= SEQUENCE {
+    #   extnID OID,
+    #   critical BOOLEAN DEFAULT FALSE,
+    #   extnValue OCTET STRING
+    # }
+    one: Asn1Cursor
+    rc: int32 = asn1_read_sequence(ext_seq, &one)
+    if rc != 0:
+        return -1
+    oid_bytes: Array[16, uint8]
+    oid_len: uint64 = 0
+    n: int64 = asn1_read_oid(&one, &oid_bytes[0], &oid_len,
+                             cast[uint64](16))
+    if n < cast[int64](0):
+        return -1
+    # Optional critical BOOLEAN — skip if present.
+    if asn1_remaining(&one) > 0:
+        p: uint64 = one.pos
+        t: uint8 = one.buf[p]
+        if t == ASN1_TAG_BOOLEAN:
+            rc = asn1_skip(&one)
+            if rc != 0:
+                return -1
+    # extnValue OCTET STRING. We need its body bytes for nested parse.
+    val_tag: uint8 = 0
+    val_body_len: uint64 = 0
+    val_body: Ptr[uint8] = one.buf
+    rc = asn1_read_tlv(&one, &val_tag, &val_body_len, &val_body)
+    if rc != 0:
+        return -1
+    if val_tag != ASN1_TAG_OCTET_STRING:
+        return -1
+    # Dispatch by OID.
+    if _bytes_eq(&oid_bytes[0], oid_len,
+                 &OID_BASIC_CONSTRAINTS[0], OID_BASIC_CONSTRAINTS_LEN) != 0:
+        return _parse_basic_constraints(val_body, val_body_len, out)
+    if _bytes_eq(&oid_bytes[0], oid_len,
+                 &OID_SUBJECT_ALT_NAME[0], OID_SUBJECT_ALT_NAME_LEN) != 0:
+        return _parse_subject_alt_name(val_body, val_body_len, out)
+    # Unknown / unhandled extension — fine; we ignore by design.
+    return 0
+
+
+# -- top-level walker -------------------------------------------------------
+
+def x509_parse(cert_buf: Ptr[uint8], cert_len: uint64,
+               out: Ptr[X509Cert]) -> int32:
+    # Initialize the parts of the struct that have "absent" defaults.
+    out[0].version = 1
+    out[0].serial_len = 0
+    out[0].sig_alg_oid_len = 0
+    out[0].issuer_dn_len = 0
+    out[0].subject_dn_len = 0
+    out[0].not_before_len = 0
+    out[0].not_after_len = 0
+    out[0].pubkey_alg_oid_len = 0
+    out[0].pubkey_bytes_len = 0
+    out[0].sig_bytes_len = 0
+    out[0].is_ca = 0
+    out[0].san_dns_count = 0
+    out[0].tbs_bytes = cert_buf
+    out[0].tbs_len = 0
+
+    # Outer SEQUENCE.
+    outer: Asn1Cursor
+    asn1_cursor_init(&outer, cert_buf, cert_len)
+    top: Asn1Cursor
+    rc: int32 = asn1_read_sequence(&outer, &top)
+    if rc != 0:
+        return -1
+
+    # tbsCertificate — capture full raw TLV (header + body) before we
+    # descend into it. The sig is over these exact bytes.
+    tbs_full: Ptr[uint8] = top.buf
+    tbs_full_len: uint64 = 0
+    rc = _asn1_read_raw(&top, &tbs_full, &tbs_full_len)
+    if rc != 0:
+        return -1
+    if tbs_full_len < 1:
+        return -1
+    if tbs_full[0] != ASN1_TAG_SEQUENCE:
+        return -1
+    out[0].tbs_bytes = tbs_full
+    out[0].tbs_len = tbs_full_len
+
+    # Descend into the TBS body. Strip the SEQUENCE header by re-parsing
+    # the full bytes through a fresh cursor.
+    tbs_outer: Asn1Cursor
+    asn1_cursor_init(&tbs_outer, tbs_full, tbs_full_len)
+    tbs: Asn1Cursor
+    rc = asn1_read_sequence(&tbs_outer, &tbs)
+    if rc != 0:
+        return -1
+
+    rc = _parse_version(&tbs, out)
+    if rc != 0:
+        return -1
+    rc = _parse_serial(&tbs, out)
+    if rc != 0:
+        return -1
+    # signature AlgorithmIdentifier (inside TBS — duplicate of the
+    # outer one per RFC 5280; we capture this copy as authoritative).
+    rc = _parse_algorithm_identifier(&tbs,
+                                     &out[0].sig_alg_oid[0],
+                                     &out[0].sig_alg_oid_len,
+                                     cast[uint64](16))
+    if rc != 0:
+        return -1
+    rc = _parse_name(&tbs,
+                     &out[0].issuer_dn[0],
+                     &out[0].issuer_dn_len,
+                     cast[uint64](256))
+    if rc != 0:
+        return -1
+    rc = _parse_validity(&tbs, out)
+    if rc != 0:
+        return -1
+    rc = _parse_name(&tbs,
+                     &out[0].subject_dn[0],
+                     &out[0].subject_dn_len,
+                     cast[uint64](256))
+    if rc != 0:
+        return -1
+    rc = _parse_spki(&tbs, out)
+    if rc != 0:
+        return -1
+    rc = _parse_extensions(&tbs, out)
+    if rc != 0:
+        return -1
+
+    # Back at the outer Certificate cursor: signatureAlgorithm then
+    # signatureValue. We discard the outer sigAlg — we already trust
+    # the TBS-inner one — but parse it for structural validation.
+    discard_alg: Array[16, uint8]
+    discard_alg_len: uint64 = 0
+    rc = _parse_algorithm_identifier(&top,
+                                     &discard_alg[0],
+                                     &discard_alg_len,
+                                     cast[uint64](16))
+    if rc != 0:
+        return -1
+    # RFC 5280 §4.1.1.2: outer and inner sigAlg MUST match.
+    if _bytes_eq(&discard_alg[0], discard_alg_len,
+                 &out[0].sig_alg_oid[0], out[0].sig_alg_oid_len) == 0:
+        return -1
+
+    sig_len: uint64 = 0
+    unused: uint8 = 0
+    n: int64 = asn1_read_bit_string(&top,
+                                    &out[0].sig_bytes[0],
+                                    &sig_len,
+                                    cast[uint64](512),
+                                    &unused)
+    if n < cast[int64](0):
+        return -1
+    out[0].sig_bytes_len = sig_len
+    return 0
+
+
+# -- DNS matching -----------------------------------------------------------
+#
+# Case-insensitive label-wise compare. Wildcard '*' is permitted only
+# as the entire leftmost label and matches exactly one label (no embedded
+# dots), per RFC 6125 §6.4.3.
+
+def _label_count(s: Ptr[uint8], n: uint64) -> int32:
+    count: int32 = 1
+    i: uint64 = 0
+    while i < n:
+        if s[i] == 0x2E:  # '.'
+            count = count + 1
+        i = i + 1
+    return count
+
+
+def _matches_one_name(pattern: Ptr[uint8], pattern_len: uint64,
+                      host: Ptr[uint8], host_len: uint64) -> int32:
+    if pattern_len == 0:
+        return 0
+    if host_len == 0:
+        return 0
+    # Wildcard form: pattern starts with "*." and has at least one more
+    # label after.
+    if pattern[0] == 0x2A:  # '*'
+        if pattern_len < 3:
+            return 0
+        if pattern[1] != 0x2E:  # '.'
+            return 0
+        # Find the first dot in host. The label before it must be
+        # non-empty and contain no dots (i.e., it's a single label).
+        first_dot: uint64 = 0
+        found: int32 = 0
+        i: uint64 = 0
+        while i < host_len:
+            if host[i] == 0x2E:
+                first_dot = i
+                found = 1
+                break
+            i = i + 1
+        if found == 0:
+            return 0
+        if first_dot == 0:
+            return 0
+        # The remainder ".rest" of host must equal the ".rest" of pattern.
+        host_rest: Ptr[uint8] = &host[first_dot]
+        host_rest_len: uint64 = host_len - first_dot
+        pat_rest: Ptr[uint8] = &pattern[1]
+        pat_rest_len: uint64 = pattern_len - 1
+        return _ascii_eq_ci(pat_rest, pat_rest_len,
+                            host_rest, host_rest_len)
+    # Non-wildcard: exact case-insensitive match.
+    return _ascii_eq_ci(pattern, pattern_len, host, host_len)
+
+
+def x509_match_dns(cert: Ptr[X509Cert], host: Ptr[char]) -> int32:
+    host_bytes: Ptr[uint8] = cast[Ptr[uint8]](host)
+    host_len: uint64 = _strlen_c(host)
+    if host_len == 0:
+        return 0
+    count: int32 = cert[0].san_dns_count
+    if count <= 0:
+        return 0
+    base: uint64 = cast[uint64](&cert[0].san_dns_names)
+    i: int32 = 0
+    while i < count:
+        row: Ptr[uint8] = cast[Ptr[uint8]](
+            base + (cast[uint64](i) * cast[uint64](128)))
+        row_len: uint64 = cert[0].san_dns_lens[i]
+        if _matches_one_name(row, row_len, host_bytes, host_len) != 0:
+            return 1
+        i = i + 1
+    return 0
