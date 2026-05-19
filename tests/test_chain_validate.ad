@@ -1,0 +1,1039 @@
+# tests/test_chain_validate.ad
+#
+# Chain-validation + CA-store + validity-window (V4) end-to-end regression.
+# Boots an openssl-generated two-cert chain (leaf signed by a self-signed
+# ECDSA-P256 CA root) and drives them through
+# lib/x509/chain.ad::validate_cert_chain. Both certs were emitted as DER
+# at build time and byte-dumped here — Adder top-level Array literals
+# don't survive to the linked image (per memory/feedback_compiler_
+# quirks.md), so we replay via an _init_*()-style runtime fill.
+#
+# CA root (CN=Hamnix Test CA, CA:TRUE, prime256v1) — 394 bytes.
+# Leaf   (CN=test.hamnix.local, DNS SAN, signed by the root) — 421 bytes.
+# Both certs are valid May 19 2026 .. May 16 2036; the fixture passes
+# now_unix = 1780272000 (Jun 1 2026 00:00:00 UTC) — inside that window.
+#
+# Asserts (all pass = `[chain] PASS`):
+#   (1) legitimate chain → validate_cert_chain returns 1
+#   (a) flip one byte of the leaf signature → returns 0
+#   (b) call with host "evil.hamnix.local" → returns 0
+#   (c) call with now_unix past not_after → returns 0
+#   (d) remove the root from the CA store → returns 0
+#
+# Driven by scripts/test_chain_validate.sh.
+
+from lib.asn1.asn1 import (
+    asn1_init_oids,
+)
+from lib.x509.x509 import (
+    X509Cert,
+    x509_parse,
+)
+from lib.ec.p256 import (
+    p256_init,
+)
+from lib.rsa.rsa import (
+    rsa_init,
+)
+from lib.ecdsa.ecdsa import (
+    ecdsa_init,
+)
+from lib.x509.chain import (
+    castore_init,
+    castore_add_root,
+    castore_remove_all,
+    castore_count,
+    validate_cert_chain,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_exit(code: uint64)
+
+
+# -- tiny printer ----------------------------------------------------------
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _wstr(s: Ptr[uint8]):
+    sys_write(1, s, _strlen(s))
+
+
+def _wdec(value: uint64):
+    if value == 0:
+        sys_write(1, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(1, &out[0], i)
+
+
+def _wdec_signed(value: int64):
+    if value < 0:
+        sys_write(1, "-", 1)
+        _wdec(cast[uint64](-value))
+        return
+    _wdec(cast[uint64](value))
+
+
+# -- failure aggregator ----------------------------------------------------
+
+fail_count: int32 = 0
+
+
+def _check_eq_i32(a: int32, b: int32, label: Ptr[uint8]):
+    if a != b:
+        _wstr("[chain] FAIL: ")
+        _wstr(label)
+        _wstr(" got=")
+        _wdec_signed(cast[int64](a))
+        _wstr(" want=")
+        _wdec_signed(cast[int64](b))
+        _wstr("\n")
+        fail_count = fail_count + 1
+
+
+# -- chain pointer table ---------------------------------------------------
+
+chain_ptrs: Array[8, Ptr[uint8]]
+chain_lens: Array[8, uint64]
+
+
+# -- root_der / leaf_der: openssl-emitted DER, byte-dumped at build time ---
+#
+# Generated via:
+#   openssl ecparam -name prime256v1 -out ec.params
+#   openssl req -x509 -newkey ec:ec.params -keyout root.key -out root.crt \
+#       -days 3650 -nodes -subj '/CN=Hamnix Test CA' \
+#       -addext 'basicConstraints=critical,CA:TRUE'
+#   openssl ecparam -name prime256v1 -genkey -noout -out leaf.key
+#   openssl req -new -key leaf.key -out leaf.csr -subj '/CN=test.hamnix.local'
+#   openssl x509 -req -in leaf.csr -CA root.crt -CAkey root.key \
+#       -CAcreateserial -out leaf.crt -days 3650 \
+#       -extfile <(printf 'basicConstraints=CA:FALSE\nsubjectAltName=DNS:test.hamnix.local\n')
+
+root_der: Array[512, uint8]
+root_der_len: uint64 = 394
+
+leaf_der: Array[512, uint8]
+leaf_der_len: uint64 = 421
+
+
+def _init_root():
+    root_der[0] = 0x30
+    root_der[1] = 0x82
+    root_der[2] = 0x01
+    root_der[3] = 0x86
+    root_der[4] = 0x30
+    root_der[5] = 0x82
+    root_der[6] = 0x01
+    root_der[7] = 0x2D
+    root_der[8] = 0xA0
+    root_der[9] = 0x03
+    root_der[10] = 0x02
+    root_der[11] = 0x01
+    root_der[12] = 0x02
+    root_der[13] = 0x02
+    root_der[14] = 0x14
+    root_der[15] = 0x2B
+    root_der[16] = 0x7E
+    root_der[17] = 0xCD
+    root_der[18] = 0xA5
+    root_der[19] = 0xFA
+    root_der[20] = 0x20
+    root_der[21] = 0xA9
+    root_der[22] = 0x39
+    root_der[23] = 0xFE
+    root_der[24] = 0x1B
+    root_der[25] = 0xFF
+    root_der[26] = 0xD9
+    root_der[27] = 0x88
+    root_der[28] = 0x95
+    root_der[29] = 0xA9
+    root_der[30] = 0x02
+    root_der[31] = 0xA0
+    root_der[32] = 0xAF
+    root_der[33] = 0x9D
+    root_der[34] = 0xF8
+    root_der[35] = 0x30
+    root_der[36] = 0x0A
+    root_der[37] = 0x06
+    root_der[38] = 0x08
+    root_der[39] = 0x2A
+    root_der[40] = 0x86
+    root_der[41] = 0x48
+    root_der[42] = 0xCE
+    root_der[43] = 0x3D
+    root_der[44] = 0x04
+    root_der[45] = 0x03
+    root_der[46] = 0x02
+    root_der[47] = 0x30
+    root_der[48] = 0x19
+    root_der[49] = 0x31
+    root_der[50] = 0x17
+    root_der[51] = 0x30
+    root_der[52] = 0x15
+    root_der[53] = 0x06
+    root_der[54] = 0x03
+    root_der[55] = 0x55
+    root_der[56] = 0x04
+    root_der[57] = 0x03
+    root_der[58] = 0x0C
+    root_der[59] = 0x0E
+    root_der[60] = 0x48
+    root_der[61] = 0x61
+    root_der[62] = 0x6D
+    root_der[63] = 0x6E
+    root_der[64] = 0x69
+    root_der[65] = 0x78
+    root_der[66] = 0x20
+    root_der[67] = 0x54
+    root_der[68] = 0x65
+    root_der[69] = 0x73
+    root_der[70] = 0x74
+    root_der[71] = 0x20
+    root_der[72] = 0x43
+    root_der[73] = 0x41
+    root_der[74] = 0x30
+    root_der[75] = 0x1E
+    root_der[76] = 0x17
+    root_der[77] = 0x0D
+    root_der[78] = 0x32
+    root_der[79] = 0x36
+    root_der[80] = 0x30
+    root_der[81] = 0x35
+    root_der[82] = 0x31
+    root_der[83] = 0x39
+    root_der[84] = 0x30
+    root_der[85] = 0x35
+    root_der[86] = 0x34
+    root_der[87] = 0x31
+    root_der[88] = 0x32
+    root_der[89] = 0x31
+    root_der[90] = 0x5A
+    root_der[91] = 0x17
+    root_der[92] = 0x0D
+    root_der[93] = 0x33
+    root_der[94] = 0x36
+    root_der[95] = 0x30
+    root_der[96] = 0x35
+    root_der[97] = 0x31
+    root_der[98] = 0x36
+    root_der[99] = 0x30
+    root_der[100] = 0x35
+    root_der[101] = 0x34
+    root_der[102] = 0x31
+    root_der[103] = 0x32
+    root_der[104] = 0x31
+    root_der[105] = 0x5A
+    root_der[106] = 0x30
+    root_der[107] = 0x19
+    root_der[108] = 0x31
+    root_der[109] = 0x17
+    root_der[110] = 0x30
+    root_der[111] = 0x15
+    root_der[112] = 0x06
+    root_der[113] = 0x03
+    root_der[114] = 0x55
+    root_der[115] = 0x04
+    root_der[116] = 0x03
+    root_der[117] = 0x0C
+    root_der[118] = 0x0E
+    root_der[119] = 0x48
+    root_der[120] = 0x61
+    root_der[121] = 0x6D
+    root_der[122] = 0x6E
+    root_der[123] = 0x69
+    root_der[124] = 0x78
+    root_der[125] = 0x20
+    root_der[126] = 0x54
+    root_der[127] = 0x65
+    root_der[128] = 0x73
+    root_der[129] = 0x74
+    root_der[130] = 0x20
+    root_der[131] = 0x43
+    root_der[132] = 0x41
+    root_der[133] = 0x30
+    root_der[134] = 0x59
+    root_der[135] = 0x30
+    root_der[136] = 0x13
+    root_der[137] = 0x06
+    root_der[138] = 0x07
+    root_der[139] = 0x2A
+    root_der[140] = 0x86
+    root_der[141] = 0x48
+    root_der[142] = 0xCE
+    root_der[143] = 0x3D
+    root_der[144] = 0x02
+    root_der[145] = 0x01
+    root_der[146] = 0x06
+    root_der[147] = 0x08
+    root_der[148] = 0x2A
+    root_der[149] = 0x86
+    root_der[150] = 0x48
+    root_der[151] = 0xCE
+    root_der[152] = 0x3D
+    root_der[153] = 0x03
+    root_der[154] = 0x01
+    root_der[155] = 0x07
+    root_der[156] = 0x03
+    root_der[157] = 0x42
+    root_der[158] = 0x00
+    root_der[159] = 0x04
+    root_der[160] = 0x4A
+    root_der[161] = 0x3A
+    root_der[162] = 0xC7
+    root_der[163] = 0x3D
+    root_der[164] = 0x99
+    root_der[165] = 0x65
+    root_der[166] = 0x0A
+    root_der[167] = 0x39
+    root_der[168] = 0x3B
+    root_der[169] = 0xED
+    root_der[170] = 0xA9
+    root_der[171] = 0x3F
+    root_der[172] = 0x17
+    root_der[173] = 0x0F
+    root_der[174] = 0x1A
+    root_der[175] = 0x54
+    root_der[176] = 0xEF
+    root_der[177] = 0x36
+    root_der[178] = 0xCB
+    root_der[179] = 0x26
+    root_der[180] = 0x4D
+    root_der[181] = 0x4C
+    root_der[182] = 0x9D
+    root_der[183] = 0x20
+    root_der[184] = 0x6D
+    root_der[185] = 0x9B
+    root_der[186] = 0xEA
+    root_der[187] = 0x53
+    root_der[188] = 0x75
+    root_der[189] = 0x05
+    root_der[190] = 0x25
+    root_der[191] = 0x6A
+    root_der[192] = 0x85
+    root_der[193] = 0x52
+    root_der[194] = 0x73
+    root_der[195] = 0x45
+    root_der[196] = 0xB3
+    root_der[197] = 0x3E
+    root_der[198] = 0x9F
+    root_der[199] = 0x76
+    root_der[200] = 0xCB
+    root_der[201] = 0x9C
+    root_der[202] = 0xAF
+    root_der[203] = 0x7E
+    root_der[204] = 0xA2
+    root_der[205] = 0x3B
+    root_der[206] = 0xD9
+    root_der[207] = 0x3D
+    root_der[208] = 0x50
+    root_der[209] = 0x5C
+    root_der[210] = 0xB6
+    root_der[211] = 0x4A
+    root_der[212] = 0x4B
+    root_der[213] = 0xB8
+    root_der[214] = 0x94
+    root_der[215] = 0x31
+    root_der[216] = 0xC0
+    root_der[217] = 0x05
+    root_der[218] = 0x8F
+    root_der[219] = 0xA7
+    root_der[220] = 0x70
+    root_der[221] = 0x68
+    root_der[222] = 0xD8
+    root_der[223] = 0x3C
+    root_der[224] = 0xA3
+    root_der[225] = 0x53
+    root_der[226] = 0x30
+    root_der[227] = 0x51
+    root_der[228] = 0x30
+    root_der[229] = 0x1D
+    root_der[230] = 0x06
+    root_der[231] = 0x03
+    root_der[232] = 0x55
+    root_der[233] = 0x1D
+    root_der[234] = 0x0E
+    root_der[235] = 0x04
+    root_der[236] = 0x16
+    root_der[237] = 0x04
+    root_der[238] = 0x14
+    root_der[239] = 0x30
+    root_der[240] = 0xDF
+    root_der[241] = 0xF7
+    root_der[242] = 0xF6
+    root_der[243] = 0x0D
+    root_der[244] = 0x98
+    root_der[245] = 0x60
+    root_der[246] = 0xA5
+    root_der[247] = 0x0D
+    root_der[248] = 0x27
+    root_der[249] = 0x90
+    root_der[250] = 0x5C
+    root_der[251] = 0x46
+    root_der[252] = 0x29
+    root_der[253] = 0xCD
+    root_der[254] = 0xEB
+    root_der[255] = 0x9A
+    root_der[256] = 0x9F
+    root_der[257] = 0x29
+    root_der[258] = 0xDB
+    root_der[259] = 0x30
+    root_der[260] = 0x1F
+    root_der[261] = 0x06
+    root_der[262] = 0x03
+    root_der[263] = 0x55
+    root_der[264] = 0x1D
+    root_der[265] = 0x23
+    root_der[266] = 0x04
+    root_der[267] = 0x18
+    root_der[268] = 0x30
+    root_der[269] = 0x16
+    root_der[270] = 0x80
+    root_der[271] = 0x14
+    root_der[272] = 0x30
+    root_der[273] = 0xDF
+    root_der[274] = 0xF7
+    root_der[275] = 0xF6
+    root_der[276] = 0x0D
+    root_der[277] = 0x98
+    root_der[278] = 0x60
+    root_der[279] = 0xA5
+    root_der[280] = 0x0D
+    root_der[281] = 0x27
+    root_der[282] = 0x90
+    root_der[283] = 0x5C
+    root_der[284] = 0x46
+    root_der[285] = 0x29
+    root_der[286] = 0xCD
+    root_der[287] = 0xEB
+    root_der[288] = 0x9A
+    root_der[289] = 0x9F
+    root_der[290] = 0x29
+    root_der[291] = 0xDB
+    root_der[292] = 0x30
+    root_der[293] = 0x0F
+    root_der[294] = 0x06
+    root_der[295] = 0x03
+    root_der[296] = 0x55
+    root_der[297] = 0x1D
+    root_der[298] = 0x13
+    root_der[299] = 0x01
+    root_der[300] = 0x01
+    root_der[301] = 0xFF
+    root_der[302] = 0x04
+    root_der[303] = 0x05
+    root_der[304] = 0x30
+    root_der[305] = 0x03
+    root_der[306] = 0x01
+    root_der[307] = 0x01
+    root_der[308] = 0xFF
+    root_der[309] = 0x30
+    root_der[310] = 0x0A
+    root_der[311] = 0x06
+    root_der[312] = 0x08
+    root_der[313] = 0x2A
+    root_der[314] = 0x86
+    root_der[315] = 0x48
+    root_der[316] = 0xCE
+    root_der[317] = 0x3D
+    root_der[318] = 0x04
+    root_der[319] = 0x03
+    root_der[320] = 0x02
+    root_der[321] = 0x03
+    root_der[322] = 0x47
+    root_der[323] = 0x00
+    root_der[324] = 0x30
+    root_der[325] = 0x44
+    root_der[326] = 0x02
+    root_der[327] = 0x20
+    root_der[328] = 0x75
+    root_der[329] = 0x1E
+    root_der[330] = 0xCF
+    root_der[331] = 0x69
+    root_der[332] = 0xC5
+    root_der[333] = 0x48
+    root_der[334] = 0x18
+    root_der[335] = 0xF7
+    root_der[336] = 0x25
+    root_der[337] = 0x36
+    root_der[338] = 0x86
+    root_der[339] = 0xF2
+    root_der[340] = 0xEB
+    root_der[341] = 0x19
+    root_der[342] = 0xBB
+    root_der[343] = 0x10
+    root_der[344] = 0x1F
+    root_der[345] = 0x09
+    root_der[346] = 0xA7
+    root_der[347] = 0xB3
+    root_der[348] = 0xF3
+    root_der[349] = 0xE9
+    root_der[350] = 0x6E
+    root_der[351] = 0xBC
+    root_der[352] = 0xA4
+    root_der[353] = 0xF9
+    root_der[354] = 0x99
+    root_der[355] = 0xCB
+    root_der[356] = 0x1D
+    root_der[357] = 0xE7
+    root_der[358] = 0x12
+    root_der[359] = 0x70
+    root_der[360] = 0x02
+    root_der[361] = 0x20
+    root_der[362] = 0x66
+    root_der[363] = 0xA2
+    root_der[364] = 0xBB
+    root_der[365] = 0x87
+    root_der[366] = 0xD5
+    root_der[367] = 0x2C
+    root_der[368] = 0xB9
+    root_der[369] = 0x65
+    root_der[370] = 0x65
+    root_der[371] = 0xDF
+    root_der[372] = 0xAD
+    root_der[373] = 0x86
+    root_der[374] = 0x06
+    root_der[375] = 0x01
+    root_der[376] = 0x5F
+    root_der[377] = 0xE9
+    root_der[378] = 0xC0
+    root_der[379] = 0xD0
+    root_der[380] = 0x3B
+    root_der[381] = 0x0D
+    root_der[382] = 0x69
+    root_der[383] = 0xB9
+    root_der[384] = 0xE9
+    root_der[385] = 0x4A
+    root_der[386] = 0x1E
+    root_der[387] = 0xAB
+    root_der[388] = 0xA1
+    root_der[389] = 0xBF
+    root_der[390] = 0x4F
+    root_der[391] = 0x38
+    root_der[392] = 0x7F
+    root_der[393] = 0xF0
+
+
+def _init_leaf():
+    leaf_der[0] = 0x30
+    leaf_der[1] = 0x82
+    leaf_der[2] = 0x01
+    leaf_der[3] = 0xA1
+    leaf_der[4] = 0x30
+    leaf_der[5] = 0x82
+    leaf_der[6] = 0x01
+    leaf_der[7] = 0x48
+    leaf_der[8] = 0xA0
+    leaf_der[9] = 0x03
+    leaf_der[10] = 0x02
+    leaf_der[11] = 0x01
+    leaf_der[12] = 0x02
+    leaf_der[13] = 0x02
+    leaf_der[14] = 0x14
+    leaf_der[15] = 0x0C
+    leaf_der[16] = 0x53
+    leaf_der[17] = 0xE7
+    leaf_der[18] = 0xFB
+    leaf_der[19] = 0x1E
+    leaf_der[20] = 0xD6
+    leaf_der[21] = 0xCE
+    leaf_der[22] = 0xB3
+    leaf_der[23] = 0xF5
+    leaf_der[24] = 0xE6
+    leaf_der[25] = 0xE7
+    leaf_der[26] = 0x7E
+    leaf_der[27] = 0x18
+    leaf_der[28] = 0x0F
+    leaf_der[29] = 0xA3
+    leaf_der[30] = 0x46
+    leaf_der[31] = 0x1F
+    leaf_der[32] = 0x4E
+    leaf_der[33] = 0x96
+    leaf_der[34] = 0xA0
+    leaf_der[35] = 0x30
+    leaf_der[36] = 0x0A
+    leaf_der[37] = 0x06
+    leaf_der[38] = 0x08
+    leaf_der[39] = 0x2A
+    leaf_der[40] = 0x86
+    leaf_der[41] = 0x48
+    leaf_der[42] = 0xCE
+    leaf_der[43] = 0x3D
+    leaf_der[44] = 0x04
+    leaf_der[45] = 0x03
+    leaf_der[46] = 0x02
+    leaf_der[47] = 0x30
+    leaf_der[48] = 0x19
+    leaf_der[49] = 0x31
+    leaf_der[50] = 0x17
+    leaf_der[51] = 0x30
+    leaf_der[52] = 0x15
+    leaf_der[53] = 0x06
+    leaf_der[54] = 0x03
+    leaf_der[55] = 0x55
+    leaf_der[56] = 0x04
+    leaf_der[57] = 0x03
+    leaf_der[58] = 0x0C
+    leaf_der[59] = 0x0E
+    leaf_der[60] = 0x48
+    leaf_der[61] = 0x61
+    leaf_der[62] = 0x6D
+    leaf_der[63] = 0x6E
+    leaf_der[64] = 0x69
+    leaf_der[65] = 0x78
+    leaf_der[66] = 0x20
+    leaf_der[67] = 0x54
+    leaf_der[68] = 0x65
+    leaf_der[69] = 0x73
+    leaf_der[70] = 0x74
+    leaf_der[71] = 0x20
+    leaf_der[72] = 0x43
+    leaf_der[73] = 0x41
+    leaf_der[74] = 0x30
+    leaf_der[75] = 0x1E
+    leaf_der[76] = 0x17
+    leaf_der[77] = 0x0D
+    leaf_der[78] = 0x32
+    leaf_der[79] = 0x36
+    leaf_der[80] = 0x30
+    leaf_der[81] = 0x35
+    leaf_der[82] = 0x31
+    leaf_der[83] = 0x39
+    leaf_der[84] = 0x30
+    leaf_der[85] = 0x35
+    leaf_der[86] = 0x34
+    leaf_der[87] = 0x31
+    leaf_der[88] = 0x32
+    leaf_der[89] = 0x37
+    leaf_der[90] = 0x5A
+    leaf_der[91] = 0x17
+    leaf_der[92] = 0x0D
+    leaf_der[93] = 0x33
+    leaf_der[94] = 0x36
+    leaf_der[95] = 0x30
+    leaf_der[96] = 0x35
+    leaf_der[97] = 0x31
+    leaf_der[98] = 0x36
+    leaf_der[99] = 0x30
+    leaf_der[100] = 0x35
+    leaf_der[101] = 0x34
+    leaf_der[102] = 0x31
+    leaf_der[103] = 0x32
+    leaf_der[104] = 0x37
+    leaf_der[105] = 0x5A
+    leaf_der[106] = 0x30
+    leaf_der[107] = 0x1C
+    leaf_der[108] = 0x31
+    leaf_der[109] = 0x1A
+    leaf_der[110] = 0x30
+    leaf_der[111] = 0x18
+    leaf_der[112] = 0x06
+    leaf_der[113] = 0x03
+    leaf_der[114] = 0x55
+    leaf_der[115] = 0x04
+    leaf_der[116] = 0x03
+    leaf_der[117] = 0x0C
+    leaf_der[118] = 0x11
+    leaf_der[119] = 0x74
+    leaf_der[120] = 0x65
+    leaf_der[121] = 0x73
+    leaf_der[122] = 0x74
+    leaf_der[123] = 0x2E
+    leaf_der[124] = 0x68
+    leaf_der[125] = 0x61
+    leaf_der[126] = 0x6D
+    leaf_der[127] = 0x6E
+    leaf_der[128] = 0x69
+    leaf_der[129] = 0x78
+    leaf_der[130] = 0x2E
+    leaf_der[131] = 0x6C
+    leaf_der[132] = 0x6F
+    leaf_der[133] = 0x63
+    leaf_der[134] = 0x61
+    leaf_der[135] = 0x6C
+    leaf_der[136] = 0x30
+    leaf_der[137] = 0x59
+    leaf_der[138] = 0x30
+    leaf_der[139] = 0x13
+    leaf_der[140] = 0x06
+    leaf_der[141] = 0x07
+    leaf_der[142] = 0x2A
+    leaf_der[143] = 0x86
+    leaf_der[144] = 0x48
+    leaf_der[145] = 0xCE
+    leaf_der[146] = 0x3D
+    leaf_der[147] = 0x02
+    leaf_der[148] = 0x01
+    leaf_der[149] = 0x06
+    leaf_der[150] = 0x08
+    leaf_der[151] = 0x2A
+    leaf_der[152] = 0x86
+    leaf_der[153] = 0x48
+    leaf_der[154] = 0xCE
+    leaf_der[155] = 0x3D
+    leaf_der[156] = 0x03
+    leaf_der[157] = 0x01
+    leaf_der[158] = 0x07
+    leaf_der[159] = 0x03
+    leaf_der[160] = 0x42
+    leaf_der[161] = 0x00
+    leaf_der[162] = 0x04
+    leaf_der[163] = 0x03
+    leaf_der[164] = 0xE9
+    leaf_der[165] = 0xEC
+    leaf_der[166] = 0x3A
+    leaf_der[167] = 0x60
+    leaf_der[168] = 0xE3
+    leaf_der[169] = 0xBB
+    leaf_der[170] = 0x52
+    leaf_der[171] = 0x35
+    leaf_der[172] = 0xDA
+    leaf_der[173] = 0x92
+    leaf_der[174] = 0x02
+    leaf_der[175] = 0x84
+    leaf_der[176] = 0xB9
+    leaf_der[177] = 0x31
+    leaf_der[178] = 0x34
+    leaf_der[179] = 0x18
+    leaf_der[180] = 0x04
+    leaf_der[181] = 0xB2
+    leaf_der[182] = 0x21
+    leaf_der[183] = 0xFD
+    leaf_der[184] = 0xC8
+    leaf_der[185] = 0xE7
+    leaf_der[186] = 0x51
+    leaf_der[187] = 0x4F
+    leaf_der[188] = 0x19
+    leaf_der[189] = 0xC5
+    leaf_der[190] = 0x61
+    leaf_der[191] = 0x87
+    leaf_der[192] = 0x2E
+    leaf_der[193] = 0x8D
+    leaf_der[194] = 0x1A
+    leaf_der[195] = 0x70
+    leaf_der[196] = 0x17
+    leaf_der[197] = 0x57
+    leaf_der[198] = 0x18
+    leaf_der[199] = 0x3D
+    leaf_der[200] = 0xD0
+    leaf_der[201] = 0x56
+    leaf_der[202] = 0xF3
+    leaf_der[203] = 0x24
+    leaf_der[204] = 0x9E
+    leaf_der[205] = 0xAA
+    leaf_der[206] = 0xF7
+    leaf_der[207] = 0x05
+    leaf_der[208] = 0xFB
+    leaf_der[209] = 0xB2
+    leaf_der[210] = 0x51
+    leaf_der[211] = 0xD3
+    leaf_der[212] = 0x1F
+    leaf_der[213] = 0xE2
+    leaf_der[214] = 0x6D
+    leaf_der[215] = 0xD8
+    leaf_der[216] = 0x10
+    leaf_der[217] = 0x89
+    leaf_der[218] = 0xA8
+    leaf_der[219] = 0x2F
+    leaf_der[220] = 0x17
+    leaf_der[221] = 0x7F
+    leaf_der[222] = 0x34
+    leaf_der[223] = 0x23
+    leaf_der[224] = 0x51
+    leaf_der[225] = 0xA8
+    leaf_der[226] = 0xAD
+    leaf_der[227] = 0xA3
+    leaf_der[228] = 0x6B
+    leaf_der[229] = 0x30
+    leaf_der[230] = 0x69
+    leaf_der[231] = 0x30
+    leaf_der[232] = 0x09
+    leaf_der[233] = 0x06
+    leaf_der[234] = 0x03
+    leaf_der[235] = 0x55
+    leaf_der[236] = 0x1D
+    leaf_der[237] = 0x13
+    leaf_der[238] = 0x04
+    leaf_der[239] = 0x02
+    leaf_der[240] = 0x30
+    leaf_der[241] = 0x00
+    leaf_der[242] = 0x30
+    leaf_der[243] = 0x1C
+    leaf_der[244] = 0x06
+    leaf_der[245] = 0x03
+    leaf_der[246] = 0x55
+    leaf_der[247] = 0x1D
+    leaf_der[248] = 0x11
+    leaf_der[249] = 0x04
+    leaf_der[250] = 0x15
+    leaf_der[251] = 0x30
+    leaf_der[252] = 0x13
+    leaf_der[253] = 0x82
+    leaf_der[254] = 0x11
+    leaf_der[255] = 0x74
+    leaf_der[256] = 0x65
+    leaf_der[257] = 0x73
+    leaf_der[258] = 0x74
+    leaf_der[259] = 0x2E
+    leaf_der[260] = 0x68
+    leaf_der[261] = 0x61
+    leaf_der[262] = 0x6D
+    leaf_der[263] = 0x6E
+    leaf_der[264] = 0x69
+    leaf_der[265] = 0x78
+    leaf_der[266] = 0x2E
+    leaf_der[267] = 0x6C
+    leaf_der[268] = 0x6F
+    leaf_der[269] = 0x63
+    leaf_der[270] = 0x61
+    leaf_der[271] = 0x6C
+    leaf_der[272] = 0x30
+    leaf_der[273] = 0x1D
+    leaf_der[274] = 0x06
+    leaf_der[275] = 0x03
+    leaf_der[276] = 0x55
+    leaf_der[277] = 0x1D
+    leaf_der[278] = 0x0E
+    leaf_der[279] = 0x04
+    leaf_der[280] = 0x16
+    leaf_der[281] = 0x04
+    leaf_der[282] = 0x14
+    leaf_der[283] = 0x98
+    leaf_der[284] = 0xB0
+    leaf_der[285] = 0x39
+    leaf_der[286] = 0x90
+    leaf_der[287] = 0x66
+    leaf_der[288] = 0xEE
+    leaf_der[289] = 0xA8
+    leaf_der[290] = 0x44
+    leaf_der[291] = 0x91
+    leaf_der[292] = 0x9D
+    leaf_der[293] = 0x61
+    leaf_der[294] = 0x57
+    leaf_der[295] = 0x58
+    leaf_der[296] = 0x46
+    leaf_der[297] = 0xD9
+    leaf_der[298] = 0x31
+    leaf_der[299] = 0x07
+    leaf_der[300] = 0xEC
+    leaf_der[301] = 0x46
+    leaf_der[302] = 0xEB
+    leaf_der[303] = 0x30
+    leaf_der[304] = 0x1F
+    leaf_der[305] = 0x06
+    leaf_der[306] = 0x03
+    leaf_der[307] = 0x55
+    leaf_der[308] = 0x1D
+    leaf_der[309] = 0x23
+    leaf_der[310] = 0x04
+    leaf_der[311] = 0x18
+    leaf_der[312] = 0x30
+    leaf_der[313] = 0x16
+    leaf_der[314] = 0x80
+    leaf_der[315] = 0x14
+    leaf_der[316] = 0x30
+    leaf_der[317] = 0xDF
+    leaf_der[318] = 0xF7
+    leaf_der[319] = 0xF6
+    leaf_der[320] = 0x0D
+    leaf_der[321] = 0x98
+    leaf_der[322] = 0x60
+    leaf_der[323] = 0xA5
+    leaf_der[324] = 0x0D
+    leaf_der[325] = 0x27
+    leaf_der[326] = 0x90
+    leaf_der[327] = 0x5C
+    leaf_der[328] = 0x46
+    leaf_der[329] = 0x29
+    leaf_der[330] = 0xCD
+    leaf_der[331] = 0xEB
+    leaf_der[332] = 0x9A
+    leaf_der[333] = 0x9F
+    leaf_der[334] = 0x29
+    leaf_der[335] = 0xDB
+    leaf_der[336] = 0x30
+    leaf_der[337] = 0x0A
+    leaf_der[338] = 0x06
+    leaf_der[339] = 0x08
+    leaf_der[340] = 0x2A
+    leaf_der[341] = 0x86
+    leaf_der[342] = 0x48
+    leaf_der[343] = 0xCE
+    leaf_der[344] = 0x3D
+    leaf_der[345] = 0x04
+    leaf_der[346] = 0x03
+    leaf_der[347] = 0x02
+    leaf_der[348] = 0x03
+    leaf_der[349] = 0x47
+    leaf_der[350] = 0x00
+    leaf_der[351] = 0x30
+    leaf_der[352] = 0x44
+    leaf_der[353] = 0x02
+    leaf_der[354] = 0x20
+    leaf_der[355] = 0x03
+    leaf_der[356] = 0xCE
+    leaf_der[357] = 0xCA
+    leaf_der[358] = 0x10
+    leaf_der[359] = 0xB5
+    leaf_der[360] = 0xC5
+    leaf_der[361] = 0x4B
+    leaf_der[362] = 0xBF
+    leaf_der[363] = 0xF6
+    leaf_der[364] = 0x17
+    leaf_der[365] = 0x41
+    leaf_der[366] = 0xE1
+    leaf_der[367] = 0x03
+    leaf_der[368] = 0x49
+    leaf_der[369] = 0x39
+    leaf_der[370] = 0xA3
+    leaf_der[371] = 0x81
+    leaf_der[372] = 0x4B
+    leaf_der[373] = 0x88
+    leaf_der[374] = 0x1D
+    leaf_der[375] = 0xB9
+    leaf_der[376] = 0x58
+    leaf_der[377] = 0x34
+    leaf_der[378] = 0x3A
+    leaf_der[379] = 0xC6
+    leaf_der[380] = 0x78
+    leaf_der[381] = 0x61
+    leaf_der[382] = 0xBC
+    leaf_der[383] = 0xC6
+    leaf_der[384] = 0x02
+    leaf_der[385] = 0xDA
+    leaf_der[386] = 0xC4
+    leaf_der[387] = 0x02
+    leaf_der[388] = 0x20
+    leaf_der[389] = 0x1B
+    leaf_der[390] = 0x16
+    leaf_der[391] = 0xF6
+    leaf_der[392] = 0x99
+    leaf_der[393] = 0x1B
+    leaf_der[394] = 0x92
+    leaf_der[395] = 0x0E
+    leaf_der[396] = 0xBB
+    leaf_der[397] = 0xFA
+    leaf_der[398] = 0xA2
+    leaf_der[399] = 0xC4
+    leaf_der[400] = 0xF1
+    leaf_der[401] = 0xE9
+    leaf_der[402] = 0x2A
+    leaf_der[403] = 0xC8
+    leaf_der[404] = 0xB5
+    leaf_der[405] = 0x31
+    leaf_der[406] = 0xDB
+    leaf_der[407] = 0xCF
+    leaf_der[408] = 0xC7
+    leaf_der[409] = 0x2A
+    leaf_der[410] = 0x2F
+    leaf_der[411] = 0x43
+    leaf_der[412] = 0x43
+    leaf_der[413] = 0xF5
+    leaf_der[414] = 0x87
+    leaf_der[415] = 0x61
+    leaf_der[416] = 0x2B
+    leaf_der[417] = 0x68
+    leaf_der[418] = 0x31
+    leaf_der[419] = 0xC8
+    leaf_der[420] = 0xE8
+
+
+# A target unix time inside the certs' validity window
+# (Jun 1 2026 00:00:00 UTC == 1780272000). Both certs run
+# May 19 2026 .. May 16 2036.
+NOW_GOOD: uint64 = 1780272000
+
+# Past the not_after (May 16 2036 05:41:27 UTC = 2094529287);
+# any value strictly greater is past expiry. Pick May 25 2036.
+NOW_EXPIRED: uint64 = 2095286400
+
+
+def main() -> int32:
+    _wstr("[chain] start\n")
+
+    # 0. Initialize OID tables + crypto runtime state.
+    asn1_init_oids()
+    p256_init()
+    rsa_init()
+    ecdsa_init()
+    castore_init()
+    _init_root()
+    _init_leaf()
+
+    # Plant the chain table: chain[0] = leaf only (root comes from the
+    # CA store, not from the on-the-wire chain — typical TLS shape).
+    chain_ptrs[0] = &leaf_der[0]
+    chain_lens[0] = leaf_der_len
+
+    # 1. Add the root to the CA store. Expect slot 0.
+    slot: int32 = castore_add_root(&root_der[0], root_der_len)
+    _check_eq_i32(slot, 0, "castore_add_root returns slot 0")
+    _check_eq_i32(castore_count(), 1, "castore_count == 1 after add")
+
+    # 2. Legitimate chain validation: expect 1.
+    _wstr("[chain] case 1: legitimate chain (ecdsa verify ~5s)\n")
+    rc: int32 = validate_cert_chain(&chain_ptrs[0], &chain_lens[0],
+                                    cast[int32](1),
+                                    "test.hamnix.local", NOW_GOOD)
+    _check_eq_i32(rc, 1, "legitimate chain returns 1")
+
+    # 3. Tamper test (a): flip one byte of the leaf signature. The
+    # signature BIT STRING is the trailing ECDSA SEQUENCE; offset 360
+    # is well inside the `r` INTEGER body (cert is 421 bytes total).
+    saved_a: uint8 = leaf_der[360]
+    leaf_der[360] = saved_a ^ 0x01
+    _wstr("[chain] case (a): leaf sig bit-flipped\n")
+    rc = validate_cert_chain(&chain_ptrs[0], &chain_lens[0],
+                             cast[int32](1),
+                             "test.hamnix.local", NOW_GOOD)
+    _check_eq_i32(rc, 0, "(a) flipped leaf sig returns 0")
+    leaf_der[360] = saved_a
+
+    # 4. Tamper test (b): wrong host.
+    _wstr("[chain] case (b): wrong host\n")
+    rc = validate_cert_chain(&chain_ptrs[0], &chain_lens[0],
+                             cast[int32](1),
+                             "evil.hamnix.local", NOW_GOOD)
+    _check_eq_i32(rc, 0, "(b) wrong host returns 0")
+
+    # 5. Tamper test (c): now_unix past leaf.not_after.
+    _wstr("[chain] case (c): past not_after\n")
+    rc = validate_cert_chain(&chain_ptrs[0], &chain_lens[0],
+                             cast[int32](1),
+                             "test.hamnix.local", NOW_EXPIRED)
+    _check_eq_i32(rc, 0, "(c) past not_after returns 0")
+
+    # 6. Tamper test (d): remove the root from the CA store.
+    castore_remove_all()
+    _check_eq_i32(castore_count(), 0, "castore_count == 0 after remove_all")
+    _wstr("[chain] case (d): no anchor in CA store\n")
+    rc = validate_cert_chain(&chain_ptrs[0], &chain_lens[0],
+                             cast[int32](1),
+                             "test.hamnix.local", NOW_GOOD)
+    _check_eq_i32(rc, 0, "(d) empty CA store returns 0")
+
+    _wstr("[chain] failures=")
+    _wdec(cast[uint64](fail_count))
+    _wstr("\n")
+    if fail_count == 0:
+        _wstr("[chain] PASS\n")
+        return 0
+    _wstr("[chain] FAIL\n")
+    return 1

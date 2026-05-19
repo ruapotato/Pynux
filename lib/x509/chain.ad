@@ -1,0 +1,570 @@
+# lib/x509/chain.ad
+#
+# Chain validation + CA trust store + validity-window check (V4) — the
+# fourth and last layer of Hamnix's TLS cert-validation stack before
+# V5 wires it into drivers/net/tls.ad. Builds on:
+#   - lib/asn1/asn1.ad         (V0) for DER + OID byte constants
+#   - lib/x509/x509.ad         (V1) for X509Cert + x509_parse + DNS match
+#   - lib/rsa/rsa.ad           (V2) for rsa_pss_verify on RSA leaves
+#   - lib/ec/p256.ad +
+#     lib/ecdsa/ecdsa.ad       (V3) for ecdsa_p256_verify on ECDSA leaves
+#
+# RFC 5280 §6.1 PATH VALIDATION — simplified for V4:
+#
+#   1. Parse the leaf into an X509Cert.
+#   2. Hostname check: x509_match_dns(leaf, host) == 1.
+#   3. Time-window check: leaf.not_before <= now_unix <= leaf.not_after.
+#   4. Walk the chain leaf -> root:
+#        a. For each non-root cert, find a parent whose subject_dn (DER
+#           bytes) matches the current cert's issuer_dn. The parent is
+#           either (i) another cert in the caller-supplied chain or
+#           (ii) one of the CA store roots.
+#        b. Parent must have basicConstraints CA:TRUE.
+#        c. Parent's validity window must also cover now_unix.
+#        d. Verify current cert's signature via parent's public key,
+#           dispatched on cert.sig_alg_oid (OID_RSASSA_PSS -> RSA-PSS,
+#           OID_ECDSA_WITH_SHA256 -> ECDSA-P256; anything else -> -1).
+#        e. If parent IS a CA-store root, we're done. Else advance to
+#           parent and repeat.
+#   5. Reject if (a) chain depth > 8, (b) any signature verify fails,
+#      (c) any validity-window fails, (d) parent's CA bit unset,
+#      (e) no anchor matches the chain.
+#
+# OUT OF SCOPE (intentional, not bugs):
+#   - CRL / OCSP revocation checks
+#   - Name constraints / policy constraints (RFC 5280 §4.2.1.10-11)
+#   - Path length constraint enforcement (we accept any path <= 8)
+#   - keyUsage / extendedKeyUsage enforcement
+#   - GeneralizedTime in validity (V4 implements just UTCTime per the
+#     1950..2049 two-digit-year rule; RFC 5280 mandates GeneralizedTime
+#     for dates >= 2050 — out of scope until V5+)
+#   - ECDSA curves other than P-256 (P-384/Ed25519 are V5+)
+#   - const-time hardening of the underlying verifies (V6)
+#
+# RETURN-VALUE CONVENTION (validate_cert_chain):
+#   1   chain valid (terminates at a trusted root)
+#   0   chain well-formed but rejected (signature, time, CA-bit, no
+#       anchor, hostname mismatch)
+#  -1   malformed (DER decode failure, unsupported sig alg, depth > 8,
+#       UTCTime malformed)
+
+from lib.asn1.asn1 import (
+    OID_RSASSA_PSS,
+    OID_RSASSA_PSS_LEN,
+    OID_ECDSA_WITH_SHA256,
+    OID_ECDSA_WITH_SHA256_LEN,
+)
+from lib.x509.x509 import (
+    X509Cert,
+    x509_parse,
+    x509_match_dns,
+)
+from lib.rsa.rsa import (
+    RsaPubkey,
+    rsa_parse_pubkey,
+    rsa_pss_verify,
+)
+from lib.ecdsa.ecdsa import (
+    EcdsaPubkey,
+    ecdsa_parse_pubkey,
+    ecdsa_p256_verify,
+)
+
+
+# -- limits ----------------------------------------------------------------
+
+CASTORE_MAX_ROOTS:  int32  = 8
+CASTORE_ROOT_BYTES: uint64 = 2048   # max DER bytes per anchor
+CHAIN_MAX_DEPTH:    int32  = 8
+
+
+# -- CA trust store ---------------------------------------------------------
+#
+# We keep the trust store as a flat byte array sized for 8 anchors of up
+# to 2048 bytes each (16 KiB), indexed by anchor slot. A separate length
+# array tracks how much of each slot is used. No parsed X509Cert is
+# cached per anchor — we re-parse on demand into a single shared scratch
+# slot. This dodges the nested-Array/struct quirks in feedback_compiler_
+# quirks.md and keeps the .bss footprint predictable.
+#
+# 2048 bytes is comfortably above every well-known root: ISRG Root X1
+# is ~1391 bytes, DigiCert Global Root G2 is ~914 bytes, GTS Root R4 is
+# ~552 bytes. Most modern ECDSA roots are <600 bytes.
+
+castore_data:  Array[16384, uint8]   # CASTORE_MAX_ROOTS * CASTORE_ROOT_BYTES
+castore_lens:  Array[8, uint64]
+castore_n:     int32 = 0
+
+
+def _castore_slot_ptr(slot: int32) -> Ptr[uint8]:
+    base: uint64 = cast[uint64](&castore_data[0])
+    off:  uint64 = cast[uint64](slot) * CASTORE_ROOT_BYTES
+    return cast[Ptr[uint8]](base + off)
+
+
+def castore_init():
+    # Reset the store. Idempotent; safe to call more than once.
+    # V5 (drivers/net/tls.ad) will call this once during kernel boot
+    # before the first TLS handshake. V4 callers (test fixtures) call
+    # it themselves. We deliberately do NOT bake in any production
+    # roots here — every anchor is added explicitly via
+    # castore_add_root, so a build that wires in zero roots fails closed
+    # rather than silently trusting upstream defaults.
+    castore_n = 0
+    i: int32 = 0
+    while i < CASTORE_MAX_ROOTS:
+        castore_lens[i] = 0
+        i = i + 1
+
+
+def castore_add_root(cert_bytes: Ptr[uint8], cert_len: uint64) -> int32:
+    # Append a raw DER cert to the trust store. Returns the new anchor
+    # slot index on success, -1 on capacity overflow or sanity-check
+    # failure (zero-length, oversize, or DER doesn't parse / lacks the
+    # CA bit).
+    if castore_n >= CASTORE_MAX_ROOTS:
+        return -1
+    if cert_len == 0:
+        return -1
+    if cert_len > CASTORE_ROOT_BYTES:
+        return -1
+    slot: int32 = castore_n
+    dst: Ptr[uint8] = _castore_slot_ptr(slot)
+    i: uint64 = 0
+    while i < cert_len:
+        dst[i] = cert_bytes[i]
+        i = i + 1
+    castore_lens[slot] = cert_len
+    # Validate the anchor parses + has CA bit set. We don't keep the
+    # parsed X509Cert around — the validator re-parses on demand into
+    # `parent_scratch`. We re-use that same scratch here.
+    rc: int32 = x509_parse(dst, cert_len, &parent_scratch)
+    if rc != 0:
+        castore_lens[slot] = 0
+        return -1
+    if parent_scratch.is_ca == 0:
+        castore_lens[slot] = 0
+        return -1
+    castore_n = slot + 1
+    return slot
+
+
+def castore_remove_all():
+    # Drop every anchor. Used by the test fixture's "no-anchor"
+    # negative case.
+    castore_init()
+
+
+def castore_count() -> int32:
+    return castore_n
+
+
+# -- single-cert scratch slots ---------------------------------------------
+#
+# We hold the parsed leaf / current / parent certs as module-globals
+# rather than stack locals. X509Cert contains ~1 KiB of arrays and Adder
+# (per memory/feedback_compiler_quirks.md) still has known nested-frame
+# Array spill bugs; module-globals dodge them entirely.
+
+leaf_scratch:    X509Cert
+current_scratch: X509Cert
+parent_scratch:  X509Cert
+candidate_scratch: X509Cert
+
+# Parsed parent public keys. Both verify paths take a pubkey pointer;
+# we hold both shapes statically and pick the right one based on the
+# parent's signature algorithm.
+parent_rsa:   RsaPubkey
+parent_ecdsa: EcdsaPubkey
+
+
+# -- byte helpers ----------------------------------------------------------
+
+def _chain_bytes_eq(a: Ptr[uint8], a_len: uint64,
+              b: Ptr[uint8], b_len: uint64) -> int32:
+    if a_len != b_len:
+        return 0
+    i: uint64 = 0
+    while i < a_len:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# -- ASCII -> integer helpers for UTCTime decode ---------------------------
+
+def _ascii_d2(c0: uint8, c1: uint8, out: Ptr[uint64]) -> int32:
+    if c0 < 0x30:
+        return -1
+    if c0 > 0x39:
+        return -1
+    if c1 < 0x30:
+        return -1
+    if c1 > 0x39:
+        return -1
+    v: uint64 = cast[uint64](c0 - 0x30) * 10 + cast[uint64](c1 - 0x30)
+    out[0] = v
+    return 0
+
+
+# Is the given (Gregorian) year a leap year? Civil rule.
+def _is_leap(year: uint64) -> int32:
+    if (year % 4) != 0:
+        return 0
+    if (year % 100) != 0:
+        return 1
+    if (year % 400) != 0:
+        return 0
+    return 1
+
+
+# Days from 1970-01-01 to the first day of `year`. Year >= 1970.
+def _days_from_1970_to_year(year: uint64) -> uint64:
+    days: uint64 = 0
+    y: uint64 = 1970
+    while y < year:
+        if _is_leap(y) != 0:
+            days = days + 366
+        else:
+            days = days + 365
+        y = y + 1
+    return days
+
+
+# Days from start of `year` to first day of `month` (1..12).
+def _days_to_month(year: uint64, month: uint64) -> uint64:
+    # Cumulative days at the start of each month in a non-leap year.
+    days: uint64 = 0
+    m: uint64 = 1
+    while m < month:
+        if m == 1:
+            days = days + 31
+        else:
+            if m == 2:
+                if _is_leap(year) != 0:
+                    days = days + 29
+                else:
+                    days = days + 28
+            else:
+                if m == 3:
+                    days = days + 31
+                else:
+                    if m == 4:
+                        days = days + 30
+                    else:
+                        if m == 5:
+                            days = days + 31
+                        else:
+                            if m == 6:
+                                days = days + 30
+                            else:
+                                if m == 7:
+                                    days = days + 31
+                                else:
+                                    if m == 8:
+                                        days = days + 31
+                                    else:
+                                        if m == 9:
+                                            days = days + 30
+                                        else:
+                                            if m == 10:
+                                                days = days + 31
+                                            else:
+                                                if m == 11:
+                                                    days = days + 30
+                                                else:
+                                                    days = days + 31
+        m = m + 1
+    return days
+
+
+# -- UTCTime -> unix-seconds decode ---------------------------------------
+#
+# UTCTime body is exactly 13 ASCII bytes: YYMMDDHHMMSSZ. RFC 5280 §4.1.2.5
+# fixes the two-digit-year rule: YY in 00..49 -> 2000..2049, YY in
+# 50..99 -> 1950..1999. The 14th byte must be 'Z'. Returns 0 on success
+# and stores unix seconds in *out_unix; returns -1 on malformed input.
+
+def _utctime_to_unix(t: Ptr[uint8], t_len: uint64,
+                     out_unix: Ptr[uint64]) -> int32:
+    if t_len != 13:
+        return -1
+    if t[12] != 0x5A:   # 'Z'
+        return -1
+    yy: uint64 = 0
+    mm: uint64 = 0
+    dd: uint64 = 0
+    hh: uint64 = 0
+    mi: uint64 = 0
+    ss: uint64 = 0
+    rc: int32 = _ascii_d2(t[0],  t[1],  &yy)
+    if rc != 0:
+        return -1
+    rc = _ascii_d2(t[2],  t[3],  &mm)
+    if rc != 0:
+        return -1
+    rc = _ascii_d2(t[4],  t[5],  &dd)
+    if rc != 0:
+        return -1
+    rc = _ascii_d2(t[6],  t[7],  &hh)
+    if rc != 0:
+        return -1
+    rc = _ascii_d2(t[8],  t[9],  &mi)
+    if rc != 0:
+        return -1
+    rc = _ascii_d2(t[10], t[11], &ss)
+    if rc != 0:
+        return -1
+    if mm < 1:
+        return -1
+    if mm > 12:
+        return -1
+    if dd < 1:
+        return -1
+    if dd > 31:
+        return -1
+    if hh > 23:
+        return -1
+    if mi > 59:
+        return -1
+    if ss > 60:   # 60 to accept the rare leap second; treat as 59 below
+        return -1
+    if ss == 60:
+        ss = 59
+    year: uint64 = 0
+    if yy <= 49:
+        year = 2000 + yy
+    else:
+        year = 1900 + yy
+    # Pre-1970 dates aren't expressible in unix-seconds; reject.
+    if year < 1970:
+        return -1
+    days: uint64 = _days_from_1970_to_year(year) + _days_to_month(year, mm)
+    days = days + (dd - 1)
+    total: uint64 = days * 86400 + hh * 3600 + mi * 60 + ss
+    out_unix[0] = total
+    return 0
+
+
+# -- validity-window check -------------------------------------------------
+#
+# Returns 1 if now_unix is inside [not_before, not_after], 0 if outside,
+# -1 if either timestamp is malformed.
+
+def _check_validity(cert: Ptr[X509Cert], now_unix: uint64) -> int32:
+    nb_unix: uint64 = 0
+    rc: int32 = _utctime_to_unix(&cert[0].not_before[0],
+                                 cert[0].not_before_len, &nb_unix)
+    if rc != 0:
+        return -1
+    na_unix: uint64 = 0
+    rc = _utctime_to_unix(&cert[0].not_after[0],
+                          cert[0].not_after_len, &na_unix)
+    if rc != 0:
+        return -1
+    if now_unix < nb_unix:
+        return 0
+    if now_unix > na_unix:
+        return 0
+    return 1
+
+
+# -- signature verify dispatch --------------------------------------------
+#
+# Dispatch on the *child*'s sig_alg_oid (which encodes how the parent
+# signed the child) and pick the matching parent-pubkey shape derived
+# from parent.pubkey_alg_oid.
+#
+# Returns 1 valid, 0 invalid, -1 malformed / unsupported algorithm.
+
+def _verify_signature(child: Ptr[X509Cert],
+                      parent: Ptr[X509Cert]) -> int32:
+    # RSASSA-PSS-SHA256 path.
+    if _chain_bytes_eq(&child[0].sig_alg_oid[0], child[0].sig_alg_oid_len,
+                 &OID_RSASSA_PSS[0], OID_RSASSA_PSS_LEN) != 0:
+        rc: int32 = rsa_parse_pubkey(&parent[0].pubkey_bytes[0],
+                                     parent[0].pubkey_bytes_len,
+                                     &parent_rsa)
+        if rc != 0:
+            return -1
+        return rsa_pss_verify(&parent_rsa,
+                              child[0].tbs_bytes, child[0].tbs_len,
+                              &child[0].sig_bytes[0],
+                              child[0].sig_bytes_len)
+    # ECDSA-with-SHA256 (P-256) path.
+    if _chain_bytes_eq(&child[0].sig_alg_oid[0], child[0].sig_alg_oid_len,
+                 &OID_ECDSA_WITH_SHA256[0],
+                 OID_ECDSA_WITH_SHA256_LEN) != 0:
+        rc2: int32 = ecdsa_parse_pubkey(&parent[0].pubkey_bytes[0],
+                                        parent[0].pubkey_bytes_len,
+                                        &parent_ecdsa)
+        if rc2 != 0:
+            return -1
+        return ecdsa_p256_verify(&parent_ecdsa,
+                                 child[0].tbs_bytes, child[0].tbs_len,
+                                 &child[0].sig_bytes[0],
+                                 child[0].sig_bytes_len)
+    # Anything else is unsupported in V4.
+    return -1
+
+
+# -- chain walk -----------------------------------------------------------
+#
+# Helper: re-parse castore slot `slot` into parent_scratch (or
+# candidate_scratch). Returns 0 on success, -1 on malformed.
+
+def _parse_root_into(slot: int32, out: Ptr[X509Cert]) -> int32:
+    p: Ptr[uint8] = _castore_slot_ptr(slot)
+    n: uint64     = castore_lens[slot]
+    if n == 0:
+        return -1
+    return x509_parse(p, n, out)
+
+
+# -- validate_cert_chain ---------------------------------------------------
+#
+# chain_ptrs[0..chain_count) is the caller-supplied list of DER cert
+# byte spans, leaf-first. chain_ptrs[0] MUST be the leaf. The chain may
+# optionally include the root, but the root is also looked up in the
+# CA store regardless: a chain that terminates at a self-signed root NOT
+# present in the CA store is rejected.
+
+def validate_cert_chain(chain_ptrs: Ptr[Ptr[uint8]],
+                        chain_lens: Ptr[uint64],
+                        chain_count: int32,
+                        host: Ptr[char],
+                        now_unix: uint64) -> int32:
+    if chain_count <= 0:
+        return -1
+    if chain_count > CHAIN_MAX_DEPTH:
+        return -1
+
+    # 1. Parse the leaf.
+    rc: int32 = x509_parse(chain_ptrs[0], chain_lens[0], &leaf_scratch)
+    if rc != 0:
+        return -1
+
+    # 2. Hostname check.
+    if x509_match_dns(&leaf_scratch, host) != 1:
+        return 0
+
+    # 3. Leaf validity window.
+    vc: int32 = _check_validity(&leaf_scratch, now_unix)
+    if vc < 0:
+        return -1
+    if vc == 0:
+        return 0
+
+    # 4. Leaf must NOT be a CA (defence in depth — a CA cert sitting in
+    # the leaf slot would be a chain confusion). RFC 5280 §6.1.4(k):
+    # only intermediate certs may carry the CA bit.
+    if leaf_scratch.is_ca != 0:
+        return 0
+
+    # Walk the chain leaf -> root, copying leaf_scratch into
+    # current_scratch as the live "child" for the loop.
+    _x509_copy(&leaf_scratch, &current_scratch)
+
+    # depth counts the number of certs we've already verified -- starts
+    # at 0 (we haven't proven leaf yet). Cap at CHAIN_MAX_DEPTH.
+    depth: int32 = 0
+    while depth < CHAIN_MAX_DEPTH:
+        # 4a. Try CA-store roots first. A root that's a parent terminates
+        # the chain.
+        i: int32 = 0
+        while i < castore_n:
+            if castore_lens[i] != 0:
+                rc = _parse_root_into(i, &candidate_scratch)
+                if rc == 0:
+                    if _chain_bytes_eq(&candidate_scratch.subject_dn[0],
+                                 candidate_scratch.subject_dn_len,
+                                 &current_scratch.issuer_dn[0],
+                                 current_scratch.issuer_dn_len) != 0:
+                        if candidate_scratch.is_ca != 0:
+                            vc = _check_validity(&candidate_scratch,
+                                                 now_unix)
+                            if vc == 1:
+                                # Verify current cert's signature with
+                                # this root's pubkey.
+                                vrc: int32 = _verify_signature(
+                                    &current_scratch, &candidate_scratch)
+                                if vrc < 0:
+                                    return -1
+                                if vrc == 1:
+                                    # Anchor reached. Done.
+                                    return 1
+            i = i + 1
+
+        # 4b. Try caller-supplied chain certs (anything beyond the leaf).
+        # If we find a parent, verify and advance. We don't terminate
+        # here even if the chain cert happens to be self-signed — only
+        # CA-store roots terminate.
+        found: int32 = 0
+        j: int32 = 1
+        while j < chain_count:
+            rc = x509_parse(chain_ptrs[j], chain_lens[j], &candidate_scratch)
+            if rc == 0:
+                if _chain_bytes_eq(&candidate_scratch.subject_dn[0],
+                             candidate_scratch.subject_dn_len,
+                             &current_scratch.issuer_dn[0],
+                             current_scratch.issuer_dn_len) != 0:
+                    if candidate_scratch.is_ca != 0:
+                        vc = _check_validity(&candidate_scratch, now_unix)
+                        if vc < 0:
+                            return -1
+                        if vc == 1:
+                            vrc2: int32 = _verify_signature(
+                                &current_scratch, &candidate_scratch)
+                            if vrc2 < 0:
+                                return -1
+                            if vrc2 == 1:
+                                # Advance: candidate becomes the new
+                                # child, search for ITS parent next
+                                # iteration. Also verify the candidate
+                                # is not the same cert as current
+                                # (degenerate loop protection — RFC 5280
+                                # discourages but does not forbid self-
+                                # links).
+                                _x509_copy(&candidate_scratch,
+                                           &current_scratch)
+                                found = 1
+                                break
+            j = j + 1
+
+        if found == 0:
+            # No parent found in either the chain or the trust store.
+            return 0
+        depth = depth + 1
+
+    # Walked CHAIN_MAX_DEPTH certs without reaching a trust anchor.
+    return 0
+
+
+# -- struct copy helper ----------------------------------------------------
+#
+# A flat byte-wise copy of an X509Cert. This is needed when we advance
+# from a chain cert to its (chain) parent — we have to preserve the
+# parent's parse state across candidate_scratch reuse on the next loop
+# iteration. We byte-copy from the source pointer to the destination
+# pointer using sizeof-by-pointer-arithmetic. The X509Cert layout is
+# fixed at compile time, so taking address-of (&a + 1) yields the size.
+
+def _x509_copy(src: Ptr[X509Cert], dst: Ptr[X509Cert]):
+    # Compute sizeof(X509Cert) at runtime via pointer arithmetic on a
+    # one-element array.
+    s_lo: uint64 = cast[uint64](src)
+    s_hi: uint64 = cast[uint64](&src[1])
+    n:    uint64 = s_hi - s_lo
+    sp: Ptr[uint8] = cast[Ptr[uint8]](src)
+    dp: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    i: uint64 = 0
+    while i < n:
+        dp[i] = sp[i]
+        i = i + 1
+    # tbs_bytes is a Ptr[uint8] that points back into the caller's input
+    # buffer; byte-copy already moved the pointer value, so the dst's
+    # tbs_bytes now references the same source bytes. That's exactly
+    # what we want — the bytes the parent's signature is computed over
+    # are still backed by the caller's chain buffer, which lives
+    # through this call.
