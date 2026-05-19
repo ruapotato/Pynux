@@ -81,30 +81,45 @@ Hamnix is a wide project. The minimum-viable shape we're converging on:
 
 Concretely this means closing four named gates:
 
-1. **L40 — boot on real ThinkPad hardware.** Today's UEFI verification
-   is QEMU + OVMF firmware + GNOME Boxes. The structural pieces (PE/COFF
-   stub, SFSP ELF loader, GDT handoff at M16.138, FAT12 ESP per OVMF's
-   El Torito quirk) are in place, but **L40 is Pending** — no T480
-   / Dell / HP physical box has run the ISO yet.
+1. **L40 — boot on real ThinkPad hardware.** Pending. Today's UEFI
+   verification is QEMU + OVMF firmware + GNOME Boxes. Structural
+   pieces (PE/COFF stub, SFSP ELF loader, GDT handoff at M16.138,
+   FAT12 ESP per OVMF's El Torito quirk) all in place. No T480 /
+   Dell / HP physical box has run the ISO yet. `docs/REAL_HARDWARE.md`
+   has the concrete USB-stick recipe + firmware checklist for the
+   first volunteer.
 2. **TLS-CERT — X.509 + RSA-PSS / ECDSA verify with a baked CA store.**
-   **Closed** in V0..V6 + V5.1 (commits `f47449e` → `563e23f`).
+   **Closed.** V0..V6 + V5.1/V5.2/V5.3 (commits `f47449e` → `dc7676c`).
    ASN.1 parser, X.509 walker, RSA-PSS-SHA256, ECDSA-P256 (binary-GCD
-   modular inverse — ~1s verify in QEMU), PKCS#1 v1.5 SHA-256 dispatch,
-   chain builder with 8-anchor CA store, validity window, CertificateVerify
-   transcript binding. Apt-over-HTTPS against LE-signed mirrors is now
-   MITM-resistant for the common path. Remaining fragilities are
-   smaller in scope: multi-record handshake stitching unsupported
-   (chains > ~1.4 KB split across two AEAD records will trip);
-   CRL/OCSP intentionally out of scope; primitives are not const-time
-   yet (V6+ hardening).
-3. **USB HID V2 — interrupt-IN poll** so real `sendkey x` keystrokes
-   reach hamsh stdin. M16.139 V0+V1 ship the controller + transfer
-   engine end-to-end on `qemu-xhci + usb-kbd`; the continuous polling
-   loop is the only remaining piece. (In flight.)
-4. **inbound SSH** — needs `sshd` running. The crypto primitives are
-   in place (ChaCha20-Poly1305, X25519, SHA-256); the SSH protocol
-   itself is not. Once present, "useful server OS" is functionally
-   demonstrated.
+   modular inverse — ~1 s verify in QEMU), PKCS#1 v1.5 SHA-256, chain
+   builder + 8-anchor CA store + validity window, CertificateVerify
+   transcript binding (V5.1), multi-record handshake stitching (V5.2),
+   TCP per-slot RX ring so multi-segment chains accumulate cleanly
+   (V5.3), CMOS RTC backing `_tls_now_unix` so clock-rollback attacks
+   don't fly. HTTP/1.1 chunked transfer-encoding decoder and gzip
+   inflater (`lib/zlib/inflate.ad`) wired into `http_get` so real
+   `Packages.gz` decompresses transparently. Outstanding before
+   real-world `apt update` against Cloudflare-fronted Debian mirrors:
+   AES-256-GCM-SHA384 cipher suite (currently clean-fails on
+   unsupported suites per RFC 8446 §6.2 — no crash); HTTP redirects
+   (in flight); apt-glue itself (Release → Packages.gz → .deb →
+   dpkg — userland work atop a working transport).
+3. **USB HID continuous polling** so a real `sendkey x` keystroke
+   reaches hamsh stdin. **Closed structurally** in M16.139 V0/V1/V2
+   (xHCI controller + transfer engine + interrupt-IN timer-tick poll
+   + HID → atkbd FIFO). Verified synthetically; wire-side `sendkey`
+   in the test harness is pending `socat` install on the host (the
+   kernel path itself is sound).
+4. **Inbound SSH.** Not yet started. The crypto primitives are in
+   place (ChaCha20-Poly1305, AES-128-GCM, X25519, SHA-256, ECDSA-P256,
+   RSA-PSS, the inflater, the validated TLS stack), but the SSH
+   protocol layer itself doesn't exist yet. Once present, "useful
+   server OS" is functionally demonstrated.
+
+Stack-canary compiler hardening (`-fstack-protector-strong` equivalent)
+just landed in flight — it would have caught today's `_tls_aead_seal`
+2 KiB `mac_buf` overflow at function-exit instead of crashing later
+in unrelated code. That class of bug, now caught at the source.
 
 Everything else on the project — GUI / rio, full real cert validation
 for outbound TLS, multi-core scheduler polish, additional drivers — is
