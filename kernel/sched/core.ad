@@ -883,6 +883,20 @@ def start_first_task():
     diag_efer:     uint64 = read_msr(0xC0000080)   # IA32_EFER
     diag_lstar:    uint64 = read_msr(0xC0000082)   # IA32_LSTAR
     diag_fmask:    uint64 = read_msr(0xC0000084)   # IA32_FMASK
+    # M16.154-eft: snapshot the three FS/GS base MSRs so a real-hw
+    # capture surfaces any stale segment-base value the firmware left
+    # behind. The iretq into ring 3 does NOT touch these — whatever
+    # value is in them at this moment is what the user task inherits.
+    # FS_BASE is what `mov %fs:offset, ...` displaces from; GS_BASE
+    # is the active gs base when no swapgs has happened; KERNEL_GS_BASE
+    # is the shadow that swapgs would swap IN. A nonzero KERNEL_GS_BASE
+    # combined with a kernel that doesn't do swapgs on the iretq path
+    # is benign; a nonzero GS_BASE pointing at a userland VA could
+    # become live if a future patch adds swapgs (none does on this
+    # path today, but surfacing it pre-empts the question).
+    diag_fs_base:        uint64 = read_msr(0xC0000100)  # IA32_FS_BASE
+    diag_gs_base:        uint64 = read_msr(0xC0000101)  # IA32_GS_BASE
+    diag_kernel_gs_base: uint64 = read_msr(0xC0000102)  # IA32_KERNEL_GS_BASE
     # First, dump the static state: user RIP, CR3, CR4, TSS RSP0, MSRs.
     printk1("[ring3-diag] target rip=%p\n", diag_user_rip)
     printk2("[ring3-diag] target cs=%p ss=%p\n", diag_user_cs, diag_user_ss)
@@ -904,6 +918,13 @@ def start_first_task():
     printk1("[ring3-diag] STAR=%p\n", diag_star)
     printk1("[ring3-diag] EFER=%p\n", diag_efer)
     printk2("[ring3-diag] LSTAR=%p FMASK=%p\n", diag_lstar, diag_fmask)
+    # M16.154-eft: per-CPU segment-base MSRs. Any nonzero / garbage
+    # value here on real-hw would be a candidate iretq-fault root
+    # cause if a future code path adds swapgs; today's path doesn't
+    # swapgs on the iretq-into-ring-3 leg, so these are documentary.
+    printk1("[msr-diag] KERNEL_GS_BASE=%p\n", diag_kernel_gs_base)
+    printk1("[msr-diag] GS_BASE=%p\n",        diag_gs_base)
+    printk1("[msr-diag] FS_BASE=%p\n",        diag_fs_base)
     # M16.154: explicit PDPT-index dump for the user RIP. If the RIP
     # is below 4 GiB (the regime QEMU exercises) this is 0..3 and
     # the corresponding PDPT slot is what the boot stub stamps at
