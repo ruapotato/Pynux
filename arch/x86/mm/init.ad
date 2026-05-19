@@ -19,6 +19,7 @@ from mm.memblock import memblock_init
 from mm.page_alloc import page_alloc_init
 from mm.slab import slab_init
 from arch.x86.kernel.e820 import e820_init
+from arch.x86.mm.pgtable import pgtable_extend_from_e820
 
 
 def mem_init():
@@ -30,5 +31,15 @@ def mem_init():
     # takes pages from page_alloc.
     memblock_init()
     e820_init()
+    # Identity map extension MUST run before any allocator that may
+    # hand out pages above 4 GiB. The boot stub installs a fixed
+    # 4 GiB identity map (4× 1 GiB PDPT entries); on a host with
+    # > 4 GiB RAM (Asus laptop with ~5 GiB, ThinkPad with 16 GiB,
+    # server with 64 GiB...) e820 reports memory extending well
+    # beyond that. Without this call page_alloc_init's first write
+    # into a freshly-carved high page traps #PF (vector 0x0e
+    # err=0x02 — kernel write to not-present), which is exactly
+    # what real-hardware UEFI boot was hitting at rip≈0x1c6019.
+    pgtable_extend_from_e820()
     page_alloc_init()
     slab_init()

@@ -1,0 +1,211 @@
+# arch/x86/mm/pgtable.ad
+#
+# Dynamic post-e820 identity-map extension.
+#
+# Background:
+#   The boot stub (arch/x86/boot/header.S for multiboot1, arch/x86/boot/
+#   efi_stub.S for UEFI direct boot) installs a fixed identity map: 4
+#   PDPT entries pointing at 1 GiB pages covering 0..4 GiB. That's
+#   enough to reach LAPIC / IOAPIC / HPET MMIO under 4 GiB and to
+#   identity-cover the kernel image / boot stack / early-allocator
+#   pool. But QEMU `-m 6G` or a real laptop with 5 GiB / 8 GiB / 16 GiB
+#   reports RAM extending beyond 4 GiB in the e820 / multiboot mmap,
+#   and the moment page_alloc_init() carves a page from above 4 GiB
+#   the kernel write into that page traps #PF (vector 0x0e, err=0x02 —
+#   "kernel-mode write to not-present").
+#
+# Fix:
+#   After e820_init() has parsed the firmware memory map (which we
+#   re-walk here — e820.ad doesn't expose a public iterator yet), stamp
+#   one PDPT entry per 1 GiB page covering every E820_RAM (type=1)
+#   region. Already-present entries (the first 4 GiB stamped by the
+#   boot stub) are skipped, so this is idempotent.
+#
+# Design notes:
+#   - We read the PDPT base from CR3 (CR3 -> PML4 phys; PML4[0] holds
+#     the PDPT phys with the lower 12 bits being flags). This works
+#     uniformly on the multiboot1 boot path (kernel `pml4`/`pdpt` in
+#     .pgtables) AND the UEFI direct-boot path (efi_stub's private
+#     efi_pml4/efi_pdpt in the stub's .bss). Both arrangements satisfy
+#     PML4[0] -> PDPT -> 4× 1 GiB pages at PDPT[0..3].
+#   - Flags on new entries: PS|RW|P (0x83). U=0: kernel-only. NX=0:
+#     deferred to a separate W^X hardening pass.
+#   - Whole 1 GiB pages: if an E820_RAM region is only e.g. 100 MiB,
+#     we still stamp a full 1 GiB. The overshoot just identity-maps a
+#     non-RAM hole; nothing writes there because page_alloc only
+#     allocates from memblock, and memblock only tracks the one
+#     selected region from e820.ad. Harmless.
+#   - TLB flush: page-walkers don't cache absent PDPT entries on x86,
+#     so strictly speaking we don't need a flush after adding entries.
+#     But a full reload via `mov %cr3,%rax; mov %rax,%cr3` costs
+#     < 1 microsecond and shuts the door on any speculative-prefetch
+#     edge case. Done via load_cr3(get_bsp_cr3()).
+#
+# Theoretical ceiling: PDPT has 512 entries × 1 GiB = 512 GiB. Beyond
+# that we'd need to widen PML4 (4-level paging) or move to LA57. Both
+# are deliberately out of scope; the 512 GiB ceiling covers every
+# current x86_64 server config Hamnix targets.
+
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def get_mb_info() -> uint64
+extern def get_mb_magic() -> uint64
+extern def get_bsp_cr3() -> uint64
+extern def load_cr3(value: uint64)
+
+# Multiboot1 constants (mirror arch/x86/kernel/e820.ad — kept inline
+# rather than imported to avoid coupling to e820.ad's private surface).
+PGT_MB_MAGIC:        uint64 = 0x2BADB002
+PGT_MB_MMAP_BIT:     uint64 = 0x40            # flags bit 6
+PGT_MMAP_TYPE_RAM:   uint64 = 1
+
+# Address-mask constants for page-table walks. CR3 / PDPT-entry layout:
+#   bits  0..11  flags (P/RW/US/PWT/PCD/A/PS/...)
+#   bits 12..51  physical address (40-bit phys on most CPUs; we treat
+#                it as the lower 52 bits and mask off everything below
+#                bit 12). The mask 0x000FFFFFFFFFF000 isolates the
+#                physical-frame-number field independent of which
+#                flag bits the boot stub set (0x7 multiboot path vs.
+#                0x3 EFI path).
+PGT_ADDR_MASK:       uint64 = 0x000FFFFFFFFFF000
+
+# PDPT-entry flags for a 1 GiB page:
+#   bit 0 P   = present
+#   bit 1 RW  = writable
+#   bit 2 US  = user-accessible
+#   bit 7 PS  = 1 GiB page (terminal entry at PDPT level)
+#
+# We set US=1 to match what arch/x86/boot/header.S stamps on the first
+# 4 GiB (0x87 = PS|US|RW|P). The intuition "kernel pages should be
+# kernel-only" doesn't hold for the Hamnix identity map today: user
+# tasks created by SYS_SPAWN clone the BSP's PML4 and share the same
+# PDPT; ET_DYN user binaries (the common case for /init, hamsh,
+# coreutils) run from identity-mapped physical RAM rather than from a
+# private overlay (elf_apply_last_user_mapping is a no-op for ET_DYN,
+# per fs/elf.ad). If alloc_page hands a user task a page above 4 GiB,
+# the task's instruction fetch lands in our new PDPT entries; without
+# US=1 they #PF with err=0x05 the moment CPL=3 touches them. Matching
+# the boot-stub flag set is the minimum invasive change. NX-bit
+# enforcement / per-task user-private overlays are tracked separately
+# under the W^X hardening line item.
+PGT_FLAG_P:    uint64 = 0x1
+PGT_FLAG_PS:   uint64 = 0x80
+PGT_NEW_FLAGS: uint64 = 0x87        # PS | US | RW | P (matches boot stub)
+
+# 1 GiB in bytes, and the corresponding shift for PDPT-entry index.
+PGT_1GB:       uint64 = 0x40000000
+PGT_1GB_SHIFT: uint64 = 30
+
+# PDPT has 512 entries → 512 GiB maximum coverage with 1 GiB pages.
+PGT_PDPT_ENTRIES: uint64 = 512
+
+
+def _pgtable_pdpt_base() -> uint64:
+    # Locate the live PDPT by reading CR3 -> PML4 -> PML4[0] -> PDPT
+    # phys. Works for both boot paths (multiboot1 .pgtables and EFI
+    # stub .bss arrangements) because they share the PML4[0] -> PDPT
+    # convention. Assumes we are still identity-mapped, which is
+    # exactly the regime we run in throughout early boot.
+    cr3:  uint64 = get_bsp_cr3()
+    pml4: uint64 = cr3 & PGT_ADDR_MASK
+    pml4e0: uint64 = cast[Ptr[uint64]](pml4)[0]
+    return pml4e0 & PGT_ADDR_MASK
+
+
+def _pgtable_stamp_1gb(pdpt_base: uint64, idx: uint64) -> int32:
+    # Stamp PDPT[idx] with a 1 GiB page mapping at phys = idx * 1 GiB.
+    # Returns 1 if a new entry was written, 0 if the slot was already
+    # present (so callers can count newly-covered GiB for the log).
+    if idx >= PGT_PDPT_ENTRIES:
+        return 0
+    slot: Ptr[uint64] = cast[Ptr[uint64]](pdpt_base + idx * 8)
+    existing: uint64 = slot[0]
+    if (existing & PGT_FLAG_P) != 0:
+        return 0
+    phys: uint64 = idx << PGT_1GB_SHIFT
+    slot[0] = phys | PGT_NEW_FLAGS
+    return 1
+
+
+def pgtable_extend_from_e820():
+    # Re-walk the multiboot1 memory map and stamp PDPT entries for
+    # every 1 GiB page that overlaps an E820_RAM region. Called from
+    # mem_init() between e820_init() and page_alloc_init() so the
+    # page allocator sees a fully-mapped identity window for every
+    # RAM byte the firmware reported.
+    #
+    # If the boot path didn't supply a multiboot1 info struct (the
+    # UEFI direct-boot path today — e820.ad's EFI fallback installs
+    # the same 2..240 MiB memblock window we already had), there's
+    # nothing to extend: the existing 4 GiB identity map already
+    # covers every memblock byte. Return early and emit a log line
+    # so the absence is visible.
+    magic: uint64 = get_mb_magic()
+    if magic != PGT_MB_MAGIC:
+        printk0("[pgtable] no multiboot1 mmap; identity map unchanged\n")
+        return
+
+    info: uint64 = get_mb_info()
+    if info == 0:
+        printk0("[pgtable] mb_info null; identity map unchanged\n")
+        return
+
+    flags: uint64 = cast[uint64](cast[Ptr[uint32]](info)[0])
+    if (flags & PGT_MB_MMAP_BIT) == 0:
+        printk0("[pgtable] mmap bit clear; identity map unchanged\n")
+        return
+
+    mmap_length: uint64 = cast[uint64](cast[Ptr[uint32]](info + 44)[0])
+    mmap_addr:   uint64 = cast[uint64](cast[Ptr[uint32]](info + 48)[0])
+
+    pdpt_base: uint64 = _pgtable_pdpt_base()
+    printk2("[pgtable] pdpt_base=%p mmap=%p\n", pdpt_base, mmap_addr)
+
+    # Track total reported RAM (for the post-condition log line) and
+    # newly-stamped 1 GiB pages (so we can confirm we did real work
+    # when memory > 4 GiB is present).
+    total_ram_bytes: uint64 = 0
+    new_entries:     uint64 = 0
+
+    pos: uint64 = mmap_addr
+    end: uint64 = mmap_addr + mmap_length
+    while pos < end:
+        entry_size: uint64 = cast[uint64](cast[Ptr[uint32]](pos)[0])
+        base:       uint64 = cast[Ptr[uint64]](pos + 4)[0]
+        length:     uint64 = cast[Ptr[uint64]](pos + 12)[0]
+        type_code:  uint64 = cast[uint64](cast[Ptr[uint32]](pos + 20)[0])
+
+        if type_code == PGT_MMAP_TYPE_RAM:
+            total_ram_bytes = total_ram_bytes + length
+
+            # Round base DOWN and (base+length) UP to 1 GiB boundary.
+            # This guarantees we cover every byte in the region without
+            # having to worry about per-byte granularity within the
+            # 1 GiB page (we deliberately overshoot — see file header).
+            region_start: uint64 = base & ~(PGT_1GB - 1)
+            region_end:   uint64 = (base + length + PGT_1GB - 1) & ~(PGT_1GB - 1)
+
+            # Iterate by 1 GiB page index. Skip indices 0..3 implicitly
+            # via the "already present" check inside _pgtable_stamp_1gb
+            # (the boot stub pre-stamped those four). Indices >= 512
+            # are clamped inside the helper too.
+            cur: uint64 = region_start
+            while cur < region_end:
+                idx: uint64 = cur >> PGT_1GB_SHIFT
+                new_entries = new_entries + cast[uint64](_pgtable_stamp_1gb(pdpt_base, idx))
+                cur = cur + PGT_1GB
+
+        pos = pos + entry_size + 4
+
+    # If we actually added new entries, flush the TLB. x86 page-walkers
+    # don't cache absent entries, so this is defensive — costs < 1 μs
+    # and shuts the door on any speculative-prefetch edge case.
+    if new_entries > 0:
+        load_cr3(get_bsp_cr3())
+
+    # Round total RAM to GiB for the log line. Use ceil division so a
+    # ~4.78 GiB Asus laptop logs "5 GiB" — matches what the user sees
+    # printed on a marketing sticker / dmesg one-liner.
+    total_gb: uint64 = (total_ram_bytes + PGT_1GB - 1) >> PGT_1GB_SHIFT
+    printk2("[pgtable] extended identity map: %d GiB total RAM via e820 (+%d new 1GiB entries)\n",
+            total_gb, new_entries)
