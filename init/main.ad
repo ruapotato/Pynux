@@ -789,6 +789,61 @@ def https_smoke_test():
     printk0("'\n")
 
 
+def https_chunked_smoke_test():
+    # Validates the chunked-transfer-encoding decoder in
+    # drivers/net/http.ad. The test harness
+    # (scripts/test_net_https_chunked.sh) spins up a Python TLS 1.3
+    # server on 10.0.2.200:443 (via the same SLIRP guestfwd shape as
+    # test_net_https.sh) that responds to every request with
+    #
+    #   HTTP/1.1 200 OK\r\n
+    #   Transfer-Encoding: chunked\r\n\r\n
+    #   a\r\n0123456789\r\n          (10 bytes)
+    #   5\r\nABCDE\r\n                (5 bytes)
+    #   0\r\n\r\n                     (last-chunk)
+    #
+    # so the decoded body is exactly "0123456789ABCDE" (15 bytes).
+    # The wrapper script greps for the PASS marker [https-chunked]
+    # PASS once those 15 bytes appear in the kernel log.
+    printk0("[https-chunked] smoke test starting (10.0.2.200:443)\n")
+    https_url:    Ptr[uint8] = "https://10.0.2.200/chunked"
+    https_status: int32 = 0
+    body_ptr:     Ptr[uint8] = cast[Ptr[uint8]](&https_body[0])
+    status_ptr:   Ptr[int32] = cast[Ptr[int32]](&https_status)
+    n: int64 = https_get(https_url, body_ptr, 8192, status_ptr)
+    if n < 0:
+        printk0("[https-chunked] FAIL (https_get returned -1)\n")
+        return
+    printk2("[https-chunked] GET 10.0.2.200/chunked -> status=%d body=%dbytes\n",
+            cast[uint64](https_status), cast[uint64](n))
+    body_n: uint64 = cast[uint64](n)
+    # Verify length first; the harness greps the body printout below
+    # so a divergence here is visible.
+    if body_n != 15:
+        printk1("[https-chunked] FAIL (expected 15 body bytes, got %d)\n",
+                body_n)
+        return
+    expected: Ptr[uint8] = "0123456789ABCDE"
+    eq: int32 = 1
+    j: uint64 = 0
+    while j < 15:
+        if https_body[j] != expected[j]:
+            eq = 0
+            j = 15
+        else:
+            j = j + 1
+    printk0("[https-chunked] body[0..15]: '")
+    k: uint64 = 0
+    while k < 15:
+        printk1("%c", cast[uint64](https_body[k]))
+        k = k + 1
+    printk0("'\n")
+    if eq == 1:
+        printk0("[https-chunked] PASS\n")
+    else:
+        printk0("[https-chunked] FAIL (body bytes mismatch)\n")
+
+
 def memblock_smoke_test():
     printk0("Hamnix: memblock smoke test\n")
     a: uint64 = memblock_alloc(128, 16)
@@ -1282,6 +1337,38 @@ def start_kernel():
         https_local_smoke_test()
     else:
         printk0("[https-local] skipped (no /etc/tls-test marker)\n")
+
+    # --- Chunked Transfer-Encoding smoke gated on cpio marker -----
+    # Runs only when scripts/test_net_https_chunked.sh planted
+    # /etc/tls-chunked-test in the initramfs. The marker is set
+    # independently from /etc/tls-test because the harness brings
+    # up a TLS server that always serves a Transfer-Encoding:
+    # chunked response — which would break the existing
+    # `<!doctype html>` assertion in https_local_smoke_test if
+    # both ran against the same fixture.
+    chunked_marker_found: int32 = 0
+    cm_idx: uint64 = 0
+    cm_count: uint64 = initramfs_entry_count()
+    while cm_idx < cm_count:
+        cm_name: Ptr[char] = initramfs_entry_name(cm_idx)
+        ok_c: int32 = 1
+        cm_target: Ptr[uint8] = "/etc/tls-chunked-test"
+        cm_j: uint64 = 0
+        while cm_j < 22:                            # 21 chars + NUL
+            if cast[uint8](cm_name[cm_j]) != cm_target[cm_j]:
+                ok_c = 0
+                cm_j = 22                            # break
+            else:
+                cm_j = cm_j + 1
+        if ok_c == 1:
+            chunked_marker_found = 1
+            cm_idx = cm_count                        # break
+        else:
+            cm_idx = cm_idx + 1
+    if chunked_marker_found == 1:
+        https_chunked_smoke_test()
+    else:
+        printk0("[https-chunked] skipped (no /etc/tls-chunked-test marker)\n")
 
     # --- V5.3 TCP RX-ring smoke gated on cpio marker -----------
     # Same gating pattern as /etc/tls-test above. Runs only when

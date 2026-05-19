@@ -100,6 +100,13 @@ HTTP_HS_AFTER_R: uint8 = 1
 HTTP_HS_LINESTART: uint8 = 2
 HTTP_HS_AFTER_RN_R: uint8 = 3
 
+# Transport tag for the chunked decoder. We don't have ergonomic
+# function pointers in Adder so the byte-source is selected with a
+# small tag; _http_chunked_refill switches on it and calls the right
+# recv primitive.
+HTTP_TRANS_TCP: uint8 = 0
+HTTP_TRANS_TLS: uint8 = 1
+
 
 # Per-call scratch buffers. We keep these as globals (BSS) rather than
 # locals so the call frame stays tiny — Adder's nested-frame Array
@@ -111,6 +118,17 @@ http_rx_buf:      Array[4096, uint8]
 http_host_buf:    Array[128, uint8]
 http_path_buf:    Array[256, uint8]
 http_portstr_buf: Array[8, uint8]
+
+# Chunked-decoder reader state. The first response read may carry both
+# the tail of the headers AND the start of the chunked body in the
+# same buffer; we copy that leftover into http_chunked_buf and decode
+# from there, refilling via tcp_recv / tls_recv when it drains. The
+# 4 KiB size mirrors http_rx_buf — large enough for several full
+# chunks in flight but small enough to not bloat BSS.
+HTTP_CHUNKED_BUF_BYTES: uint64 = 4096
+http_chunked_buf: Array[4096, uint8]
+http_chunked_head: uint64 = 0     # next byte to consume
+http_chunked_tail: uint64 = 0     # one past last valid byte
 
 
 # Counters bumped per call. Mirrors the dns_in/dns_out style at the
@@ -533,6 +551,318 @@ def _http_extract_content_length(buf: Ptr[uint8], hdrs_start: uint64,
     return 0
 
 
+def _http_extract_chunked_te(buf: Ptr[uint8], hdrs_start: uint64,
+                             hdrs_end: uint64) -> int32:
+    # Walk the header block looking for a case-insensitive
+    # "Transfer-Encoding:" line whose value is (case-insensitively)
+    # "chunked". Returns 1 if found, 0 otherwise.
+    #
+    # We intentionally do NOT support comma-separated multi-coding
+    # values like "gzip, chunked" — RFC 7230 §3.3.1 mandates that
+    # chunked be the final coding, but compressed transfer codings
+    # are out of scope for this commit (the gzip/deflate decode is
+    # a separate codec). For real apt traffic the server sends
+    # exactly `Transfer-Encoding: chunked`, which is what we match.
+    needle: Ptr[uint8] = "transfer-encoding:"
+    needle_len: uint64 = 18
+    chunked_lit: Ptr[uint8] = "chunked"
+    chunked_lit_len: uint64 = 7
+    pos: uint64 = hdrs_start
+    while pos < hdrs_end:
+        line_start: uint64 = pos
+        while pos < hdrs_end:
+            if buf[pos] == 0x0A:              # '\n'
+                break
+            pos = pos + 1
+        line_end: uint64 = pos
+        if line_end > line_start:
+            if buf[line_end - 1] == 0x0D:
+                line_end = line_end - 1
+        line_len: uint64 = line_end - line_start
+        line_buf: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](buf) + line_start)
+        if _http_buf_starts_with_ci(line_buf, line_len,
+                                    needle, needle_len) == 1:
+            # Skip "Transfer-Encoding:" then any leading whitespace.
+            vp: uint64 = needle_len
+            while vp < line_len:
+                c: uint8 = line_buf[vp]
+                if c == 0x20:
+                    vp = vp + 1
+                elif c == 0x09:
+                    vp = vp + 1
+                else:
+                    break
+            # Token-end: the value ends at the first whitespace,
+            # comma, or end-of-line. We compare the first token
+            # case-insensitively against "chunked".
+            tok_start: uint64 = vp
+            while vp < line_len:
+                cc: uint8 = line_buf[vp]
+                if cc == 0x20:
+                    break
+                if cc == 0x09:
+                    break
+                if cc == 0x2C:                # ','
+                    break
+                vp = vp + 1
+            tok_len: uint64 = vp - tok_start
+            if tok_len == chunked_lit_len:
+                tok_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](line_buf) + tok_start)
+                if _http_buf_starts_with_ci(tok_ptr, tok_len,
+                                            chunked_lit,
+                                            chunked_lit_len) == 1:
+                    return 1
+            return 0
+        if pos < hdrs_end:
+            pos = pos + 1
+    return 0
+
+
+def _http_hex_val(c: uint8) -> int32:
+    # Map an ASCII hex digit (0-9 / a-f / A-F) to its 0..15 value, or
+    # -1 if `c` isn't a hex digit. Used by the chunk-size parser.
+    if c >= 0x30:
+        if c <= 0x39:
+            return cast[int32](c - 0x30)
+    if c >= 0x41:
+        if c <= 0x46:
+            return cast[int32](c - 0x41 + 10)
+    if c >= 0x61:
+        if c <= 0x66:
+            return cast[int32](c - 0x61 + 10)
+    return -1
+
+
+def _http_chunked_refill(transport: uint8, slot: int32) -> int32:
+    # Drain consumed bytes (head==tail => reset to 0), then pull more
+    # bytes from the configured transport. Returns 1 on success
+    # (>=1 fresh byte available), 0 on clean EOF, -1 on transport
+    # error. The decoder calls this whenever http_chunked_head ==
+    # http_chunked_tail.
+    if http_chunked_head == http_chunked_tail:
+        http_chunked_head = 0
+        http_chunked_tail = 0
+    if http_chunked_tail >= HTTP_CHUNKED_BUF_BYTES:
+        # Buffer is full but caller hasn't drained it. Shouldn't
+        # happen in practice — the decoder reads byte-by-byte for
+        # the size line and in big copy blocks for chunk-data, and
+        # both paths advance head before refilling.
+        return -1
+    room: uint64 = HTTP_CHUNKED_BUF_BYTES - http_chunked_tail
+    buf_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+        cast[uint64](&http_chunked_buf[0]) + http_chunked_tail)
+    n: int64 = 0
+    if transport == HTTP_TRANS_TCP:
+        n = tcp_recv(slot, buf_ptr, room, 400)
+    else:
+        n = tls_recv(slot, buf_ptr, room, 400)
+    if n < 0:
+        return -1
+    if n == 0:
+        return 0
+    http_chunked_tail = http_chunked_tail + cast[uint64](n)
+    return 1
+
+
+def _http_chunked_read_byte(transport: uint8, slot: int32,
+                            out: Ptr[uint8]) -> int32:
+    # Read a single byte from the chunked stream, refilling from the
+    # transport as needed. Returns 1 on success, 0 on EOF, -1 on
+    # transport error. Used for the chunk-size line + CRLFs +
+    # trailer headers — the bulk chunk-data copy uses bigger reads
+    # via _http_chunked_consume.
+    if http_chunked_head >= http_chunked_tail:
+        rc: int32 = _http_chunked_refill(transport, slot)
+        if rc <= 0:
+            return rc
+    out[0] = http_chunked_buf[http_chunked_head]
+    http_chunked_head = http_chunked_head + 1
+    return 1
+
+
+def _http_chunked_decode(transport: uint8, slot: int32,
+                         out_buf: Ptr[uint8], out_max: uint64,
+                         carry_ptr: Ptr[uint8],
+                         carry_len: uint64) -> int64:
+    # Decode an RFC 7230 §4.1 chunked-transfer-encoded body from the
+    # configured transport into out_buf, respecting out_max.
+    #
+    # `carry_ptr` + `carry_len` are bytes the caller already pulled
+    # from the transport (the leftover slice after `\r\n\r\n` in the
+    # first response chunk). They're prepended to our internal
+    # buffer so the decoder sees a contiguous stream.
+    #
+    # Returns the number of body bytes written to out_buf on success
+    # (clean last-chunk seen). Returns -1 on a malformed chunked
+    # stream or transport error. Output is silently truncated at
+    # out_max, but we still drain the rest of the body so the
+    # connection can be cleanly closed — V0 punts on that drain (no
+    # keep-alive anyway) and just returns the truncated length.
+
+    # --- Seed internal buffer with the carry-over bytes. ---
+    http_chunked_head = 0
+    http_chunked_tail = 0
+    if carry_len > 0:
+        if carry_len > HTTP_CHUNKED_BUF_BYTES:
+            # Should never happen: the rx scratch is the same 4 KiB
+            # size, and the carry is a substring of it. Defensive
+            # bail.
+            return -1
+        ci: uint64 = 0
+        while ci < carry_len:
+            http_chunked_buf[ci] = carry_ptr[ci]
+            ci = ci + 1
+        http_chunked_tail = carry_len
+
+    body_written: uint64 = 0
+    truncated: int32 = 0
+    one_byte: uint8 = 0
+    obp: Ptr[uint8] = cast[Ptr[uint8]](&one_byte)
+
+    while True:
+        # --- Parse chunk-size line (hex digits, optional ;ext, CRLF). ---
+        size_val: uint64 = 0
+        saw_digit: int32 = 0
+        in_ext: int32 = 0
+        while True:
+            rc: int32 = _http_chunked_read_byte(transport, slot, obp)
+            if rc <= 0:
+                printk0("[http] chunked: EOF/error in size line\n")
+                return -1
+            c: uint8 = one_byte
+            if c == 0x0D:                     # '\r'
+                # Expect '\n' next.
+                rc2: int32 = _http_chunked_read_byte(transport, slot, obp)
+                if rc2 <= 0:
+                    printk0("[http] chunked: EOF after CR in size line\n")
+                    return -1
+                if one_byte != 0x0A:
+                    printk0("[http] chunked: bad CR/LF in size line\n")
+                    return -1
+                break
+            if in_ext == 1:
+                # Inside chunk-ext — skip until CRLF. Bytes are
+                # discarded; only the size already accumulated
+                # matters.
+                pass
+            elif c == 0x3B:                   # ';'
+                in_ext = 1
+            else:
+                hv: int32 = _http_hex_val(c)
+                if hv < 0:
+                    printk0("[http] chunked: bad hex in size line\n")
+                    return -1
+                # size_val = size_val * 16 + hv. Cap at 32 MiB so a
+                # malicious peer can't claim a 2^60 chunk and have us
+                # loop forever; bigger than that is hostile in our
+                # threat model.
+                if size_val > 0x2000000:
+                    printk0("[http] chunked: chunk size > 32 MiB\n")
+                    return -1
+                size_val = size_val * 16 + cast[uint64](hv)
+                saw_digit = 1
+        if saw_digit == 0:
+            printk0("[http] chunked: empty chunk-size\n")
+            return -1
+        # --- Last-chunk: size==0 means end of body; consume trailer. ---
+        if size_val == 0:
+            # Trailer-section: zero or more `field-line CRLF`,
+            # terminated by an empty CRLF line. We don't parse any
+            # trailing headers (rare; Content-Length-Of-Decoded /
+            # Digest etc.). State machine matches the response-
+            # header scanner: read bytes until we cross \r\n\r\n
+            # (or just \r\n with no headers, which is the common
+            # `0\r\n\r\n` shape).
+            tstate: uint8 = HTTP_HS_LINESTART
+            # We've already consumed the "0\r\n" so the next byte
+            # starts a new line. From here, an immediate '\r' means
+            # "trailer block is empty", and '\n' ends the body.
+            while True:
+                rcT: int32 = _http_chunked_read_byte(transport, slot, obp)
+                if rcT <= 0:
+                    # Tolerate EOF here — many servers half-close
+                    # right after the last-chunk CRLF without
+                    # waiting for the client's ACK on the trailer
+                    # terminator.
+                    break
+                cT: uint8 = one_byte
+                if tstate == HTTP_HS_LINESTART:
+                    if cT == 0x0D:
+                        tstate = HTTP_HS_AFTER_RN_R
+                    else:
+                        tstate = HTTP_HS_TEXT
+                elif tstate == HTTP_HS_TEXT:
+                    if cT == 0x0D:
+                        tstate = HTTP_HS_AFTER_R
+                elif tstate == HTTP_HS_AFTER_R:
+                    if cT == 0x0A:
+                        tstate = HTTP_HS_LINESTART
+                    else:
+                        tstate = HTTP_HS_TEXT
+                elif tstate == HTTP_HS_AFTER_RN_R:
+                    if cT == 0x0A:
+                        break
+                    else:
+                        tstate = HTTP_HS_TEXT
+            if truncated == 1:
+                printk1("[http] chunked: body truncated at %d bytes\n",
+                        body_written)
+            return cast[int64](body_written)
+
+        # --- chunk-data: read exactly size_val bytes. ---
+        remaining: uint64 = size_val
+        while remaining > 0:
+            if http_chunked_head >= http_chunked_tail:
+                rcR: int32 = _http_chunked_refill(transport, slot)
+                if rcR < 0:
+                    printk0("[http] chunked: refill error in data\n")
+                    return -1
+                if rcR == 0:
+                    printk0("[http] chunked: EOF mid-data\n")
+                    return -1
+            avail: uint64 = http_chunked_tail - http_chunked_head
+            take: uint64 = avail
+            if take > remaining:
+                take = remaining
+            # Copy into out_buf (bounded by out_max), drop the rest
+            # silently — we still need to advance head so subsequent
+            # CRLF / next-chunk scanning works.
+            if truncated == 0:
+                room: uint64 = out_max - body_written
+                copy_n: uint64 = take
+                if copy_n > room:
+                    copy_n = room
+                    truncated = 1
+                ii: uint64 = 0
+                while ii < copy_n:
+                    out_buf[body_written + ii] = \
+                        http_chunked_buf[http_chunked_head + ii]
+                    ii = ii + 1
+                body_written = body_written + copy_n
+            http_chunked_head = http_chunked_head + take
+            remaining = remaining - take
+
+        # --- Trailing CRLF after chunk-data. ---
+        rcC: int32 = _http_chunked_read_byte(transport, slot, obp)
+        if rcC <= 0:
+            printk0("[http] chunked: EOF before chunk CR\n")
+            return -1
+        if one_byte != 0x0D:
+            printk0("[http] chunked: missing CR after chunk\n")
+            return -1
+        rcL: int32 = _http_chunked_read_byte(transport, slot, obp)
+        if rcL <= 0:
+            printk0("[http] chunked: EOF before chunk LF\n")
+            return -1
+        if one_byte != 0x0A:
+            printk0("[http] chunked: missing LF after chunk\n")
+            return -1
+    # Unreachable — the size==0 branch above is the only exit.
+    return cast[int64](body_written)
+
+
 def http_init():
     # No state needs zeroing — BSS is zero-initialised by start_kernel
     # and we don't keep a connection table (each http_get opens a
@@ -542,6 +872,8 @@ def http_init():
     http_4xx = 0
     http_5xx = 0
     http_bytes_in = 0
+    http_chunked_head = 0
+    http_chunked_tail = 0
     printk0("http: client initialized (HTTP/1.1, GET only)\n")
 
 
@@ -710,7 +1042,32 @@ def http_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                     hp = hp + 1
                 if found_end == 1:
                     head_done = 1
-                    # Walk the headers looking for Content-Length.
+                    # Walk the headers looking for Content-Length and
+                    # Transfer-Encoding. Per RFC 7230 §3.3.3, chunked
+                    # takes precedence over Content-Length when both
+                    # are present (and most servers send exactly one).
+                    is_chunked: int32 = _http_extract_chunked_te(
+                        rx_ptr, hdr_scan_start, end_off)
+                    if is_chunked == 1:
+                        have_cl = 0
+                        cl_val = 0
+                        printk0("[http] Transfer-Encoding: chunked\n")
+                        # Hand the bytes that arrived in this same
+                        # chunk after \r\n\r\n to the chunked decoder
+                        # as its initial carry-over.
+                        carry_len: uint64 = chunk_n - end_off
+                        carry_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                            cast[uint64](rx_ptr) + end_off)
+                        dec_rc: int64 = _http_chunked_decode(
+                            HTTP_TRANS_TCP, slot, out_buf, out_max,
+                            carry_ptr, carry_len)
+                        tcp_close(slot)
+                        if dec_rc < 0:
+                            return -1
+                        body_written = cast[uint64](dec_rc)
+                        printk2("[http] GET complete: status=%d body=%d bytes\n",
+                                cast[uint64](status_out[0]), body_written)
+                        return dec_rc
                     cl_ptr: Ptr[uint64] = cast[Ptr[uint64]](&cl_val)
                     rc_cl: int32 = _http_extract_content_length(
                         rx_ptr, hdr_scan_start, end_off, cl_ptr)
@@ -1048,6 +1405,25 @@ def https_get(url: Ptr[uint8], out_buf: Ptr[uint8], out_max: uint64,
                     hp = hp + 1
                 if found_end == 1:
                     head_done = 1
+                    is_chunked: int32 = _http_extract_chunked_te(
+                        rx_ptr, hdr_scan_start, end_off)
+                    if is_chunked == 1:
+                        have_cl = 0
+                        cl_val = 0
+                        printk0("[https] Transfer-Encoding: chunked\n")
+                        carry_len: uint64 = chunk_n - end_off
+                        carry_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                            cast[uint64](rx_ptr) + end_off)
+                        dec_rc: int64 = _http_chunked_decode(
+                            HTTP_TRANS_TLS, slot, out_buf, out_max,
+                            carry_ptr, carry_len)
+                        tls_close()
+                        if dec_rc < 0:
+                            return -1
+                        body_written = cast[uint64](dec_rc)
+                        printk2("[https] GET complete: status=%d body=%d bytes\n",
+                                cast[uint64](status_out[0]), body_written)
+                        return dec_rc
                     cl_ptr: Ptr[uint64] = cast[Ptr[uint64]](&cl_val)
                     rc_cl: int32 = _http_extract_content_length(
                         rx_ptr, hdr_scan_start, end_off, cl_ptr)
