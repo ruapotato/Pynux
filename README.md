@@ -217,9 +217,11 @@ Discipline rules enforced in agent prompts:
   sweep. This guarantees real work survives test-infrastructure flakes.
 
 If the workflow itself is interesting to you, the orchestrator's
-hands-on observations live in
-[`memory/`](https://github.com/ruapotato/Hamnix) — the per-session
-project memory that drives orchestrator decisions.
+hands-on observations live in [`memory/`](memory/) — the per-session
+project memory that drives orchestrator decisions. The pattern is
+honest about what was tried, what was fixed at the source, and what
+was a phantom; see [`memory/feedback_compiler_quirks.md`](memory/feedback_compiler_quirks.md)
+for the canonical example.
 
 ---
 
