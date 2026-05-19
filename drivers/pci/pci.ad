@@ -28,7 +28,9 @@ from kernel.printk.printk import printk0, printk1, printk2
 # already does the same trick with `drivers/net/virtio_net.ad`. We
 # only need the two entry points here; the rest of the driver lives
 # entirely under `drivers/net/e1000e.ad`.
-from drivers.net.e1000e import e1000e_init, e1000e_poll
+from drivers.net.e1000e import (
+    e1000e_init, e1000e_poll, e1000e_send_arp_probe, e1000e_rx_packets,
+)
 
 # Cross-import the r8169 probe (Realtek RTL8139 / RTL8168 / RTL8169
 # family) for the same reason as e1000e above. virtio-net is the
@@ -224,15 +226,23 @@ def pci_scan():
     # -1 and is silent except for the "[e1000e] no controller found"
     # log; the kernel keeps booting either way.
     if e1000e_init() == 0:
-        # Drain whatever the device has spontaneously delivered. On
-        # QEMU SLIRP this is usually nothing (SLIRP doesn't broadcast
-        # unsolicited frames), but the call costs ~one PCI MMIO
-        # read against an empty ring on the miss path. We loop a
-        # short busy-wait to give QEMU SLIRP time to inject any
-        # link-up triggered traffic.
+        # M16.114b: kick a single ARP request at SLIRP's gateway
+        # (10.0.2.2). SLIRP doesn't broadcast unsolicited frames, so
+        # without a TX of our own there's nothing on the wire for the
+        # RX ring to receive. The TX path sets EOP|IFCS|RS and spin-
+        # waits for DD writeback, so when e1000e_send_arp_probe()
+        # returns 0 we know the frame is on the wire. SLIRP answers
+        # within a few PCI MMIO reads; the poll loop below drains
+        # whatever lands in the RX ring (the ARP reply being the
+        # expected first frame).
+        e1000e_send_arp_probe()
         spin: uint64 = 0
         while spin < 1000000:
             e1000e_poll()
+            if e1000e_rx_packets() > 0:
+                # Got at least one frame — short-circuit out so the
+                # rest of boot doesn't sit in this loop.
+                spin = 999999
             spin = spin + 1
 
     # Symmetric opportunistic probe for the Realtek r8169 family

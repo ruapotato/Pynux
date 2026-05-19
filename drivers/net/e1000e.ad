@@ -73,6 +73,7 @@ from mm.slab import kmalloc
 from drivers.net.eth import eth_rx
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
 # PCI config-space offsets used by the IRQ wiring path.
@@ -129,17 +130,25 @@ E1000E_DEV_I219_V3:  uint32 = 0x15B7      # I219-LM v3 (Skylake)
 E1000_CTRL:    uint64 = 0x00000
 E1000_STATUS:  uint64 = 0x00008
 E1000_RCTL:    uint64 = 0x00100
+E1000_TCTL:    uint64 = 0x00400
+E1000_TIPG:    uint64 = 0x00410
 E1000_RDBAL:   uint64 = 0x02800
 E1000_RDBAH:   uint64 = 0x02804
 E1000_RDLEN:   uint64 = 0x02808
 E1000_RDH:     uint64 = 0x02810
 E1000_RDT:     uint64 = 0x02818
+E1000_TDBAL:   uint64 = 0x03800
+E1000_TDBAH:   uint64 = 0x03804
+E1000_TDLEN:   uint64 = 0x03808
+E1000_TDH:     uint64 = 0x03810
+E1000_TDT:     uint64 = 0x03818
 E1000_RAL0:    uint64 = 0x05400
 E1000_RAH0:    uint64 = 0x05404
 
 # CTRL (Device Control) bits we set.
 E1000_CTRL_SLU:      uint32 = 0x00000040    # Set Link Up
 E1000_CTRL_ASDE:     uint32 = 0x00000020    # Auto-Speed Detection Enable
+E1000_CTRL_RST:      uint32 = 0x04000000    # Device Reset (bit 26, self-clear)
 
 # STATUS bits we read.
 E1000_STATUS_LU:     uint32 = 0x00000002    # Link Up
@@ -150,6 +159,31 @@ E1000_RCTL_BAM:      uint32 = 0x00008000    # Broadcast Accept Mode
 E1000_RCTL_BSIZE_2K: uint32 = 0x00000000    # BSIZE = 00 → 2048 bytes
 E1000_RCTL_SECRC:    uint32 = 0x04000000    # Strip Ethernet CRC
 
+# TCTL (Transmit Control) bits we set.
+# EN  = Transmit Enable; PSP = Pad Short Packets (frames < 64 bytes
+# get padded so QEMU SLIRP / real hw don't reject them as runts);
+# CT  = Collision Threshold, datasheet default 0x10 (bits 4..11);
+# COLD = Collision Distance, datasheet default 0x40 for full-duplex
+# (bits 12..21).
+E1000_TCTL_EN:       uint32 = 0x00000002
+E1000_TCTL_PSP:      uint32 = 0x00000008
+E1000_TCTL_CT_10H:   uint32 = 0x00000100    # CT = 0x10 << 4
+E1000_TCTL_COLD_40H: uint32 = 0x00040000    # COLD = 0x40 << 12
+
+# TIPG (Transmit Inter-Packet Gap) default per 82574L datasheet
+# section 13.4.34. IPGT=10, IPGR1=10, IPGR2=10 — valid for IEEE 802.3
+# full-duplex Gigabit. QEMU ignores TIPG entirely; this matters only
+# on real silicon.
+E1000_TIPG_DEFAULT:  uint32 = 0x0060200A
+
+# Legacy TX descriptor CMD byte (offset +11) bits.
+E1000_TXD_CMD_EOP:   uint8 = 0x01           # End Of Packet
+E1000_TXD_CMD_IFCS:  uint8 = 0x02           # Insert FCS / CRC
+E1000_TXD_CMD_RS:    uint8 = 0x08           # Report Status (writeback DD)
+
+# Legacy TX descriptor STATUS byte (offset +12) bits.
+E1000_TXD_STAT_DD:   uint8 = 0x01           # Descriptor Done
+
 # RAH (Receive Address High) — bit 31 is "Address Valid" once the
 # device has loaded the EEPROM MAC into RAL0/RAH0.
 E1000_RAH_AV:        uint32 = 0x80000000
@@ -157,7 +191,7 @@ E1000_RAH_AV:        uint32 = 0x80000000
 
 # --- Descriptor ring layout ----------------------------------------
 #
-# We use a fixed 256-descriptor ring × 16 bytes/descriptor = 4096
+# We use a fixed 256-descriptor RX ring × 16 bytes/descriptor = 4096
 # bytes, which fits in a single 4 KiB page and satisfies the spec's
 # 128-byte alignment requirement for RDBAL. Each descriptor points at
 # a 2 KiB receive buffer (matches RCTL.BSIZE=00).
@@ -170,6 +204,20 @@ E1000E_RX_BUF_BYTES: uint64 = 2048
 # Receive descriptor status bits.
 E1000_RXD_STAT_DD: uint8 = 0x01           # Descriptor Done
 E1000_RXD_STAT_EOP: uint8 = 0x02          # End of Packet
+
+# TX ring shape — symmetric with RX. 256 × 16 bytes = one 4 KiB page,
+# 128-byte alignment satisfied by alloc_pages(0). Datasheet says TDLEN
+# must be a multiple of 128 bytes.
+NR_TX_DESCS:       uint64 = 256
+TX_DESC_BYTES:     uint64 = 16
+TX_RING_BYTES:     uint64 = 4096          # 256 * 16
+
+# Outbound scratch buffer — one frame in flight at a time is fine for
+# the polled bring-up scope. Sized to fit a full MTU (1514) plus a few
+# bytes of head/tail room without resorting to kmalloc (kmalloc isn't
+# in TX-completion context, but a BSS buffer is the simpler shape and
+# matches drivers/net/virtio_net.ad's vnet_tx_buf discipline).
+E1000E_TX_BUF_BYTES: uint64 = 2048
 
 
 # --- Driver state --------------------------------------------------
@@ -193,9 +241,29 @@ class E1000e:
     irq_pin:      uint32
     pad_irq:      uint32
     irq_count:    uint64
+    tx_ring:      uint64                  # base of the 4 KiB TX descriptor ring
+    tx_tail:      uint16                  # next descriptor to use (TDT we'll write)
+    pad_tx0:      uint16
+    pad_tx1:      uint32
+    tx_packets:   uint64
 
 
 e1000e_state: E1000e
+
+
+# Top-level TX scratch buffer — kept in BSS so the address is stable
+# (we hand it directly to the device via the descriptor ring) and
+# aligned naturally on a uint8-Array boundary. virtio_net_tx() uses
+# the exact same pattern.
+e1000e_tx_buf: Array[2048, uint8]
+
+# ARP-probe scratch buffer. 64 bytes is the minimum legal Ethernet
+# frame on the wire (14-byte L2 header + 28-byte ARP payload =
+# 42 bytes, then we pad to 60 — the NIC auto-appends a 4-byte CRC,
+# bringing the wire frame to the 64-byte legal minimum). PSP in
+# TCTL would pad for us, but pre-zeroing here makes the wireshark
+# capture deterministic on real hardware.
+e1000e_arp_buf: Array[64, uint8]
 
 
 # --- MMIO helpers --------------------------------------------------
@@ -383,6 +451,81 @@ def _e1000e_setup_rx(state: Ptr[E1000e]) -> int32:
     return 0
 
 
+# --- Device reset --------------------------------------------------
+#
+# Per Intel 82574L datasheet §8.2.1 (Device Reset), the host issues a
+# software reset by setting CTRL.RST and then polls until the device
+# clears that bit. The wait is bounded — on QEMU it clears within a
+# handful of register reads, but real hardware can take ~100 ms after
+# PCIe link-down events; we cap at 1 M iterations as a real-hw hygiene
+# guard so a wedged silicon doesn't hang the kernel.
+#
+# We do NOT touch IMC (Interrupt Mask Clear) here — reset already
+# masks all sources. After RST we re-program CTRL with the bits we
+# actually want (SLU + ASDE) in e1000e_init.
+
+def _e1000e_reset(bar0: uint64):
+    ctrl: uint32 = _e1000e_mmio_r32(bar0 + E1000_CTRL)
+    _e1000e_mmio_w32(bar0 + E1000_CTRL, ctrl | E1000_CTRL_RST)
+    spin: uint64 = 0
+    while spin < 1000000:
+        cur: uint32 = _e1000e_mmio_r32(bar0 + E1000_CTRL)
+        if (cur & E1000_CTRL_RST) == 0:
+            spin = 1000000              # break
+        else:
+            spin = spin + 1
+
+
+# --- TX ring setup -------------------------------------------------
+#
+# Mirror of _e1000e_setup_rx but for the transmit side: one 4 KiB page
+# of descriptors (256 × 16 bytes), RDBAL/RDBAH/RDLEN equivalents on
+# the TX path (TDBAL/TDBAH/TDLEN), TDH=TDT=0 so the device sees no
+# pending work yet. Enable TCTL with EN+PSP (+ CT and COLD at the
+# datasheet-default values). No per-slot buffer pre-allocation here;
+# the e1000e_tx() submission path supplies its own buffer pointer
+# every call (single in-flight slot, slot 0).
+
+def _e1000e_setup_tx(state: Ptr[E1000e]) -> int32:
+    ring: uint64 = alloc_pages(0)
+    if ring == 0:
+        printk0("[e1000e] alloc_pages(0) for TX ring failed\n")
+        return -1
+    memset(cast[Ptr[uint8]](ring), 0, cast[uint64](TX_RING_BYTES))
+    state[0].tx_ring = ring
+    state[0].tx_tail = 0
+    state[0].tx_packets = 0
+
+    bar0: uint64 = state[0].bar0
+
+    # Plant the ring base. TDBAL gets the low 32 bits, TDBAH the high.
+    # The ring sits in identity-mapped low memory so the physical and
+    # virtual addresses are the same — no IOMMU translation step.
+    _e1000e_mmio_w32(bar0 + E1000_TDBAL,
+                     cast[uint32](ring & 0xFFFFFFFF))
+    _e1000e_mmio_w32(bar0 + E1000_TDBAH,
+                     cast[uint32](ring >> 32))
+    # Length is in BYTES, must be a multiple of 128.
+    _e1000e_mmio_w32(bar0 + E1000_TDLEN,
+                     cast[uint32](TX_RING_BYTES))
+    # Head = Tail = 0 — no pending TX work.
+    _e1000e_mmio_w32(bar0 + E1000_TDH, 0)
+    _e1000e_mmio_w32(bar0 + E1000_TDT, 0)
+
+    # TIPG default IPG (10/10/10) per datasheet §13.4.34.
+    _e1000e_mmio_w32(bar0 + E1000_TIPG, E1000_TIPG_DEFAULT)
+
+    # Enable the transmitter. EN + PSP (pad short packets to 64 B
+    # minimum on the wire) + datasheet-default CT (0x10) and COLD
+    # (0x40 for full-duplex). We deliberately leave the SWXOFF / RTLC
+    # / NRTU / MULR bits at zero — those gate features we don't use
+    # yet (LPLU, ERR retransmit policy, multiple requests).
+    tctl: uint32 = E1000_TCTL_EN | E1000_TCTL_PSP \
+                 | E1000_TCTL_CT_10H | E1000_TCTL_COLD_40H
+    _e1000e_mmio_w32(bar0 + E1000_TCTL, tctl)
+    return 0
+
+
 # --- Public entry point --------------------------------------------
 
 def e1000e_init() -> int32:
@@ -414,6 +557,15 @@ def e1000e_init() -> int32:
     bar0: uint64 = cast[uint64](bar0_raw & 0xFFFFFFF0)
     e1000e_state.bar0 = bar0
     printk1("[e1000e] bar0=%p\n", bar0)
+
+    # Initial reset — CTRL.RST self-clears once the device has wiped
+    # internal state. After this the controller is in the "ready but
+    # disabled" state described in datasheet §8.2.1: RAL/RAH still hold
+    # the EEPROM-loaded MAC, but RCTL.EN / TCTL.EN are clear and the
+    # descriptor rings are unconfigured. Bounded 1M-iteration wait is
+    # the real-hw hygiene the milestone spec calls for.
+    _e1000e_reset(bar0)
+    printk0("[e1000e] reset complete\n")
 
     # PHY / link init. Set SLU (Set Link Up) + ASDE (Auto-Speed
     # Detection Enable). On QEMU's emulated 82574L the link is
@@ -457,6 +609,16 @@ def e1000e_init() -> int32:
         return -1
     printk1("[e1000e] RX ring ready (%d descriptors)\n",
             cast[uint64](NR_RX_DESCS))
+
+    # TX ring setup. Symmetric to RX: alloc one 4 KiB page for 256
+    # descriptors, zero it, plant TDBAL/TDBAH/TDLEN/TDH/TDT, set
+    # TCTL.EN+PSP. After this the controller will DMA whatever we
+    # park in a descriptor with CMD.RS|EOP|IFCS.
+    if _e1000e_setup_tx(&e1000e_state) != 0:
+        printk0("[e1000e] TX setup failed\n")
+        return -1
+    printk1("[e1000e] TX ring ready (%d descriptors)\n",
+            cast[uint64](NR_TX_DESCS))
 
     # M16.114: wire the INTx IRQ. Same shape as drivers/net/virtio_net.ad
     # — read PCI INTx pin / line, route the firmware-assigned IOAPIC pin
@@ -569,3 +731,171 @@ def e1000e_poll():
 
 def e1000e_rx_packets() -> uint64:
     return e1000e_state.rx_packets
+
+
+def e1000e_tx_packets() -> uint64:
+    return e1000e_state.tx_packets
+
+
+# --- TX path -------------------------------------------------------
+#
+# Single-descriptor single-in-flight TX. We always submit at slot
+# `tx_tail`, set CMD = EOP|IFCS|RS so the device computes the FCS
+# (insert-CRC) and writes back DD on completion. Then we spin-wait
+# on the DD bit (bounded — 1 M iterations) so the caller knows the
+# frame actually went out. RS = Report Status is what makes the
+# device update the writeback byte after DMA completes.
+#
+# Layout of the legacy TX descriptor (16 bytes):
+#   [+0]  u64 buffer_addr
+#   [+8]  u16 length
+#   [+10] u8  CSO (checksum offset — unused)
+#   [+11] u8  CMD (EOP/IFCS/RS/...)
+#   [+12] u8  STATUS (writeback: DD/EC/LC/TU)
+#   [+13] u8  CSS (checksum start — unused)
+#   [+14] u16 SPECIAL/VLAN (unused)
+#
+# We DON'T re-use slot 0 forever — tx_tail advances modulo
+# NR_TX_DESCS so consecutive TX calls don't fight the device for
+# the same writeback byte. Real hardware can lag DD-clear by a
+# microsecond or two even after head moves past.
+
+def _e1000e_tx_desc_set(ring: uint64, idx: uint64,
+                        buf_addr: uint64, length: uint16):
+    d: uint64 = ring + idx * TX_DESC_BYTES
+    cast[Ptr[uint64]](d +  0)[0] = buf_addr
+    cast[Ptr[uint16]](d +  8)[0] = length
+    # CSO (+10) = 0; CMD (+11) = EOP|IFCS|RS.
+    cast[Ptr[uint8]](d + 10)[0] = 0
+    cmd: uint8 = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS \
+               | E1000_TXD_CMD_RS
+    cast[Ptr[uint8]](d + 11)[0] = cmd
+    # STATUS (+12) cleared so we can detect DD writeback.
+    cast[Ptr[uint8]](d + 12)[0] = 0
+    cast[Ptr[uint8]](d + 13)[0] = 0
+    cast[Ptr[uint16]](d + 14)[0] = 0
+
+
+def e1000e_tx(buf: Ptr[uint8], length: uint64) -> int32:
+    # Public TX entry. Caller hands a fully built Ethernet frame
+    # (dst MAC + src MAC + ethertype + payload, no headers we add).
+    # We copy it into the BSS scratch buffer (so the caller's
+    # transient stack buffer is safe to free immediately), park a
+    # descriptor at tx_tail, advance TDT, then spin-wait on DD.
+    # Returns 0 on success, -1 on size violation / no device.
+    if e1000e_state.bar0 == 0:
+        return -1
+    if length > 1514:
+        return -1
+    if length < 1:
+        return -1
+    # Copy the caller's frame into the BSS scratch buffer.
+    memcpy(cast[Ptr[uint8]](&e1000e_tx_buf[0]), buf, length)
+
+    bar0: uint64 = e1000e_state.bar0
+    ring: uint64 = e1000e_state.tx_ring
+    idx:  uint64 = cast[uint64](e1000e_state.tx_tail)
+    addr: uint64 = cast[uint64](&e1000e_tx_buf[0])
+    _e1000e_tx_desc_set(ring, idx, addr, cast[uint16](length & 0xFFFF))
+
+    # Advance TDT to one past the descriptor we just submitted —
+    # that's what tells the device "drain up to (but not including)
+    # this slot". Wraps modulo NR_TX_DESCS.
+    next_idx: uint64 = (idx + 1) % NR_TX_DESCS
+    e1000e_state.tx_tail = cast[uint16](next_idx & 0xFFFF)
+    _e1000e_mmio_w32(bar0 + E1000_TDT, cast[uint32](next_idx & 0xFFFFFFFF))
+
+    # Spin-wait for DD on this descriptor. Bounded — on QEMU this
+    # fires within a few iterations, on real hardware a slow link
+    # could take milliseconds. 1 M iterations is the same cap as
+    # the reset path.
+    d: uint64 = ring + idx * TX_DESC_BYTES
+    spin: uint64 = 0
+    while spin < 1000000:
+        st: uint8 = cast[Ptr[uint8]](d + 12)[0]
+        if (st & E1000_TXD_STAT_DD) != 0:
+            e1000e_state.tx_packets = e1000e_state.tx_packets + 1
+            printk1("[e1000e] tx ok len=%d\n", length)
+            return 0
+        spin = spin + 1
+    # Timed out — descriptor never reported DD. Frame may or may
+    # not have gone out; we treat as error so the caller knows
+    # not to trust round-trip behaviour.
+    printk1("[e1000e] tx timeout len=%d\n", length)
+    return -1
+
+
+# --- ARP-probe TX helper -------------------------------------------
+#
+# Same shape as virtio_net_send_arp_probe: build an ARP request from
+# 10.0.2.15 (default SLIRP guest IP) to 10.0.2.2 (default SLIRP
+# gateway) with our MAC as sender hardware address, push it through
+# the TX path. SLIRP's emulated gateway will answer with an ARP
+# reply that lands in our RX ring — that's the round-trip the test
+# fixture asserts on.
+
+def _e1000e_arp_build():
+    # Zero the 64-byte scratch frame.
+    i: uint64 = 0
+    while i < 64:
+        e1000e_arp_buf[i] = 0
+        i = i + 1
+    # Ethernet header @ offset 0:
+    #   dest = ff:ff:ff:ff:ff:ff (broadcast)
+    #   src  = our MAC
+    #   type = 0x0806 (ARP, big-endian on the wire)
+    j: uint64 = 0
+    while j < 6:
+        e1000e_arp_buf[j] = 0xFF
+        j = j + 1
+    j = 0
+    while j < 6:
+        e1000e_arp_buf[6 + j] = e1000e_state.mac[j]
+        j = j + 1
+    e1000e_arp_buf[12] = 0x08
+    e1000e_arp_buf[13] = 0x06
+    # ARP payload @ offset 14:
+    #   htype = 0x0001 (Ethernet), ptype = 0x0800 (IPv4)
+    #   hlen  = 6, plen = 4
+    #   oper  = 0x0001 (request)
+    #   sha   = our MAC
+    #   spa   = 10.0.2.15
+    #   tha   = 00:00:00:00:00:00
+    #   tpa   = 10.0.2.2
+    aoff: uint64 = 14
+    e1000e_arp_buf[aoff +  0] = 0x00
+    e1000e_arp_buf[aoff +  1] = 0x01
+    e1000e_arp_buf[aoff +  2] = 0x08
+    e1000e_arp_buf[aoff +  3] = 0x00
+    e1000e_arp_buf[aoff +  4] = 6
+    e1000e_arp_buf[aoff +  5] = 4
+    e1000e_arp_buf[aoff +  6] = 0x00
+    e1000e_arp_buf[aoff +  7] = 0x01
+    k: uint64 = 0
+    while k < 6:
+        e1000e_arp_buf[aoff + 8 + k] = e1000e_state.mac[k]
+        k = k + 1
+    e1000e_arp_buf[aoff + 14] = 10
+    e1000e_arp_buf[aoff + 15] = 0
+    e1000e_arp_buf[aoff + 16] = 2
+    e1000e_arp_buf[aoff + 17] = 15
+    # tha (offset aoff+18..aoff+23) already zero.
+    e1000e_arp_buf[aoff + 24] = 10
+    e1000e_arp_buf[aoff + 25] = 0
+    e1000e_arp_buf[aoff + 26] = 2
+    e1000e_arp_buf[aoff + 27] = 2
+
+
+def e1000e_send_arp_probe() -> int32:
+    # Compose + transmit a single ARP request. The frame body is 42
+    # bytes (14-byte L2 header + 28-byte ARP payload); TCTL.PSP will
+    # pad to 60 + 4-byte CRC = 64 bytes on the wire. We hand 64
+    # bytes anyway so the descriptor length matches what the device
+    # transmits.
+    if e1000e_state.bar0 == 0:
+        return -1
+    _e1000e_arp_build()
+    rc: int32 = e1000e_tx(cast[Ptr[uint8]](&e1000e_arp_buf[0]), 64)
+    if rc == 0:
+        printk0("[e1000e] ARP probe sent (10.0.2.15 -> 10.0.2.2)\n")
+    return rc
