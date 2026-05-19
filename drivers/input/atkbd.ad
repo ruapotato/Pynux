@@ -38,11 +38,36 @@ from drivers.input.auxmouse import auxmouse_init
 # i8042 controller I/O ports — fixed by the ISA PC/AT spec.
 KBD_DATA_PORT:   int32 = 0x60      # read scancodes, write commands/data
 KBD_STATUS_PORT: int32 = 0x64      # read status, write commands
+KBD_CMD_PORT:    int32 = 0x64      # write controller commands (alias)
 
-# Status register bit 0 — Output Buffer Full (data available to read
-# from 0x60). We never touch bit 1 (Input Buffer Full, host->ctrl)
-# because we never write commands in the scaffold.
+# Status register bits. Bit 0 is Output Buffer Full (data ready for the
+# host on 0x60). Bit 1 is Input Buffer Full (the controller hasn't
+# consumed our last write to 0x60/0x64 yet); we must spin on this
+# clearing BEFORE every command/data byte we send during bring-up.
 KBD_STATUS_OBF: int32 = 0x01
+KBD_STATUS_IBF: int32 = 0x02
+
+# i8042 controller-command-byte values (written to 0x64). Mirrors the
+# subset Linux's drivers/input/serio/i8042.c uses during boot. We add
+# only what we need for the V0.1 KBD-side handshake; the AUX-side
+# commands live in drivers/input/auxmouse.ad. Names are KBD_-prefixed
+# because Adder top-level constants are global across merged modules
+# and auxmouse already owns the I8042_-prefixed namespace.
+KBD_I8042_CMD_DISABLE_AUX:   int32 = 0xA7  # disable AUX port  (auxmouse re-enables)
+KBD_I8042_CMD_DISABLE_KBD:   int32 = 0xAD  # disable KBD port  (re-enabled below)
+KBD_I8042_CMD_ENABLE_KBD:    int32 = 0xAE  # enable  KBD port
+KBD_I8042_CMD_SELF_TEST:     int32 = 0xAA  # controller self-test (expect 0x55)
+KBD_I8042_CMD_TEST_KBD_PORT: int32 = 0xAB  # KBD port test       (expect 0x00)
+
+KBD_I8042_SELF_TEST_OK: int32 = 0x55
+KBD_I8042_KBD_PORT_OK:  int32 = 0x00
+
+# Keyboard device command (written to 0x60 after IBF clears). 0xF4 is
+# "enable scanning" — the BIOS *usually* leaves it on, but UEFI-only
+# firmware on a number of laptops disables scanning before handoff so
+# we issue it explicitly. 0xFA is the standard PS/2 ACK.
+KBD_CMD_ENABLE_SCAN: int32 = 0xF4
+KBD_ACK:             int32 = 0xFA
 
 # Set 1 high-bit flag — scancode | 0x80 is the break (key-up) event
 # for that scancode. For modifier keys we DO care about the break
@@ -722,6 +747,143 @@ def atkbd_self_test():
                 cast[uint64](selftest_fail))
 
 
+# --- i8042 controller bring-up handshake -------------------------------
+#
+# V0.1 of the real-hardware path. Some UEFI-only laptops hand control
+# to the kernel with the i8042 controller disabled — the BIOS legacy-
+# free firmware never bothered to leave the KBD scanning enabled. The
+# original M16.100 path relied on "BIOS left the controller live" and
+# only drained the output buffer; on those laptops the keyboard
+# appeared dead. Mirror Linux's i8042_controller_check() /
+# i8042_controller_selftest() at the smallest still-recognisable
+# scale, and ALWAYS continue to the polled-drain path so a flaky
+# self-test never bricks the keyboard (the user still sees a banner).
+#
+# Sibling auxmouse.ad does a richer CCB-RMW on the AUX side; we keep
+# the KBD-side CCB alone for now because the polled path
+# (arch/x86/kernel/time.ad:84) is still load-bearing — flipping the
+# KBD IRQ bit prematurely would deliver IRQ 1 to a vector we haven't
+# wired up. Re-enabling the AUX port after the disable below is left
+# to auxmouse_init(); it does that as its very first controller step.
+
+def _kbd_wait_input_clear() -> int32:
+    # Spin until IBF clears (controller is ready to accept a host byte
+    # on 0x60 or 0x64). Bounded so a wedged controller can't hang the
+    # kernel during boot. Returns 1 on success, 0 on timeout.
+    timeout: int32 = 100000
+    while timeout > 0:
+        if (inb(KBD_STATUS_PORT) & KBD_STATUS_IBF) == 0:
+            return 1
+        timeout = timeout - 1
+    return 0
+
+
+def _kbd_wait_output_full() -> int32:
+    # Spin until OBF sets (controller has a byte for us on 0x60).
+    # Same bounded discipline as auxmouse's _i8042_wait_output_full —
+    # used during init when we're expecting a self-test result and a
+    # missing/dead controller must not stall the kernel.
+    timeout: int32 = 100000
+    while timeout > 0:
+        if (inb(KBD_STATUS_PORT) & KBD_STATUS_OBF) != 0:
+            return 1
+        timeout = timeout - 1
+    return 0
+
+
+def _kbd_cmd(cmd: int32):
+    # Write a controller command to 0x64. Caller polls OBF afterwards
+    # if a result byte is expected.
+    _kbd_wait_input_clear()
+    outb(cmd, KBD_CMD_PORT)
+
+
+def _kbd_write_data(b: int32):
+    # Write a data byte (kbd command, or CCB value) to 0x60.
+    _kbd_wait_input_clear()
+    outb(b, KBD_DATA_PORT)
+
+
+def atkbd_controller_init():
+    # 1. Quiesce both ports so junk from a half-configured firmware
+    #    can't masquerade as a self-test response. Disabling the AUX
+    #    port here is harmless — auxmouse_init() re-enables it as
+    #    its first step (cmd 0xA8) when we call it later in atkbd_init.
+    _kbd_cmd(KBD_I8042_CMD_DISABLE_KBD)
+    _kbd_cmd(KBD_I8042_CMD_DISABLE_AUX)
+
+    # 2. Drain anything stale in the output buffer. We deliberately do
+    #    NOT use the existing drain loop in atkbd_init — that one runs
+    #    AFTER the handshake to flush whatever the handshake leaves
+    #    behind. This one is hard-capped tighter because we're about
+    #    to feed the controller a self-test byte and any straggler
+    #    here would corrupt that response.
+    pre: int32 = 0
+    while (inb(KBD_STATUS_PORT) & KBD_STATUS_OBF) != 0:
+        inb(KBD_DATA_PORT)
+        pre = pre + 1
+        if pre > 16:
+            break
+
+    # 3. Controller self-test. Expect 0x55 on the data port. Anything
+    #    else (including a timeout) is logged + continued — a stubborn
+    #    controller still has a chance of responding to the KBD-port
+    #    test below, and worst case we fall through to the original
+    #    drain-and-go path that the M16.100 driver shipped with.
+    _kbd_cmd(KBD_I8042_CMD_SELF_TEST)
+    if _kbd_wait_output_full() == 0:
+        printk0("atkbd: i8042 self-test TIMEOUT (continuing)\n")
+    else:
+        st: int32 = inb(KBD_DATA_PORT) & 0xFF
+        if st == KBD_I8042_SELF_TEST_OK:
+            printk0("atkbd: i8042 self-test PASS\n")
+        else:
+            printk1("atkbd: i8042 self-test FAIL (got=0x%x, continuing)\n",
+                    cast[uint64](st))
+
+    # 4. Port 1 (keyboard) interface test. 0x00 == OK; anything else
+    #    means the controller suspects the line, but real-hardware
+    #    bring-up has historically continued anyway — most non-zero
+    #    results are spurious and the device still works.
+    _kbd_cmd(KBD_I8042_CMD_TEST_KBD_PORT)
+    if _kbd_wait_output_full() == 0:
+        printk0("atkbd: i8042 port1 test TIMEOUT (continuing)\n")
+    else:
+        pt: int32 = inb(KBD_DATA_PORT) & 0xFF
+        if pt == KBD_I8042_KBD_PORT_OK:
+            printk0("atkbd: i8042 port1 PASS\n")
+        else:
+            printk1("atkbd: i8042 port1 FAIL (got=0x%x, continuing)\n",
+                    cast[uint64](pt))
+
+    # 5. Re-enable port 1. From this point the keyboard is allowed to
+    #    push scancodes into the output buffer when the user types.
+    _kbd_cmd(KBD_I8042_CMD_ENABLE_KBD)
+
+    # 6. CCB IRQ bit deliberately untouched. The kernel still polls
+    #    the keyboard from the timer tick (arch/x86/kernel/time.ad:84)
+    #    and IRQ 1 isn't wired in the IDT yet; flipping bit 0 of the
+    #    CCB now would either be ignored (best case) or fire an
+    #    unhandled IRQ 1 once the IOAPIC comes up (worst case). The
+    #    AUX-side equivalent (auxmouse.ad) flips bit 1 because IRQ 12
+    #    *is* wired there.
+
+    # 7. Tell the keyboard device to start scanning. The BIOS usually
+    #    has this on already, but UEFI-only firmware on a number of
+    #    laptops hands off with scanning disabled — this is the load-
+    #    bearing fix for the "keyboard dead on real hardware" symptom.
+    _kbd_write_data(KBD_CMD_ENABLE_SCAN)
+    if _kbd_wait_output_full() == 0:
+        printk0("atkbd: enable-scan ACK TIMEOUT (continuing)\n")
+    else:
+        ack: int32 = inb(KBD_DATA_PORT) & 0xFF
+        if ack == KBD_ACK:
+            printk0("atkbd: scan enabled (ACK)\n")
+        else:
+            printk1("atkbd: enable-scan unexpected response 0x%x (continuing)\n",
+                    cast[uint64](ack))
+
+
 # --- Init --------------------------------------------------------------
 
 def atkbd_init() -> int32:
@@ -737,6 +899,13 @@ def atkbd_init() -> int32:
     # this in any order; doing it first means a translator regression
     # is reported even on systems where the i8042 itself is wedged.
     atkbd_self_test()
+
+    # i8042 controller bring-up (disable ports / self-test / enable
+    # port 1 / enable scanning). This is the V0.1 real-hardware path
+    # for UEFI-only laptops that hand off with the controller in a
+    # disabled / non-scanning state. Always continues — every step
+    # logs and falls through to the drain below.
+    atkbd_controller_init()
 
     # Drain anything the BIOS/firmware left in the controller output
     # buffer. If we don't, the first real keystroke arrives behind a
