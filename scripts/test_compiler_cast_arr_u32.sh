@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# Compiler regression for cast[uint64](arr32[i]) where arr32 is
-# Array[N, uint32]. The memory note claimed cast-then-equal leaked
-# stale upper bits across the compare. This script proves whether
-# that quirk is still real on current main.
+# scripts/test_compiler_cast_arr_u32.sh — compiler regression for
+# `cast[uint64](arr32[i])` where arr32 is Array[N, uint32]. The M16.97
+# memory note claimed cast-then-equal leaked stale upper bits across
+# the compare; this fixture proves the quirk is phantom on current main
+# (the asm shape is movl + auto-zero-extend, which is correct).
 #
-# Shape borrowed from scripts/test_compiler_addr_of_nested.sh: builds
-# the fixture as the init binary, swaps it in for /init, boots the
-# stock kernel, greps the serial log for [comp_cast32] PASS.
+# Boots QEMU with the fixture as /init, greps the serial log for the
+# fixture's internal PASS banner (`[comp_cast32] PASS`), then emits the
+# canonical `[cast_arr_u32] PASS` line that run_compiler_tests.sh greps.
+#
+# PASS criterion: `[comp_cast32] PASS` in serial log.
+
+. "$(dirname "$0")/_build_lock.sh"
+
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
@@ -15,7 +21,7 @@ trap "rm -rf $TMP" EXIT
 INIT_ELF=build/user/test_compiler_cast_arr_u32.elf
 python3 -m compiler.adder compile --target=x86_64-adder-user \
     tests/test_compiler_cast_arr_u32.ad -o "$INIT_ELF" >"$TMP/build.log" 2>&1 || {
-    echo "[comp_cast32] FAIL: fixture did not compile"
+    echo "[cast_arr_u32] FAIL: fixture did not compile"
     cat "$TMP/build.log"
     exit 1
 }
@@ -29,9 +35,9 @@ sleep 30
 kill -9 $QEMU 2>/dev/null || true
 wait $QEMU 2>/dev/null || true
 if grep -q "\[comp_cast32\] PASS" "$TMP/serial.log"; then
-    echo "[test_compiler_cast_arr_u32] PASS"
+    echo "[cast_arr_u32] PASS"
     exit 0
 fi
-echo "[test_compiler_cast_arr_u32] FAIL"
+echo "[cast_arr_u32] FAIL"
 tail -30 "$TMP/serial.log"
 exit 1

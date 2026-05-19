@@ -56,6 +56,20 @@ jobs:
       - name: Build userland
         run: bash scripts/build_user.sh
 
+      # Compiler regression suite — one fixture per known Adder
+      # compiler quirk. Runs cheap host-side lexer unit tests + the
+      # per-quirk QEMU fixtures via scripts/run_compiler_tests.sh.
+      # See CONTRIBUTING.md "Compiler regression suite".
+      - name: compiler regression suite
+        run: bash scripts/run_compiler_tests.sh 2>&1 | tee /tmp/run_compiler_tests.log
+      - name: Upload compiler regression suite log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run_compiler_tests-log
+          path: /tmp/run_compiler_tests.log
+          if-no-files-found: ignore
+
       # Regression battery — one step per test so a failing test name
       # is visible in the CI run UI. Order is shortest-first so quick
       # failures fail fast. Each step uploads its serial log on

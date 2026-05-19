@@ -1,0 +1,139 @@
+# tests/test_compiler_nested_frame_array.ad
+#
+# Compiler regression for the U9 nested-frame Array spill pattern (see
+# memory/feedback_compiler_quirks.md "Nested fixed-size Array locals
+# across call frames"). The canonical pattern, per the memory note, is
+#
+#   def caller(): local: Array[256, uint8]; callee(&local[0])
+#
+# where `callee` also declares a same-shape `Array[256, uint8]` local.
+# The kernel-side surface (resolve_path inside `_u_openat`) showed
+# byte-pointer args getting clobbered across the call boundary; the
+# production fix is to inline the callee's body (see `_u_openat` in
+# `linux_abi/u_syscalls.ad`).
+#
+# EMPIRICAL FINDING (2026-05-18, this fixture): the minimal pattern
+# above, plus a chain of three same-shape-Array frames, PASSES on
+# current main. The U9 bug appears to require additional ingredients
+# that the kernel-mode resolve_path chain supplies — possibly the
+# specific cast-to-Ptr / cast-to-uint64 round-trips, or interaction
+# with the syscall trampoline. This fixture therefore guards the
+# **abstract pattern** at the minimum repro depth: if it ever starts
+# failing, codegen has regressed in a way visible at the simple level.
+#
+# This fixture is wired as a normal PASS-expected test (NOT xfail) by
+# scripts/test_compiler_nested_frame_array.sh. When a future agent
+# finds a userland-level reproducer that DOES exhibit the U9 bug, they
+# should:
+#   1. Expand this fixture's repro shape so it FAILs on current main.
+#   2. Flip scripts/test_compiler_nested_frame_array.sh to xfail
+#      semantics (exit 0 iff marker absent, exit 1 iff marker present)
+#      until the compiler fix lands. The CONTRIBUTING.md "Compiler
+#      regression suite" section documents the xfail convention.
+#
+# Repro shape (mirrors the resolve_path / _u_openat call chain):
+#   caller_top -> middle_callee -> callee_deep
+# Each frame declares a same-shape Array[256, uint8] + an
+# Array[64, uint8] aux scratch; each intermediate frame re-checks the
+# byte pattern through the passed pointer.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_exit(code: int32)
+
+
+def _check_pattern(buf: Ptr[uint8], n: uint64) -> int32:
+    i: uint64 = 0
+    while i < n:
+        expected: uint8 = cast[uint8](i & 0xFF)
+        if buf[i] != expected:
+            return 1
+        i = i + 1
+    return 0
+
+
+def callee_deep(in_buf: Ptr[uint8]) -> int32:
+    # Depth-2 callee. Same-shape Array locals as caller_top and
+    # middle_callee to maximize the spill collision pressure.
+    deep_scratch: Array[256, uint8]
+    deep_aux: Array[64, uint8]
+    i: uint64 = 0
+    while i < 256:
+        deep_scratch[i] = 0
+        i = i + 1
+    j: uint64 = 0
+    while j < 64:
+        deep_aux[j] = 0
+        j = j + 1
+    return _check_pattern(in_buf, 256)
+
+
+def middle_callee(in_buf: Ptr[uint8]) -> int32:
+    # Depth-1 callee. Same-shape Array locals; passes pointer onward.
+    mid_scratch: Array[256, uint8]
+    mid_aux: Array[64, uint8]
+    i: uint64 = 0
+    while i < 256:
+        mid_scratch[i] = 0
+        i = i + 1
+    j: uint64 = 0
+    while j < 64:
+        mid_aux[j] = 0
+        j = j + 1
+
+    # First check the buffer at this depth.
+    rc1: int32 = _check_pattern(in_buf, 256)
+    if rc1 != 0:
+        return rc1
+    # Then recurse: passes byte pointer derived from caller's Array
+    # through a same-shape-Array frame, the exact U9 ingredient.
+    return callee_deep(in_buf)
+
+
+def caller_top() -> int32:
+    local: Array[256, uint8]
+    aux: Array[64, uint8]
+    k: uint64 = 0
+    while k < 256:
+        local[k] = cast[uint8](k & 0xFF)
+        k = k + 1
+    m: uint64 = 0
+    while m < 64:
+        aux[m] = 0
+        m = m + 1
+    return middle_callee(&local[0])
+
+
+pass_msg: Array[32, uint8]
+
+
+def main():
+    rc: int32 = caller_top()
+    if rc == 0:
+        pass_msg[0]  = 91   # '['
+        pass_msg[1]  = 110  # 'n'
+        pass_msg[2]  = 101  # 'e'
+        pass_msg[3]  = 115  # 's'
+        pass_msg[4]  = 116  # 't'
+        pass_msg[5]  = 101  # 'e'
+        pass_msg[6]  = 100  # 'd'
+        pass_msg[7]  = 95   # '_'
+        pass_msg[8]  = 102  # 'f'
+        pass_msg[9]  = 114  # 'r'
+        pass_msg[10] = 97   # 'a'
+        pass_msg[11] = 109  # 'm'
+        pass_msg[12] = 101  # 'e'
+        pass_msg[13] = 95   # '_'
+        pass_msg[14] = 97   # 'a'
+        pass_msg[15] = 114  # 'r'
+        pass_msg[16] = 114  # 'r'
+        pass_msg[17] = 97   # 'a'
+        pass_msg[18] = 121  # 'y'
+        pass_msg[19] = 93   # ']'
+        pass_msg[20] = 32   # ' '
+        pass_msg[21] = 80   # 'P'
+        pass_msg[22] = 65   # 'A'
+        pass_msg[23] = 83   # 'S'
+        pass_msg[24] = 83   # 'S'
+        pass_msg[25] = 10   # '\n'
+        sys_write(1, &pass_msg[0], 26)
+    sys_exit(rc)

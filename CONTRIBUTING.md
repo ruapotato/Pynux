@@ -358,6 +358,46 @@ bash scripts/test_net_dhcp.sh
 # … etc; see .github/workflows/ci.yml for the canonical list.
 ```
 
+### Compiler regression suite
+
+Every known Adder compiler quirk lives as one fixture under
+`tests/test_compiler_<short_name>.ad` driven by a same-named script
+`scripts/test_compiler_<short_name>.sh`. The canonical "did the
+compiler regress?" check is:
+
+```bash
+bash scripts/run_compiler_tests.sh
+```
+
+This runs every `scripts/test_compiler_*.sh` + `scripts/test_lex_*.sh`
++ `python3 compiler/lexer_test.py` serially and prints a per-test
+PASS/FAIL summary. It exits 0 iff every fixture is green. Run it
+before submitting any change to `compiler/codegen_x86.py`,
+`compiler/lexer.py`, or `compiler/parser.py`.
+
+**Conventions for new quirk fixtures:**
+
+- File names: `tests/test_compiler_<short_name>.ad` +
+  `scripts/test_compiler_<short_name>.sh`.
+- Each fixture documents its purpose in a 3+ line header comment
+  citing the bug, the fix commit (if any), and the failure mode.
+- Each script emits `[<short_name>] PASS` on success, non-zero exit
+  on failure.
+- Kernel-level (QEMU-boot) fixtures source `scripts/_build_lock.sh`
+  as their first action; pure host-side compile-and-asm-inspection
+  fixtures don't need the lock.
+- Add the new fixture to the `TESTS=(...)` array in
+  `scripts/run_compiler_tests.sh`.
+
+**XFAIL fixtures** (a known-active bug with no fix yet):
+
+- The script's exit logic is inverted: it exits 0 when the expected
+  failure happens, exits 1 when the bug appears fixed (a regression
+  in the xfail status — the fixture should then be flipped to a
+  normal PASS-expected test).
+- Document the xfail convention in the fixture's `.ad` header. See
+  `tests/test_compiler_nested_frame_array.ad` for the reference shape.
+
 ### Writing Tests
 
 For Hamnix code tests (run on target):
