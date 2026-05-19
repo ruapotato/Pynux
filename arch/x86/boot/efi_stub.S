@@ -438,7 +438,7 @@ efi_main:
     jmp     .Lefi_elf_bad
 
 .Lscan_mb_hit:
-    /* %rsi = address of the multiboot1 magic. Read +48..+60. */
+    /* %rsi = address of the multiboot1 magic. Read +48..+64. */
     cmpl    $HAMNIX_HANDOFF_MAGIC, 48(%rsi)
     jne     .Lefi_handoff_bad
     movl    52(%rsi), %eax                  /* efi_entry_addr */
@@ -453,6 +453,12 @@ efi_main:
      * elf32-i386 (VMAs < 4 GiB) and we identity-map below 4 GiB. */
     movl    60(%rsi), %eax                  /* gdt64_addr */
     movl    %eax, efi_kernel_gdt_addr(%rip)
+    /* GOP capture: pull &efi_fb_info out of the +64 handoff slot. The
+     * stub will populate this struct via LocateProtocol(GOP) below,
+     * BEFORE ExitBootServices (boot services calls are illegal after
+     * that). */
+    movl    64(%rsi), %eax                  /* efi_fb_info addr */
+    movq    %rax, efi_kernel_fb_info_ptr(%rip)
 
     /* Patch *boot_via_efi = 1 so e820_init() takes the EFI fallback. */
     movq    efi_boot_via_efi_ptr(%rip), %rax
@@ -460,6 +466,141 @@ efi_main:
 
     leaq    efi_msg_handoff(%rip), %rsi
     call    efi_serial_puts
+
+    /* ----- 4j. Capture GOP framebuffer info -------------------------
+     *
+     * Call BootServices->LocateProtocol(EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID,
+     *                                   NULL, &efi_gop). On success,
+     * read gop->Mode->{Info, FrameBufferBase, FrameBufferSize} and
+     * write the geometry into the kernel's efi_fb_info struct (whose
+     * address came from the +64 handoff slot above).
+     *
+     * Failure (no GOP available — extremely rare on real UEFI hardware,
+     * but possible with stripped/minimal firmware) is non-fatal: we
+     * leave efi_fb_info.present = 0 and the kernel-side fb_init_early
+     * silently falls through with no on-screen output. The kernel
+     * still boots; only the GOP console is unavailable.
+     *
+     * EFI_BOOT_SERVICES.LocateProtocol is at offset 320 (UEFI 2.10
+     * §7.3.16 — sequence: HandleProtocol@152 ... LocateProtocol@320).
+     * Signature:
+     *   EFI_STATUS LocateProtocol(EFI_GUID *Protocol,        // rcx
+     *                             VOID     *Registration,    // rdx
+     *                             VOID    **Interface);      // r8
+     */
+    movq    efi_kernel_fb_info_ptr(%rip), %rax
+    testq   %rax, %rax
+    jz      .Lefi_gop_skip                  /* old kernel, no +64 slot */
+
+    /* LocateProtocol(&GOP_GUID, NULL, &efi_gop) */
+    leaq    gop_guid(%rip), %rcx            /* Protocol = &GOP_GUID */
+    xorl    %edx, %edx                      /* Registration = NULL  */
+    leaq    efi_gop(%rip), %r8              /* &Interface           */
+    movq    efi_boot_services(%rip), %rax
+    movq    320(%rax), %rax                 /* ->LocateProtocol     */
+    subq    $0x20, %rsp
+    call    *%rax
+    addq    $0x20, %rsp
+    testq   %rax, %rax
+    jnz     .Lefi_gop_skip                  /* not found / disabled */
+
+    /* %rax = EFI_SUCCESS. efi_gop = EFI_GRAPHICS_OUTPUT_PROTOCOL *.
+     *
+     * EFI_GRAPHICS_OUTPUT_PROTOCOL layout (UEFI 2.10 §12.9):
+     *   off  0: QueryMode
+     *   off  8: SetMode
+     *   off 16: Blt
+     *   off 24: EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode
+     *
+     * EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE:
+     *   off  0: UINT32 MaxMode
+     *   off  4: UINT32 Mode
+     *   off  8: EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *Info
+     *   off 16: UINTN SizeOfInfo
+     *   off 24: EFI_PHYSICAL_ADDRESS FrameBufferBase (uint64)
+     *   off 32: UINTN FrameBufferSize
+     *
+     * EFI_GRAPHICS_OUTPUT_MODE_INFORMATION:
+     *   off  0: UINT32 Version
+     *   off  4: UINT32 HorizontalResolution
+     *   off  8: UINT32 VerticalResolution
+     *   off 12: UINT32 PixelFormat
+     *           0 = PixelRedGreenBlueReserved8BitPerColor (RGB)
+     *           1 = PixelBlueGreenRedReserved8BitPerColor (BGR)
+     *           2 = PixelBitMask
+     *           3 = PixelBltOnly (no linear FB, can't render)
+     *   off 16: EFI_PIXEL_BITMASK PixelInformation[4 × uint32]
+     *   off 32: UINT32 PixelsPerScanLine
+     */
+    movq    efi_gop(%rip), %rax
+    movq    24(%rax), %r10                  /* r10 = ->Mode */
+    movq    8(%r10), %r11                   /* r11 = Mode->Info */
+    movq    24(%r10), %r12                  /* r12 = FrameBufferBase (u64) */
+    movq    32(%r10), %r13                  /* r13 = FrameBufferSize */
+
+    /* Sanity: bail if FrameBufferBase==0 OR PixelFormat==PixelBltOnly
+     * (Blt-only modes have no scan-out memory). In either case leave
+     * present=0 and skip writing the struct. */
+    testq   %r12, %r12
+    jz      .Lefi_gop_skip
+    movl    12(%r11), %eax                  /* PixelFormat */
+    cmpl    $3, %eax                        /* 3 = PixelBltOnly */
+    je      .Lefi_gop_skip
+
+    /* Pull the geometry fields into scratch registers. */
+    movl    4(%r11), %ecx                   /* HorizontalResolution  */
+    movl    8(%r11), %edx                   /* VerticalResolution    */
+    movl    12(%r11), %esi                  /* PixelFormat           */
+    movl    32(%r11), %edi                  /* PixelsPerScanLine     */
+
+    /* pitch_bytes = PixelsPerScanLine * 4.
+     *
+     * Per UEFI 2.10 §12.9.2, PixelsPerScanLine is the number of
+     * *pixels* in each scanline of the framebuffer's video memory,
+     * which may exceed HorizontalResolution because real GPUs pad
+     * each scanline to a hardware-friendly stride (typically a
+     * multiple of 64 or 128 bytes). Hamnix supports only 32 bpp GOP
+     * formats (RGB/BGR with 8-bit reserved channel), so the byte
+     * stride is exactly PixelsPerScanLine * 4. Using HorizontalRes
+     * here would be the classic GOP renderer bug (a) — every fourth
+     * scanline drifts by a few pixels on hardware where PPSL > HRes,
+     * which is most real laptops. */
+    shll    $2, %edi                        /* pitch_bytes */
+
+    /* Now write the struct. %rax = &efi_fb_info, set up at the top
+     * of this block. Layout (matches boot_info_asm.S):
+     *   off  0: present       (u32)
+     *   off  4: width         (u32)
+     *   off  8: height        (u32)
+     *   off 12: pitch_bytes   (u32)
+     *   off 16: pixel_format  (u32)
+     *   off 20: bpp           (u32)
+     *   off 24: base          (u64)
+     *   off 32: size          (u64)
+     */
+    movq    efi_kernel_fb_info_ptr(%rip), %rax
+    movl    %ecx,  4(%rax)                  /* width                 */
+    movl    %edx,  8(%rax)                  /* height                */
+    movl    %edi, 12(%rax)                  /* pitch_bytes           */
+    movl    %esi, 16(%rax)                  /* pixel_format          */
+    movl    $32,  20(%rax)                  /* bpp (constant, GOP)   */
+    movq    %r12, 24(%rax)                  /* base                  */
+    movq    %r13, 32(%rax)                  /* size                  */
+    /* Write `present` LAST so a reader of the struct (post-kernel-boot
+     * Adder code) never sees a half-populated record. The kernel
+     * is single-threaded at this point — no real concurrency — but
+     * the ordering is correct for cheap and future-proof. */
+    movl    $1,   0(%rax)                   /* present = 1           */
+
+    leaq    efi_msg_gop_ok(%rip), %rsi
+    call    efi_serial_puts
+    jmp     .Lefi_gop_done
+
+.Lefi_gop_skip:
+    leaq    efi_msg_gop_skip(%rip), %rsi
+    call    efi_serial_puts
+
+.Lefi_gop_done:
 
     /* =================================================================
      * STEP 5+6: GetMemoryMap + ExitBootServices retry loop.
@@ -737,6 +878,10 @@ efi_msg_cr3:
     .asciz  "[hamnix] EFI: CR3 swap OK\r\n"
 efi_msg_ljmp:
     .asciz  "[hamnix] EFI: long-mode ljmp OK\r\n"
+efi_msg_gop_ok:
+    .asciz  "[hamnix] EFI: GOP captured\r\n"
+efi_msg_gop_skip:
+    .asciz  "[hamnix] EFI: GOP unavailable (skipped)\r\n"
 
     /* UEFI protocol GUIDs (16-byte structures, little-endian on x86).
      *
@@ -756,6 +901,15 @@ sfsp_guid:
     .short  0x6459
     .short  0x11d2
     .byte   0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b
+
+    /* EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID:
+     *   9042a9de-23dc-4a38-96fb-7aded080516a   (UEFI 2.10 §12.9) */
+    .align 8
+gop_guid:
+    .long   0x9042a9de
+    .short  0x23dc
+    .short  0x4a38
+    .byte   0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a
 
     /* UCS-2 path to the kernel ELF on the ESP. Backslash-separated,
      * NUL-terminated. Each ASCII char is followed by a zero byte for
@@ -867,6 +1021,24 @@ efi_far_jmp_offset:         .quad 0     /* runtime offset[63:0] */
      * easy mov into a pointer register. */
     .globl efi_boot_via_efi_ptr
 efi_boot_via_efi_ptr:       .quad 0
+
+    /* GOP capture state (M16.149).
+     *
+     * efi_gop: Interface pointer returned by LocateProtocol — pointer to
+     *          an EFI_GRAPHICS_OUTPUT_PROTOCOL struct in firmware memory.
+     *          We dereference it once to read Mode->{Info, FrameBufferBase,
+     *          FrameBufferSize} before ExitBootServices invalidates it.
+     *
+     * efi_kernel_fb_info_ptr: Address of the kernel's efi_fb_info struct
+     *          (in arch/x86/kernel/boot_info_asm.S .data). The stub reads
+     *          this from handoff slot +64 and writes the captured GOP
+     *          geometry there. Stored as uint64 to match the pointer-
+     *          register dereference shape used later. */
+    .align 8
+    .globl efi_gop
+efi_gop:                    .quad 0
+    .globl efi_kernel_fb_info_ptr
+efi_kernel_fb_info_ptr:     .quad 0
 
     /* GetMemoryMap scratch. */
     .align 8

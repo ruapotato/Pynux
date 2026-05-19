@@ -39,6 +39,19 @@ extern def get_mb_info() -> uint64
 extern def get_mb_magic() -> uint64
 extern def kernel_image_end() -> uint64
 
+# EFI GOP framebuffer accessors (boot_info_asm.S). Populated by
+# arch/x86/boot/efi_stub.S before ExitBootServices when the kernel
+# boots via UEFI. Zero on the BIOS multiboot1 path, so callers must
+# gate on efi_fb_present().
+extern def get_efi_fb_present() -> uint32
+extern def get_efi_fb_width() -> uint32
+extern def get_efi_fb_height() -> uint32
+extern def get_efi_fb_pitch_bytes() -> uint32
+extern def get_efi_fb_pixel_format() -> uint32
+extern def get_efi_fb_bpp() -> uint32
+extern def get_efi_fb_base() -> uint64
+extern def get_efi_fb_size() -> uint64
+
 MULTIBOOT_BOOTLOADER_MAGIC:   uint64 = 0x2BADB002
 MULTIBOOT_INFO_MMAP_BIT:      uint64 = 0x40            # flags bit  6
 MULTIBOOT_INFO_FRAMEBUF_BIT:  uint64 = 0x1000          # flags bit 12
@@ -353,3 +366,84 @@ def mb_fb_dump():
     printk2("mb_fb: width=%d height=%d\n", mb_fb_width(), mb_fb_height())
     printk2("mb_fb: bpp=%d type=%d (1=RGB, 2=EGA-text)\n",
             mb_fb_bpp(), mb_fb_type())
+
+
+# --- EFI GOP framebuffer accessors --------------------------------
+#
+# Companion to mb_fb_* above for the UEFI direct-boot path. The
+# EFI stub (arch/x86/boot/efi_stub.S) calls
+# BootServices->LocateProtocol(EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID)
+# right before ExitBootServices and writes the resulting Mode info
+# into the kernel's efi_fb_info struct (boot_info_asm.S). After
+# ExitBootServices, GOP calls are no longer legal so this is the
+# only opportunity to capture the framebuffer geometry on the
+# UEFI path — that's why this lives in the boot stub, not in
+# kernel code.
+#
+# Per UEFI 2.10 §12.9.2 (EFI_GRAPHICS_OUTPUT_MODE_INFORMATION):
+#   - HorizontalResolution / VerticalResolution are pixel dimensions
+#   - PixelsPerScanLine is also in *pixels* and may exceed
+#     HorizontalResolution (hardware scanline alignment padding)
+#   - PixelFormat is one of:
+#       0 = PixelRedGreenBlueReserved8BitPerColor (RGB byte order)
+#       1 = PixelBlueGreenRedReserved8BitPerColor (BGR byte order)
+#       2 = PixelBitMask (rare — separate masks per channel)
+#       3 = PixelBltOnly (no linear FB, Blt() only — we skip these)
+# The stub already filters out (3); the kernel only sees modes
+# whose framebuffer is directly addressable.
+
+def efi_fb_present() -> int32:
+    if get_efi_fb_present() == 0:
+        return 0
+    return 1
+
+
+def efi_fb_base() -> uint64:
+    return get_efi_fb_base()
+
+
+def efi_fb_pitch() -> uint64:
+    # Returns the byte stride between scanlines. Stored by efi_stub.S
+    # as PixelsPerScanLine * 4 (32 bpp constant). UEFI 2.10 §12.9.2:
+    # PixelsPerScanLine is in pixels and may exceed
+    # HorizontalResolution due to hardware alignment padding — the
+    # most-cited cause of garbled GOP text in OS development is
+    # using width*4 as the stride instead of this value.
+    return cast[uint64](get_efi_fb_pitch_bytes())
+
+
+def efi_fb_width() -> uint64:
+    return cast[uint64](get_efi_fb_width())
+
+
+def efi_fb_height() -> uint64:
+    return cast[uint64](get_efi_fb_height())
+
+
+def efi_fb_bpp() -> uint64:
+    return cast[uint64](get_efi_fb_bpp())
+
+
+def efi_fb_pixel_format() -> uint32:
+    return get_efi_fb_pixel_format()
+
+
+def efi_fb_dump():
+    # Diagnostic: dump the captured GOP mode. Always called by
+    # fb_init_early so the UART log on every UEFI boot contains a
+    # self-diagnostic `gop:` line — when a real-hardware test reports
+    # "screen is garbled" we can read the log and check whether
+    # PixelsPerScanLine > HorizontalResolution (i.e. the hardware
+    # has scanline padding), what byte order the firmware reported,
+    # and whether the framebuffer base address looks sane (typically
+    # 0x80000000..0xFFFFFFFF on real hardware, anywhere on QEMU).
+    if efi_fb_present() == 0:
+        printk0("gop: no GOP capture (BIOS boot or LocateProtocol failed)\n")
+        return
+    # One-line summary. Two printks because printk2 maxes out at two args.
+    printk2("gop: hres=%d vres=%d ",
+            efi_fb_width(), efi_fb_height())
+    printk2("ppsl_bytes=%d pixfmt=%d ",
+            efi_fb_pitch(), cast[uint64](efi_fb_pixel_format()))
+    printk2("fb=%p size=%d\n",
+            efi_fb_base(), get_efi_fb_size())

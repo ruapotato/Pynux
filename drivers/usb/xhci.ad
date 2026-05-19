@@ -302,6 +302,17 @@ class XhciState:
     # state so we don't poison the FIFO with garbage events.
     kbd_enabled:    uint32
 
+    # Real-hardware-safety gate: set to 1 inside _xhci_v1_attach_keyboard
+    # ONLY when the root-hub PORTSC scan turned up a USB 2.x boot-kbd
+    # candidate (target_port != 0). The synthetic V1/V2 selftests forge
+    # Event-Ring state that real silicon won't agree with when no
+    # keyboard is attached — gating them on this flag keeps real
+    # laptops (PS/2-only Asus, etc.) from hanging in xhci_poll's
+    # MMIO-poll path after a controller probe. The smoke environments
+    # override the gate via the /etc/xhci-selftest cpio marker so
+    # QEMU + usb-kbd tests still exercise the synthetic path.
+    real_kbd_present: uint32
+
     # Counters surfaced in the boot banner + asserted by the test:
     # `reports_received` increments on every interrupt-IN completion
     # the poll loop sees, regardless of source (real or synthetic).
@@ -1252,6 +1263,15 @@ def _xhci_v1_attach_keyboard():
     if target_port == 0:
         printk0("[xhci] no boot-keyboard candidate to attach\n")
         return
+    # A real USB 2.x boot-keyboard candidate is present on the root
+    # hub. Set the real_kbd_present gate BEFORE any of the remaining
+    # early-return paths (reset / alloc / control-xfer failures), so
+    # the synthetic V1/V2 selftests can keep running on QEMU even if
+    # the live SETUP exchange trips on a finicky qemu-xhci version —
+    # which was the original reason the selftests ran unconditionally.
+    # On real hardware with no USB keyboard, we never get here, the
+    # gate stays 0, and the selftests skip themselves.
+    xhci.real_kbd_present = 1
     printk2("[xhci] attaching keyboard at port=%d speed=%d\n",
             cast[uint64](target_port), cast[uint64](target_speed))
     xhci.kbd_port = target_port
@@ -1410,6 +1430,22 @@ def _xhci_v1_attach_keyboard():
 
     xhci.kbd_enabled = 1
     printk0("[xhci] USB keyboard enabled: events armed\n")
+
+
+# --- Real-hardware safety gate accessor ---------------------------
+#
+# init/main.ad reads this to decide whether to skip the synthetic
+# self-tests. Returns 1 when _xhci_v1_attach_keyboard found a USB 2.x
+# boot-keyboard candidate on the root hub (i.e. running the selftest
+# is safe — the controller has live state matching what we'll inject),
+# 0 otherwise. On a PS/2-only laptop with no USB keyboard attached,
+# this stays 0 and the kernel skips the synthetic injection path so
+# we don't wedge xhci_poll waiting on MMIO state real silicon won't
+# produce.
+
+
+def xhci_real_kbd_present() -> uint32:
+    return xhci.real_kbd_present
 
 
 # --- V1 synthetic-completion self-test ---------------------------

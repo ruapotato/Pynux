@@ -93,6 +93,7 @@ multiboot_header:
      *   +52  uint32  efi_entry_addr   = &_x86_start_after_loader
      *   +56  uint32  boot_via_efi_addr = &boot_via_efi
      *   +60  uint32  gdt64_addr       = &gdt64
+     *   +64  uint32  efi_fb_info_addr = &efi_fb_info (GOP capture target)
      *
      * The +60 slot was reserved until M16.126: the EFI stub now has to
      * install the kernel's own gdt64 (with all 7 entries: null, kernel
@@ -101,6 +102,17 @@ multiboot_header:
      * #GPs because the stub's private 3-entry GDT has no slot 5.
      * Passing &gdt64 through the handoff table lets the stub
      * lgdt-load the kernel's own GDT instead of guessing at offsets.
+     *
+     * The +64 slot (this commit) lets the EFI stub query GOP before
+     * ExitBootServices and write the captured framebuffer geometry
+     * (base, pitch_bytes, width, height, pixel_format) into the
+     * kernel's `efi_fb_info` struct (arch/x86/kernel/boot_info_asm.S).
+     * Without this, the UEFI direct-boot path arrives at start_kernel
+     * with no framebuffer info at all — the multiboot fields are zero,
+     * mb_fb_present() returns 0, fb_init never runs, and the kernel's
+     * on-screen output is silent. On a real laptop this looks like
+     * "slaughtered" text because the VGA fallback (0xB8000) scribbles
+     * into whatever the firmware left in low memory.
      *
      * Why pack these into the kernel image instead of having the EFI
      * stub parse the ELF symbol table:
@@ -120,6 +132,7 @@ multiboot_header:
     .long   _x86_start_after_loader /* off 52 */
     .long   boot_via_efi            /* off 56 */
     .long   gdt64                   /* off 60 — &gdt64 (M16.126) */
+    .long   efi_fb_info             /* off 64 — &efi_fb_info (GOP target) */
 
 /* ---------- 32-bit protected-mode entry ---------------------------- */
     .globl  _start

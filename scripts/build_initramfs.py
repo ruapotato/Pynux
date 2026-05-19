@@ -96,6 +96,17 @@ if os.environ.get("ENABLE_TCP_FIN_WAIT2_SMOKE") == "1":
 if os.environ.get("ENABLE_DHCP_RENEW_SMOKE") == "1":
     FILES.append(("/etc/dhcp-renew-test", b"1\n"))
 
+# xHCI V1/V2 synthetic transfer-engine selftests. Gated the same way as
+# the markers above — see init/main.ad's xhci_marker_found gate. The
+# selftests forge Event-Ring state that real silicon won't agree with
+# when no USB keyboard is enumerated, so default boots skip them (which
+# is what real Asus / ThinkPad laptops without a USB keyboard attached
+# now do — pre-marker boots were hanging in xhci_poll's MMIO-poll path).
+# scripts/test_usb_hid_v1.sh and scripts/test_usb_hid_v2.sh set this to
+# force the synthetic selftests to run under QEMU.
+if os.environ.get("ENABLE_XHCI_SELFTEST") == "1":
+    FILES.append(("/etc/xhci-selftest", b"1\n"))
+
 # HTTP 3xx redirect-follow smoke. Gated the same way as the markers
 # above. scripts/test_net_http_redirect.sh stands up a Python HTTP
 # server that 302s to a same-host /final endpoint serving "hello";

@@ -53,6 +53,9 @@ from drivers.video.console.fb_text import fb_init, fb_puts, fb_is_initialized
 from arch.x86.kernel.e820 import (
     mb_fb_present, mb_fb_base, mb_fb_pitch, mb_fb_width,
     mb_fb_height, mb_fb_bpp, mb_fb_dump,
+    efi_fb_present, efi_fb_base, efi_fb_pitch, efi_fb_width,
+    efi_fb_height, efi_fb_bpp, efi_fb_pixel_format, efi_fb_dump,
+    is_boot_via_efi,
 )
 from fs.vfs import (
     vfs_init, vfs_open, vfs_read, vfs_close,
@@ -87,7 +90,10 @@ from drivers.input.atkbd import atkbd_init
 # scan + HID-report-to-ASCII self-test; the transfer-ring engine that
 # would actually carry keystrokes off the wire lands in V1. See
 # drivers/usb/xhci.ad header comment for the explicit scope boundary.
-from drivers.usb.xhci import xhci_init, xhci_v1_selftest, xhci_v2_selftest
+from drivers.usb.xhci import (
+    xhci_init, xhci_v1_selftest, xhci_v2_selftest,
+    xhci_real_kbd_present,
+)
 from drivers.net.netfilter import (
     netfilter_init, register_netfilter_hook, nf_run_hooks,
     NF_HOOK_ACCEPT,
@@ -1343,20 +1349,38 @@ def vga_smoke_test():
     # the cells via serial. This works in -nographic where no display
     # exists — VGA memory at 0xB8000 still receives writes, and the
     # readback confirms the path end-to-end.
-    printk0("Hamnix: VGA framebuffer smoke test\n")
-    vga_init()
-    vga_puts("Hamnix VGA framebuffer @ 0xB8000\n")
-    vga_puts("If you are seeing this in a graphical QEMU window,\n")
-    vga_puts("the text-mode console works.\n")
+    #
+    # SKIP the VGA portion on the UEFI direct-boot path. On a real
+    # UEFI laptop the legacy CGA hole at 0xB8000 isn't a text-mode
+    # buffer — depending on chipset / CSM-disabled state, it can be
+    # backed by graphics memory the firmware is scanning out, in
+    # which case every byte we write here scribbles a random pixel
+    # onto the active GOP framebuffer. That was the diagnosed cause
+    # of the "kinda slaughtered" text the user reported on an Asus
+    # laptop. Under UEFI the GOP console (set up by fb_init_early)
+    # has already taken over on-screen output, so this smoke test
+    # has nothing useful to do anyway.
+    #
+    # The list_head smoke test that historically lived in the same
+    # function body continues to run on both paths.
+    if is_boot_via_efi() != 0:
+        printk0("Hamnix: VGA framebuffer smoke test SKIPPED (UEFI boot — using GOP console)\n")
+    else:
+        printk0("Hamnix: VGA framebuffer smoke test\n")
+        vga_init()
+        vga_puts("Hamnix VGA framebuffer @ 0xB8000\n")
+        vga_puts("If you are seeing this in a graphical QEMU window,\n")
+        vga_puts("the text-mode console works.\n")
 
-    # Read first 9 cells of row 0 back over serial. We wrote "Hamnix VGA"
-    # as the first 9 characters above, so the readback should match.
-    printk0("  readback first row 0: '")
-    j: uint64 = 0
-    while j < 9:
-        printk1("%c", cast[uint64](vga_read_cell_char(0, j)))
-        j = j + 1
-    printk0("'\n")
+        # Read first 9 cells of row 0 back over serial. We wrote
+        # "Hamnix VGA" as the first 9 characters above, so the
+        # readback should match.
+        printk0("  readback first row 0: '")
+        j: uint64 = 0
+        while j < 9:
+            printk1("%c", cast[uint64](vga_read_cell_char(0, j)))
+            j = j + 1
+        printk0("'\n")
     printk0("Hamnix: list_head smoke test\n")
 
     INIT_LIST_HEAD(&demo_head)
@@ -1471,25 +1495,73 @@ def task_b_entry():
 
 
 def fb_init_early():
-    # Inspect the multiboot1 framebuffer info struct (parsed by
-    # arch/x86/kernel/e820.ad) and, if a usable mode is present,
-    # initialise the framebuffer text console driver. Logs to UART
-    # whatever the result is so a serial dump shows whether the
-    # UEFI GOP path engaged on this boot or fell through to VGA.
-    if mb_fb_present() == 0:
-        printk0("fb: no multiboot framebuffer (BIOS/QEMU -kernel path)\n")
-        return
+    # Try two framebuffer info sources, in priority order:
+    #
+    #   1. EFI GOP capture (efi_fb_*): populated by
+    #      arch/x86/boot/efi_stub.S right before ExitBootServices on
+    #      the UEFI direct-boot path. The pitch is in BYTES
+    #      (PixelsPerScanLine × 4) per UEFI 2.10 §12.9.2. This is the
+    #      authoritative source on a real laptop where the firmware
+    #      controls the framebuffer.
+    #
+    #   2. Multiboot1 framebuffer info (mb_fb_*): populated by GRUB or
+    #      another multiboot1 loader on the BIOS path. The pitch is
+    #      also in BYTES.
+    #
+    # The GOP path was added in M16.149 because the prior code only
+    # read mb_fb_*, which on the UEFI direct-boot path is always zero
+    # (no multiboot info struct gets handed to us). The visible
+    # symptom on real hardware was a blank or garbage screen because
+    # the kernel never called fb_init, and the VGA fallback at
+    # 0xB8000 scribbles into whatever the firmware left there on
+    # UEFI systems where CSM is off.
+    #
+    # Always emit a `gop:` line to UART so serial-dump diagnostics
+    # capture the captured mode. This is also the acceptance gate for
+    # M16.149: every UEFI boot must log `gop: ...` with the actual
+    # captured geometry.
+    efi_fb_dump()
     mb_fb_dump()
-    rc: int32 = fb_init(mb_fb_base(), mb_fb_pitch(), mb_fb_width(),
-                        mb_fb_height(), mb_fb_bpp())
+
+    fb_base_v:   uint64 = 0
+    fb_pitch_v:  uint64 = 0
+    fb_width_v:  uint64 = 0
+    fb_height_v: uint64 = 0
+    fb_bpp_v:    uint64 = 0
+    fb_pixfmt_v: uint32 = 1     # default BGR (multiboot1 type=1)
+    src:         Ptr[char] = "none"
+
+    if efi_fb_present() != 0:
+        fb_base_v   = efi_fb_base()
+        fb_pitch_v  = efi_fb_pitch()
+        fb_width_v  = efi_fb_width()
+        fb_height_v = efi_fb_height()
+        fb_bpp_v    = efi_fb_bpp()
+        fb_pixfmt_v = efi_fb_pixel_format()
+        src         = "EFI GOP"
+    else:
+        if mb_fb_present() == 0:
+            printk0("fb: no framebuffer info (BIOS without VBE? QEMU -kernel?)\n")
+            return
+        fb_base_v   = mb_fb_base()
+        fb_pitch_v  = mb_fb_pitch()
+        fb_width_v  = mb_fb_width()
+        fb_height_v = mb_fb_height()
+        fb_bpp_v    = mb_fb_bpp()
+        fb_pixfmt_v = 1             # BGR — see fb_text.ad default rationale
+        src         = "multiboot1"
+
+    printk1("fb: framebuffer source = %s\n", cast[uint64](src))
+    rc: int32 = fb_init(fb_base_v, fb_pitch_v, fb_width_v,
+                        fb_height_v, fb_bpp_v, fb_pixfmt_v)
     if rc != 0:
         printk1("fb: fb_init refused (rc=%d); will fall back to VGA\n",
                 cast[uint64](rc))
         return
     # Banner via fb_puts so we know the glyph path works without
     # waiting on the UART fan-out to kick in for the next printk.
-    fb_puts("Hamnix EFI GOP framebuffer console online.\n")
-    printk0("fb: EFI GOP framebuffer console ready\n")
+    fb_puts("Hamnix framebuffer console online.\n")
+    printk0("fb: framebuffer console ready\n")
 
 
 def start_kernel():
@@ -1559,17 +1631,60 @@ def start_kernel():
     # the kbd FIFO already exists and the PS/2 path is set up; failure
     # in xhci_init is non-fatal (just no USB keyboard this boot).
     xhci_init()
-    # V1 USB HID — synthetic transfer-engine round-trip. Asserts that
-    # submitting a fake Transfer Event TRB to the Event Ring drives
-    # xhci_poll all the way through to a kbd_rx_push call. Deterministic
-    # even when the live SETUP exchange has trouble on a given QEMU
-    # version. PASS line: `[xhci_v1] transfer-engine PASS (N reports)`.
-    xhci_v1_selftest()
-    # V2 USB HID — continuous-poll round-trip. Injects three synthetic
-    # interrupt-IN Transfer Events back-to-back ('h', 'i', '!'), drains
-    # each through xhci_poll(), asserts the FIFO bytes + ring re-arm.
-    # PASS line: `[usb_hid_v2] PASS` (the test wrapper greps for this).
-    xhci_v2_selftest()
+    # --- xHCI V1/V2 synthetic selftests, gated for real-hw safety ---
+    #
+    # Background: on a real Asus laptop (PS/2 keyboard only, no USB
+    # keyboard attached) the post-M16.x boot transcript reached
+    #   [xhci] no boot-keyboard candidate to attach
+    #   [xhci_v1] self-test: synthetic 'a' keypress
+    # and then HANGED inside xhci_poll's MMIO-poll path. The synthetic
+    # path forges Event-Ring state (kbd_slot_id=1, cycle bits flipped)
+    # that real silicon won't agree with when no USB keyboard is
+    # enumerated. Original design ran the selftest unconditionally so
+    # it survived qemu-xhci versions whose live SETUP exchange was
+    # finicky.
+    #
+    # Resolution mirrors the dhcp-renew / tls-test / tcp-finwait2
+    # marker pattern: the synthetic selftests run when EITHER
+    #   (a) the initramfs ships /etc/xhci-selftest (QEMU smoke), OR
+    #   (b) the V1 attach walk found a USB 2.x boot-kbd candidate on
+    #       the root hub (real hardware with a USB keyboard plugged in).
+    # Default real-hw boot lands in neither branch and prints a skip
+    # banner — the diagnostic the cron test wrappers can pattern-match.
+    cpio_init()                                # idempotent w/ vfs_init's
+    xhci_marker_found: int32 = 0
+    xs_idx: uint64 = 0
+    xs_count: uint64 = initramfs_entry_count()
+    while xs_idx < xs_count:
+        xs_name: Ptr[char] = initramfs_entry_name(xs_idx)
+        xs_ok: int32 = 1
+        xs_target: Ptr[uint8] = "/etc/xhci-selftest"
+        xs_j: uint64 = 0
+        while xs_j < 19:                       # 18 chars + NUL
+            if cast[uint8](xs_name[xs_j]) != xs_target[xs_j]:
+                xs_ok = 0
+                xs_j = 19                       # break
+            else:
+                xs_j = xs_j + 1
+        if xs_ok == 1:
+            xhci_marker_found = 1
+            xs_idx = xs_count                  # break
+        else:
+            xs_idx = xs_idx + 1
+    if xhci_marker_found == 1 or xhci_real_kbd_present() != 0:
+        # V1 USB HID — synthetic transfer-engine round-trip. Asserts
+        # that submitting a fake Transfer Event TRB to the Event Ring
+        # drives xhci_poll all the way through to a kbd_rx_push call.
+        # PASS line: `[xhci_v1] transfer-engine PASS (N reports)`.
+        xhci_v1_selftest()
+        # V2 USB HID — continuous-poll round-trip. Injects three
+        # synthetic interrupt-IN Transfer Events back-to-back
+        # ('h','i','!'), drains each through xhci_poll(), asserts the
+        # FIFO bytes + ring re-arm. PASS line: `[usb_hid_v2] PASS`.
+        xhci_v2_selftest()
+    else:
+        printk0("[xhci_v1] self-test skipped: no USB keyboard found (set /etc/xhci-selftest cpio marker to force)\n")
+        printk0("[xhci_v2] self-test skipped: no USB keyboard found (set /etc/xhci-selftest cpio marker to force)\n")
     time_init()
     i8259_disable()
     apic_init()

@@ -54,8 +54,15 @@ echo "[test_usb_hid_v1] (1/3) Build userland (init.elf must exist for cpio)"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 
-echo "[test_usb_hid_v1] (2/3) Build default initramfs"
-INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null
+echo "[test_usb_hid_v1] (2/3) Build initramfs with /etc/xhci-selftest marker"
+# ENABLE_XHCI_SELFTEST plants /etc/xhci-selftest so init/main.ad's gated
+# xhci_v1_selftest / xhci_v2_selftest actually fire. Default boots skip
+# the synthetic selftests (real-hw safety on PS/2-only Asus etc. — the
+# synthetic event injection hangs xhci_poll when no USB kbd enumerated).
+# The trap below rebuilds the initramfs without the marker so subsequent
+# test runs get a clean default.
+INIT_ELF=build/user/init.elf ENABLE_XHCI_SELFTEST=1 \
+    python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_usb_hid_v1] (3/3) Rebuild kernel + boot QEMU with qemu-xhci + usb-kbd"
 python3 -m compiler.adder compile \
@@ -64,7 +71,7 @@ python3 -m compiler.adder compile \
     -o "$ELF" >/dev/null
 
 LOG=$(mktemp)
-trap 'rm -f "$LOG"' EXIT
+trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
 timeout 15s qemu-system-x86_64 \
