@@ -33,7 +33,7 @@ qemu-system-x86_64 -kernel init/main.elf -nographic \
 QEMU=$!
 for _i in $(seq 1 60); do
     sleep 1
-    if grep -q "PASS" "$TMP/serial.log" 2>/dev/null; then break; fi
+    if grep -q "\[comp_nest\] PASS" "$TMP/serial.log" 2>/dev/null; then break; fi
     kill -0 $QEMU 2>/dev/null || break
 done
 kill -9 $QEMU 2>/dev/null || true
