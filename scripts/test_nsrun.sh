@@ -5,7 +5,7 @@
 # nsrun runs a program in a FRESH private namespace whose /var, /usr,
 # and /etc are each served by a live distrofs 9P daemon. This test
 # proves BOTH halves of the Plan 9 invariant with one fixture binary
-# (tests/test_nsrun.ad) run two ways from hamsh:
+# (tests/test_nsrun.ad) run several ways from hamsh:
 #
 #   A. `/bin/nsrun /bin/test_nsrun write`
 #      nsrun spawns THREE distrofs daemons (one per subtree), clones
@@ -21,11 +21,26 @@
 #      asserts /var/lib/dpkg/nsrun_probe is NOT openable — proving the
 #      write from run A did not leak into the parent's namespace.
 #
+#   C, D. `/bin/nsrun /bin/test_nsrun write` (x2 more)
+#      The second and third sequential nsrun invocations. They reuse
+#      the same low srvfd numbers run A used; with the p9_conns leak
+#      fixed, their mounts MUST still succeed (fresh connection slots).
+#
 # CONCURRENCY: the /srv post name carries the launcher pid
 # (nsrun.distrofs.<pid>.<sub>) so two concurrent nsrun invocations get
 # distinct /srv names and never collide. We assert the [nsrun] pid=
 # marker is present; a second nsrun run (run C) proves a fresh pid is
 # used and its mounts work independently.
+#
+# CONNECTION-TABLE LEAK FIX: the in-kernel 9P client's p9_conns table
+# (sys/src/9/port/9p_client.ad) is now released — on unmount and on
+# task exit (chan.ad's mnttab_unmount + pgrp_ref_dec call p9c_detach).
+# A 9P connection is owned by the namespace mount entry, refcounted so
+# rfork(RFNAMEG) clones share it safely. Because of this, a SECOND and
+# THIRD sequential nsrun each get FRESH connection slots even though
+# they reuse the same low srvfd numbers. This test runs nsrun THREE
+# times sequentially (runs A, C, D) and asserts EVERY run's mounts
+# succeed — proving the table no longer leaks.
 #
 # Pipeline (same shape as scripts/test_9p_realfd.sh):
 #   1. Build userland (hamsh + coreutils + distrofs + nsrun).
@@ -99,12 +114,21 @@ set +e
     # Run C: a SECOND nsrun invocation. It gets a fresh pid, hence
     # fresh /srv post names (nsrun.distrofs.<pid>.<sub>) — proving two
     # nsrun runs don't collide on /srv. Its own three daemons back its
-    # own private /var, /usr, /etc trees.
+    # own private /var, /usr, /etc trees. With the p9_conns leak fixed,
+    # its mounts MUST succeed even though it reuses the same low srvfd
+    # numbers run A used (run A's conns were detached when run A's
+    # exec'd target exited and its Pgrp was freed).
+    printf '/bin/nsrun /bin/test_nsrun write\n'
+    sleep 6
+    # Run D: a THIRD sequential nsrun invocation — the acceptance bar
+    # for the connection-table-leak fix is "3+ sequential runs all
+    # succeed". Like run C, it reuses low srvfd numbers and MUST get
+    # fresh connection slots.
     printf '/bin/nsrun /bin/test_nsrun write\n'
     sleep 6
     printf 'exit\n'
     sleep 1
-) | timeout 50s qemu-system-x86_64 \
+) | timeout 70s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -170,46 +194,51 @@ else
     fail=1
 fi
 
-# Concurrency: run C is a SECOND nsrun invocation. It must report a
-# DIFFERENT pid than run A (a fresh process) — proving the per-pid
-# /srv names (nsrun.distrofs.<pid>.<sub>) are genuinely distinct
-# between two nsrun runs, which is the collision fix this milestone
-# delivers for the /srv namespace.
+# Concurrency: runs A, C and D are three SEPARATE nsrun invocations.
+# Each must report a DIFFERENT pid (a fresh process) — proving the
+# per-pid /srv names (nsrun.distrofs.<pid>.<sub>) are genuinely
+# distinct across runs.
 pids=$(grep -E -o '\[nsrun\] pid=[0-9]+' "$LOG" | grep -E -o '[0-9]+' | sort -u)
 pid_count=$(echo "$pids" | grep -c . || true)
-if [ "$pid_count" -ge 2 ]; then
-    echo "[test_nsrun] OK: two nsrun runs used distinct pids ($(echo $pids | tr '\n' ' ')) -> distinct /srv names"
+if [ "$pid_count" -ge 3 ]; then
+    echo "[test_nsrun] OK: three nsrun runs used distinct pids ($(echo $pids | tr '\n' ' ')) -> distinct /srv names"
 else
-    echo "[test_nsrun] MISS: expected 2 distinct nsrun pids, saw $pid_count"
+    echo "[test_nsrun] MISS: expected 3 distinct nsrun pids, saw $pid_count"
     fail=1
 fi
 
-# PASS-line accounting. Run A (write) and run B (probe) MUST PASS.
-#
-# Run C is a second nsrun write. Whether it PASSes depends on a
-# SEPARATE, pre-existing 9P-stack limitation that is OUT OF SCOPE for
-# this milestone: the in-kernel 9P client's connection table
-# (sys/src/9/port/9p_client.ad's p9_conns) is keyed by srvfd NUMBER and
-# is NEVER released — not on unmount, not on process exit. A second
-# nsrun reuses the same low srvfd numbers as the first, so p9c_attach
-# rejects the mount with "p9c_attach (conn alloc)". This is a kernel
-# conn-lifecycle bug, not a /srv-naming collision — nsrun's per-pid
-# names are correct and distinct (asserted above). Fixing the
-# conn-table leak needs a kernel-side change (p9c_detach on unmount /
-# task teardown) tracked as V1 follow-up. So run C is allowed to
-# either PASS (clean) or fail with exactly that known errstr.
-pass_count=$(grep -F -c "[nsrun_test] PASS" "$LOG" || true)
-if [ "$pass_count" -ge 3 ]; then
-    echo "[test_nsrun] OK: all three fixture runs reached PASS ($pass_count)"
-elif [ "$pass_count" -ge 2 ]; then
-    if grep -F -q "p9c_attach (conn alloc)" "$LOG"; then
-        echo "[test_nsrun] OK: runs A+B PASS; run C hit the known 9P conn-table leak (p9c_attach conn alloc) — kernel V1 follow-up"
-    else
-        echo "[test_nsrun] MISS: only 2 PASS lines and run C failed for an UNEXPECTED reason"
-        fail=1
-    fi
+# Per-run mount accounting. The connection-table-leak fix means EVERY
+# sequential nsrun must mount all three subtrees — the kernel detaches
+# a run's 9P connections when its exec'd target exits and its Pgrp is
+# freed, so the next run gets fresh p9_conns slots even though it
+# reuses the same low srvfd numbers. With three nsrun runs (A, C, D)
+# each mounting /var + /usr + /etc, we expect 9 "distrofs mounted at"
+# lines total. The known leak errstr ("p9c_attach (conn alloc)") must
+# NOT appear at all — its presence means the table still leaks.
+if grep -F -q "p9c_attach (conn alloc)" "$LOG"; then
+    echo "[test_nsrun] MISS: 'p9c_attach (conn alloc)' present — 9P conn table still leaks"
+    fail=1
 else
-    echo "[test_nsrun] MISS: expected >=2 PASS lines (runs A+B), saw $pass_count"
+    echo "[test_nsrun] OK: no 'p9c_attach (conn alloc)' — conn table released between runs"
+fi
+
+mount_count=$(grep -F -c "[nsrun] distrofs mounted at" "$LOG" || true)
+if [ "$mount_count" -ge 9 ]; then
+    echo "[test_nsrun] OK: all three nsrun runs mounted all three subtrees ($mount_count mount lines)"
+else
+    echo "[test_nsrun] MISS: expected >=9 'distrofs mounted at' lines (3 runs x 3 subtrees), saw $mount_count"
+    fail=1
+fi
+
+# PASS-line accounting. Runs A (write), B (probe), C (write) and D
+# (write) must ALL reach PASS. With the p9_conns leak fixed there is
+# no longer a tolerated-failure case: 3+ sequential nsrun cycles MUST
+# all succeed.
+pass_count=$(grep -F -c "[nsrun_test] PASS" "$LOG" || true)
+if [ "$pass_count" -ge 4 ]; then
+    echo "[test_nsrun] OK: all four fixture runs reached PASS ($pass_count)"
+else
+    echo "[test_nsrun] MISS: expected >=4 PASS lines (runs A+B+C+D), saw $pass_count"
     fail=1
 fi
 

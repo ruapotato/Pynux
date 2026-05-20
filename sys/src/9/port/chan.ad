@@ -82,6 +82,16 @@ from sys.src.port9.port.devsrv import devsrv_init
 # V2.75: real heap allocator. kzalloc gives us a zeroed region; kfree
 # returns it to the slab / page allocator.
 from mm.slab import kzalloc, kfree
+# 9P connection lifecycle. A SRV-kind mount entry is the namespace-side
+# OWNER of an in-kernel 9P connection (keyed by srvfd in 9p_client.ad's
+# p9_conns table). Cloning a SRV entry across rfork(RFNAMEG) adds an
+# owner (p9c_conn_owner_inc); tearing one down — by unmount or because
+# the owning Pgrp is being freed — drops one (p9c_detach). When the
+# last owner goes, p9c_detach reclaims the p9_conns slot, which is the
+# fix for the connection-table leak that wedged a second nsrun.
+from sys.src.port9.port.9p_client import (
+    p9c_detach, p9c_conn_owner_inc,
+)
 
 
 # Chan kind discriminator. CHAN_KIND_NONE marks an unused chan
@@ -247,6 +257,15 @@ def _copy_mtab(src: uint64, dst: uint64):
             gd[0].mtab[s].from_path[i] = gs[0].mtab[s].from_path[i]
             gd[0].mtab[s].to_path[i]   = gs[0].mtab[s].to_path[i]
             i = i + 1
+        # A live SRV entry just got a SECOND owner: the destination
+        # Pgrp's copy now also references the underlying 9P connection.
+        # Bump its owner refcount so an unmount / exit in EITHER the
+        # parent or the rfork(RFNAMEG) child doesn't tear the conn out
+        # from under the other. The conn is reclaimed only when the
+        # last of the two mount entries goes away.
+        if gs[0].mtab[s].in_use != 0 \
+                and gs[0].mtab[s].chan.kind == CHAN_KIND_SRV:
+            p9c_conn_owner_inc(gs[0].mtab[s].chan.srvfd)
         s = s + 1
     gd[0].mnt_count = gs[0].mnt_count
 
@@ -325,6 +344,30 @@ def pgrp_ref_inc(p: uint64) -> int32:
     return g[0].ref
 
 
+def _detach_srv_conns(p: uint64):
+    # A Pgrp is about to be freed (its last task referer is gone).
+    # Every live SRV-kind mount entry it still holds is an owner of a
+    # 9P connection — drop each of those owner references so the
+    # underlying conn (and its p9_conns slot) is reclaimed once no
+    # surviving namespace references it. This is the task-exit half of
+    # the connection-lifecycle fix: without it, a process that mounted
+    # a 9P server and exited without unmounting (exactly what nsrun's
+    # exec'd target does) would leak its conns forever, and the next
+    # nsrun's mounts would collide on the reused srvfd numbers.
+    #
+    # p9c_detach is benign on a srvfd with no conn (returns -1), so an
+    # entry whose conn was already torn down by an explicit unmount is
+    # handled cleanly. Re-entrancy: see the note on p9c_detach — its
+    # only outbound work is best-effort fid clunks through fs/pipe.ad.
+    g: Ptr[Pgrp] = _pgrp_ptr(p)
+    s: uint64 = 0
+    while s < MNT_CAP:
+        if g[0].mtab[s].in_use != 0 \
+                and g[0].mtab[s].chan.kind == CHAN_KIND_SRV:
+            p9c_detach(g[0].mtab[s].chan.srvfd)
+        s = s + 1
+
+
 def pgrp_ref_dec(p: uint64) -> int32:
     # Drop refcount on task exit. When refcount hits 0, kfree the
     # storage and return 0. Returns the new refcount, or -1 on NULL
@@ -338,10 +381,13 @@ def pgrp_ref_dec(p: uint64) -> int32:
     g[0].ref = g[0].ref - 1
     new_ref: int32 = g[0].ref
     if new_ref == 0:
-        # Last referer dropped — return the storage to the slab /
-        # page allocator. The caller's pointer is now dangling; this
-        # is the standard refcount contract (caller must not retain
-        # it past the ref_dec call).
+        # Last referer dropped — release any 9P connections this
+        # Pgrp's SRV mounts still own, THEN return the storage to the
+        # slab / page allocator. Order matters: _detach_srv_conns
+        # reads the mtab, so it must run before kfree. The caller's
+        # pointer is dangling after kfree; this is the standard
+        # refcount contract (caller must not retain it past ref_dec).
+        _detach_srv_conns(p)
         kfree(p)
     return new_ref
 
@@ -519,6 +565,16 @@ def mnttab_unmount(new_path: Ptr[uint8],
                     elif _path_eq_u8(&g[0].mtab[s].to_path[0], old_path) != 0:
                         keep = 0
             if keep == 0:
+                # A SRV-kind entry owns a 9P connection — drop this
+                # mount's owner reference BEFORE we zero the slot (we
+                # still need the srvfd). p9c_detach reclaims the
+                # p9_conns slot once the last owner is gone, so an
+                # explicit unmount(2) no longer leaks the connection.
+                # Re-entrancy: p9c_detach's only outbound work is
+                # best-effort fid clunks routed through fs/pipe.ad —
+                # never a nested vfs_* / chan_* dispatch.
+                if g[0].mtab[s].chan.kind == CHAN_KIND_SRV:
+                    p9c_detach(g[0].mtab[s].chan.srvfd)
                 _zero_entry(p, s)
                 removed = removed + 1
                 if g[0].mnt_count > 0:

@@ -153,6 +153,17 @@ class P9Conn:
     msize:         uint32         # negotiated msize (<= P9C_MSIZE)
     next_tag:      uint16         # next tag to emit (skip P9_NOTAG)
     root_fid:      uint32         # set by p9c_attach
+    # owner_refs: how many namespace mount entries reference this
+    # connection. A 9P connection's logical owner is the mount entry
+    # in a Pgrp's mount table (the SRV chan), NOT the raw per-task
+    # srvfd — the srvfd can outlive or pre-decease the mount and is
+    # only the transport. do_mount creates a conn with owner_refs=1;
+    # pgrp_clone (rfork(RFNAMEG)) deep-copies the mtab, so each SRV
+    # entry it copies bumps owner_refs via p9c_conn_owner_inc; unmount
+    # and Pgrp-free each drop one ref via p9c_detach. At owner_refs==0
+    # the conn is torn down and its p9_conns slot reclaimed — which is
+    # what lets a second nsrun reuse the low srvfd numbers cleanly.
+    owner_refs:    int32          # 0 = orphaned (slot reclaimable)
     fid_used:      Array[32, uint8]   # per-fid used bit (1 == in use)
     # Smoke-test bypass. When smoke_mode != 0, _p9_send / _p9_recv
     # operate on smoke_tx_slot / smoke_rx_slot rather than the srvfd.
@@ -216,6 +227,10 @@ def _conn_alloc(srvfd: int32) -> int32:
     p9_conns[su].msize    = P9C_MSIZE
     p9_conns[su].next_tag = 1
     p9_conns[su].root_fid = 0xFFFFFFFF
+    # The do_mount (or smoke fixture) that allocated this conn is its
+    # first and so far only owner. Cloned mtabs bump it; unmount /
+    # Pgrp-free drop it.
+    p9_conns[su].owner_refs    = 1
     p9_conns[su].smoke_mode    = 0
     p9_conns[su].smoke_tx_slot = -1
     p9_conns[su].smoke_rx_slot = -1
@@ -229,9 +244,120 @@ def _conn_alloc(srvfd: int32) -> int32:
 
 
 def _conn_release(slot: int32):
+    # Hard-free the slot: mark it free, drop the srvfd, and reset the
+    # owner refcount so a future _conn_alloc starts clean. Used by the
+    # attach-handshake failure paths (the conn never became a real
+    # mount) and as the final step of p9c_detach once owner_refs hits
+    # zero.
     su: uint64 = cast[uint64](slot)
-    p9_conns[su].in_use = 0
-    p9_conns[su].srvfd  = -1
+    p9_conns[su].in_use     = 0
+    p9_conns[su].srvfd      = -1
+    p9_conns[su].owner_refs = 0
+    # Reset the smoke / transport bindings so a reused slot can't
+    # accidentally inherit a stale pipe slot from the previous tenant.
+    p9_conns[su].smoke_mode    = 0
+    p9_conns[su].smoke_tx_slot = -1
+    p9_conns[su].smoke_rx_slot = -1
+    p9_conns[su].rx_srvfd      = -1
+    p9_conns[su].root_fid      = 0xFFFFFFFF
+    # Clear the fid pool so a reused slot starts with no fids held.
+    i: uint64 = 0
+    while i < P9C_FIDS_PER_CONN:
+        p9_conns[su].fid_used[i] = 0
+        i = i + 1
+
+
+# -- connection teardown (p9c_detach) ------------------------------
+#
+# THE BUG THIS FIXES: the p9_conns table was never released. do_mount
+# allocated a conn keyed by srvfd; nothing freed it on unmount or on
+# task exit. A second nsrun reuses the same low srvfd numbers, so
+# p9c_attach's "_conn_find_by_srvfd(srvfd) >= 0" guard rejected the
+# mount with "p9c_attach (conn alloc)". Two live processes could also
+# hold the same srvfd number, colliding in the global table.
+#
+# OWNERSHIP MODEL: a 9P connection is owned by the namespace mount
+# entry (the SRV chan in a Pgrp's mtab), not the raw srvfd. The srvfd
+# is only the transport handle. So the conn's lifetime is refcounted
+# by how many mount entries reference it:
+#
+#   * do_mount      -> p9c_attach        -> owner_refs = 1
+#   * rfork(RFNAMEG)-> pgrp_clone        -> p9c_conn_owner_inc (++)
+#   * unmount       -> mnttab_unmount    -> p9c_detach (--)
+#   * task exit     -> pgrp_ref_dec == 0 -> p9c_detach per SRV entry (--)
+#
+# When owner_refs reaches 0 the slot is reclaimed.
+
+def _conn_try_clunk_all(slot: int32):
+    # Best-effort: clunk every fid this connection still holds so the
+    # server can release its per-fid state promptly. A 9P connection
+    # drop implicitly clunks every fid server-side anyway (docs/9p.md
+    # §2.2), so a failed clunk here is harmless — we tolerate it and
+    # press on. p9c_clunk routes through _p9_send / _p9_recv, which
+    # already self-protect against a dead / closed transport (a closed
+    # srvfd makes _fd_to_pipe_slot return -1 and _p9_send return -1
+    # without touching any pipe). That means this is also safe to call
+    # from the task-exit path where the transport fd is already gone:
+    # the clunk simply no-ops.
+    su: uint64 = cast[uint64](slot)
+    srvfd: int32 = p9_conns[su].srvfd
+    i: uint64 = 0
+    while i < P9C_FIDS_PER_CONN:
+        if p9_conns[su].fid_used[i] != 0:
+            # p9c_clunk frees the fid bit on success; on failure we
+            # clear it ourselves so the slot is fully reset either way.
+            if p9c_clunk(srvfd, cast[int32](i)) != 0:
+                p9_conns[su].fid_used[i] = 0
+        i = i + 1
+
+
+def p9c_conn_owner_inc(srvfd: int32) -> int32:
+    # Register one more namespace mount entry as an owner of the
+    # connection bound to `srvfd`. Called by chan.ad's _copy_mtab when
+    # rfork(RFNAMEG) deep-copies a SRV mount entry — both the parent
+    # and the child mtab now reference the same live connection, so it
+    # must survive until BOTH are torn down. Returns the new owner
+    # count, or -1 if no connection is bound to `srvfd`.
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    p9_conns[su].owner_refs = p9_conns[su].owner_refs + 1
+    return p9_conns[su].owner_refs
+
+
+def p9c_detach(srvfd: int32) -> int32:
+    # Release one owner reference to the connection bound to `srvfd`.
+    # Called when a 9P mount entry is torn down — either by an explicit
+    # unmount(2) or because the owning Pgrp is being freed at task
+    # exit. When the LAST owner drops, the connection is fully torn
+    # down: outstanding fids are clunked (best-effort) and the p9_conns
+    # slot is reclaimed so a future p9c_attach on the same srvfd
+    # number succeeds.
+    #
+    # Returns 0 if a connection was found and one ref dropped (whether
+    # or not that triggered a full teardown), -1 if no connection is
+    # bound to `srvfd` (already detached, or never attached — both are
+    # benign: the do_mount rollback path and a double unmount both land
+    # here harmlessly).
+    #
+    # Re-entrancy: this runs at unmount / task-teardown time. The only
+    # outbound work is _conn_try_clunk_all, which funnels through
+    # _p9_send / _p9_recv exactly like every other op — i.e. through
+    # fs/pipe.ad's ring buffers (or fs/socketpair.ad), never a nested
+    # vfs_* dispatch. So it mirrors the care the rest of this module
+    # already takes and cannot re-enter the channel layer.
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if p9_conns[su].owner_refs > 0:
+        p9_conns[su].owner_refs = p9_conns[su].owner_refs - 1
+    if p9_conns[su].owner_refs <= 0:
+        # Last owner gone — clunk what we can, then reclaim the slot.
+        _conn_try_clunk_all(slot)
+        _conn_release(slot)
+    return 0
 
 
 def _alloc_tag(slot: int32) -> uint16:
