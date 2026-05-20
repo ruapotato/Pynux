@@ -80,6 +80,7 @@ from lib.9p.9p import (
     p9_emit_tattach, p9_decode_rattach,
     p9_emit_twalk,   p9_decode_rwalk,
     p9_emit_topen,   p9_decode_ropen,
+    p9_emit_tcreate, p9_decode_rcreate,
     p9_emit_tread,   p9_decode_rread,
     p9_emit_twrite,  p9_decode_rwrite,
     p9_emit_tclunk,  p9_decode_rclunk,
@@ -89,6 +90,7 @@ from lib.9p.9p import (
     P9_MSIZE_DEFAULT,
     P9_TVERSION, P9_RVERSION, P9_TATTACH, P9_RATTACH,
     P9_TWALK, P9_RWALK, P9_TOPEN, P9_ROPEN,
+    P9_TCREATE, P9_RCREATE,
     P9_TREAD, P9_RREAD, P9_TWRITE, P9_RWRITE,
     P9_TCLUNK, P9_RCLUNK, P9_TSTAT, P9_RSTAT,
     P9_RERROR,
@@ -892,6 +894,63 @@ def p9c_open(srvfd: int32, fid: int32, mode: int32) -> int32:
     return 0
 
 
+# -- p9c_create ----------------------------------------------------
+#
+# Tcreate creates `name` inside the directory `fid` references, then
+# opens it as if by Topen. Per docs/9p.md §3.8 the fid is MUTATED by a
+# successful Rcreate — afterwards it references the newly-created file
+# (NOT the parent dir) and is left open for I/O. So the caller hands us
+# a fid that has been walked to the *parent directory* and gets the
+# same fid back, now pointing at (and open on) the new file.
+#
+# `name` is a NUL-terminated cstring (the leaf basename — no '/').
+# `perm` carries Plan 9 mode bits (low 9 = rwxrwxrwx, plus DMDIR /
+# DMAPPEND / DMEXCL high bits). `open_mode` is the Plan 9 open-mode
+# byte the new fid ends up open with.
+#
+# Returns 0 on success, -1 on any failure. Routes through _p9_send /
+# _p9_recv exactly like every other op — i.e. through fs/pipe.ad's
+# pipe_write / pipe_read directly, never the re-entrant vfs_* path.
+
+def p9c_create(srvfd: int32, fid: int32, name: Ptr[char],
+               perm: uint32, open_mode: int32) -> int32:
+    slot: int32 = _conn_find_by_srvfd(srvfd)
+    if slot < 0:
+        return -1
+    if name == cast[Ptr[char]](0):
+        return -1
+    name_p: Ptr[uint8] = cast[Ptr[uint8]](name)
+    name_l: uint64 = _cstrlen(name)
+    if name_l == 0:
+        return -1
+    c: P9Cursor
+    p9_cursor_init(&c, &p9c_scratch[0], P9C_BUF_LEN)
+    tag: uint16 = _alloc_tag(slot)
+    n: int32 = p9_emit_tcreate(&c, tag, cast[uint32](fid),
+                               name_p, name_l, perm,
+                               cast[uint8](open_mode & 0xFF))
+    if n < 0:
+        return -1
+    if _p9_send(slot, n) < 0:
+        return -1
+    rn: int32 = _p9_recv(slot)
+    if rn < 0:
+        return -1
+    if p9c_scratch[4] == P9_RERROR:
+        return -1
+    tg_out: uint16 = 0
+    qt: uint8 = 0
+    qv: uint32 = 0
+    qp: uint64 = 0
+    iou: uint32 = 0
+    consumed: int64 = p9_decode_rcreate(
+        &p9c_scratch[0], cast[uint64](rn),
+        &tg_out, &qt, &qv, &qp, &iou)
+    if consumed < cast[int64](0):
+        return -1
+    return 0
+
+
 # -- p9c_read ------------------------------------------------------
 
 def p9c_read(srvfd: int32, fid: int32, offset: uint64,
@@ -1118,6 +1177,101 @@ def p9c_walk_open_path(srvfd: int32, root_fid: int32,
         p9c_clunk(srvfd, new_fid)
         return -1
     return new_fid
+
+
+# -- path-aware create used by fs/vfs.ad ---------------------------
+#
+# Given a srvfd, the connection's root fid, and a relative path (the
+# bytes after the mount-point prefix), walk to the path's PARENT
+# directory then Tcreate the final component. Returns the new file's
+# fid (>= 0, open for `open_mode` I/O) on success, -1 on any failure.
+# Caller is responsible for clunk on close.
+#
+# Path split: the leaf is the bytes after the final '/'; everything
+# before it is the parent path. "/foo"        -> parent=root,     leaf=foo
+#                               "/a/b/c"      -> parent=root/a/b,  leaf=c
+#                               "foo"         -> parent=root,      leaf=foo
+# A path with no leaf (empty, "/", or trailing '/') is rejected — you
+# cannot create "the root" or an unnamed file.
+#
+# Re-entrancy: p9c_walk + p9c_create both funnel through _p9_send /
+# _p9_recv, which talk to fs/pipe.ad's ring buffers directly. No nested
+# vfs_* dispatch — safe to call from inside vfs_open_for_write.
+
+def p9c_walk_create_path(srvfd: int32, root_fid: int32,
+                         rel_path: Ptr[uint8], perm: uint32,
+                         open_mode: int32) -> int32:
+    # Find the last '/' so we can split parent vs. leaf. We also need
+    # the overall length to bound the leaf copy.
+    plen: uint64 = 0
+    while rel_path[plen] != 0:
+        plen = plen + 1
+    if plen == 0:
+        return -1                                # nothing to create
+    # last_slash = index of the final '/', or a sentinel if none.
+    last_slash: uint64 = plen                    # plen == "no slash"
+    j: uint64 = 0
+    while j < plen:
+        if rel_path[j] == 47:                    # '/'
+            last_slash = j
+        j = j + 1
+    # Leaf starts right after the final slash (or at 0 if no slash).
+    leaf_start: uint64 = 0
+    if last_slash != plen:
+        leaf_start = last_slash + 1
+    leaf_len: uint64 = plen - leaf_start
+    if leaf_len == 0 or leaf_len + 1 >= P9C_MAX_NAME_LEN:
+        return -1                                # empty / oversized leaf
+    # Split the parent components into the shared top-level storage,
+    # exactly like p9c_walk_open_path does. We stop the component scan
+    # at leaf_start so the leaf itself is never treated as a walk
+    # component.
+    n_comp: uint64 = 0
+    i: uint64 = 0
+    if rel_path[0] == 47:                        # skip a leading '/'
+        i = 1
+    while i < leaf_start and n_comp < P9C_MAX_COMPONENTS:
+        base: uint64 = n_comp * P9C_MAX_NAME_LEN
+        cidx: uint64 = 0
+        while i < leaf_start and rel_path[i] != 47 \
+                and cidx + 1 < P9C_MAX_NAME_LEN:
+            _p9c_path_comp_storage[base + cidx] = rel_path[i]
+            cidx = cidx + 1
+            i = i + 1
+        _p9c_path_comp_storage[base + cidx] = 0
+        if cidx > 0:
+            _p9c_path_comp_ptrs[n_comp] = cast[Ptr[char]](
+                &_p9c_path_comp_storage[base])
+            n_comp = n_comp + 1
+        if i < leaf_start and rel_path[i] == 47:
+            i = i + 1
+    # Walk to the parent directory. n_comp == 0 means the parent IS the
+    # root — p9c_walk with zero names clone-walks the root into a fresh
+    # fid (the canonical "clone fid" op, docs/9p.md §3.6), which is
+    # exactly the parent fid Tcreate needs.
+    qid_out: Array[13, uint8]
+    parent_fid: int32 = p9c_walk(srvfd, root_fid,
+                                 cast[Ptr[Ptr[char]]](&_p9c_path_comp_ptrs[0]),
+                                 cast[int32](n_comp), &qid_out[0])
+    if parent_fid < 0:
+        return -1
+    # Stage the leaf as a NUL-terminated cstring in component slot 0 of
+    # the shared storage (the parent walk has already consumed it for
+    # the walk emit, so reusing the front slot is safe — synchronous
+    # single-call lifetime).
+    k: uint64 = 0
+    while k < leaf_len:
+        _p9c_path_comp_storage[k] = rel_path[leaf_start + k]
+        k = k + 1
+    _p9c_path_comp_storage[k] = 0
+    # Tcreate mutates parent_fid in place: on success it now references
+    # the new file and is left open for open_mode I/O.
+    if p9c_create(srvfd, parent_fid,
+                  cast[Ptr[char]](&_p9c_path_comp_storage[0]),
+                  perm, open_mode) < 0:
+        p9c_clunk(srvfd, parent_fid)
+        return -1
+    return parent_fid
 
 
 def p9c_encode_fd_buf(srvfd: int32, fid: int32) -> uint64:

@@ -111,7 +111,8 @@ from kernel.sched.core import task_struct_at
 # through these. 9p_client.ad's FD_P9_MARK lives next to the dev*.ad
 # trio's marks (same pattern, see comment above the devstat import).
 from sys.src.port9.port.9p_client import (
-    p9c_walk_open_path, p9c_read, p9c_write, p9c_clunk,
+    p9c_walk_open_path, p9c_walk_create_path,
+    p9c_read, p9c_write, p9c_clunk,
     p9c_encode_fd_buf, p9c_decode_srvfd, p9c_decode_fid,
     FD_P9_MARK,
 )
@@ -850,15 +851,26 @@ def vfs_open_write(name: Ptr[char]) -> int32:
         if rc < 0:
             return ENOENT
         return _install_proc_fd(cast[uint32](rc & 0xFFFFFFFF))
-    # V1: 9P SRV-kind mount probe on the OWRITE side. Same shape as
-    # vfs_open's probe above. Today we open with mode=OWRITE (1); the
-    # underlying p9c_open passes the byte through verbatim. Write-side
-    # opens on a 9P-mounted path don't truncate-or-create yet (V2);
-    # they just walk + Topen-OWRITE, which matches Plan 9 semantics
-    # for an existing file. Create-on-open lands when V2 adds Tcreate
-    # routing through this entry point.
+    # V4.1: 9P SRV-kind mount probe on the OWRITE side. Same shape as
+    # vfs_open's probe above. We first try to walk + Topen-OWRITE an
+    # EXISTING file. If that misses (ENOENT — the leaf isn't there),
+    # fall through to a Tcreate of the leaf via p9c_walk_create_path,
+    # which walks to the parent dir and issues Tcreate. Both legs route
+    # through the in-kernel 9P client's _p9_send / _p9_recv, i.e. the
+    # real-fd pipe path — so create-on-write-open works against a
+    # userland 9P server (distrofs etc.) mounted over a real srvfd.
     p9_wfd: int32 = _try_open_p9_write(name)
     if p9_wfd != -10000:
+        if p9_wfd == ENOENT:
+            # The path is under a 9P mount but the file doesn't exist
+            # yet — create it. _try_create_p9 returns P9_NO_MOUNT only
+            # if the SRV-mount probe somehow misses on the retry (it
+            # won't, the prefix matched a line ago); treat that as the
+            # original ENOENT to stay deterministic.
+            p9_cfd: int32 = _try_create_p9(name)
+            if p9_cfd != -10000:
+                return p9_cfd
+            return ENOENT
         return p9_wfd
     if is_tmpfs_path(name) != 0:
         # tmpfs_open_for_write returns a negative TMPFS_E* on failure
@@ -1453,6 +1465,48 @@ def _try_open_p9(name: Ptr[char]) -> int32:
 
 def _try_open_p9_write(name: Ptr[char]) -> int32:
     return _try_open_p9_with_mode(name, 1)        # OWRITE
+
+
+# Default perm bits for a 9P Tcreate of a regular file on the
+# write-open-create path: rw-rw-rw- (0o666). DMDIR / DMAPPEND / DMEXCL
+# stay clear — a plain file. The server clamps these to whatever its
+# own policy allows; distrofs honours the low 9 verbatim.
+P9_CREATE_PERM_FILE: uint32 = 0x1B6                # 0o666
+
+
+def _try_create_p9(name: Ptr[char]) -> int32:
+    # Create-on-write-open leg for a 9P-mounted path. Same SRV-mount
+    # probe as _try_open_p9_with_mode, but on a hit it walks to the
+    # path's PARENT and issues Tcreate for the leaf via the in-kernel
+    # 9P client. Returns the installed FD_P9_MARK fd on success, an
+    # errno on failure, or the P9_NO_MOUNT sentinel when no SRV mount
+    # covers `name` (caller falls through to local-FS create routing).
+    srvfd:    int32 = -1
+    root_fid: int32 = -1
+    prefix_len: uint64 = 0
+    hit: int32 = chan_find_srv_prefix(
+        cast[Ptr[uint8]](name),
+        &srvfd, &root_fid, &prefix_len)
+    if hit == 0:
+        return P9_NO_MOUNT
+    if root_fid < 0:
+        return ENOENT
+    rel: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](name) + prefix_len)
+    new_fid: int32 = p9c_walk_create_path(srvfd, root_fid, rel,
+                                          P9_CREATE_PERM_FILE, 1)   # OWRITE
+    if new_fid < 0:
+        return EROFS
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        p9c_clunk(srvfd, new_fid)
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu]    = FD_P9_MARK
+    task[0].fd_pos[fdu]    = 0
+    task[0].fd_buf[fdu]    = p9c_encode_fd_buf(srvfd, new_fid)
+    task[0].fd_buflen[fdu] = 0
+    return fd
 
 
 def _try_open_p9_with_mode(name: Ptr[char], mode: int32) -> int32:
