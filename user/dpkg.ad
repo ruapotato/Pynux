@@ -1,11 +1,12 @@
 # user/dpkg.ad
 #
-# Hamnix V1 of the `dpkg` package-database front-end — the next
+# Hamnix V2 of the `dpkg` package-database front-end — the next
 # apt-path piece after `dpkg-deb` (user/dpkg_deb.ad). Where dpkg_deb
 # unpacks a `.deb`'s tar members, `dpkg` *records* an installed
-# package in the dpkg database — and now also *queries* it.
+# package in the dpkg database — and now also *queries* and *removes*.
 #
 #   dpkg -i <file.deb>     install: record a package in the DB
+#   dpkg -r <package>      remove: deregister a package from the DB
 #   dpkg -l                list all installed packages
 #   dpkg -s <package>      show one package's status stanza
 #   dpkg -L <package>      list one package's installed files
@@ -23,12 +24,26 @@
 #          Architecture, Maintainer, Description. Multi-line
 #          Description continuation lines (lines that begin with a
 #          space) are folded into the Description value.
-#       3. Append a Debian-format status stanza to the dpkg status
-#          database (see DB path note below).
-#       4. Inflate data.tar.gz, walk its ustar headers, and write the
-#          installed-file manifest (one path per line) to the
-#          per-package `<package>.list` file — what `dpkg -L` reads.
+#       3. Update-or-insert a Debian-format status stanza into the
+#          dpkg status database: if a stanza for the same Package is
+#          already present it is REPLACED in place; otherwise the new
+#          stanza is appended (see DB path note below).
+#       4. Inflate data.tar.gz, walk its ustar headers, and write (not
+#          append — overwrite) the installed-file manifest (one path
+#          per line) to the per-package `<package>.list` file — what
+#          `dpkg -L` reads.
 #       5. Print: `dpkg: registered <package> <version> (<N> files)`.
+#
+#   dpkg -r <package>
+#       Deregister a package: find its stanza in the status DB by
+#       Package name, splice the stanza out, rewrite the DB, and
+#       delete the per-package `<package>.list` manifest. Prints
+#       `dpkg: removed <package>`. Errors (stderr + non-zero exit)
+#       with `dpkg: package '<package>' is not installed` if the
+#       package has no stanza in the DB. V2 `-r` only updates the
+#       DATABASE — it does NOT delete the package's actually-installed
+#       files from the filesystem (that is the V3 file-sweep, which
+#       would drive a per-path unlink off the .list manifest).
 #
 # -- DATABASE PATH (Hamnix tmpfs limitation, documented per spec) ----
 #
@@ -56,23 +71,32 @@
 # canonical /var/lib/dpkg/{status,info/<pkg>.list} and drop the
 # flatten/truncate logic. The stanza format + parsing stay identical.
 #
-# -- V1 SCOPE (NOT done — V2 backlog) --------------------------------
-#   * No dedup/replace: if a stanza for the same Package already exists
-#     in the status DB, V1 just APPENDS a new stanza. dpkg's real
-#     "update-or-insert" (find the existing stanza by Package, replace
-#     it in place) is V2.
+# -- V2 SCOPE (NOT done — V3 backlog) --------------------------------
+#   * `dpkg -r` deregisters a package from the DATABASE only — it does
+#     NOT delete the package's installed files from the filesystem.
+#     V3's real "remove" walks the .list manifest and unlinks each
+#     recorded path before deleting the .list itself.
 #   * No data.tar extraction to the live filesystem — that is
 #     `dpkg-deb -x` (user/dpkg_deb.ad), already shipped. `dpkg -i` here
 #     records metadata only.
 #   * No dependency resolution (Depends/Pre-Depends/Conflicts).
 #   * No maintainer scripts (preinst/postinst/prerm/postrm).
-#   * No conffiles handling, no triggers, no `dpkg --remove`/`-r`.
+#   * No conffiles handling, no triggers, no `dpkg --purge`.
 #   * Compression: gzip only (same as dpkg_deb V0); .xz/.zst error out.
 #   * The -l/-s/-L query sub-commands are shipped (see the QUERY
-#     section). What is still V2 there: -l column alignment is naive
+#     section). What is still V3 there: -l column alignment is naive
 #     single-space padding (no fixed-width columns), and -s/-L key the
 #     status DB / .list paths off the flattened tmpfs names — they
-#     follow the same V2 path migration as -i.
+#     follow the same V3 path migration as -i.
+#
+# -- V2 DONE (was V1 backlog) ----------------------------------------
+#   * Dedup/replace on `dpkg -i`: a re-install of the same Package now
+#     REPLACES the existing stanza in place instead of appending a
+#     duplicate — the DB carries exactly one stanza per package. The
+#     .list manifest is overwritten, not appended.
+#   * `dpkg -r <package>`: removes the stanza from the status DB and
+#     deletes the .list manifest (database deregister only — see the
+#     V3 backlog above for the live-file sweep).
 #
 # Build: scripts/build_user.sh auto-discovers via build_adder_user dpkg.
 # Test:  scripts/test_dpkg_db.sh.
@@ -88,6 +112,7 @@ extern def sys_open_write(path: Ptr[char]) -> int32
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_close(fd: int32) -> int32
+extern def sys_unlink(path: Ptr[char]) -> int32
 
 
 # -- bounded BSS buffers (Hamnix idiom: never park large Arrays in a
@@ -631,12 +656,20 @@ def _build_stanza() -> uint64:
     return o
 
 
-# -- append the stanza to the status DB --------------------------------
+# -- update-or-insert the stanza into the status DB --------------------
 #
 # tmpfs has no O_APPEND: open_for_write truncates. So we read the
 # existing /tmp/dpkg-status (if any) into status_buf, then rewrite the
-# whole file = old contents + new stanza. Capped at 4096 (TMPFS_FILE_CAP).
-# Returns 0 on success, -1 on a write/overflow error.
+# whole file. The DB is capped at 4096 (TMPFS_FILE_CAP) — status_buf is
+# sized to exactly that cap, so it always holds the whole DB; an
+# install that would push the DB past the cap is rejected.
+#
+# V2 update-or-insert (no longer a blind append): before writing, scan
+# the in-memory DB for an existing stanza with the same Package name.
+# If one is found its byte run [old_start, old_end) is SPLICED OUT and
+# the freshly-built stanza is written in its place; otherwise the new
+# stanza is appended at the tail. Result: exactly one stanza per
+# package, no stale duplicates accumulating on re-install.
 #
 # The DB path is the flattened tmpfs name "/tmp/dpkg-status" — see the
 # DATABASE PATH note at the top of this file for why it isn't the
@@ -644,7 +677,29 @@ def _build_stanza() -> uint64:
 # globals, so the literal is materialised inline at each use site.
 
 
-def _append_to_status(stanza_len: uint64) -> int32:
+# Compare the NUL-terminated string `a` against the byte range `b[0,
+# blen)` of status_buf-relative bytes. Returns 1 if they are equal
+# (same length, same bytes), 0 otherwise.
+
+def _str_eq_range(a: Ptr[uint8], b: Ptr[uint8], blen: uint64) -> int32:
+    i: uint64 = 0
+    while i < blen:
+        if a[i] == 0:
+            return 0
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] != 0:
+        return 0
+    return 1
+
+
+# Slurp /tmp/dpkg-status into status_buf. Returns the byte length, or
+# 0 if the DB does not yet exist (no package installed). status_buf is
+# capped at 4096; a longer DB is short-read (and would already have
+# been rejected at write time by the cap check).
+
+def _load_status_db() -> uint64:
     db_path: Ptr[char] = cast[Ptr[char]]("/tmp/dpkg-status")
     old_len: uint64 = 0
     rfd: int32 = sys_open(db_path)
@@ -657,9 +712,83 @@ def _append_to_status(stanza_len: uint64) -> int32:
                 break
             old_len = old_len + cast[uint64](n)
         sys_close(rfd)
+    return old_len
 
-    if old_len + stanza_len > 4096:
-        write_str(2, "dpkg: status DB would exceed tmpfs 4 KiB cap (V1 limit)\n")
+
+# Scan status_buf[0, db_len) for the stanza whose `Package:` value
+# equals the NUL-terminated `pkg`. A stanza begins at a column-0
+# "Package:" line and runs up to (and INCLUDING) the blank-line
+# separator that terminates it — splicing [out_start, out_end) thus
+# also removes the separating blank line, leaving the DB well-formed.
+#
+# On a hit: writes the stanza's byte span to *out_start / *out_end and
+# returns 1. On a miss: returns 0 (the out params are untouched).
+
+def _find_stanza_span(db_len: uint64, pkg: Ptr[uint8],
+                      out_start: Ptr[uint64], out_end: Ptr[uint64]) -> int32:
+    pos: uint64 = 0
+    while pos < db_len:
+        lstart: uint64 = pos
+        lend: uint64 = pos
+        while lend < db_len and status_buf[lend] != 10:
+            lend = lend + 1
+        if _field_name_matches(&status_buf[0], lstart, lend - lstart,
+                               cast[Ptr[uint8]]("Package"), 7) != 0:
+            # send = end of the stanza body (the next blank line, or EOF).
+            send: uint64 = lstart
+            while send < db_len:
+                ls: uint64 = send
+                le: uint64 = send
+                while le < db_len and status_buf[le] != 10:
+                    le = le + 1
+                if le == ls:                            # blank line
+                    break
+                send = le
+                if send < db_len:
+                    send = send + 1
+            # span_end consumes the trailing blank-line separator too,
+            # so a splice leaves no orphan blank line behind.
+            span_end: uint64 = send
+            while span_end < db_len and status_buf[span_end] == 10:
+                span_end = span_end + 1
+            # Extract this stanza's Package value and compare.
+            _stanza_field(lstart, send, cast[Ptr[uint8]]("Package"), 7)
+            if _str_eq_range(pkg, &qf_buf[0], strlen_u8(&qf_buf[0])) != 0:
+                out_start[0] = lstart
+                out_end[0] = span_end
+                return 1
+            pos = span_end
+        else:
+            pos = lend
+            if pos < db_len:
+                pos = pos + 1
+    return 0
+
+
+# _write_status: rewrite /tmp/dpkg-status as the current DB with the
+# freshly-built stanza_buf update-or-inserted. The DB is read into
+# status_buf first; if a stanza for fld_package already exists it is
+# replaced in place (prefix + new stanza + suffix), otherwise the new
+# stanza is appended. Returns 0 on success, -1 on overflow/write error.
+
+def _write_status(stanza_len: uint64) -> int32:
+    db_path: Ptr[char] = cast[Ptr[char]]("/tmp/dpkg-status")
+    old_len: uint64 = _load_status_db()
+
+    # Locate an existing stanza for this package (update-or-insert).
+    old_start: uint64 = 0
+    old_end: uint64 = 0
+    have_old: int32 = _find_stanza_span(old_len, &fld_package[0],
+                                        &old_start, &old_end)
+
+    # New total = old DB minus the replaced span (if any) plus the new
+    # stanza. For an append have_old==0 so old_span_len==0.
+    old_span_len: uint64 = 0
+    if have_old != 0:
+        old_span_len = old_end - old_start
+    new_total: uint64 = old_len - old_span_len + stanza_len
+    if new_total > 4096:
+        write_str(2, "dpkg: status DB would exceed tmpfs 4 KiB cap (V2 limit)\n")
         return -1
 
     wfd: int32 = sys_open_write(db_path)
@@ -669,14 +798,31 @@ def _append_to_status(stanza_len: uint64) -> int32:
         write_str(2, "\n")
         return -1
     ok: int32 = 0
-    if old_len > 0:
-        w1: int64 = _write_full(wfd, &status_buf[0], old_len)
-        if w1 < 0 or cast[uint64](w1) != old_len:
-            ok = -1
-    if ok == 0:
-        w2: int64 = _write_full(wfd, &stanza_buf[0], stanza_len)
-        if w2 < 0 or cast[uint64](w2) != stanza_len:
-            ok = -1
+    if have_old != 0:
+        # Prefix [0, old_start) + new stanza + suffix [old_end, old_len).
+        if old_start > 0:
+            w1: int64 = _write_full(wfd, &status_buf[0], old_start)
+            if w1 < 0 or cast[uint64](w1) != old_start:
+                ok = -1
+        if ok == 0:
+            w2: int64 = _write_full(wfd, &stanza_buf[0], stanza_len)
+            if w2 < 0 or cast[uint64](w2) != stanza_len:
+                ok = -1
+        if ok == 0 and old_end < old_len:
+            suf_len: uint64 = old_len - old_end
+            w3: int64 = _write_full(wfd, &status_buf[old_end], suf_len)
+            if w3 < 0 or cast[uint64](w3) != suf_len:
+                ok = -1
+    else:
+        # No existing stanza: keep old DB verbatim, append the new one.
+        if old_len > 0:
+            wa: int64 = _write_full(wfd, &status_buf[0], old_len)
+            if wa < 0 or cast[uint64](wa) != old_len:
+                ok = -1
+        if ok == 0:
+            wb: int64 = _write_full(wfd, &stanza_buf[0], stanza_len)
+            if wb < 0 or cast[uint64](wb) != stanza_len:
+                ok = -1
     sys_close(wfd)
     if ok != 0:
         write_str(2, "dpkg: short write updating status DB\n")
@@ -1017,12 +1163,84 @@ def _do_files(pkg: Ptr[uint8]) -> int32:
     return 0
 
 
+# -- remove sub-command: -r --------------------------------------------
+#
+# dpkg -r <package> : deregister a package from the status DB and
+# delete its .list manifest. This is the inverse of `dpkg -i`'s DB
+# bookkeeping — it does NOT delete the package's actually-installed
+# files from the filesystem (that file sweep is V3 backlog; it would
+# walk the .list manifest and unlink each recorded path BEFORE the
+# .list itself is removed).
+#
+# Steps:
+#   1. Read the status DB; if it is empty the package is not installed.
+#   2. Scan for the package's stanza span via _find_stanza_span. If no
+#      stanza matches, error: package is not installed.
+#   3. Rewrite the DB as prefix [0, start) + suffix [end, db_len) — the
+#      stanza (and its trailing blank-line separator) spliced out.
+#   4. Delete the per-package /tmp/dpkg.<pkg>.list manifest.
+#   5. Print `dpkg: removed <package>`.
+#
+# Returns 0 on success, 1 if the package is not installed or a DB
+# write fails.
+
+def _do_remove(pkg: Ptr[uint8]) -> int32:
+    db_len: uint64 = _load_status_db()
+    old_start: uint64 = 0
+    old_end: uint64 = 0
+    if db_len == 0 or _find_stanza_span(db_len, pkg,
+                                        &old_start, &old_end) == 0:
+        write_str(2, "dpkg: package '")
+        write_str(2, pkg)
+        write_str(2, "' is not installed\n")
+        return 1
+
+    # Rewrite the DB without the matched stanza. tmpfs open_for_write
+    # truncates, so this is a full rewrite = prefix + suffix.
+    db_path: Ptr[char] = cast[Ptr[char]]("/tmp/dpkg-status")
+    wfd: int32 = sys_open_write(db_path)
+    if wfd < 0:
+        write_str(2, "dpkg: cannot open status DB for write: ")
+        write_str(2, cast[Ptr[uint8]](db_path))
+        write_str(2, "\n")
+        return 1
+    ok: int32 = 0
+    if old_start > 0:
+        w1: int64 = _write_full(wfd, &status_buf[0], old_start)
+        if w1 < 0 or cast[uint64](w1) != old_start:
+            ok = -1
+    if ok == 0 and old_end < db_len:
+        suf_len: uint64 = db_len - old_end
+        w2: int64 = _write_full(wfd, &status_buf[old_end], suf_len)
+        if w2 < 0 or cast[uint64](w2) != suf_len:
+            ok = -1
+    sys_close(wfd)
+    if ok != 0:
+        write_str(2, "dpkg: short write updating status DB\n")
+        return 1
+
+    # Delete the per-package .list manifest. A missing .list is not an
+    # error here — the stanza was the authoritative "installed" record
+    # and it has already been removed; a -L on this package would only
+    # ever have keyed off the .list anyway.
+    _compose_list_path_for(pkg)
+    sys_unlink(cast[Ptr[char]](&list_path[0]))
+
+    write_str(1, "dpkg: removed ")
+    write_str(1, pkg)
+    write_str(1, "\n")
+    return 0
+
+
 # -- top-level driver --------------------------------------------------
 
 def _usage(progname: Ptr[uint8]) -> int32:
     write_str(2, "Usage: ")
     write_str(2, progname)
     write_str(2, " -i <archive.deb>\n")
+    write_str(2, "       ")
+    write_str(2, progname)
+    write_str(2, " -r <package>\n")
     write_str(2, "       ")
     write_str(2, progname)
     write_str(2, " -l\n")
@@ -1061,9 +1279,11 @@ def _do_install(deb_path: Ptr[char]) -> int32:
                       ctl_body_len) != 0:
         return 1
 
-    # 3. Build the stanza and append it to the status DB.
+    # 3. Build the stanza and update-or-insert it into the status DB.
+    #    A re-install of the same Package replaces its existing stanza
+    #    in place; a first install appends.
     stanza_len: uint64 = _build_stanza()
-    if _append_to_status(stanza_len) != 0:
+    if _write_status(stanza_len) != 0:
         return 1
 
     # 4. Locate + inflate data.tar.gz, write the per-package file list.
@@ -1099,9 +1319,10 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     if argc < 2:
         return _usage(progname)
     flag: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
-    # Single-letter flags only ("-i", "-l", "-s", "-L"); reject "-xyz".
+    # Single-letter flags only ("-i", "-r", "-l", "-s", "-L"); reject
+    # "-xyz".
     if flag[0] != 45 or flag[1] == 0 or flag[2] != 0:       # "-?"
-        write_str(2, "dpkg: unknown action (supports: -i, -l, -s, -L)\n")
+        write_str(2, "dpkg: unknown action (supports: -i, -r, -l, -s, -L)\n")
         return _usage(progname)
     op: uint8 = flag[1]
 
@@ -1111,6 +1332,12 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             return _usage(progname)
         deb_path: Ptr[char] = cast[Ptr[char]](argv[2])
         return _do_install(deb_path)
+
+    # -r <package>  (remove: deregister a package from the DB).
+    if op == 114:                                           # 'r'
+        if argc != 3:
+            return _usage(progname)
+        return _do_remove(cast[Ptr[uint8]](argv[2]))
 
     # -l  (list every installed package).
     if op == 108:                                           # 'l'
@@ -1130,5 +1357,5 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             return _usage(progname)
         return _do_files(cast[Ptr[uint8]](argv[2]))
 
-    write_str(2, "dpkg: unknown action (supports: -i, -l, -s, -L)\n")
+    write_str(2, "dpkg: unknown action (supports: -i, -r, -l, -s, -L)\n")
     return _usage(progname)
