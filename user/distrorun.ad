@@ -12,11 +12,15 @@
 # exec's the target command. See docs/distro-namespaces.md for the
 # architectural spec and boundary rules.
 #
-# Spec pseudocode (docs/distro-namespaces.md):
+# Spec pseudocode (docs/distro-namespaces.md), adapted to the
+# directory-graft reality (see "bind(), not mount()" note below):
 #
 #   backing = "/var/lib/distros/" + distro
 #   rfork(RFNAMEG)
-#   mount(backing, "/")              # graft backing at /
+#   bind(backing/etc, "/etc", MREPL) # graft distro-shape subdirs
+#   bind(backing/usr, "/usr", MREPL)
+#   bind(backing/lib, "/lib", MREPL)
+#   bind(backing/var, "/var", MREPL)
 #   bind("/home", "/home", MREPL)    # re-expose shared paths
 #   bind("/net",  "/net",  MREPL)
 #   bind("/srv",  "/srv",  MREPL)
@@ -24,31 +28,43 @@
 #   bind("/proc", "/proc", MREPL)
 #   exec(argv[0], argv)
 #
-# Phase C limitation + concrete workaround:
+# What distrorun actually does — and why it is bind(), not mount():
 #
-#   The literal spec calls mount(srvfd_for_backing, "/", MREPL, "")
-#   to graft the backing store as an overlay at /. Phase C's
-#   sys/src/9/port/chan.ad records SRV-kind mounts but treats them
-#   as inert during path resolution (CHAN_KIND_SRV is skipped in
-#   chan_resolve_prefix because no 9P client lives behind the srvfd
-#   yet — that's Phase D's hamwd job). On top of that, Phase C's
-#   `bind` prefix matcher requires the byte after the matched prefix
-#   to be NUL or '/', so a bind of literal "/" never matches any
-#   sub-path. Both of those make the spec's literal calls a no-op
-#   for actual file lookups.
+#   In Plan 9 there are two distinct namespace primitives:
+#     * mount(srvfd, ...) ATTACHES A FILE SERVER — it speaks 9P
+#       (Tversion / Tattach) over srvfd.
+#     * bind(new, old, ...) GRAFTS AN EXISTING DIRECTORY — no
+#       protocol, just a name->name edge in the mount table.
 #
-#   To make Phase C.5 observable end-to-end today, distrorun ALSO
-#   binds the distro-shape subdirectories that the layout table in
-#   docs/distro-namespaces.md says live inside the namespace:
+#   distrorun's backing store is a set of initramfs cpio
+#   directories (/var/lib/distros/<distro>/{etc,usr,lib,var}). A
+#   cpio directory is NOT a 9P file server — it does not speak the
+#   protocol. Grafting it into the namespace is therefore a `bind`,
+#   not a `mount`. distrorun binds the distro-shape subdirectories
+#   that the layout table in docs/distro-namespaces.md says live
+#   inside the namespace:
 #     /etc, /usr, /lib, /var  -> backing/{etc,usr,lib,var}
-#   Each is a bind() with a concrete from_path that the Phase C
-#   resolve_path hook can match. The shared paths (/home, /net,
+#   Each is a bind() with a concrete from_path that resolve_path's
+#   chan_resolve_prefix hook matches. The shared paths (/home, /net,
 #   /srv, /dev, /proc) are then re-bound onto themselves per the
-#   spec — at Phase C those re-binds are effectively no-ops (the
-#   distro-shape binds above don't cover those prefixes anyway), but
-#   we emit them so the call shape is in place and a future agent
-#   wiring Phase D's chan dispatch can swap the local binds for the
-#   spec's single mount() with zero callsite churn.
+#   spec — those re-binds are effectively no-ops (the distro-shape
+#   binds above don't cover those prefixes anyway), but we emit them
+#   so the call shape matches docs/distro-namespaces.md's pseudocode.
+#
+#   HISTORICAL NOTE — why there is no mount("/") call here:
+#
+#   distrorun once also issued mount(backing_fd, "/", MREPL, "") as
+#   a structural placeholder. That worked only while do_mount was an
+#   inert Phase-C stub that merely recorded the srvfd. Once chan.ad's
+#   do_mount became a REAL 9P attach (it runs Tversion + Tattach over
+#   the mounted fd), passing a plain cpio directory fd to mount()
+#   fails — the directory does not speak 9P. The placeholder was a
+#   conceptual error: a directory graft is a bind, never a mount.
+#   The mount("/") call has been removed; the four bind() calls below
+#   are the whole job. A future namespace that wants the distro tree
+#   served over a real 9P connection is `nsrun` (user/nsrun.ad),
+#   which spawns a distrofs daemon and mount()s its 9P-speaking fd —
+#   that is the correct home for a mount() call.
 #
 # Build: handled by scripts/build_user.sh, which auto-discovers
 # user/distrorun.ad and emits build/user/distrorun.elf. Lands at
@@ -60,8 +76,6 @@ extern def sys_close(fd: int32) -> int32
 extern def sys_rfork(flags: int32) -> int32
 extern def sys_bind(new_path: Ptr[uint8], old_path: Ptr[uint8],
                     flag: int32) -> int32
-extern def sys_mount(srvfd: int32, afd: int32, old_path: Ptr[uint8],
-                     flag: int32, spec: Ptr[uint8]) -> int32
 extern def sys_execve(path: Ptr[char], argv: Ptr[uint64],
                       envp: Ptr[uint64]) -> int32
 extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
@@ -214,9 +228,11 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
 
     # 1) Verify the backing tree exists. sys_open on a directory
     # returns a valid fd in Hamnix's cpio archive — every embedded
-    # path is openable, including the directory-ish prefixes. We
-    # also keep the fd open as the candidate srvfd for the spec's
-    # mount() call below.
+    # path is openable, including the directory-ish prefixes. The fd
+    # is used purely as an existence probe (an unknown distro fails
+    # the open); it is closed immediately. The distro tree is grafted
+    # by the bind() calls below, NOT by this fd — a cpio directory is
+    # not a 9P file server, so it can never be a mount() srvfd.
     if build_backing(distro) < 0:
         write_str(2, "distrorun: distro name too long\n")
         return 1
@@ -227,6 +243,9 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
         write_str(2, "\n")
         write_errstr_line("distrorun: open backing failed")
         return 1
+    # The probe is done; the bind() machinery below re-derives every
+    # path string from scratch, so the fd has no further use.
+    sys_close(backing_fd)
 
     # 2) Privatise the namespace. rfork(RFNAMEG) without RFPROC
     # mutates the CURRENT task — no child is forked, the existing
@@ -238,39 +257,27 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     rc: int32 = sys_rfork(RFNAMEG)
     if rc < 0:
         write_errstr_line("distrorun: rfork(RFNAMEG) failed")
-        sys_close(backing_fd)
         return 1
 
-    # 3) Spec call: mount the backing fd at "/". Phase C records the
-    # SRV-kind chan but resolve_path skips it (no 9P client yet —
-    # that's Phase D's hamwd). We emit the call so the architectural
-    # shape is in place + a future agent can swap the four per-
-    # subdir binds below for this one call once the chan dispatch
-    # lands. afd = -1 ("no auth"), spec = "" (default tree).
-    rc = sys_mount(backing_fd, -1, "/", MREPL, "")
-    if rc < 0:
-        write_errstr_line("distrorun: mount(/) failed")
-        sys_close(backing_fd)
-        return 1
-
-    # 4) Phase C workaround: bind distro-shape subdirs onto the
-    # backing tree's matching subdirs. These are the paths the
-    # layout table in docs/distro-namespaces.md marks as
-    # "namespace-owned" — they should show distro contents, not
-    # Hamnix's. /bin is deliberately left native at this milestone:
-    # binding it onto backing/bin would shadow Hamnix's coreutils
-    # AND the test command we're about to exec (/bin/cat). Once
-    # the backing tree carries a real /bin (e.g. debootstrap's),
-    # add the bind here.
+    # 3) Bind distro-shape subdirs onto the backing tree's matching
+    # subdirs. These are the paths the layout table in
+    # docs/distro-namespaces.md marks as "namespace-owned" — they
+    # should show distro contents, not Hamnix's. This is a directory
+    # graft (bind), the Plan 9-correct primitive for grafting an
+    # existing directory: mount() is for attaching a 9P file server,
+    # which a cpio directory is not. /bin is deliberately left native
+    # at this milestone: binding it onto backing/bin would shadow
+    # Hamnix's coreutils AND the test command we're about to exec
+    # (/bin/cat). Once the backing tree carries a real /bin (e.g.
+    # debootstrap's), add the bind here.
     if bind_into_namespace(distro, "/etc") < 0:
-        sys_close(backing_fd)
         return 1
     write_str(1, "[distrorun] bound /etc -> backing/etc ok\n")
     bind_into_namespace(distro, "/usr")
     bind_into_namespace(distro, "/lib")
     bind_into_namespace(distro, "/var")
 
-    # 5) Re-expose shared paths per the spec. These are bind(path,
+    # 4) Re-expose shared paths per the spec. These are bind(path,
     # path, MREPL) — a self-binding that keeps the path resolving
     # natively. Structural no-ops at Phase C; placeholder for the
     # Phase D rewrite (see comment in reexpose_shared).
@@ -280,16 +287,9 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     reexpose_shared("/dev")
     reexpose_shared("/proc")
 
-    # 6) The srvfd has been recorded in the mount table; the fd
-    # itself can be closed (the kernel keeps the mount entry alive
-    # via the table slot, independent of the user fd). do_execve
-    # reuses the calling task's fd table modulo OCEXEC; closing
-    # before exec keeps the child's fd table clean.
-    sys_close(backing_fd)
-
     write_str(1, "[distrorun] entered namespace ok\n")
 
-    # 7) Exec the target binary. argv[2..argc-1] becomes the new
+    # 5) Exec the target binary. argv[2..argc-1] becomes the new
     # image's argv; envp is forwarded as 0 (native exec path
     # ignores it — see arch/x86/kernel/syscall.ad::do_execve). The
     # kernel's initramfs_data_ptr lookup is namespace-agnostic, so

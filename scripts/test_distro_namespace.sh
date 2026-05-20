@@ -141,12 +141,21 @@ fi
 # the kernel's `elf: entry=...` / `execve: jumping ...` printk debug
 # spam, hamsh's prompt redraw, AND (for the distrorun case)
 # distrorun's own pre-exec banners before the child's cat output.
+#
+# `[atkbd-diag]` lines are an unconditional periodic kernel
+# keyboard-poll diagnostic (drivers/input/atkbd.ad::atkbd_diag_tick).
+# They have nothing to do with this test's subject — and when the VM
+# idles between the driver's `sleep` steps the diagnostic emits
+# hundreds of them, which would otherwise blow the 20-line window
+# apart. Skip them entirely: they are neither program output nor a
+# window-consuming line.
 assert_banner_value() {
     local banner="$1"
     local value="$2"
     local label="$3"
     if awk -v b="$banner" -v v="$value" '
         BEGIN { armed=0; win=0; found=0 }
+        index($0, "[atkbd-diag]") > 0 { next }
         index($0, b) > 0 { armed=1; win=0; next }
         armed { win++ ; if (index($0, v) > 0) { found=1; exit }
                 if (win > 20) armed=0 }
