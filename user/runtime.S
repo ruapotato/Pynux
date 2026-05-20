@@ -301,6 +301,23 @@ sys_connect:
     .size sys_connect, .-sys_connect
 
 
+    /* --- sys_resolve(hostname, len) -> int64 ------------------------
+     * U-resolve: native-ABI hostname -> IPv4. Hands a NUL-terminated
+     * hostname (%rdi) + its length (%rsi) to the in-kernel DNS
+     * resolver via SYS_RESOLVE (269) -> dns_lookup. On success %rax
+     * holds the resolved IPv4 packed big-endian in the low 32 bits
+     * (octet 0 in bits 31:24); on failure %rax is a negative errno
+     * (-2 == cannot resolve). Two args fit the SysV/syscall-ABI
+     * overlap directly — no shuffle. */
+    .globl sys_resolve
+    .type sys_resolve, @function
+sys_resolve:
+    movq    $269, %rax              /* SYS_RESOLVE */
+    syscall
+    ret
+    .size sys_resolve, .-sys_resolve
+
+
     /* --- sys_kill(pid, sig) -> int32 ---------------------------------
      * Post `sig` into pid's pending-signal bitmap. Default
      * disposition for every signal is TERM with exit code 128+sig

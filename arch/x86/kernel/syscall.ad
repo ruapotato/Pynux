@@ -93,6 +93,14 @@ from linux_abi.u_syscalls import (
     # FD_SOCKET_MARK arms in fs/vfs.ad's vfs_read/vfs_write/vfs_close.
     _u_socket, _u_connect,
 )
+# U-resolve: the in-kernel DNS resolver (drivers/net/dns.ad). The
+# native SYS_RESOLVE (269) arm in do_syscall() hands a userland
+# hostname straight to dns_lookup so user binaries (user/apt.ad) can
+# connect to a host by name. dns_lookup is the same blocking,
+# virtio_net_poll-driven body init/main.ad's boot smoke and
+# drivers/net/http.ad already call — so it is safe from syscall
+# context (apt already does blocking TCP from a syscall the same way).
+from drivers.net.dns import dns_lookup
 # Phase B / M16.93: Plan 9-shape errstr body. Lives at
 # sys/src/9/port/error.ad on disk (mirrors 9front's layout); imported
 # here via the sys/src/port9 -> 9 directory alias because Adder
@@ -202,6 +210,14 @@ SYS_FWSTAT:      uint64 = 267                  # a0=fd, a1=buf, a2=nbuf
 # 270 / 271 in docs/native-api.md; bodies in sys/src/9/port/sysnote.ad.
 SYS_NOTIFY:      uint64 = 270                  # a0=handler RIP (0 = clear); returns 0
 SYS_NOTED:       uint64 = 271                  # a0=action (NCONT/NDFLT/NSAVE/NRSTR); returns 0
+# U-resolve: native-ABI hostname -> IPv4 resolver. Number 269 is the
+# one free slot in the Plan 9 reserved block (268 = fauth reserved,
+# 270/271 = notify/noted). a0 = Ptr to a NUL-terminated hostname,
+# a1 = hostname byte length (excl NUL; advisory bound). Returns the
+# resolved IPv4 packed big-endian into the low 32 bits — octet 0 in
+# bits 31:24 — so a positive return is always a valid address and a
+# negative return is an errno. -2 (-ENOENT) means "cannot resolve".
+SYS_RESOLVE:     uint64 = 269                  # a0=hostname ptr, a1=len; returns packed IPv4 / -errno
 # Phase D / V4: Plan 9 `srv` post/open. Numbers 272..274 are reserved
 # in docs/native-api.md (awake/segattach/segdetach — none implemented),
 # so SYS_SRV_POST / SYS_SRV_OPEN pick the next two free slots above
@@ -1492,6 +1508,36 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # FD_TMPFS_MARK fds are supported today; other backends
         # return -1 with "fwstat: backend not supported".
         return cast[uint64](do_fwstat(cast[int32](a0), a1, a2))
+    if nr == SYS_RESOLVE:
+        # U-resolve: native-ABI hostname -> IPv4. a0 = Ptr to a
+        # NUL-terminated hostname, a1 = its byte length (advisory).
+        # Bridges straight to the in-kernel DNS resolver
+        # (drivers/net/dns.ad::dns_lookup), which sends an A-record
+        # query over UDP/53 to the DHCP-supplied server and polls
+        # virtio_net internally — the same blocking model apt's
+        # SYS_CONNECT already uses, so it is safe here. On success we
+        # pack the 4 octets big-endian into the low 32 bits (octet 0
+        # in bits 31:24): a positive int64 is always a valid IPv4, a
+        # negative int64 is an errno. Resolution failure (timeout /
+        # NXDOMAIN / no DNS server) -> -ENOENT so userland surfaces a
+        # clear "cannot resolve" diagnostic.
+        if a0 == 0:
+            set_current_errstr("resolve: null hostname")
+            return cast[uint64](-2)            # -ENOENT
+        # dns_lookup writes the 4-byte IPv4 (network order, octet 0
+        # first) through this pointer. 200 jiffies (~2 s @ HZ=100)
+        # matches the boot smoke + http.ad lookup budget.
+        resolve_ip: Array[4, uint8]
+        rc: int32 = dns_lookup(cast[Ptr[uint8]](a0),
+                               cast[Ptr[uint8]](&resolve_ip[0]), 200)
+        if rc != 0:
+            set_current_errstr("resolve: cannot resolve hostname")
+            return cast[uint64](-2)            # -ENOENT
+        resolve_packed: uint64 = (cast[uint64](resolve_ip[0]) << 24) \
+                               | (cast[uint64](resolve_ip[1]) << 16) \
+                               | (cast[uint64](resolve_ip[2]) << 8) \
+                               | cast[uint64](resolve_ip[3])
+        return resolve_packed
     if nr == SYS_NOTIFY:
         # Phase C / M16.109: install (or clear, when a0==0) the
         # user-mode note handler for the current task. a0 = handler
