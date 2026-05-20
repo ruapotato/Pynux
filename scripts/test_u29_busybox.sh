@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
-# scripts/test_u29_busybox.sh -- U29: run a real busybox-static on Hamnix.
+# scripts/test_u29_busybox.sh -- U29: run a real busybox on Hamnix.
 #
-# busybox-static is a fully-static x86_64 Linux ELF that bundles dozens of
-# UNIX utilities. Getting "busybox echo hello" (or even the busybox usage
-# banner) to print from Hamnix's user mode is a meaningful end-to-end test
-# of the Linux ABI surface: busybox's applet dispatch hits a much wider
-# slice of syscalls than any of our hand-written u_* fixtures.
+# busybox is a fully-static x86_64 Linux ELF that bundles dozens of
+# UNIX utilities. Getting the busybox multi-call banner to print from
+# Hamnix's user mode is a meaningful end-to-end test of the Linux ABI
+# surface: busybox's applet dispatch hits a much wider slice of
+# syscalls than any of our hand-written u_* fixtures.
 #
-# This test is best-effort: it captures the qemu transcript and greps for
-# either a busybox-emitted marker (the banner / "hello") OR a clear ENOSYS
-# trace. It exits 0 in either case so it doesn't gate the U-track on a
-# moving target, but FAILs loudly if QEMU crashes or no useful output
-# appears at all.
+# FIXTURE (U42 re-point): this test used to drive the glibc-static
+# `tests/u-binary/u_busybox`, an ET_EXEC linked at 0x400000. Commit
+# 653d962 ("elf loader: refuse ET_EXEC overlay that collides with
+# kernel image") made that binary dead on arrival -- its fixed LOAD
+# range collides with Hamnix's identity-mapped kernel image, so the
+# loader -ENOEXECs it. The test SKIP'd ever since. It now drives the
+# musl static-PIE (ET_DYN) busybox fixture instead -- the same one
+# test_u40_musl_busybox.sh exercises. ET_DYN loads at a kernel-chosen
+# relocated base with no fixed-address overlay, so nothing collides.
+# Same busybox 1.36.1, same applets -- just a leaner libc.
 #
-# To stage the binary: extract /usr/bin/busybox from the busybox-static
-# Debian package and stamp OSABI=Linux:
-#   apt-get download busybox-static
-#   dpkg-deb -x busybox-static_*.deb /tmp/bb
-#   cp /tmp/bb/usr/bin/busybox tests/u-binary/u_busybox
-#   printf '\003' | dd of=tests/u-binary/u_busybox bs=1 seek=7 count=1 conv=notrunc
+# The fixture (tests/u-binary/u_busybox_musl) is host-built by
+# `make -C tests/u-binary/src/musl_busybox install`. If the fixture
+# is missing this test SKIPs the same way U22 / U24 / U39 / U40 do --
+# CI in environments without `musl-tools` keeps moving.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -26,14 +29,12 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-UBIN=tests/u-binary/u_busybox
+UBIN=tests/u-binary/u_busybox_musl
 
 if [ ! -f "$UBIN" ]; then
     echo "[test_u29_busybox] SKIP: $UBIN not staged"
-    echo "    apt-get download busybox-static"
-    echo "    dpkg-deb -x busybox-static_*.deb /tmp/bb"
-    echo "    cp /tmp/bb/usr/bin/busybox $UBIN"
-    echo "    printf '\\003' | dd of=$UBIN bs=1 seek=7 count=1 conv=notrunc"
+    echo "    REQUIRES host musl-gcc (apt-get install musl-tools)"
+    echo "    then: make -C tests/u-binary/src/musl_busybox install"
     exit 0
 fi
 
@@ -44,14 +45,14 @@ echo "[test_u29_busybox] (1/4) Build userland"
 bash scripts/build_user.sh
 bash scripts/build_modules.sh
 
-echo "[test_u29_busybox] (2/4) Swap /init + embed u_busybox"
-# U30: also stage the same blob as /bin/busybox. Busybox's main()
-# dispatches to applets based on the basename of argv[0] — with argv[0]
-# = "u_busybox" it prints "applet not found" and exits. Invoking it as
-# "busybox" makes busybox_main print its banner, which is what this
-# test greps for. The /bin/u_busybox copy stays around for callers that
-# want to address it by the U-track name.
-cp tests/u-binary/u_busybox tests/u-binary/busybox
+echo "[test_u29_busybox] (2/4) Swap /init + embed musl busybox"
+# Stage the musl busybox as /bin/busybox. Busybox's main() dispatches
+# to applets based on the basename of argv[0] -- with argv[0]=
+# "busybox" it prints its banner, which is what this test greps for.
+# build_initramfs.py picks up tests/u-binary/busybox and plants
+# busybox-bytes at applet paths. The trap restores the default
+# initramfs on exit.
+cp tests/u-binary/u_busybox_musl tests/u-binary/busybox
 HAMNIX_EMBED_UBIN=1 INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py
 
 echo "[test_u29_busybox] (3/4) Rebuild kernel image"

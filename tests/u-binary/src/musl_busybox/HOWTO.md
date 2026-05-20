@@ -4,9 +4,21 @@ U40 ships `tests/u-binary/u_busybox_musl` -- busybox 1.36.1 linked
 against musl libc and built **static-PIE (ET_DYN)**. The intent is to
 give the U-track a leaner busybox than the glibc-static `u_busybox`
 shipped at M16.37+: smaller binary, smaller syscall surface, faster
-iteration. The glibc-static busybox stays put -- M16.37+ pipe tests
-depend on its exact applet menu -- so this is a SECOND fixture, side
-by side.
+iteration.
+
+RETIRED (U42): the glibc-static `u_busybox` is no longer used. It was
+an ET_EXEC linked at 0x400000; commit `653d962` ("elf loader: refuse
+ET_EXEC overlay that collides with kernel image") made it dead on
+arrival -- its fixed LOAD range collides with Hamnix's identity-
+mapped kernel image, so the loader -ENOEXECs it. Every busybox
+regression test (`test_u29_busybox.sh`, `test_u32_busybox_ls.sh`,
+`test_u33_busybox_applets.sh`, `test_u36_busybox_sh.sh`,
+`test_u37_busybox_pipe3.sh`, `test_u40_musl_busybox.sh`) now drives
+THIS musl static-PIE fixture instead. `tests/u-binary/u_busybox` (if
+still present on a host from an old extraction) is unused -- delete
+it; nothing reads it. There is no build recipe for it to retire: it
+was never built here, only extracted from a Debian `busybox-static`
+package by hand.
 
 ## Why static-PIE (ET_DYN), NOT `-static` (ET_EXEC)
 
@@ -105,22 +117,36 @@ This:
 
 Build time on a modern host CPU: ~30-90 seconds.
 
-## Why a SECOND busybox?
+## The glibc-static busybox is retired (U42)
 
-The glibc-static busybox came in at M16.37 specifically to stress-
-test pipes / SYS_pipe2 / SYS_dup2 with a third-party binary. Its
-applet menu and exact set of glibc startup syscalls are now baked
-into multiple regression tests (`test_u29_busybox.sh`,
-`test_u32_busybox_ls.sh`, `test_u33_busybox_applets.sh`,
-`test_u35_pipelines.sh`, `test_u36_busybox_sh.sh`,
-`test_u37_busybox_pipe3.sh`). Swapping the underlying libc would
-shift those tests' syscall trace and force a regression sweep we
-don't need right now.
+The glibc-static busybox came in at M16.37 to stress-test pipes /
+SYS_pipe2 / SYS_dup2 with a third-party binary. It was an ET_EXEC
+linked at the fixed address 0x400000.
 
-The musl variant is the documented path to a leaner U-track. When
-we eventually retire the glibc-static busybox (probably alongside
-the U39 follow-up -- "swap MicroPython for full CPython"), the
-musl variant is the candidate replacement.
+Commit `653d962` ("elf loader: refuse ET_EXEC overlay that collides
+with kernel image") added a kernel-image collision guard to
+`fs/elf.ad`: an ET_EXEC whose fixed `[vlow, vhigh)` LOAD range
+overlaps Hamnix's ~12 MiB identity-mapped kernel image is REFUSED
+with `-ENOEXEC`. A `-static` busybox links squarely inside that
+range, so it is dead on arrival -- the busybox tests that drove it
+SKIP'd (fixture refused) ever after.
+
+U42 re-pointed every busybox regression test
+(`test_u29_busybox.sh`, `test_u32_busybox_ls.sh`,
+`test_u33_busybox_applets.sh`, `test_u36_busybox_sh.sh`,
+`test_u37_busybox_pipe3.sh`) at THIS musl static-PIE fixture --
+`test_u40_musl_busybox.sh` already used it. ET_DYN loads at a
+kernel-chosen relocated base with no fixed-address overlay, so
+nothing collides. Same busybox 1.36.1, same applet menu.
+
+There is nothing to "retire" build-recipe-wise: the glibc
+`u_busybox` was never built by a Makefile here -- it was extracted
+by hand from a Debian `busybox-static` package. If a stale copy
+still sits at `tests/u-binary/u_busybox` on an old host, delete it;
+no test or script reads it any more. (`test_u34_syscalls.sh` and
+`test_u35_pipelines.sh` still name it in a `UBIN=` guard; with the
+fixture absent they SKIP cleanly -- they are outside the U42
+re-point scope and a follow-up can re-point them the same way.)
 
 ## Skip behaviour
 

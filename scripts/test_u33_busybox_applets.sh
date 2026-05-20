@@ -2,21 +2,30 @@
 # scripts/test_u33_busybox_applets.sh -- U33: drive real busybox
 # applets (echo, cat, ls, pwd, uname) through hamsh.
 #
-# U32 shipped getdents64 + cpio directory snapshots so `busybox ls
-# /etc` printed all 22 files. U33 widens the verb surface:
+# U33 widens the verb surface beyond the U29 banner:
 #   * busybox echo hello world    — pure stdio write
 #   * busybox cat /etc/motd       — open + read + write loop
-#   * busybox ls /bin             — needs the 16K dir buffer for 155
-#                                   /bin entries (raised in fs/vfs.ad)
+#   * busybox ls /bin             — getdents64 directory walk
 #   * busybox pwd                 — getcwd round-trip
 #   * busybox uname               — utsname plumbing
 #
-# Each marker is reported as OK or MISS; the script fails only if
-# qemu crashes or no marker hits at all.
+# FIXTURE (U42 re-point): switched off the dead glibc-static
+# u_busybox (ET_EXEC @ 0x400000, refused by the elf-loader kernel-
+# image collision guard from commit 653d962) onto the musl
+# static-PIE (ET_DYN) busybox -- the same fixture U29 / U40 use.
 #
-# Side effects: temporarily copies u_busybox to tests/u-binary/busybox
-# so basename-dispatch resolves the applet name; restores the
-# original /init on exit.
+# XFAIL (U42, real Hamnix gap): the `ls` applet. The musl busybox's
+# ls produces NO output -- musl's opendir()/readdir() round-trip the
+# directory fd through musl's DIR struct and hand getdents64 fd 0
+# (stdin) instead of the directory fd. getdents64 itself is correct
+# (a direct SYS_getdents64 syscall enumerates a directory cleanly).
+# This is a musl-libc <-> Hamnix fd-interaction gap, kernel-side fix
+# out of scope here -- tracked as a U-track follow-up. The other
+# four applets (echo / cat / pwd / uname) work and ARE required.
+#
+# Side effects: temporarily copies u_busybox_musl to
+# tests/u-binary/busybox so basename-dispatch resolves the applet
+# name; restores the original /init on exit.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -24,10 +33,12 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-UBIN=tests/u-binary/u_busybox
+UBIN=tests/u-binary/u_busybox_musl
 
 if [ ! -f "$UBIN" ]; then
     echo "[test_u33_busybox_applets] SKIP: $UBIN not staged"
+    echo "    REQUIRES host musl-gcc (apt-get install musl-tools)"
+    echo "    then: make -C tests/u-binary/src/musl_busybox install"
     exit 0
 fi
 
@@ -38,8 +49,8 @@ echo "[test_u33_busybox_applets] (1/4) Build userland + modules"
 bash scripts/build_user.sh
 bash scripts/build_modules.sh
 
-echo "[test_u33_busybox_applets] (2/4) Swap /init=hamsh + embed busybox"
-cp tests/u-binary/u_busybox tests/u-binary/busybox
+echo "[test_u33_busybox_applets] (2/4) Swap /init=hamsh + embed musl busybox"
+cp tests/u-binary/u_busybox_musl tests/u-binary/busybox
 HAMNIX_EMBED_UBIN=1 INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py
 
 echo "[test_u33_busybox_applets] (3/4) Rebuild kernel image"
@@ -91,7 +102,8 @@ if grep -F -q "hello world" "$LOG"; then
     echo "[test_u33_busybox_applets] OK   echo:   'hello world' printed"
     hits=$((hits + 1))
 else
-    echo "[test_u33_busybox_applets] MISS echo:   'hello world' not seen"
+    echo "[test_u33_busybox_applets] FAIL echo:   'hello world' not seen"
+    fail=1
 fi
 
 # Applet 2: busybox cat /etc/motd — at least 2 of these motd words
@@ -106,42 +118,49 @@ if [ "$cat_hits" -ge 2 ]; then
     echo "[test_u33_busybox_applets] OK   cat:    $cat_hits motd words printed"
     hits=$((hits + 1))
 else
-    echo "[test_u33_busybox_applets] MISS cat:    only $cat_hits motd words (need >=2)"
+    echo "[test_u33_busybox_applets] FAIL cat:    only $cat_hits motd words (need >=2)"
+    fail=1
 fi
 
-# Applet 3: busybox ls /bin — at least 5 of these binary names must
-# appear. /bin has ~155 entries (40+ Hamnix userland + 100+ host-
-# built u_*), so a working ls /bin output should hit several.
+# Applet 3 (XFAIL — see header): busybox ls /bin. The musl busybox's
+# ls produces no output (musl opendir/getdents64 fd round-trip gap).
+# Scope the grep to the window AFTER `busybox ls /bin` and BEFORE the
+# next command (`busybox pwd`) so motd / banner text bearing the same
+# words elsewhere in the log can't masquerade as ls output.
+LS_WINDOW=$(awk '/busybox ls \/bin/{flag=1;next} /busybox pwd/{flag=0} flag' "$LOG")
 ls_hits=0
 for name in echo cat ls sh mount uname pwd grep find date head; do
-    if grep -F -q "$name" "$LOG"; then
+    if printf '%s\n' "$LS_WINDOW" | grep -F -q "$name"; then
         ls_hits=$((ls_hits + 1))
     fi
 done
 if [ "$ls_hits" -ge 5 ]; then
-    echo "[test_u33_busybox_applets] OK   ls:     $ls_hits binary names printed"
+    echo "[test_u33_busybox_applets] XPASS ls:   $ls_hits binary names printed --"
+    echo "    musl opendir/getdents64 now works (remove XFAIL)"
     hits=$((hits + 1))
 else
-    echo "[test_u33_busybox_applets] MISS ls:     only $ls_hits binary names (need >=5)"
+    echo "[test_u33_busybox_applets] XFAIL ls:   $ls_hits binary names (musl"
+    echo "    busybox 'ls' enumeration gap -- getdents64 itself is correct;"
+    echo "    musl opendir() hands it the wrong fd. U-track follow-up.)"
 fi
 
 # Applet 4: busybox pwd — must produce "/".
-# Grep for a bare "/" line specifically (anchored) so we don't match
-# every random slash in the transcript.
 if grep -E -q "^/[[:space:]]*$" "$LOG" || grep -F -q "/ " "$LOG"; then
     echo "[test_u33_busybox_applets] OK   pwd:    '/' printed"
     hits=$((hits + 1))
 else
-    echo "[test_u33_busybox_applets] MISS pwd:    '/' not seen on its own line"
+    echo "[test_u33_busybox_applets] FAIL pwd:    '/' not seen on its own line"
+    fail=1
 fi
 
-# Applet 5: busybox uname — must produce "Hamnix" (since _u_uname
-# fills utsname.sysname with "Hamnix").
+# Applet 5: busybox uname — must produce "Hamnix" (_u_uname fills
+# utsname.sysname with "Hamnix").
 if grep -F -q "Hamnix" "$LOG"; then
     echo "[test_u33_busybox_applets] OK   uname:  'Hamnix' printed"
     hits=$((hits + 1))
 else
-    echo "[test_u33_busybox_applets] MISS uname:  'Hamnix' not seen"
+    echo "[test_u33_busybox_applets] FAIL uname:  'Hamnix' not seen"
+    fail=1
 fi
 
 if grep -F -q "TRAP: vector" "$LOG"; then
@@ -159,15 +178,12 @@ if grep -F -q "page fault" "$LOG"; then
 fi
 
 echo "[test_u33_busybox_applets] summary: $hits/5 applet markers hit"
+echo "    (ls is a marked XFAIL; the other 4 are required)"
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_u33_busybox_applets] FAIL (qemu rc=$rc)"
     exit 1
 fi
 
-if [ "$hits" -lt 1 ]; then
-    echo "[test_u33_busybox_applets] FAIL: no applet markers hit at all"
-    exit 1
-fi
-
-echo "[test_u33_busybox_applets] PASS -- $hits/5 busybox applets reached user output"
+echo "[test_u33_busybox_applets] PASS -- echo / cat / pwd / uname applets"
+echo "    reached user output (ls XFAIL)"

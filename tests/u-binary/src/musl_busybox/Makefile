@@ -1,16 +1,21 @@
 # tests/u-binary/src/musl_busybox/Makefile -- U40 fixture build.
 #
 # Produces ../../u_busybox_musl -- a tiny busybox 1.36.1 linked
-# against musl libc and built **static-PIE (ET_DYN)**. The intent is
-# to replace the M16.37+ glibc-static busybox (tests/u-binary/
-# u_busybox, ~2 MB) with a leaner musl variant for the U-track: musl
-# emits ~10x smaller static binaries than glibc and reaches a
+# against musl libc and built **static-PIE (ET_DYN)**. It replaces
+# the retired M16.37+ glibc-static busybox (tests/u-binary/u_busybox,
+# ~2 MB): musl emits smaller static binaries than glibc and reaches a
 # markedly smaller syscall surface; both properties matter as we
 # scope Hamnix toward a real server OS.
 #
-# The glibc-static u_busybox stays put -- M16.37+ pipe tests
-# (test_u29_busybox.sh, test_u32_busybox_ls.sh, ...) depend on its
-# exact applet menu. u_busybox_musl is a SECOND binary, side by side.
+# RETIRED (U42): the glibc-static u_busybox is no longer used. It was
+# an ET_EXEC linked at 0x400000 -- commit 653d962's elf-loader
+# kernel-image collision guard REFUSES it (the fixed LOAD range
+# overlaps Hamnix's identity-mapped kernel image). Every busybox
+# regression test (test_u29 / u32 / u33 / u36 / u37 / u40) now drives
+# THIS musl static-PIE fixture. The glibc binary had no build recipe
+# here -- it was hand-extracted from a Debian busybox-static package
+# -- so there is no recipe to delete; just remove a stale
+# tests/u-binary/u_busybox if one is lying around.
 #
 # Why static-PIE (ET_DYN), NOT `-static` (ET_EXEC)?  [U42 fix]
 #

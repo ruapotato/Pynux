@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
-# scripts/test_u36_busybox_sh.sh -- U36: gettid / tgkill / setsid /
-# getsid / getpgid / setpgid / getpgrp + tty-aware ioctl.
+# scripts/test_u36_busybox_sh.sh -- U36: busybox sh -c one-liner +
+# gettid / tgkill / setsid / getsid / getpgid / setpgid / getpgrp +
+# tty-aware ioctl.
 #
-# U35 left two known-noise paths in the busybox trace:
-#
-#   * The 3-stage pipeline (echo | cat | cat) tripped glibc's abort()
-#     in one of the children. abort() reaches for gettid(186) +
-#     tgkill(234), both of which fell through to -ENOSYS and tripped
-#     the dispatcher's "unknown syscall" line.
-#   * busybox sh's job-control bring-up probes setsid(112) /
-#     setpgid(109) / getpgrp(111) and TIOCGWINSZ / TIOCGPGRP / TCGETS
-#     via ioctl(16). Each of those was -ENOSYS, so `busybox sh -c ...`
-#     stalled before its argv parser ran.
+# busybox sh's job-control bring-up probes setsid(112) / setpgid(109)
+# / getpgrp(111) and TIOCGWINSZ / TIOCGPGRP / TCGETS via ioctl(16)
+# before it agrees to run a command. abort()-style teardown reaches
+# for gettid(186) + tgkill(234). Each of those, when -ENOSYS, would
+# stall `busybox sh -c ...` before its argv parser ran.
 #
 # This test boots hamsh, runs a one-liner through `busybox sh -c`,
 # and asserts both the output and the absence of -ENOSYS for the
 # eight U36-relevant syscall numbers.
+#
+# FIXTURE (U42 re-point): switched off the dead glibc-static
+# u_busybox (ET_EXEC @ 0x400000, refused by the elf-loader kernel-
+# image collision guard from commit 653d962) onto the musl
+# static-PIE (ET_DYN) busybox -- the same fixture U29 / U40 use.
+# `busybox sh -c "echo test123"` runs cleanly on the musl fixture.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -23,10 +25,12 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-UBIN=tests/u-binary/u_busybox
+UBIN=tests/u-binary/u_busybox_musl
 
 if [ ! -f "$UBIN" ]; then
     echo "[test_u36_busybox_sh] SKIP: $UBIN not staged"
+    echo "    REQUIRES host musl-gcc (apt-get install musl-tools)"
+    echo "    then: make -C tests/u-binary/src/musl_busybox install"
     exit 0
 fi
 
@@ -37,8 +41,8 @@ echo "[test_u36_busybox_sh] (1/4) Build userland + modules"
 bash scripts/build_user.sh
 bash scripts/build_modules.sh
 
-echo "[test_u36_busybox_sh] (2/4) Swap /init=hamsh + embed busybox"
-cp tests/u-binary/u_busybox tests/u-binary/busybox
+echo "[test_u36_busybox_sh] (2/4) Swap /init=hamsh + embed musl busybox"
+cp tests/u-binary/u_busybox_musl tests/u-binary/busybox
 HAMNIX_EMBED_UBIN=1 INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py
 
 echo "[test_u36_busybox_sh] (3/4) Rebuild kernel image"
@@ -55,16 +59,9 @@ set +e
 (
     sleep 3
     # Required: sub-shell prints a literal string. Drives sh's argv
-    # parser + applet dispatch + the new ioctl/setsid/setpgid probes.
+    # parser + applet dispatch + the ioctl/setsid/setpgid probes.
     printf 'busybox sh -c "echo test123"\n'
-    sleep 4
-    # Informational: 3-stage pipeline that previously tripped abort().
-    # If gettid + tgkill are wired up, glibc's abort path no longer
-    # crashes the dispatcher; whether the pipe survives end-to-end
-    # depends on more than U36 (per-task wait state, etc.), so this
-    # one is best-effort only.
-    printf 'busybox sh -c "echo a | grep a"\n'
-    sleep 4
+    sleep 5
     printf 'exit\n'
     sleep 1
 ) | timeout 120s qemu-system-x86_64 \
@@ -93,18 +90,8 @@ else
     fail=1
 fi
 
-# Informational: 3-stage pipeline through sh + echo + grep. Not a
-# fail criterion — depends on sh's child reaping and pipe lifetimes
-# which are not part of the U36 surface.
-if grep -F -q "^a$" "$LOG" || grep -E -q "^a[[:space:]]*$" "$LOG"; then
-    echo "[test_u36_busybox_sh] OK   sh3:  'echo a | grep a' produced 'a'"
-else
-    echo "[test_u36_busybox_sh] MISS sh3:  'a' not seen from 'echo a | grep a' (informational)"
-fi
-
 # Required: no -ENOSYS for the eight U36 syscall numbers. ioctl(16)
-# is also on this list — the previous _u_ioctl returned -ENOSYS for
-# everything, so any earlier trace would have flagged nr=16 here too.
+# is also on this list — busybox sh's tty probes touch it.
 for n in 109 111 112 121 124 186 234 16; do
     if grep -E -q "unknown syscall nr=$n[^0-9]" "$LOG"; then
         echo "[test_u36_busybox_sh] FAIL: still -ENOSYS for nr=$n"
