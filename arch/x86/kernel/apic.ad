@@ -395,6 +395,53 @@ def ioapic_redirect(pin: uint32, vector: uint32, lapic_id: uint32):
             cast[uint64](pin), cast[uint64](vector))
 
 
+def ioapic_redirect_isa(pin: uint32, vector: uint32, lapic_id: uint32):
+    # ISA-pin variant of ioapic_redirect(). ISA interrupt lines (the
+    # i8042 keyboard on IRQ 1, the PS/2 mouse on IRQ 12, the PIT on
+    # IRQ 0, the RTC on IRQ 8, ...) are EDGE-triggered and ACTIVE-HIGH
+    # — the opposite of the PCI INTx convention that ioapic_redirect()
+    # bakes in. On QEMU's lenient IOAPIC emulation the wrong
+    # polarity/trigger is tolerated, but on a real chipset IOAPIC
+    # (the ICH/PCH on this Haswell laptop) a level-triggered entry
+    # pointed at an edge source latches the Remote-IRR bit and never
+    # clears it after the first interrupt — the LAPIC EOI for a
+    # level entry has to round-trip an EOI message back to the
+    # IOAPIC, and the i8042's brief edge pulse leaves Remote-IRR
+    # asserted, so IRQ 1 fires exactly once (or never, if the
+    # inverted active-low polarity makes the idle-high ISA line
+    # look permanently deasserted). Either way the keyboard goes
+    # dead on real hardware. This helper programs the entry the way
+    # an ISA edge IRQ actually needs: trigger=edge (bit 15 clear),
+    # polarity=active-high (bit 13 clear), unmasked, fixed delivery,
+    # physical destination.
+    #
+    # No MADT Interrupt-Source-Override (Type 2) parsing yet — on
+    # standard PC/AT hardware ISA IRQ N maps 1:1 to GSI/IOAPIC pin N
+    # with edge/active-high defaults, and the firmware only emits an
+    # override entry when it deviates from that. Consuming Type 2
+    # entries is the fully-correct follow-up; for IRQ 1 the 1:1
+    # default is what every real chipset uses.
+    _ioapic_init_once()
+    # Note: no IOAPIC_RED_TRIG_LEVEL, no IOAPIC_RED_POL_LOW — edge +
+    # active-high is the all-zero state of bits 13 and 15.
+    low:  uint32 = (vector & 0xFF)
+    high: uint32 = (lapic_id & 0xFF) << 24
+    _ioapic_write(IOAPIC_REDTBL_BASE + 2 * pin + 1, high)
+    _ioapic_write(IOAPIC_REDTBL_BASE + 2 * pin, low)
+    printk2("[ioapic] redirect ISA pin=%d vec=0x%x (edge, active-high)\n",
+            cast[uint64](pin), cast[uint64](vector))
+
+
+def ioapic_redirect_diag(pin: uint32) -> uint32:
+    # Read back a redirection-table entry's low 32 bits for boot-time
+    # diagnostics. Lets a driver print exactly what the IOAPIC latched
+    # — vector in bits 0..7, trigger mode in bit 15, polarity in bit
+    # 13, mask in bit 16 — so a real-hardware test transcript shows
+    # whether the entry is programmed the way the driver intended.
+    _ioapic_init_once()
+    return _ioapic_read(IOAPIC_REDTBL_BASE + 2 * pin)
+
+
 def ioapic_mask(pin: uint32):
     # Re-mask a redirection entry. Preserves the rest of the entry
     # so a subsequent ioapic_redirect doesn't need to re-supply the

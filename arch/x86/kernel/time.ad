@@ -23,7 +23,7 @@ from kernel.sched.core import (
     schedule, signal_post_to_foreground, SIGINT,
 )
 from drivers.tty.serial.early_8250 import uart_drain_hw_to_fifo
-from drivers.input.atkbd import atkbd_poll
+from drivers.input.atkbd import atkbd_poll, atkbd_diag_tick
 # V1 USB HID: drain the xHCI Event Ring + dispatch interrupt-IN
 # transfer completions to the HID layer. No-op when no USB keyboard
 # was successfully attached at boot (xhci.kbd_enabled stays 0).
@@ -82,6 +82,13 @@ def timer_interrupt():
     # accept input from a real keyboard at boot, not just serial —
     # required for non-QEMU machines that don't expose a UART.
     atkbd_poll()
+    # Real-hardware keyboard instrumentation: emit a periodic
+    # [atkbd-diag] line (every ~5 s; the function self-rate-limits)
+    # showing irq1_count / poll_calls / bytes_from_0x60 / fifo_depth.
+    # On the dead-keyboard Asus laptop this transcript is what tells
+    # us whether IRQ 1 fires, the tick poll runs, and any byte ever
+    # leaves port 0x60.
+    atkbd_diag_tick()
     # V1 USB HID: drain the xHCI Event Ring + dispatch any interrupt-IN
     # completions. xhci_poll() is a no-op if V1 enumeration didn't
     # reach kbd_enabled — so this is safe to call unconditionally.

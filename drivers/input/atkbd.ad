@@ -45,7 +45,7 @@
 # which uses the same intrinsics bare.
 
 from kernel.printk.printk import printk0, printk1, printk2
-from arch.x86.kernel.apic import ioapic_redirect
+from arch.x86.kernel.apic import ioapic_redirect_isa, ioapic_redirect_diag
 from arch.x86.kernel.irq import register_irq_handler
 from drivers.input.auxmouse import auxmouse_init
 
@@ -86,12 +86,27 @@ KBD_I8042_KBD_PORT_OK:  int32 = 0x00
 KBD_CCB_IRQ_KBD:     int32 = 0x01
 KBD_CCB_DISABLE_KBD: int32 = 0x10
 
-# Keyboard device command (written to 0x60 after IBF clears). 0xF4 is
+# Keyboard device commands (written to 0x60 after IBF clears). 0xF4 is
 # "enable scanning" — the BIOS *usually* leaves it on, but UEFI-only
 # firmware on a number of laptops disables scanning before handoff so
 # we issue it explicitly. 0xFA is the standard PS/2 ACK.
+#
+#   0xFF  RESET    — the device runs its Basic Assurance Test and then
+#                    re-announces itself. Response sequence is 0xFA
+#                    (ACK) followed, after the BAT completes, by 0xAA
+#                    (self-test pass) — or 0xFC on BAT failure. A
+#                    keyboard that's actually on the i8042 always ACKs
+#                    this; silence means nothing is wired to port 1.
+#   0xF2  IDENTIFY — the device returns its type bytes. A modern MF2
+#                    keyboard answers 0xFA then 0xAB 0x83. If IDENTIFY
+#                    returns nothing the keyboard is NOT on the i8042
+#                    (it's most likely behind the laptop's USB EHCI
+#                    controller — see atkbd_controller_init's comment).
 KBD_CMD_ENABLE_SCAN: int32 = 0xF4
+KBD_CMD_RESET:       int32 = 0xFF
+KBD_CMD_IDENTIFY:    int32 = 0xF2
 KBD_ACK:             int32 = 0xFA
+KBD_BAT_OK:          int32 = 0xAA  # Basic Assurance Test passed (post-reset)
 
 # --- IRQ wiring -------------------------------------------------------
 #
@@ -281,6 +296,29 @@ kbd_head: uint64 = 0                # next-pop index
 kbd_tail: uint64 = 0                # next-push index
 
 
+# --- Runtime diagnostic counters --------------------------------------
+#
+# Real-hardware instrumentation. On the Asus i5-4210U the keyboard is
+# dead and we can't see WHY without observability: is IRQ 1 firing at
+# all? is the timer-tick poll running? does ANY byte come out of port
+# 0x60? These counters answer all three. atkbd_diag_tick() (called
+# from the timer ISR) prints them every ~5 s as a single
+# `[atkbd-diag]` line so the next real-hw boot transcript shows the
+# state without needing an interactive session.
+#
+#   atkbd_poll_calls    bumped once per atkbd_poll() invocation
+#                       (i.e. once per timer tick — proves the tick
+#                       fallback path is alive).
+#   atkbd_bytes_0x60    total bytes ever read from the data port,
+#                       across BOTH the IRQ handler and the poll path
+#                       (proves the i8042 is actually producing data).
+# kbd_irq_count (declared below by the IRQ section) is the third
+# signal — times the IRQ 1 handler fired.
+
+atkbd_poll_calls: uint64 = 0
+atkbd_bytes_0x60: uint64 = 0
+
+
 def kbd_rx_push(b: uint8) -> int32:
     # Returns 1 if the byte fit, 0 if the FIFO was full (byte dropped).
     # Dropping is preferable to blocking — we're called from ISR/poll
@@ -308,6 +346,14 @@ def kbd_rx_has() -> int32:
     if kbd_head == kbd_tail:
         return 0
     return 1
+
+
+def kbd_fifo_depth() -> uint64:
+    # Current occupancy of the software RX FIFO (number of bytes that
+    # kbd_rx_pop would return before going empty). Used by the
+    # [atkbd-diag] periodic line. Modular subtraction handles the
+    # tail-wrapped-below-head case.
+    return (kbd_tail + KBD_FIFO_SIZE - kbd_head) % KBD_FIFO_SIZE
 
 
 # --- Special-key escape-sequence emitters -----------------------------
@@ -627,8 +673,15 @@ def atkbd_poll():
     # in a loop because QEMU (and real hardware under typing) will
     # frequently have multiple bytes pending between calls — leaving
     # them queued delays input arbitrarily.
+    #
+    # atkbd_poll_calls is bumped unconditionally (even on an empty
+    # status register) — the diagnostic wants "is the timer tick
+    # reaching us at all", which is independent of whether a byte
+    # was pending.
+    atkbd_poll_calls = atkbd_poll_calls + 1
     while (inb(KBD_STATUS_PORT) & KBD_STATUS_OBF) != 0:
         raw: int32 = inb(KBD_DATA_PORT) & 0xFF
+        atkbd_bytes_0x60 = atkbd_bytes_0x60 + 1
         atkbd_process_byte(raw)
 
 
@@ -666,13 +719,66 @@ def atkbd_irq_handler():
         # mouse byte arriving on IRQ 1 is already a controller glitch).
         if (st & 0x20) != 0:
             inb(KBD_DATA_PORT)
+            atkbd_bytes_0x60 = atkbd_bytes_0x60 + 1
         else:
             raw: int32 = inb(KBD_DATA_PORT) & 0xFF
+            atkbd_bytes_0x60 = atkbd_bytes_0x60 + 1
             atkbd_process_byte(raw)
         n = n + 1
         # Hard cap to prevent ISR storm if status bit ever sticks high.
         if n > 16:
             return
+
+
+# --- Periodic runtime diagnostic --------------------------------------
+#
+# atkbd_diag_tick() is called from the timer ISR (arch/x86/kernel/
+# time.ad) on every tick. It self-rate-limits to one print per ~5 s
+# (500 ticks at HZ=100) so the serial log isn't flooded — the timer
+# poll itself runs every tick, this just samples the counters.
+#
+# The single line it emits is the load-bearing diagnostic for the
+# "keyboard dead on the real Asus laptop" investigation:
+#
+#   [atkbd-diag] irq1_count=N poll_calls=M bytes_from_0x60=K fifo_depth=D
+#
+#   irq1_count    > 0  =>  IOAPIC pin 1 is delivering IRQ 1 to the CPU.
+#                 == 0  =>  either the IOAPIC redirection entry is
+#                           mis-programmed (the edge/polarity bug this
+#                           commit fixes), or the i8042 never raises
+#                           the line because nothing's on port 1.
+#   poll_calls    > 0  =>  the timer tick is running and the fallback
+#                          poll path is alive (this should ALWAYS be
+#                          non-zero once the timer is armed).
+#   bytes_from_0x60 > 0 => the i8042 produced at least one byte. If
+#                          this stays 0 while the user is typing, the
+#                          keyboard is not putting scancodes into the
+#                          controller's output buffer at all — strong
+#                          evidence the keyboard is NOT on the i8042.
+#   fifo_depth         => bytes queued for vfs_read; non-zero with no
+#                          reader means userspace isn't draining.
+#
+# On QEMU we expect irq1_count and poll_calls both non-zero shortly
+# after boot (QEMU's i8042 emulation delivers IRQ 1 and the timer
+# always ticks). bytes_from_0x60 is 0 in -no-reboot mode with no
+# synthetic input — that's fine; the QEMU acceptance criterion is the
+# line printing at all, plus non-zero irq1/poll.
+
+atkbd_diag_ticks:    uint64 = 0
+ATKBD_DIAG_INTERVAL: uint64 = 500     # ticks between prints (~5 s at 100 Hz)
+
+
+def atkbd_diag_tick():
+    atkbd_diag_ticks = atkbd_diag_ticks + 1
+    if (atkbd_diag_ticks % ATKBD_DIAG_INTERVAL) != 0:
+        return
+    # printk maxes out at two %-args (printk2); the line needs four
+    # numbers, so emit it as two printk2 halves under one [atkbd-diag]
+    # tag. Kept on one logical line for grep-ability of the prefix.
+    printk2("[atkbd-diag] irq1_count=%d poll_calls=%d ",
+            kbd_irq_count, atkbd_poll_calls)
+    printk2("bytes_from_0x60=%d fifo_depth=%d\n",
+            atkbd_bytes_0x60, kbd_fifo_depth())
 
 
 # --- Boot-time self test ----------------------------------------------
@@ -883,13 +989,32 @@ def _kbd_write_data(b: int32):
     outb(b, KBD_DATA_PORT)
 
 
+def _kbd_read_result() -> int32:
+    # Poll OBF and read one byte from the data port. Returns the byte
+    # (0..255), or -1 on timeout (OBF never set). Used by the loud
+    # bring-up path below where every step prints what it got.
+    if _kbd_wait_output_full() == 0:
+        return -1
+    return inb(KBD_DATA_PORT) & 0xFF
+
+
 def atkbd_controller_init():
+    # Loud, step-by-step i8042 bring-up. Every command prints the
+    # status register it saw and the result byte it read — on a real
+    # machine where the keyboard is dead this transcript is the only
+    # way to tell WHERE the chain breaks. Tag every line `[atkbd-diag]`
+    # so the boot log is greppable.
+
     # 1. Quiesce both ports so junk from a half-configured firmware
     #    can't masquerade as a self-test response. Disabling the AUX
     #    port here is harmless — auxmouse_init() re-enables it as
     #    its first step (cmd 0xA8) when we call it later in atkbd_init.
     _kbd_cmd(KBD_I8042_CMD_DISABLE_KBD)
+    printk1("[atkbd-diag] after 0xAD disable-kbd: status=0x%x\n",
+            cast[uint64](inb(KBD_STATUS_PORT) & 0xFF))
     _kbd_cmd(KBD_I8042_CMD_DISABLE_AUX)
+    printk1("[atkbd-diag] after 0xA7 disable-aux: status=0x%x\n",
+            cast[uint64](inb(KBD_STATUS_PORT) & 0xFF))
 
     # 2. Drain anything stale in the output buffer. We deliberately do
     #    NOT use the existing drain loop in atkbd_init — that one runs
@@ -903,41 +1028,39 @@ def atkbd_controller_init():
         pre = pre + 1
         if pre > 16:
             break
+    printk1("[atkbd-diag] pre-test drain: %d stale byte(s)\n",
+            cast[uint64](pre))
 
-    # 3. Controller self-test. Expect 0x55 on the data port. Anything
-    #    else (including a timeout) is logged + continued — a stubborn
-    #    controller still has a chance of responding to the KBD-port
-    #    test below, and worst case we fall through to the original
-    #    drain-and-go path that the M16.100 driver shipped with.
+    # 3. Controller self-test (0xAA). Expect 0x55 on the data port.
+    #    Anything else (including a timeout) is logged + continued —
+    #    a stubborn controller still has a chance of responding to the
+    #    KBD-port test below, and worst case we fall through to the
+    #    original drain-and-go path that the M16.100 driver shipped.
     _kbd_cmd(KBD_I8042_CMD_SELF_TEST)
-    if _kbd_wait_output_full() == 0:
-        printk0("atkbd: i8042 self-test TIMEOUT (continuing)\n")
+    st_self: int32 = _kbd_read_result()
+    if st_self < 0:
+        printk0("[atkbd-diag] self-test 0xAA -> TIMEOUT (expect 0x55)\n")
     else:
-        st: int32 = inb(KBD_DATA_PORT) & 0xFF
-        if st == KBD_I8042_SELF_TEST_OK:
-            printk0("atkbd: i8042 self-test PASS\n")
-        else:
-            printk1("atkbd: i8042 self-test FAIL (got=0x%x, continuing)\n",
-                    cast[uint64](st))
+        printk1("[atkbd-diag] self-test 0xAA -> 0x%x (expect 0x55)\n",
+                cast[uint64](st_self))
 
-    # 4. Port 1 (keyboard) interface test. 0x00 == OK; anything else
-    #    means the controller suspects the line, but real-hardware
+    # 4. Port 1 (keyboard) interface test (0xAB). 0x00 == OK; anything
+    #    else means the controller suspects the line, but real-hardware
     #    bring-up has historically continued anyway — most non-zero
     #    results are spurious and the device still works.
     _kbd_cmd(KBD_I8042_CMD_TEST_KBD_PORT)
-    if _kbd_wait_output_full() == 0:
-        printk0("atkbd: i8042 port1 test TIMEOUT (continuing)\n")
+    pt: int32 = _kbd_read_result()
+    if pt < 0:
+        printk0("[atkbd-diag] port1 test 0xAB -> TIMEOUT (expect 0x00)\n")
     else:
-        pt: int32 = inb(KBD_DATA_PORT) & 0xFF
-        if pt == KBD_I8042_KBD_PORT_OK:
-            printk0("atkbd: i8042 port1 PASS\n")
-        else:
-            printk1("atkbd: i8042 port1 FAIL (got=0x%x, continuing)\n",
-                    cast[uint64](pt))
+        printk1("[atkbd-diag] port1 test 0xAB -> 0x%x (expect 0x00)\n",
+                cast[uint64](pt))
 
     # 5. Re-enable port 1. From this point the keyboard is allowed to
     #    push scancodes into the output buffer when the user types.
     _kbd_cmd(KBD_I8042_CMD_ENABLE_KBD)
+    printk1("[atkbd-diag] after 0xAE enable-kbd: status=0x%x\n",
+            cast[uint64](inb(KBD_STATUS_PORT) & 0xFF))
 
     # 6. CCB RMW: enable IRQ 1 delivery on KBD byte (bit 0) and clear
     #    the KBD clock-disable bit (bit 4) in case firmware masked it.
@@ -946,30 +1069,74 @@ def atkbd_controller_init():
     #    later. Mirrors the auxmouse CCB-RMW shape so a future reader
     #    diffing the two files sees the same dance.
     _kbd_cmd(KBD_I8042_CMD_READ_CCB)
-    if _kbd_wait_output_full() == 0:
-        printk0("atkbd: timeout reading CCB (continuing without IRQ)\n")
+    ccb: int32 = _kbd_read_result()
+    if ccb < 0:
+        printk0("[atkbd-diag] read CCB 0x20 -> TIMEOUT (no IRQ this boot)\n")
     else:
-        ccb: int32 = inb(KBD_DATA_PORT) & 0xFF
+        printk1("[atkbd-diag] read CCB 0x20 -> 0x%x (pre-RMW)\n",
+                cast[uint64](ccb))
         ccb = (ccb | KBD_CCB_IRQ_KBD) & (~KBD_CCB_DISABLE_KBD)
         _kbd_cmd(KBD_I8042_CMD_WRITE_CCB)
         _kbd_write_data(ccb)
-        printk1("atkbd: CCB programmed (0x%x) — IRQ 1 enabled\n",
+        printk1("[atkbd-diag] CCB written 0x%x (bit0 IRQ1=on, bit4 clk=on)\n",
                 cast[uint64](ccb))
 
-    # 7. Tell the keyboard device to start scanning. The BIOS usually
-    #    has this on already, but UEFI-only firmware on a number of
-    #    laptops hands off with scanning disabled — this is the load-
-    #    bearing fix for the "keyboard dead on real hardware" symptom.
-    _kbd_write_data(KBD_CMD_ENABLE_SCAN)
-    if _kbd_wait_output_full() == 0:
-        printk0("atkbd: enable-scan ACK TIMEOUT (continuing)\n")
+    # 7. Keyboard RESET (0xFF). This is the strongest single probe of
+    #    "is there actually a keyboard on the i8042 port 1". A real
+    #    device ACKs (0xFA) immediately, runs its Basic Assurance Test,
+    #    then sends 0xAA (BAT pass) — or 0xFC on BAT failure. If BOTH
+    #    reads time out, NOTHING is responding on port 1: the internal
+    #    keyboard is not on the i8042 (on this Haswell laptop it is then
+    #    almost certainly behind the EHCI USB 2.0 controller, which
+    #    Hamnix has no driver for — see the report). RESET also makes
+    #    the keyboard re-announce itself, which clears any half-state
+    #    a UEFI/legacy firmware handoff left behind.
+    _kbd_write_data(KBD_CMD_RESET)
+    rst_ack: int32 = _kbd_read_result()
+    rst_bat: int32 = -1
+    if rst_ack >= 0:
+        rst_bat = _kbd_read_result()
+    if rst_ack < 0:
+        printk0("[atkbd-diag] keyboard reset 0xFF -> NO RESPONSE")
+        printk0(" (expect 0xFA ACK then 0xAA) -- nothing on i8042 port 1\n")
     else:
-        ack: int32 = inb(KBD_DATA_PORT) & 0xFF
-        if ack == KBD_ACK:
-            printk0("atkbd: scan enabled (ACK)\n")
-        else:
-            printk1("atkbd: enable-scan unexpected response 0x%x (continuing)\n",
-                    cast[uint64](ack))
+        printk2("[atkbd-diag] keyboard reset 0xFF -> 0x%x then 0x%x",
+                cast[uint64](rst_ack), cast[uint64](rst_bat & 0xFF))
+        printk0(" (expect 0xFA ACK then 0xAA BAT-pass)\n")
+
+    # 8. Keyboard IDENTIFY (0xF2). A real MF2 keyboard ACKs then sends
+    #    its 2-byte device ID 0xAB 0x83. The ID bytes are diagnostic
+    #    only — we don't branch on them — but they are the definitive
+    #    proof of presence: ID bytes => keyboard IS on the i8042;
+    #    nothing => it is NOT (look to EHCI/USB-HID instead).
+    _kbd_write_data(KBD_CMD_IDENTIFY)
+    id_ack: int32 = _kbd_read_result()
+    id_b0:  int32 = -1
+    id_b1:  int32 = -1
+    if id_ack >= 0:
+        id_b0 = _kbd_read_result()
+        id_b1 = _kbd_read_result()
+    if id_ack < 0:
+        printk0("[atkbd-diag] keyboard identify 0xF2 -> NO RESPONSE")
+        printk0(" (a real MF2 keyboard answers 0xFA 0xAB 0x83)\n")
+    else:
+        printk2("[atkbd-diag] keyboard identify 0xF2 -> ack=0x%x id0=0x%x",
+                cast[uint64](id_ack), cast[uint64](id_b0 & 0xFF))
+        printk1(" id1=0x%x (expect 0xAB 0x83)\n",
+                cast[uint64](id_b1 & 0xFF))
+
+    # 9. Tell the keyboard device to start scanning (0xF4). The BIOS
+    #    usually has this on already, but UEFI-only firmware on a
+    #    number of laptops hands off with scanning disabled — this is
+    #    the load-bearing fix for the "keyboard dead on real hardware"
+    #    symptom when the keyboard IS on the i8042.
+    _kbd_write_data(KBD_CMD_ENABLE_SCAN)
+    sc_ack: int32 = _kbd_read_result()
+    if sc_ack < 0:
+        printk0("[atkbd-diag] enable-scan 0xF4 -> TIMEOUT (expect 0xFA)\n")
+    else:
+        printk1("[atkbd-diag] enable-scan 0xF4 -> 0x%x (expect 0xFA ACK)\n",
+                cast[uint64](sc_ack))
 
 
 # --- Init --------------------------------------------------------------
@@ -1015,17 +1182,33 @@ def atkbd_init() -> int32:
     # Wire IRQ 1. IOAPIC pin 1 == ISA IRQ 1 (1:1 mapping on every
     # PC/AT-compatible chipset). Route to vector KBD_IRQ_VECTOR (0x46)
     # on LAPIC 0, then register the handler in the 256-slot table.
-    # ioapic_redirect() defaults entries to level-triggered active-low
-    # (PCI convention). ISA IRQs are nominally edge-triggered active-
-    # high, but QEMU's IOAPIC honours the LAPIC delivery either way;
-    # the auxmouse path uses the same call shape successfully and on
-    # real hardware a follow-up pass consuming MADT override entries
-    # is the canonical fix. The polled-from-timer-tick path is the
-    # belt-and-braces fallback documented at the top of this file.
+    #
+    # BUG FIX (real-hardware): the previous code called the generic
+    # ioapic_redirect(), which programs the redirection entry as
+    # LEVEL-triggered, ACTIVE-LOW — the PCI INTx convention. That is
+    # WRONG for an ISA line. The i8042 keyboard interrupt is an ISA
+    # IRQ: EDGE-triggered, ACTIVE-HIGH. On QEMU's lenient IOAPIC the
+    # mis-programming is tolerated and IRQ 1 still fires, which is why
+    # this slipped through; on the real Asus laptop's chipset IOAPIC
+    # a level-triggered entry pointed at an edge source latches the
+    # Remote-IRR bit (it expects an EOI message round-trip the brief
+    # i8042 edge pulse never satisfies) and the inverted active-low
+    # polarity makes the idle-high ISA line read as permanently
+    # deasserted — so IRQ 1 fires at most once, then never again.
+    # ioapic_redirect_isa() programs the entry the way an ISA edge IRQ
+    # needs: trigger=edge, polarity=active-high, unmasked. The polled-
+    # from-timer-tick path stays as the belt-and-braces fallback.
     register_irq_handler(cast[uint64](KBD_IRQ_VECTOR),
                          cast[uint64](&atkbd_irq_handler))
-    ioapic_redirect(KBD_IOAPIC_PIN, KBD_IRQ_VECTOR, KBD_LAPIC_ID)
-    printk2("atkbd: irq pin=%d vec=0x%x\n",
+    ioapic_redirect_isa(KBD_IOAPIC_PIN, KBD_IRQ_VECTOR, KBD_LAPIC_ID)
+    # Read the entry back so the boot log proves what the IOAPIC
+    # actually latched: vector in bits 0..7, bit 13 = polarity
+    # (0 = active-high, want 0), bit 15 = trigger (0 = edge, want 0),
+    # bit 16 = mask (0 = unmasked, want 0).
+    kbd_red_lo: uint32 = ioapic_redirect_diag(KBD_IOAPIC_PIN)
+    printk2("[atkbd-diag] IOAPIC pin %d redir-entry low=0x%x\n",
+            cast[uint64](KBD_IOAPIC_PIN), cast[uint64](kbd_red_lo))
+    printk2("atkbd: irq pin=%d vec=0x%x (ISA edge/active-high)\n",
             cast[uint64](KBD_IOAPIC_PIN),
             cast[uint64](KBD_IRQ_VECTOR))
 
