@@ -1,0 +1,840 @@
+# drivers/usb/ehci.ad
+#
+# EHCI (Enhanced Host Controller Interface — USB 2.0) HCD driver —
+# V0 scope: PCI probe + BIOS->OS handoff + controller init + root-hub
+# port enumeration.
+#
+# Why EHCI when Hamnix already has an xHCI driver:
+#
+#   xHCI is the only host controller on 2026-era silicon, but a lot of
+#   real laptops in the 2008..2014 window — including several Asus
+#   models — route the *built-in* keyboard through an EHCI controller
+#   (Intel ICH/PCH "Enhanced" USB) rather than the legacy i8042 PS/2
+#   port. On such a machine, if the i8042 emulation is disabled in
+#   firmware (or simply not wired to the internal keyboard), the
+#   keyboard is electrically dead to atkbd.ad and only EHCI can see
+#   it. This driver is the missing host-controller backend for that
+#   class of hardware.
+#
+# Scope of THIS milestone (V0 — controller-detect + port-scan):
+#
+#   1. PCI scan for class=0x0C subclass=0x03 progIF=0x20 (the EHCI
+#      class triple; QEMU's `-device usb-ehci` matches, as do every
+#      Intel ICH/PCH and AMD SB EHCI controller on real silicon).
+#   2. Map BAR0 — a MEM BAR holding the capability registers (at
+#      offset 0) and, CAPLENGTH bytes further on, the operational
+#      registers.
+#   3. Decode the capability block: CAPLENGTH, HCIVERSION, HCSPARAMS
+#      (N_PORTS, port-power-control, port-routing rules) and
+#      HCCPARAMS (64-bit-addressing capable?, extended-capabilities
+#      pointer for the BIOS-handoff dance).
+#   4. BIOS->OS handoff: if HCCPARAMS carries a USBLEGSUP extended
+#      capability, claim OS ownership (set the OS-owned bit, spin
+#      until the BIOS-owned bit clears). Real laptop firmware needs
+#      this; QEMU usually does not expose USBLEGSUP at all.
+#   5. Reset the controller (USBCMD.HCRESET=1, wait for self-clear).
+#   6. Allocate + install the periodic frame list (4 KiB, 1024
+#      entries, all marked T-bit invalid for V0) and a one-QH async
+#      schedule placeholder. Set USBCMD.RS=1 (run) and CONFIGFLAG=1
+#      (route every port to EHCI instead of a companion UHCI/OHCI).
+#   7. Walk PORTSC[1..N_PORTS]: for each connected port, power it,
+#      issue a Port Reset (~50 ms asserted, then de-assert and wait
+#      for the reset bit to clear), and read back the Port-Enabled
+#      bit. A low-/full-speed device that fails to enable after the
+#      reset is released to the companion controller (PORTSC.PortOwner
+#      <- 1); a USB 2.0 (high-speed) device stays owned by EHCI.
+#
+# Explicitly OUT of scope for V0 (deferred to V1 — see the precise
+# backlog in the block comment at the end of this file):
+#   - Any USB transfer. V0 brings the controller to "running, ports
+#     enumerated, high-speed device link-trained and EHCI-owned" and
+#     stops. No QH/qTD chain is submitted on the async or periodic
+#     schedule, so there is no SET_ADDRESS / GET_DESCRIPTOR /
+#     SET_CONFIGURATION and no interrupt-IN keyboard polling yet.
+#   - Companion-controller (UHCI/OHCI) driving. Devices released via
+#     PortOwner are simply logged; Hamnix has no UHCI/OHCI driver.
+#
+# References:
+#   - Intel "Enhanced Host Controller Interface Specification for
+#     Universal Serial Bus" revision 1.0 — §2 (register map), §3
+#     (data structures), §4 (operational model), Appendix A
+#     (USBLEGSUP extended capability / BIOS handoff).
+#   - Linux drivers/usb/host/ehci-hcd.c — full implementation.
+#   - drivers/usb/xhci.ad — sibling USB HCD driver, same problem
+#     domain, different register interface; this file mirrors its
+#     structure (PCI plumbing, MMIO helpers, bounded spin loops,
+#     loud boot banners).
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.pci.pci import (
+    pci_config_read_dword, pci_config_write_dword,
+    pci_bdf_bus, pci_bdf_dev, pci_bdf_fn, pci_pack_bdf,
+    pci_read_bar, PCI_BDF_NONE,
+    PCI_COMMAND_OFFSET, PCI_COMMAND_MEM, PCI_COMMAND_MASTER,
+)
+from mm.page_alloc import alloc_pages
+from drivers.usb.hid import hid_init
+from drivers.usb.usb import (
+    USB_SPEED_UNKNOWN, USB_SPEED_FULL, USB_SPEED_LOW, USB_SPEED_HIGH,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- PCI class triple ---------------------------------------------
+#
+# Per the PCI Code-and-ID assignments: base class serial-bus (0x0C),
+# subclass USB (0x03), programming interface EHCI (0x20). QEMU's
+# `usb-ehci` / `ich9-usb-ehci1` devices all match this triple, as do
+# every Intel ICH/PCH and AMD SB EHCI controller on real hardware.
+
+EHCI_PCI_CLASS:    uint32 = 0x0C
+EHCI_PCI_SUBCLASS: uint32 = 0x03
+EHCI_PCI_PROGIF:   uint32 = 0x20
+
+
+# --- Capability registers (BAR0 + N, EHCI §2.2) -------------------
+#
+# These live at the very start of the MMIO region and are read-only.
+# CAPLENGTH (1 byte) gives the offset from BAR0 to the operational
+# register block. HCSPARAMS / HCCPARAMS carry the structural and
+# capability parameters we need for init.
+
+EHCI_CAP_CAPLENGTH:  uint64 = 0x00     # u8  — op regs at bar0 + this
+EHCI_CAP_HCIVERSION: uint64 = 0x02     # u16 BCD interface version
+EHCI_CAP_HCSPARAMS:  uint64 = 0x04     # u32 structural parameters
+EHCI_CAP_HCCPARAMS:  uint64 = 0x08     # u32 capability parameters
+
+# HCSPARAMS fields (EHCI §2.2.3).
+EHCI_HCS_N_PORTS_MASK:  uint32 = 0x0F        # bits 3..0  : root-hub ports
+EHCI_HCS_PPC:           uint32 = 0x10        # bit 4      : Port Power Control
+EHCI_HCS_N_CC_SHIFT:    uint32 = 12          # bits 15..12: # companion HCs
+EHCI_HCS_N_CC_MASK:     uint32 = 0x0F
+
+# HCCPARAMS fields (EHCI §2.2.4).
+EHCI_HCC_64BIT:         uint32 = 0x01        # bit 0      : 64-bit addressing
+EHCI_HCC_EECP_SHIFT:    uint32 = 8           # bits 15..8 : EECP (PCI cfg off)
+EHCI_HCC_EECP_MASK:     uint32 = 0xFF
+
+
+# --- Operational registers (relative to BAR0 + CAPLENGTH) ----------
+#
+# EHCI §2.3. All are 32-bit. CTRLDSSEGMENT is the high 32 bits of
+# every data-structure pointer when 64-bit addressing is in use; we
+# keep it zeroed (all our DMA allocations are sub-4 GiB).
+
+EHCI_OP_USBCMD:          uint64 = 0x00   # u32 command
+EHCI_OP_USBSTS:          uint64 = 0x04   # u32 status
+EHCI_OP_USBINTR:         uint64 = 0x08   # u32 interrupt enable
+EHCI_OP_FRINDEX:         uint64 = 0x0C   # u32 frame index
+EHCI_OP_CTRLDSSEGMENT:   uint64 = 0x10   # u32 high dword of DS ptrs
+EHCI_OP_PERIODICLISTBASE: uint64 = 0x14  # u32 periodic frame list base
+EHCI_OP_ASYNCLISTADDR:   uint64 = 0x18   # u32 async list (next QH) addr
+EHCI_OP_CONFIGFLAG:      uint64 = 0x40   # u32 configure flag
+EHCI_OP_PORTSC_BASE:     uint64 = 0x44   # u32[N_PORTS], stride 4
+
+# USBCMD bits (EHCI §2.3.1).
+EHCI_CMD_RS:        uint32 = 0x01        # Run/Stop
+EHCI_CMD_HCRESET:   uint32 = 0x02        # Host Controller Reset
+EHCI_CMD_PSE:       uint32 = 0x10        # Periodic Schedule Enable
+EHCI_CMD_ASE:       uint32 = 0x20        # Async Schedule Enable
+
+# USBSTS bits (EHCI §2.3.2).
+EHCI_STS_HALTED:    uint32 = 0x1000      # HCHalted (1 = stopped)
+
+# CONFIGFLAG (EHCI §2.3.8) — 1 routes all ports to EHCI.
+EHCI_CONFIGFLAG_CF: uint32 = 0x01
+
+# PORTSC bits (EHCI §2.3.9).
+EHCI_PORTSC_CCS:        uint32 = 0x00000001  # Current Connect Status (RO)
+EHCI_PORTSC_CSC:        uint32 = 0x00000002  # Connect Status Change (RW1C)
+EHCI_PORTSC_PED:        uint32 = 0x00000004  # Port Enabled
+EHCI_PORTSC_PEDC:       uint32 = 0x00000008  # Port Enable Change (RW1C)
+EHCI_PORTSC_OCC:        uint32 = 0x00000020  # Over-Current Change (RW1C)
+EHCI_PORTSC_PR:         uint32 = 0x00000100  # Port Reset
+EHCI_PORTSC_LINESTATUS_SHIFT: uint32 = 10    # bits 11..10: D+/D- line state
+EHCI_PORTSC_LINESTATUS_MASK:  uint32 = 0x03
+EHCI_PORTSC_PP:         uint32 = 0x00001000  # Port Power
+EHCI_PORTSC_OWNER:      uint32 = 0x00002000  # Port Owner (1 = companion)
+
+# PORTSC bits that are write-1-to-clear; mask them OFF on any
+# read-modify-write so we don't unintentionally clear a change bit.
+# Literal value = CSC(0x02) | PEDC(0x08) | OCC(0x20) = 0x2A — the
+# x86 backend requires global initializers to be literal integers.
+EHCI_PORTSC_W1C_MASK:   uint32 = 0x0000002A
+
+# Line-status encoding while a port is NOT enabled (EHCI §2.3.9):
+#   00 = SE0,  01 = K-state (low-speed device — give to companion),
+#   10 = J-state,  11 = undefined.
+EHCI_LINESTATUS_KSTATE: uint32 = 0x01
+
+
+# --- USBLEGSUP extended capability (EHCI Appendix A) --------------
+#
+# When HCCPARAMS.EECP is non-zero it is a *PCI configuration-space*
+# offset to a linked list of extended capabilities. Capability ID 1
+# is "Legacy Support" (USBLEGSUP). Its first dword:
+#   bits 7..0   : capability ID (1 = legacy support)
+#   bits 15..8  : next-capability pointer (0 = end of list)
+#   bit 16      : HC BIOS Owned Semaphore
+#   bit 24      : HC OS Owned Semaphore
+# Handoff = set bit 24, spin until bit 16 clears.
+
+EHCI_LEGSUP_CAPID_LEGACY: uint32 = 0x01
+EHCI_LEGSUP_BIOS_OWNED:   uint32 = 0x00010000  # bit 16
+EHCI_LEGSUP_OS_OWNED:     uint32 = 0x01000000  # bit 24
+
+
+# --- Driver state -------------------------------------------------
+#
+# Single-controller scope, exactly like xhci.ad. A board with two
+# EHCI controllers binds to the first one the PCI scan finds; multi-
+# controller is a clean V1+ extension once a transfer engine exists.
+
+class EhciState:
+    present:     uint32     # 1 once a controller is probed + running
+    bdf:         uint32     # PCI bus/dev/fn
+    bar0:        uint64     # capability-register base (MMIO)
+    op_base:     uint64     # operational-register base = bar0+CAPLENGTH
+    caplength:   uint32     # CAPLENGTH byte
+    hci_version: uint32     # HCIVERSION BCD (e.g. 0x0100 = 1.0)
+    n_ports:     uint32     # HCSPARAMS N_PORTS
+    has_ppc:     uint32     # HCSPARAMS Port Power Control present
+    n_cc:        uint32     # HCSPARAMS # companion controllers
+    addr64:      uint32     # HCCPARAMS 64-bit-addressing capable
+    eecp:        uint32     # HCCPARAMS EHCI Extended Capabilities Ptr
+
+    # DMA structures, pinned at init (top-level BSS-allocated pages —
+    # see the periodic_frame_list / async_qh allocations below).
+    periodic_list: uint64   # 4 KiB, 1024 × 4-byte frame pointers
+    async_qh:      uint64   # placeholder async-schedule head QH
+
+    # Per-port discovery counters surfaced in the boot banner.
+    ports_connected: uint32 # ports with CCS=1
+    ports_enabled:   uint32 # ports that came up high-speed on EHCI
+    ports_released:  uint32 # ports handed to a companion controller
+
+
+ehci: EhciState
+
+
+# --- MMIO helpers --------------------------------------------------
+#
+# Same pattern as drivers/usb/xhci.ad and drivers/nvme/nvme.ad:
+# explicit ptr-cast read/write. EHCI operational registers are all
+# 32-bit and naturally aligned (EHCI §2.3), so a plain 32-bit access
+# is correct everywhere.
+
+def _ehci_r32(addr: uint64) -> uint32:
+    return cast[Ptr[uint32]](addr)[0]
+
+
+def _ehci_w32(addr: uint64, value: uint32):
+    cast[Ptr[uint32]](addr)[0] = value
+
+
+def _ehci_r8(addr: uint64) -> uint32:
+    return cast[uint32](cast[Ptr[uint8]](addr)[0])
+
+
+def _ehci_r16(addr: uint64) -> uint32:
+    return cast[uint32](cast[Ptr[uint16]](addr)[0])
+
+
+def _ehci_portsc_addr(port_zero_based: uint32) -> uint64:
+    # PORTSC[N] lives at op_base + 0x44 + N*4 (EHCI §2.3.9). The
+    # caller passes a 0-based index; boot banners print N+1 so the
+    # log matches the spec's 1-based port numbering.
+    return ehci.op_base + EHCI_OP_PORTSC_BASE \
+         + cast[uint64](port_zero_based) * 4
+
+
+# --- PCI plumbing --------------------------------------------------
+
+def _ehci_pci_find_class(class_code: uint32, subclass: uint32,
+                         prog_if: uint32) -> uint32:
+    # Linear scan of bus 0 — same scope as drivers/pci/pci.ad's
+    # pci_scan() and xhci.ad's class finder. EHCI controllers do not
+    # expose a stable vendor:device pair (Intel uses dozens of device
+    # IDs across ICH/PCH generations), so class-triple match is the
+    # only portable discovery method.
+    bus: uint32 = 0
+    dev: uint32 = 0
+    while dev < 32:
+        ident: uint32 = pci_config_read_dword(bus, dev, 0, 0x00)
+        v: uint32 = ident & 0xFFFF
+        if v != 0xFFFF:
+            cls: uint32 = pci_config_read_dword(bus, dev, 0, 0x08)
+            this_class:    uint32 = (cls >> 24) & 0xFF
+            this_subclass: uint32 = (cls >> 16) & 0xFF
+            this_progif:   uint32 = (cls >>  8) & 0xFF
+            if this_class == class_code \
+               and this_subclass == subclass \
+               and this_progif == prog_if:
+                return pci_pack_bdf(bus, dev, 0)
+        dev = dev + 1
+    return PCI_BDF_NONE
+
+
+def _ehci_pci_enable_mem_and_master(bdf: uint32):
+    # EHCI BAR0 is a MEM BAR and the controller DMAs into host memory
+    # (periodic frame list reads, qTD writeback): MEM-enable and
+    # Bus-Master are both mandatory. Mirrors xhci.ad's equivalent.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    cmd: uint32 = pci_config_read_dword(bus, dev, fn,
+                                        PCI_COMMAND_OFFSET) & 0xFFFF
+    cmd = cmd | PCI_COMMAND_MEM | PCI_COMMAND_MASTER
+    upper: uint32 = pci_config_read_dword(bus, dev, fn,
+                                          PCI_COMMAND_OFFSET) & 0xFFFF0000
+    pci_config_write_dword(bus, dev, fn, PCI_COMMAND_OFFSET,
+                           upper | cmd)
+
+
+def _ehci_pci_read_bar0(bdf: uint32) -> uint64:
+    # EHCI BAR0 is a 32-bit MEM BAR on every real controller and on
+    # QEMU's usb-ehci. Mask the low 4 type/prefetch bits. We still
+    # build a 64-bit address so the MMIO-helper signatures match.
+    low: uint32 = pci_read_bar(bdf, 0)
+    return cast[uint64](low & 0xFFFFFFF0)
+
+
+# --- Speed helper --------------------------------------------------
+
+def _ehci_speed_str(speed: uint32) -> Ptr[char]:
+    if speed == USB_SPEED_HIGH:
+        return "HighSpeed"
+    if speed == USB_SPEED_FULL:
+        return "FullSpeed"
+    if speed == USB_SPEED_LOW:
+        return "LowSpeed"
+    return "unknown"
+
+
+# --- BIOS -> OS handoff (EHCI Appendix A) -------------------------
+
+def _ehci_bios_handoff(bdf: uint32, eecp: uint32):
+    # Walk the PCI-config extended-capability list starting at EECP.
+    # The Legacy Support capability (ID 1) carries the BIOS/OS
+    # ownership semaphores. We claim OS ownership and spin (bounded)
+    # until firmware drops the BIOS-owned bit.
+    #
+    # QEMU's usb-ehci does NOT implement USBLEGSUP, so on QEMU this
+    # function typically logs "no USBLEGSUP" and returns immediately.
+    # Real laptop firmware (Asus / ThinkPad ICH/PCH) very much does.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+
+    cap_off: uint32 = eecp
+    # Bounded walk: a sane extended-capability list is short; cap the
+    # hops so a corrupt next-pointer ring can't wedge boot.
+    hops: uint32 = 0
+    while hops < 16:
+        if cap_off < 0x40:
+            # Extended caps live at >= 0x40 in PCI config space; a
+            # value below that is "end of list" or garbage.
+            printk0("[ehci] no USBLEGSUP capability — skipping handoff\n")
+            return
+        capreg: uint32 = pci_config_read_dword(bus, dev, fn, cap_off)
+        capid: uint32 = capreg & 0xFF
+        if capid == EHCI_LEGSUP_CAPID_LEGACY:
+            printk1("[ehci] USBLEGSUP at PCI cfg offset 0x%x\n",
+                    cast[uint64](cap_off))
+            if (capreg & EHCI_LEGSUP_BIOS_OWNED) == 0:
+                printk0("[ehci] controller already OS-owned\n")
+                return
+            # Claim OS ownership: set bit 24.
+            pci_config_write_dword(bus, dev, fn, cap_off,
+                                   capreg | EHCI_LEGSUP_OS_OWNED)
+            # Spin (bounded) for the BIOS to release bit 16.
+            spin: uint64 = 0
+            while spin < 1000000:
+                now: uint32 = pci_config_read_dword(bus, dev, fn,
+                                                    cap_off)
+                if (now & EHCI_LEGSUP_BIOS_OWNED) == 0:
+                    printk0("[ehci] BIOS->OS handoff complete\n")
+                    return
+                spin = spin + 1
+            printk0("[ehci] BIOS->OS handoff timeout — forcing OS ownership\n")
+            # Last resort: clear the BIOS-owned bit ourselves. EHCI
+            # Appendix A allows the OS to do this if firmware never
+            # responds; better than leaving the controller wedged.
+            forced: uint32 = pci_config_read_dword(bus, dev, fn,
+                                                   cap_off)
+            forced = (forced & ~EHCI_LEGSUP_BIOS_OWNED) \
+                   | EHCI_LEGSUP_OS_OWNED
+            pci_config_write_dword(bus, dev, fn, cap_off, forced)
+            return
+        # Not legacy-support — advance to the next capability.
+        next_off: uint32 = (capreg >> 8) & 0xFF
+        if next_off == 0:
+            printk0("[ehci] no USBLEGSUP capability — skipping handoff\n")
+            return
+        cap_off = next_off
+        hops = hops + 1
+    printk0("[ehci] extended-capability walk overran — skipping handoff\n")
+
+
+# --- Controller stop + reset --------------------------------------
+
+def _ehci_stop(op_base: uint64) -> int32:
+    # Clear RS and wait (bounded) for HCHalted=1. EHCI §4.2.4 forbids
+    # HCRESET while the controller is running, so this must precede
+    # the reset on a controller that firmware left running.
+    cmd: uint32 = _ehci_r32(op_base + EHCI_OP_USBCMD)
+    if (cmd & EHCI_CMD_RS) != 0:
+        _ehci_w32(op_base + EHCI_OP_USBCMD, cmd & ~EHCI_CMD_RS)
+    spin: uint64 = 0
+    while spin < 1000000:
+        sts: uint32 = _ehci_r32(op_base + EHCI_OP_USBSTS)
+        if (sts & EHCI_STS_HALTED) != 0:
+            return 0
+        spin = spin + 1
+    printk0("[ehci] HCHalted timeout — controller did not stop\n")
+    return -1
+
+
+def _ehci_reset(op_base: uint64) -> int32:
+    # Set USBCMD.HCRESET and poll (bounded) until the controller
+    # self-clears it. EHCI §2.3.1: HCRESET resets every operational
+    # register to its default — after this the controller is halted
+    # and not configured.
+    cmd: uint32 = _ehci_r32(op_base + EHCI_OP_USBCMD)
+    _ehci_w32(op_base + EHCI_OP_USBCMD, cmd | EHCI_CMD_HCRESET)
+    spin: uint64 = 0
+    while spin < 10000000:
+        c2: uint32 = _ehci_r32(op_base + EHCI_OP_USBCMD)
+        if (c2 & EHCI_CMD_HCRESET) == 0:
+            return 0
+        spin = spin + 1
+    printk0("[ehci] HCRESET clear timeout — abort\n")
+    return -1
+
+
+# --- Schedule setup ------------------------------------------------
+
+def _ehci_setup_schedules() -> int32:
+    # Allocate the periodic frame list and a single placeholder async
+    # QH, then install both into the operational registers.
+    #
+    # Periodic frame list: 4 KiB = 1024 × 4-byte frame pointers
+    # (EHCI §3.1). alloc_pages(0) returns a 4 KiB-aligned page — the
+    # spec's exact alignment requirement. For V0 every entry is set
+    # to 0x00000001 (T-bit = 1 = "invalid pointer, skip this frame"),
+    # so the periodic schedule does nothing until a V1 interrupt QH
+    # is linked in.
+    pfl: uint64 = ehci.periodic_list
+    async_qh: uint64 = ehci.async_qh
+    if pfl == 0 or async_qh == 0:
+        printk0("[ehci] DMA structure allocation failed\n")
+        return -1
+
+    # Fill the frame list with invalid (T-bit set) pointers.
+    i: uint32 = 0
+    pfl_p: Ptr[uint32] = cast[Ptr[uint32]](pfl)
+    while i < 1024:
+        pfl_p[i] = 0x00000001
+        i = i + 1
+
+    # Async schedule: one Queue Head linked to itself. The async
+    # schedule must always have at least one QH; the host treats it
+    # as a circular list. This placeholder QH has:
+    #   dword 0 (Horizontal Link Ptr) = &self | (type 1 = QH) | T=0
+    #   dword 1 (Endpoint Char)       = 'H' bit set (Head of Reclaim
+    #                                   list) so the controller has a
+    #                                   defined list-traversal anchor
+    #   the qTD overlay pointers      = T-bit set (no work queued)
+    # EHCI §3.6: QH is 48 bytes; we zero a full page and write the
+    # handful of fields we need.
+    memset(cast[Ptr[uint8]](async_qh), 0, 4096)
+    qh_p: Ptr[uint32] = cast[Ptr[uint32]](async_qh)
+    # dword 0: horizontal link points back at this same QH, type=QH(1).
+    qh_p[0] = cast[uint32](async_qh & 0xFFFFFFE0) | 0x02
+    # dword 1: Endpoint Characteristics — bit 15 = H (Head of Reclaim
+    # list). Endpoint 0, address 0, max-packet 0 is fine for a pure
+    # placeholder that never carries a transaction in V0.
+    qh_p[1] = 0x00008000
+    # dword 2: Endpoint Capabilities — leave 0.
+    # Next-qTD (dword 4) and Alternate-next-qTD (dword 5) get the
+    # T-bit so the controller sees "no qTD queued".
+    qh_p[4] = 0x00000001
+    qh_p[5] = 0x00000001
+    # qTD overlay token (dword 7) — 0 (not active).
+
+    # CTRLDSSEGMENT is the high 32 bits of every DS pointer. All our
+    # allocations are sub-4 GiB, so zero it explicitly.
+    _ehci_w32(ehci.op_base + EHCI_OP_CTRLDSSEGMENT, 0)
+    # Install the lists. PERIODICLISTBASE must be 4 KiB-aligned (it
+    # is — alloc_pages); ASYNCLISTADDR points at the head QH.
+    _ehci_w32(ehci.op_base + EHCI_OP_PERIODICLISTBASE,
+              cast[uint32](pfl & 0xFFFFF000))
+    _ehci_w32(ehci.op_base + EHCI_OP_ASYNCLISTADDR,
+              cast[uint32](async_qh & 0xFFFFFFE0))
+    # Mask all controller interrupts — V0 is poll-only, no IRQ
+    # handler is registered.
+    _ehci_w32(ehci.op_base + EHCI_OP_USBINTR, 0)
+
+    printk2("[ehci] periodic_list=%p async_qh=%p\n", pfl, async_qh)
+    return 0
+
+
+# --- Port enumeration ---------------------------------------------
+
+def _ehci_reset_port(port: uint32) -> int32:
+    # Drive a Port Reset on a 0-based port index. EHCI §2.3.9:
+    #   1. Write PORTSC.PortReset=1 (and PortEnable=0 — the reset
+    #      itself enables the port for a high-speed device).
+    #   2. Hold the reset asserted for at least 50 ms (USB 2.0
+    #      §7.1.7.5 — root-hub reset duration).
+    #   3. Write PortReset=0.
+    #   4. Spin (bounded) until the controller clears PortReset
+    #      (must complete within 2 ms per the spec).
+    # Returns the post-reset PORTSC value's Port-Enabled bit: 1 if
+    # the device link-trained as high-speed (EHCI owns it), 0 if not
+    # (full-/low-speed — caller releases it to a companion).
+    addr: uint64 = _ehci_portsc_addr(port)
+    portsc: uint32 = _ehci_r32(addr)
+    # Assert reset; clear PED and any W1C change bits while we're here.
+    portsc = (portsc & ~EHCI_PORTSC_W1C_MASK & ~EHCI_PORTSC_PED) \
+           | EHCI_PORTSC_PR
+    _ehci_w32(addr, portsc)
+
+    # Hold reset ~50 ms. No fine-grained timer is available this
+    # early in boot, so we burn a calibrated spin budget. The exact
+    # duration is not critical as long as it comfortably exceeds the
+    # 50 ms minimum; over-resetting is harmless.
+    hold: uint64 = 0
+    while hold < 5000000:
+        hold = hold + 1
+
+    # De-assert reset.
+    portsc = _ehci_r32(addr)
+    portsc = (portsc & ~EHCI_PORTSC_W1C_MASK & ~EHCI_PORTSC_PR)
+    _ehci_w32(addr, portsc)
+
+    # Wait (bounded) for the controller to acknowledge by clearing
+    # the PortReset bit. Spec budget is 2 ms; the spin cap is generous.
+    spin: uint64 = 0
+    while spin < 2000000:
+        now: uint32 = _ehci_r32(addr)
+        if (now & EHCI_PORTSC_PR) == 0:
+            if (now & EHCI_PORTSC_PED) != 0:
+                return 1
+            return 0
+        spin = spin + 1
+    printk1("[ehci] port %d: reset bit never cleared\n",
+            cast[uint64](port + 1))
+    return 0
+
+
+def _ehci_scan_ports():
+    # Walk PORTSC[0..N_PORTS-1]. For each connected port: power it,
+    # reset it, read back Port-Enabled. A port that does not enable
+    # after reset is carrying a full-/low-speed device — release it
+    # to a companion controller via PORTSC.PortOwner. A port that
+    # DOES enable is a USB 2.0 high-speed device and stays on EHCI;
+    # that is the case a USB 2.0 keyboard hits.
+    ehci.ports_connected = 0
+    ehci.ports_enabled   = 0
+    ehci.ports_released  = 0
+
+    n: uint32 = 0
+    while n < ehci.n_ports:
+        addr: uint64 = _ehci_portsc_addr(n)
+        portsc: uint32 = _ehci_r32(addr)
+
+        if (portsc & EHCI_PORTSC_CCS) == 0:
+            printk1("[ehci] port %d: no device\n", cast[uint64](n + 1))
+            n = n + 1
+        else:
+            ehci.ports_connected = ehci.ports_connected + 1
+
+            # Pre-reset line-status: a K-state on a not-yet-enabled
+            # port is the unambiguous signature of a low-speed device
+            # (USB 2.0 §7.1.7.5). Such a device can be handed straight
+            # to the companion without even attempting a reset.
+            linestate: uint32 = (portsc >> EHCI_PORTSC_LINESTATUS_SHIFT) \
+                              & EHCI_PORTSC_LINESTATUS_MASK
+            printk2("[ehci] port %d: connected (linestate=%d)\n",
+                    cast[uint64](n + 1), cast[uint64](linestate))
+
+            if linestate == EHCI_LINESTATUS_KSTATE:
+                # Low-speed device — EHCI cannot drive it. Release.
+                printk1("[ehci] port %d: low-speed device, releasing to companion\n",
+                        cast[uint64](n + 1))
+                rel: uint32 = (portsc & ~EHCI_PORTSC_W1C_MASK) \
+                            | EHCI_PORTSC_OWNER
+                _ehci_w32(addr, rel)
+                ehci.ports_released = ehci.ports_released + 1
+                n = n + 1
+            else:
+                # Power the port if the controller has per-port power
+                # control; otherwise power is always on.
+                if ehci.has_ppc != 0:
+                    pw: uint32 = (portsc & ~EHCI_PORTSC_W1C_MASK) \
+                               | EHCI_PORTSC_PP
+                    _ehci_w32(addr, pw)
+                    # Brief settle after applying power.
+                    settle: uint64 = 0
+                    while settle < 200000:
+                        settle = settle + 1
+
+                enabled: int32 = _ehci_reset_port(n)
+                post: uint32 = _ehci_r32(addr)
+                if enabled != 0:
+                    # High-speed device — EHCI owns it. For a USB 2.0
+                    # keyboard this is the path that keeps it on EHCI.
+                    ehci.ports_enabled = ehci.ports_enabled + 1
+                    printk2("[ehci] port %d: reset done, enabled=1 speed=%s\n",
+                            cast[uint64](n + 1),
+                            cast[uint64](_ehci_speed_str(USB_SPEED_HIGH)))
+                else:
+                    # Not enabled after reset — full-speed device.
+                    # EHCI is high-speed only; release to companion.
+                    printk1("[ehci] port %d: reset done, enabled=0 (full-speed)\n",
+                            cast[uint64](n + 1))
+                    rel2: uint32 = (post & ~EHCI_PORTSC_W1C_MASK) \
+                                 | EHCI_PORTSC_OWNER
+                    _ehci_w32(addr, rel2)
+                    ehci.ports_released = ehci.ports_released + 1
+                    printk1("[ehci] port %d: released to companion controller\n",
+                            cast[uint64](n + 1))
+                n = n + 1
+
+    printk2("[ehci] root hub scan: %d connected, %d high-speed on EHCI\n",
+            cast[uint64](ehci.ports_connected),
+            cast[uint64](ehci.ports_enabled))
+    printk1("[ehci] root hub scan: %d released to companion controller(s)\n",
+            cast[uint64](ehci.ports_released))
+
+
+# --- Public entry point -------------------------------------------
+
+def ehci_init() -> int32:
+    # PCI-scan, BAR-map, capability-decode, BIOS handoff, reset,
+    # schedule setup, run, port-scan. Returns 0 on success, -1 on any
+    # failure. Non-fatal: a failure here just means USB 2.0 devices
+    # behind an EHCI controller won't work this boot; xHCI and PS/2
+    # keyboards continue to function unchanged.
+    ehci.present = 0
+
+    bdf: uint32 = _ehci_pci_find_class(EHCI_PCI_CLASS,
+                                       EHCI_PCI_SUBCLASS,
+                                       EHCI_PCI_PROGIF)
+    if bdf == PCI_BDF_NONE:
+        printk0("[ehci] no controller found\n")
+        return -1
+    ehci.bdf = bdf
+    printk1("[ehci] controller found bdf=%x\n", cast[uint64](bdf))
+
+    _ehci_pci_enable_mem_and_master(bdf)
+
+    bar0: uint64 = _ehci_pci_read_bar0(bdf)
+    if bar0 == 0:
+        printk0("[ehci] BAR0 is unmapped\n")
+        return -1
+    ehci.bar0 = bar0
+
+    # Capability registers — read-only, no enable required.
+    caplength:  uint32 = _ehci_r8(bar0 + EHCI_CAP_CAPLENGTH)
+    hciversion: uint32 = _ehci_r16(bar0 + EHCI_CAP_HCIVERSION)
+    hcsparams:  uint32 = _ehci_r32(bar0 + EHCI_CAP_HCSPARAMS)
+    hccparams:  uint32 = _ehci_r32(bar0 + EHCI_CAP_HCCPARAMS)
+
+    ehci.caplength   = caplength
+    ehci.op_base     = bar0 + cast[uint64](caplength)
+    ehci.hci_version = hciversion
+    ehci.n_ports     = hcsparams & EHCI_HCS_N_PORTS_MASK
+    if (hcsparams & EHCI_HCS_PPC) != 0:
+        ehci.has_ppc = 1
+    else:
+        ehci.has_ppc = 0
+    ehci.n_cc = (hcsparams >> EHCI_HCS_N_CC_SHIFT) & EHCI_HCS_N_CC_MASK
+    if (hccparams & EHCI_HCC_64BIT) != 0:
+        ehci.addr64 = 1
+    else:
+        ehci.addr64 = 0
+    ehci.eecp = (hccparams >> EHCI_HCC_EECP_SHIFT) & EHCI_HCC_EECP_MASK
+
+    # THE load-bearing V0 banner — proves the BAR mapping landed and
+    # the capability decode produced sane values.
+    printk2("[ehci] controller at BAR0=%p N_PORTS=%d\n",
+            bar0, cast[uint64](ehci.n_ports))
+    printk2("[ehci] HCIVERSION=%x CAPLENGTH=%d\n",
+            cast[uint64](hciversion), cast[uint64](caplength))
+    printk2("[ehci] op_base=%p HCCPARAMS=%x\n",
+            ehci.op_base, cast[uint64](hccparams))
+    printk2("[ehci] 64-bit-addr=%d companion-HCs=%d\n",
+            cast[uint64](ehci.addr64), cast[uint64](ehci.n_cc))
+
+    if ehci.n_ports == 0:
+        printk0("[ehci] N_PORTS=0 — nothing to enumerate, abort\n")
+        return -1
+
+    # BIOS->OS handoff. Only meaningful if HCCPARAMS carries an
+    # extended-capabilities pointer; QEMU's usb-ehci does not, real
+    # laptop firmware does.
+    if ehci.eecp != 0:
+        _ehci_bios_handoff(bdf, ehci.eecp)
+    else:
+        printk0("[ehci] HCCPARAMS has no extended-capabilities pointer\n")
+
+    # Stop (if firmware left it running) then reset the controller.
+    if _ehci_stop(ehci.op_base) != 0:
+        printk0("[ehci] stop failed — abort init\n")
+        return -1
+    if _ehci_reset(ehci.op_base) != 0:
+        printk0("[ehci] reset failed — abort init\n")
+        return -1
+    printk0("[ehci] controller reset complete\n")
+
+    # Allocate the DMA structures. These are taken from the page
+    # allocator (4 KiB-aligned, which satisfies the periodic frame
+    # list's 4 KiB requirement and the QH's 32-byte requirement).
+    pfl: uint64 = alloc_pages(0)
+    aqh: uint64 = alloc_pages(0)
+    if pfl == 0 or aqh == 0:
+        printk0("[ehci] DMA page allocation failed — abort init\n")
+        return -1
+    ehci.periodic_list = pfl
+    ehci.async_qh      = aqh
+    if _ehci_setup_schedules() != 0:
+        printk0("[ehci] schedule setup failed — abort init\n")
+        return -1
+
+    # Start the controller: enable the async + periodic schedules and
+    # set Run/Stop. EHCI §4.3.2 — the async schedule is enabled even
+    # though only a placeholder QH is linked; that is the spec-
+    # required idle state.
+    cmd: uint32 = _ehci_r32(ehci.op_base + EHCI_OP_USBCMD)
+    cmd = cmd | EHCI_CMD_ASE | EHCI_CMD_PSE | EHCI_CMD_RS
+    _ehci_w32(ehci.op_base + EHCI_OP_USBCMD, cmd)
+
+    # Wait (bounded) for HCHalted to clear — confirms the controller
+    # actually transitioned to the running state.
+    rspin: uint64 = 0
+    running: int32 = 0
+    while rspin < 1000000:
+        sts: uint32 = _ehci_r32(ehci.op_base + EHCI_OP_USBSTS)
+        if (sts & EHCI_STS_HALTED) == 0:
+            running = 1
+            rspin = 1000000
+        else:
+            rspin = rspin + 1
+    if running == 0:
+        printk0("[ehci] controller failed to leave HCHalted — abort\n")
+        return -1
+    printk0("[ehci] controller running\n")
+
+    # Route all ports to EHCI (rather than a companion UHCI/OHCI).
+    # EHCI §4.2 — CONFIGFLAG must be set before any port is usable.
+    _ehci_w32(ehci.op_base + EHCI_OP_CONFIGFLAG, EHCI_CONFIGFLAG_CF)
+    printk0("[ehci] CONFIGFLAG set — ports routed to EHCI\n")
+
+    # Walk the root-hub PORTSC array.
+    _ehci_scan_ports()
+
+    # Bring the HID class driver up (idempotent if xhci_init already
+    # called it — hid_init guards its own self-test). On a machine
+    # with no xHCI controller this is where the HID boot-report
+    # translator path comes online.
+    hid_init()
+
+    ehci.present = 1
+    printk0("[ehci] V0 init complete (probe + reset + port enum)\n")
+    return 0
+
+
+# --- Accessors for init/main.ad + future V1 wiring ----------------
+
+def ehci_present() -> int32:
+    return cast[int32](ehci.present)
+
+
+def ehci_high_speed_port_count() -> int32:
+    # Number of root-hub ports that came up high-speed and are owned
+    # by EHCI. A V1 transfer engine iterates these to find a keyboard.
+    return cast[int32](ehci.ports_enabled)
+
+
+# =====================================================================
+# V1 BACKLOG — control transfers + interrupt-IN keyboard polling.
+# =====================================================================
+#
+# V0 (this commit) brings the EHCI controller to: probed, BIOS-handoff
+# done, reset, running, async+periodic schedules enabled (with only a
+# placeholder async QH and an all-invalid periodic frame list), every
+# root-hub port enumerated and either high-speed-enabled-on-EHCI or
+# released to a companion controller. It does NOT move a single byte
+# of USB data. The next agent picks up exactly here.
+#
+# V1 — control transfer + boot-keyboard enumeration. Precise steps:
+#
+#   1. qTD allocator. A qTD is 32 bytes (EHCI §3.5): Next-qTD ptr,
+#      Alternate-next-qTD ptr, token (status/PID/bytes/data-toggle),
+#      and 5 buffer-pointer dwords. Allocate qTDs + a per-device QH
+#      out of a top-level BSS pool (NOT nested-frame Arrays — the U9
+#      compiler quirk; mirror xhci.ad's `xhci_v1_test_buf` pattern or
+#      carve them from an alloc_pages(0) page). 32-byte alignment is
+#      mandatory; a page is 4 KiB-aligned so page-base + k*32 works.
+#
+#   2. Async-schedule control transfer. Build a QH for endpoint 0 of
+#      the target device (address 0 initially, max-packet 64 for
+#      high-speed). Chain three qTDs: SETUP (PID 0x2D, 8-byte setup
+#      packet in the buffer), DATA-IN/OUT (PID 0x69/0xE1), STATUS
+#      (opposite-direction zero-length). Link the QH into the async
+#      ring (insert between ehci.async_qh and its self-link). Ring is
+#      already RS-enabled; poll the last qTD's token Active bit (bit
+#      7 of the token dword) until it clears — bounded spin, then
+#      check the Halted (bit 6) / error bits.
+#
+#   3. Standard enumeration sequence on the connected high-speed
+#      port:
+#        a. GET_DESCRIPTOR(device, 8 bytes) to learn bMaxPacketSize0.
+#        b. SET_ADDRESS(n) — unlike xHCI, EHCI does NOT assign the
+#           address for you; you issue the standard SET_ADDRESS
+#           control transfer to device address 0, then update the
+#           QH's Endpoint-Characteristics dword to the new address.
+#        c. GET_DESCRIPTOR(device, 18 bytes) — full device descriptor.
+#        d. GET_DESCRIPTOR(config, wTotalLength) — config + interface
+#           + endpoint descriptors. Reuse drivers/usb/usb.ad's
+#           usb_cfg_total_length / usb_if_class / usb_if_protocol /
+#           usb_ep_* decoders (already imported-shaped for this).
+#        e. SET_CONFIGURATION(bConfigurationValue).
+#
+#   4. HID boot keyboard. If an interface descriptor reports class 3
+#      / subclass 1 / protocol 1:
+#        a. SET_PROTOCOL(boot) + SET_IDLE(0) class control transfers
+#           (usb_build_set_protocol / usb_build_set_idle in usb.ad).
+#        b. Build an interrupt QH for the keyboard's interrupt-IN
+#           endpoint and link it into the PERIODIC frame list — not
+#           the async ring. For a polling interval of ~8 frames,
+#           write the QH's address into every 8th periodic-frame-list
+#           entry (T-bit clear, type=QH). The QH's S-mask
+#           (Endpoint-Capabilities dword, bits 7..0) selects the
+#           micro-frames to poll in.
+#        c. Each frame the controller executes the interrupt qTD; the
+#           8-byte boot report lands in the qTD's buffer. Poll the
+#           qTD token Active bit from a tick handler, and when it
+#           clears feed the 8 bytes to drivers/usb/hid.ad's
+#           hid_kbd_report(Ptr[uint8]) — its signature is already
+#           HCD-agnostic and documented for exactly this. hid.ad then
+#           pushes decoded ASCII into kbd_rx_push, the SAME FIFO
+#           atkbd + xhci-hid feed. Re-arm the qTD (clear token, set
+#           Active, reset the buffer pointers) for the next poll.
+#
+#   5. Wire ehci_poll() into the same boot-time tick loop xhci_poll()
+#      uses, and add a `-device usb-kbd` arm to scripts/test_ehci.sh
+#      that greps for a decoded keystroke in the kbd FIFO.
+#
+# V2 BACKLOG:
+#   - Companion-controller (UHCI/OHCI) driver so released full-/low-
+#     speed devices are actually usable. Hamnix has neither today.
+#   - Real IRQ handler (USBINTR + an IOAPIC redirection entry) instead
+#     of the V0/V1 poll-only model.
+#   - USB hub support past the root hub — some laptops put an internal
+#     hub between the EHCI controller and the built-in keyboard.
+#   - Multi-controller: bind every EHCI controller the PCI scan finds
+#     (ICH/PCH chipsets commonly expose two), not just the first.
