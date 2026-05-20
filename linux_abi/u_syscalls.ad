@@ -73,6 +73,22 @@ from fs.vfs import (
     vfs_fd_is_dir, vfs_fd_dir_buf, vfs_fd_dir_buflen,
     vfs_fd_dir_pos, vfs_fd_dir_set_pos,
     vfs_alloc_socket_fd, vfs_fd_is_socket, vfs_fd_is_open,
+    vfs_socket_fd_set_record, vfs_socket_fd_get_record,
+)
+# U-socket: socket(2)/connect(2) on a real TCP connection. The TCP
+# stack itself is drivers/net/tcp.ad; u_socket_state.ad is the per-
+# socket-fd backing-record store shared with fs/vfs.ad's read/write/
+# close dispatch arms.
+from drivers.net.tcp import (
+    tcp_connect, TCP_ERR_NOSLOT, TCP_ERR_ARP, TCP_ERR_REFUSED,
+    TCP_ERR_TIMEOUT,
+)
+from linux_abi.u_socket_state import (
+    usock_alloc, usock_free, usock_valid, usock_set_state,
+    usock_set_tcp_slot, usock_get_state,
+    usock_fdbuf_for_record, usock_record_for_fdbuf,
+    USOCK_CREATED, USOCK_CONNECTED,
+    USOCK_AF_INET, USOCK_SOCK_STREAM,
 )
 from kernel.sched.core import (
     TaskStruct, current_task,
@@ -371,6 +387,15 @@ ELINUX_RANGE:  int64 = -34
 ELINUX_NOSYS:  int64 = -38
 ELINUX_NOTTY:  int64 = -25
 ELINUX_CONNREFUSED: int64 = -111
+# U-socket: extra errnos the connect(2) bridge maps tcp_connect's
+# failure codes onto. Numeric values from <asm-generic/errno.h>.
+ELINUX_AFNOSUPPORT:  int64 = -97    # EAFNOSUPPORT — family not AF_INET
+ELINUX_PROTONOSUP:   int64 = -93    # EPROTONOSUPPORT — type not SOCK_STREAM
+ELINUX_NETUNREACH:   int64 = -101   # ENETUNREACH — on-link ARP never resolved
+ELINUX_TIMEDOUT:     int64 = -110   # ETIMEDOUT — SYN-ACK never arrived
+ELINUX_NOTCONN:      int64 = -107   # ENOTCONN — socket not connected
+ELINUX_ISCONN:       int64 = -106   # EISCONN — already connected
+ELINUX_MFILE:        int64 = -24    # EMFILE — fd / record table exhausted
 
 
 # =====================================================================
@@ -1080,28 +1105,147 @@ POLLNVAL_BIT: uint32 = 0x0020
 def _u_socket(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int socket(int domain, int type, int protocol)
-    # We don't inspect (domain, type, protocol) — Hamnix has no real
-    # routing, just a marker fd. Any AF_* / SOCK_* combo gets the same
-    # behaviour. A future U-milestone with real AF_UNIX or AF_INET
-    # support will branch here.
+    #
+    # U-socket V0: allocate a socket fd PLUS a per-socket-fd backing
+    # record (linux_abi/u_socket_state.ad) that connect(2) / read /
+    # write / close use to reach the real in-kernel TCP stack. V0
+    # supports exactly one combination — AF_INET + SOCK_STREAM — and
+    # rejects everything else with a faithful errno so the caller sees
+    # the same refusal Linux would give. `protocol` is ignored (0 ==
+    # "default for this type", which for SOCK_STREAM is TCP).
+    domain:    uint32 = cast[uint32](a0)
+    sock_type: uint32 = cast[uint32](a1)
+    # SOCK_CLOEXEC (0x80000) / SOCK_NONBLOCK (0x800) ride in the high
+    # bits of `type` on Linux. Hamnix has no CLOEXEC table and no
+    # non-blocking sockets yet (see V1 backlog), so mask them off
+    # before the SOCK_STREAM compare rather than failing the call.
+    sock_type = sock_type & 0xFF
+    if domain != USOCK_AF_INET:
+        # Only AF_INET in V0 — AF_UNIX / AF_INET6 not supported.
+        set_current_errstr("socket: address family not supported")
+        return ELINUX_AFNOSUPPORT
+    if sock_type != USOCK_SOCK_STREAM:
+        # Only SOCK_STREAM (TCP) in V0 — SOCK_DGRAM (UDP) not supported.
+        set_current_errstr("socket: socket type not supported")
+        return ELINUX_PROTONOSUP
     fd: int32 = vfs_alloc_socket_fd()
+    if fd < 0:
+        set_current_errstr("socket: out of fd slots")
+        return cast[int64](fd)
+    rec: int32 = usock_alloc(domain, sock_type)
+    if rec < 0:
+        # Backing-record pool exhausted — undo the fd allocation so we
+        # don't leak a recordless socket fd.
+        vfs_close(fd)
+        set_current_errstr("socket: out of socket records")
+        return ELINUX_MFILE
+    # Wire the record id into the fd's fd_buf so vfs read/write/close
+    # can find it. If the fd_buf write fails the fd vanished from
+    # under us — release the record and surface the error.
+    if vfs_socket_fd_set_record(fd, usock_fdbuf_for_record(rec)) != 0:
+        usock_free(rec)
+        vfs_close(fd)
+        set_current_errstr("socket: fd record bind failed")
+        return ELINUX_BADF
     return cast[int64](fd)
 
 
 def _u_connect(a0: uint64, a1: uint64, a2: uint64,
                a3: uint64, a4: uint64, a5: uint64) -> int64:
-    # int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
-    # No listener can ever exist, so -ECONNREFUSED is the honest answer.
-    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+    # int connect(int sockfd, const struct sockaddr *addr,
+    #             socklen_t addrlen)
+    #
+    # U-socket V0: parse the sockaddr_in and drive a real TCP active
+    # open through drivers/net/tcp.ad. On success the returned tcp
+    # slot is stored in the fd's backing record and the record moves
+    # to USOCK_CONNECTED; subsequent read/write route through tcp_recv
+    # / tcp_send (see fs/vfs.ad's FD_SOCKET_MARK arms).
+    #
+    # struct sockaddr_in (Linux <netinet/in.h>, 16 bytes):
+    #   offset 0  : uint16  sin_family   (host order — AF_INET == 2)
+    #   offset 2  : uint16  sin_port     (network / big-endian)
+    #   offset 4  : uint32  sin_addr     (network / big-endian IPv4)
+    #   offset 8  : uint8[8] sin_zero    (padding)
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
-    return ELINUX_CONNREFUSED
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) == 0:
+        # Socket fd with no backing record — a legacy U35-era fd, or a
+        # record-alloc failure slipped through. Treat as a bad fd.
+        return ELINUX_BADF
+    st: uint32 = usock_get_state(rec)
+    if st == USOCK_CONNECTED:
+        set_current_errstr("connect: socket already connected")
+        return ELINUX_ISCONN
+    if st != USOCK_CREATED:
+        # CLOSED — a connected socket that hit EOF can't be reconnected.
+        set_current_errstr("connect: socket not in a connectable state")
+        return ELINUX_INVAL
+    if a1 == 0:
+        set_current_errstr("connect: null sockaddr")
+        return ELINUX_INVAL
+    if a2 < 16:
+        # sockaddr_in is 16 bytes — a shorter addrlen can't hold one.
+        set_current_errstr("connect: addrlen too short for sockaddr_in")
+        return ELINUX_INVAL
+    addr: Ptr[uint8] = cast[Ptr[uint8]](a1)
+    # sin_family — two host-order bytes, little-endian on x86_64.
+    sin_family: uint32 = cast[uint32](addr[0]) \
+                       | (cast[uint32](addr[1]) << 8)
+    if sin_family != USOCK_AF_INET:
+        set_current_errstr("connect: sockaddr family not AF_INET")
+        return ELINUX_AFNOSUPPORT
+    # sin_port — network byte order (big-endian): high byte first.
+    port16: uint16 = cast[uint16](
+        (cast[uint32](addr[2]) << 8) | cast[uint32](addr[3]))
+    # sin_addr — network byte order: addr[4] is the first IPv4 octet.
+    ip_b0: uint8 = addr[4]
+    ip_b1: uint8 = addr[5]
+    ip_b2: uint8 = addr[6]
+    ip_b3: uint8 = addr[7]
+    printk2("[u_socket] connect -> %d.%d", cast[uint64](ip_b0),
+            cast[uint64](ip_b1))
+    printk2(".%d.%d", cast[uint64](ip_b2), cast[uint64](ip_b3))
+    printk1(":%d\n", cast[uint64](port16))
+    # Drive the real active open. 500 jiffies (~5 s @ HZ=100) covers a
+    # SLIRP handshake (<10 ms) plus the SYN retransmit backoff with a
+    # comfortable margin; bounded so an unreachable host can't wedge
+    # the syscall. tcp_connect polls virtio_net internally.
+    tcp_slot: int32 = tcp_connect(ip_b0, ip_b1, ip_b2, ip_b3,
+                                  port16, 500)
+    if tcp_slot < 0:
+        # Map tcp_connect's distinct failure codes onto faithful
+        # errnos. Anything unrecognised falls back to -ECONNREFUSED.
+        if tcp_slot == TCP_ERR_ARP:
+            set_current_errstr("connect: network unreachable")
+            return ELINUX_NETUNREACH
+        if tcp_slot == TCP_ERR_TIMEOUT:
+            set_current_errstr("connect: connection timed out")
+            return ELINUX_TIMEDOUT
+        if tcp_slot == TCP_ERR_NOSLOT:
+            set_current_errstr("connect: no TCP connection slot")
+            return ELINUX_NETUNREACH
+        set_current_errstr("connect: connection refused")
+        return ELINUX_CONNREFUSED
+    # Connected. Record the live tcp slot and flip state.
+    usock_set_tcp_slot(rec, tcp_slot)
+    usock_set_state(rec, USOCK_CONNECTED)
+    printk1("[u_socket] connected: tcp slot=%d\n",
+            cast[uint64](tcp_slot))
+    return 0
 
 
 def _u_accept(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
-    # No incoming connections without a stack. -EAGAIN matches the
-    # would-block answer a NONBLOCK listening socket gets in Linux.
+    #
+    # U-socket V0 is CLIENT-SIDE ONLY: socket()/connect() drive a real
+    # TCP active open, but the server side (bind/listen/accept) is NOT
+    # bridged yet — the TCP stack does have tcp_listen / tcp_accept
+    # (drivers/net/tcp.ad), so V1 can wire this. Until then accept
+    # returns -EAGAIN, the would-block answer a non-blocking listening
+    # socket gets in Linux when no connection is pending.
     if vfs_fd_is_socket(cast[int32](a0)) == 0:
         return ELINUX_BADF
     return ELINUX_AGAIN
@@ -1119,7 +1263,11 @@ def _u_accept4(a0: uint64, a1: uint64, a2: uint64,
 def _u_bind(a0: uint64, a1: uint64, a2: uint64,
             a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
-    # Accept and discard the address — there's no name table to populate.
+    #
+    # U-socket V0 stub (server side not bridged — see _u_accept). We
+    # accept and discard the address so a program that bind()s before
+    # it discovers accept() is unsupported doesn't fail prematurely.
+    # V1 should record the bound port and pass it to tcp_listen.
     if vfs_fd_is_socket(cast[int32](a0)) == 0:
         return ELINUX_BADF
     return 0
@@ -1128,6 +1276,10 @@ def _u_bind(a0: uint64, a1: uint64, a2: uint64,
 def _u_listen(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int listen(int sockfd, int backlog)
+    #
+    # U-socket V0 stub (server side not bridged — see _u_accept). V1
+    # should call tcp_listen(bound_port) and move the record into a
+    # LISTEN state so accept() can return tcp_accept()'s slot.
     if vfs_fd_is_socket(cast[int32](a0)) == 0:
         return ELINUX_BADF
     return 0
@@ -1191,6 +1343,40 @@ def _u_socketpair(a0: uint64, a1: uint64, a2: uint64,
         return ELINUX_INVAL
     rc: int32 = vfs_pipe(cast[Ptr[int32]](a3))
     return cast[int64](rc)
+
+
+def _u_sendto(a0: uint64, a1: uint64, a2: uint64,
+              a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t sendto(int sockfd, const void *buf, size_t len,
+    #                int flags, const struct sockaddr *dest_addr,
+    #                socklen_t addrlen)
+    #
+    # U-socket V0: a connected SOCK_STREAM socket ignores the
+    # dest_addr / addrlen pair (Linux does too — the connection's peer
+    # is fixed), so sendto degrades to write(2). `flags` is ignored;
+    # we don't implement MSG_OOB / MSG_DONTWAIT yet. vfs_write's
+    # FD_SOCKET_MARK arm routes the bytes through tcp_send.
+    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+        return ELINUX_BADF
+    return vfs_write(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
+
+
+def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
+    #                  struct sockaddr *src_addr, socklen_t *addrlen)
+    #
+    # U-socket V0: a connected SOCK_STREAM socket degrades recvfrom to
+    # read(2). If the caller passed a src_addr buffer we zero its
+    # addrlen out-param (we have no peer address table to populate),
+    # matching the getpeername / getsockname stubs. vfs_read's
+    # FD_SOCKET_MARK arm routes the read through tcp_recv.
+    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+        return ELINUX_BADF
+    if a4 != 0:
+        if a5 != 0:
+            cast[Ptr[uint32]](a5)[0] = 0
+    return vfs_read(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
 
 
 def _u_poll(a0: uint64, a1: uint64, a2: uint64,
@@ -3281,10 +3467,14 @@ def linux_u_syscall_dispatch(nr: uint64,
     # tee / log-rotator path that probes sendfile first.
     if nr == SYS_sendfile:
         return _u_sendfile(a0, a1, a2, a3, a4, a5)
-    # U35: socket(2) family — stub-but-functional. Allocates fds,
-    # accepts addrs, refuses connect, returns -EAGAIN on accept;
-    # socketpair forwards to vfs_pipe. Plus a real poll(2) that walks
-    # the user pollfd array and answers POLLIN on every open fd.
+    # socket(2) family. U-socket: socket / connect / sendto / recvfrom
+    # are now bridged to the real in-kernel TCP stack (drivers/net/
+    # tcp.ad) for AF_INET + SOCK_STREAM — a user binary can complete a
+    # full TCP request/response. read/write on a connected socket fd
+    # route through fs/vfs.ad's FD_SOCKET_MARK arms. accept / bind /
+    # listen remain stubbed (V0 is client-side connect only — server
+    # sockets are V1, see the per-handler comments). socketpair
+    # forwards to vfs_pipe. poll(2) walks the user pollfd array.
     if nr == SYS_socket:
         return _u_socket(a0, a1, a2, a3, a4, a5)
     if nr == SYS_connect:
@@ -3293,6 +3483,10 @@ def linux_u_syscall_dispatch(nr: uint64,
         return _u_accept(a0, a1, a2, a3, a4, a5)
     if nr == SYS_accept4:
         return _u_accept4(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_sendto:
+        return _u_sendto(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_recvfrom:
+        return _u_recvfrom(a0, a1, a2, a3, a4, a5)
     if nr == SYS_bind:
         return _u_bind(a0, a1, a2, a3, a4, a5)
     if nr == SYS_listen:

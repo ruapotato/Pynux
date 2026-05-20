@@ -73,6 +73,18 @@ TCP_CLOSING:     uint32 = 8
 TCP_LAST_ACK:    uint32 = 9
 TCP_TIME_WAIT:   uint32 = 10
 
+# tcp_connect() failure codes. Pre-U-socket this function returned a
+# flat -1 for every failure; the userland connect(2) bridge in
+# linux_abi/u_syscalls.ad needs to distinguish the cases so it can
+# hand back a faithful errno (-ECONNREFUSED vs -ETIMEDOUT vs
+# -ENETUNREACH). All four are negative, so existing in-kernel callers
+# that only test `slot < 0` (http.ad / tls.ad / init/main.ad smokes)
+# are unaffected.
+TCP_ERR_NOSLOT:  int32 = -1    # connection table full / SYN send failed
+TCP_ERR_ARP:     int32 = -2    # on-link ARP never resolved (net unreachable)
+TCP_ERR_REFUSED: int32 = -3    # peer sent RST in response to our SYN
+TCP_ERR_TIMEOUT: int32 = -4    # SYN-ACK never arrived before the deadline
+
 
 # Flag bits in TcpHdr.flags (low byte of the data_off/flags word).
 TCP_FIN: uint8 = 0x01
@@ -943,7 +955,7 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
     slot_signed: int32 = _tcp_alloc_slot()
     if slot_signed < 0:
         printk0("[tcp] no free slot for connect\n")
-        return -1
+        return TCP_ERR_NOSLOT
     slot: uint64 = cast[uint64](slot_signed)
     # On-link destinations (same /24 as our IP) need their own ARP
     # entry before ip_send can find a destination MAC; off-link
@@ -958,7 +970,7 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
                     if _tcp_prime_arp(remote_b0, remote_b1,
                                       remote_b2, remote_b3) != 0:
                         printk0("[tcp] ARP for target timed out\n")
-                        return -1
+                        return TCP_ERR_ARP
     isn: uint32 = _tcp_isn_next()
     local_port: uint16 = TCP_EPHEMERAL_BASE + cast[uint16](slot)
 
@@ -1001,7 +1013,7 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
     if rc != 0:
         printk0("[tcp] SYN send failed\n")
         tcp_slot_state[slot] = TCP_CLOSED
-        return -1
+        return TCP_ERR_NOSLOT
 
     # Poll until ESTABLISHED or timeout. tcp_rx flips the state.
     # On each iteration also nudge _tcp_check_retrans so the SYN
@@ -1015,15 +1027,16 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
         if tcp_slot_state[slot] == TCP_CLOSED:
             # Got a RST while waiting for SYN-ACK.
             printk0("[tcp] connect refused\n")
-            return -1
+            return TCP_ERR_REFUSED
         rtx: int32 = _tcp_check_retrans(slot)
         if rtx < 0:
-            # Exceeded TCP_MAX_RETRIES — give up early.
+            # Exceeded TCP_MAX_RETRIES — give up early. No SYN-ACK
+            # ever came back, so this is a timeout, not a refusal.
             tcp_slot_state[slot] = TCP_CLOSED
-            return -1
+            return TCP_ERR_TIMEOUT
     printk1("[tcp] connect timeout on slot=%d\n", slot)
     tcp_slot_state[slot] = TCP_CLOSED
-    return -1
+    return TCP_ERR_TIMEOUT
 
 
 def tcp_send(slot_signed: int32, buf: Ptr[uint8],

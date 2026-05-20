@@ -1,0 +1,172 @@
+# linux_abi/u_socket_state.ad — per-socket-fd backing store.
+#
+# U-track milestone: bridge userland socket(2)/connect(2)/read/write/
+# close on a socket fd to the real in-kernel TCP/IP stack
+# (drivers/net/tcp.ad). A Hamnix socket fd carries the FD_SOCKET_MARK
+# tag in its per-task fd_idx slot; that marker alone can't hold the
+# extra state a connected stream socket needs (which tcp.ad connection
+# slot is behind it, what AF_*/SOCK_* it was created as, whether it
+# has reached the connected/closed state).
+#
+# This module is a leaf — it imports nothing but printk — so both
+# fs/vfs.ad (read/write/close dispatch arms) and
+# linux_abi/u_syscalls.ad (the _u_socket / _u_connect bodies) can
+# import it without creating an import cycle.
+#
+# ---------------------------------------------------------------------
+# Layout
+#
+# A small fixed pool of socket records lives in top-level BSS — flat
+# parallel arrays, NOT an Array of structs (U9 nested-frame-Array
+# compiler quirk: structs-in-arrays inside nested frames miscompile;
+# parallel arrays sidestep it entirely). USOCK_MAX records is plenty:
+# drivers/net/tcp.ad only has TCP_NUM_SLOTS (8) connection slots, so a
+# 9th socket fd could never get a TCP connection anyway.
+#
+# The socket fd's per-task fd_buf field stores `record_id + 1`
+# (0 means "no record yet" — the FD_SOCKET_MARK fd was allocated by
+# the legacy path or the record alloc failed). usock_record_for_fdbuf
+# / usock_fdbuf_for_record convert between the two.
+
+from kernel.printk.printk import printk0
+
+
+# Socket lifecycle states.
+USOCK_FREE:      uint32 = 0    # record slot not allocated
+USOCK_CREATED:   uint32 = 1    # socket() done, not yet connected
+USOCK_CONNECTED: uint32 = 2    # connect() succeeded, tcp slot live
+USOCK_CLOSED:    uint32 = 3    # peer FIN / local close — no more I/O
+
+# Address family / socket type values we recognise (subset of Linux's
+# <bits/socket.h> / <bits/socket_type.h>). V0 supports exactly one
+# combination: AF_INET + SOCK_STREAM.
+USOCK_AF_INET:     uint32 = 2
+USOCK_SOCK_STREAM: uint32 = 1
+
+# Pool size — see header. One spare over TCP_NUM_SLOTS so a socket()
+# that out-runs the TCP table still gets a record (connect() then
+# fails cleanly with -ENETUNREACH instead of -EMFILE-on-record).
+USOCK_MAX: uint64 = 9
+
+# Parallel-array backing store (top-level BSS).
+usock_inuse:    Array[9, uint8]    # 1 if this record slot is live
+usock_state:    Array[9, uint32]   # USOCK_CREATED / CONNECTED / CLOSED
+usock_tcp_slot: Array[9, int32]    # drivers/net/tcp.ad slot, -1 if none
+usock_family:   Array[9, uint32]   # USOCK_AF_INET (the only one for V0)
+usock_type:     Array[9, uint32]   # USOCK_SOCK_STREAM (V0)
+
+
+def usock_init():
+    # Reset every record to FREE. Called once during kernel bring-up so
+    # a record left dirty by a previous boot image can't be mistaken
+    # for a live socket. Safe to call again — idempotent.
+    i: uint64 = 0
+    while i < USOCK_MAX:
+        usock_inuse[i]    = 0
+        usock_state[i]    = USOCK_FREE
+        usock_tcp_slot[i] = -1
+        usock_family[i]   = 0
+        usock_type[i]     = 0
+        i = i + 1
+    printk0("[usock] socket-fd record pool initialised\n")
+
+
+def usock_alloc(family: uint32, sock_type: uint32) -> int32:
+    # Claim the lowest free record slot for a freshly created socket.
+    # Returns the record id (0..USOCK_MAX-1) or -1 if the pool is
+    # exhausted. The record starts in USOCK_CREATED with no TCP slot.
+    i: uint64 = 0
+    while i < USOCK_MAX:
+        if usock_inuse[i] == 0:
+            usock_inuse[i]    = 1
+            usock_state[i]    = USOCK_CREATED
+            usock_tcp_slot[i] = -1
+            usock_family[i]   = family
+            usock_type[i]     = sock_type
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def usock_free(rec: int32):
+    # Release a socket record back to the pool. Idempotent for an
+    # out-of-range / already-free id so a double-close can't corrupt
+    # a neighbouring record.
+    if rec < 0:
+        return
+    ru: uint64 = cast[uint64](rec)
+    if ru >= USOCK_MAX:
+        return
+    usock_inuse[ru]    = 0
+    usock_state[ru]    = USOCK_FREE
+    usock_tcp_slot[ru] = -1
+    usock_family[ru]   = 0
+    usock_type[ru]     = 0
+
+
+def usock_valid(rec: int32) -> int32:
+    # 1 if `rec` names a live (in-use) record, else 0.
+    if rec < 0:
+        return 0
+    ru: uint64 = cast[uint64](rec)
+    if ru >= USOCK_MAX:
+        return 0
+    if usock_inuse[ru] == 0:
+        return 0
+    return 1
+
+
+def usock_get_state(rec: int32) -> uint32:
+    # Record state, or USOCK_FREE for an invalid id.
+    if usock_valid(rec) == 0:
+        return USOCK_FREE
+    return usock_state[cast[uint64](rec)]
+
+
+def usock_set_state(rec: int32, state: uint32):
+    if usock_valid(rec) == 0:
+        return
+    usock_state[cast[uint64](rec)] = state
+
+
+def usock_get_tcp_slot(rec: int32) -> int32:
+    # The drivers/net/tcp.ad connection slot behind this socket, or -1
+    # if it has none (not yet connected, or already closed).
+    if usock_valid(rec) == 0:
+        return -1
+    return usock_tcp_slot[cast[uint64](rec)]
+
+
+def usock_set_tcp_slot(rec: int32, tcp_slot: int32):
+    if usock_valid(rec) == 0:
+        return
+    usock_tcp_slot[cast[uint64](rec)] = tcp_slot
+
+
+def usock_get_family(rec: int32) -> uint32:
+    if usock_valid(rec) == 0:
+        return 0
+    return usock_family[cast[uint64](rec)]
+
+
+def usock_get_type(rec: int32) -> uint32:
+    if usock_valid(rec) == 0:
+        return 0
+    return usock_type[cast[uint64](rec)]
+
+
+def usock_fdbuf_for_record(rec: int32) -> uint64:
+    # Encode a record id for storage in the socket fd's per-task
+    # fd_buf field. We store `rec + 1` so a zero fd_buf unambiguously
+    # means "no record" (the legacy FD_SOCKET_MARK alloc path leaves
+    # fd_buf == 0).
+    return cast[uint64](rec + 1)
+
+
+def usock_record_for_fdbuf(fdbuf: uint64) -> int32:
+    # Decode the record id stored in a socket fd's fd_buf. Returns -1
+    # when fd_buf is 0 (no record) so callers can treat a legacy /
+    # uninitialised socket fd as "created but never wired to TCP".
+    if fdbuf == 0:
+        return -1
+    return cast[int32](fdbuf) - 1

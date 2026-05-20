@@ -142,6 +142,18 @@ from fs.socketpair import (
     sockpair_pack, sockpair_unpack_slot, sockpair_unpack_dir,
     FD_SOCKETPAIR_MARK,
 )
+# U-socket: read/write/close on a connected AF_INET SOCK_STREAM fd
+# routes through the real in-kernel TCP stack. tcp.ad is an import
+# leaf (it pulls in ip/eth/arp/virtio_net but never fs/vfs.ad), so no
+# cycle. u_socket_state.ad is the per-socket-fd backing-record store —
+# also a leaf — shared with linux_abi/u_syscalls.ad's socket(2)/
+# connect(2) bodies.
+from drivers.net.tcp import tcp_send, tcp_recv, tcp_close
+from linux_abi.u_socket_state import (
+    usock_record_for_fdbuf, usock_get_state, usock_get_tcp_slot,
+    usock_set_state, usock_set_tcp_slot, usock_free,
+    USOCK_CONNECTED, USOCK_CLOSED,
+)
 from fs.fat import (
     is_fat_path, strip_mnt_prefix, fat_open, fat_close,
     fat_open_first_cluster, fat_open_size, fat_read, fat_listdir,
@@ -1306,6 +1318,31 @@ def vfs_fd_is_socket(fd: int32) -> int32:
     return 0
 
 
+def vfs_socket_fd_set_record(fd: int32, fdbuf: uint64) -> int32:
+    # U-socket: stash the encoded u_socket_state record id (produced
+    # by usock_fdbuf_for_record) into a socket fd's per-task fd_buf.
+    # linux_abi/u_syscalls.ad's socket(2) handler calls this after it
+    # has allocated both the fd and the backing record — fd_buf can't
+    # be reached from u_syscalls.ad directly because the fd table is
+    # per-task private state. Returns 0 on success, -EBADF if `fd` is
+    # not a live socket fd.
+    if vfs_fd_is_socket(fd) == 0:
+        return EBADF
+    task: Ptr[TaskStruct] = current_task()
+    task[0].fd_buf[cast[uint64](fd)] = fdbuf
+    return 0
+
+
+def vfs_socket_fd_get_record(fd: int32) -> uint64:
+    # U-socket: read back the encoded record id from a socket fd's
+    # fd_buf. Returns 0 (== "no record") for a non-socket / closed fd
+    # so the caller's usock_record_for_fdbuf decode yields -1.
+    if vfs_fd_is_socket(fd) == 0:
+        return 0
+    task: Ptr[TaskStruct] = current_task()
+    return task[0].fd_buf[cast[uint64](fd)]
+
+
 def vfs_fd_is_open(fd: int32) -> int32:
     # U35: poll(2) needs to distinguish "valid fd" from "fd not open"
     # (returns POLLNVAL for the latter). Returns 1 if the fd slot is
@@ -1543,11 +1580,30 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # /dev/null reads always return EOF.
         return 0
     if file_idx == FD_SOCKET_MARK:
-        # U35: AF_UNIX stub socket fds. No peer is ever attached on
-        # Hamnix (connect(2) returns -ECONNREFUSED), so a read always
-        # sees end-of-stream. Linux returns EOF (0) on a connected
-        # socket whose peer has shut down — same shape here.
-        return 0
+        # U-socket: a socket fd backed by a live TCP connection routes
+        # read(2) into the real stack via tcp_recv. fd_buf carries the
+        # u_socket_state record id (encoded +1; 0 == no record). A
+        # socket that was created but never connect()'d — or one whose
+        # connect() failed, or one already closed — has no TCP slot and
+        # reads as immediate EOF (the same answer the U35 stub gave).
+        sk_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
+        if sk_rec < 0:
+            return 0
+        if usock_get_state(sk_rec) != USOCK_CONNECTED:
+            return 0
+        sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
+        if sk_tcp < 0:
+            return 0
+        # 500 jiffies (~5 s @ HZ=100) blocking budget — generous for a
+        # local server, bounded so a dead peer can't wedge the syscall.
+        # tcp_recv polls virtio_net internally; on a connected socket
+        # it returns >0 bytes, 0 on peer-FIN-with-no-data (EOF), or -1
+        # on a hard transport error. We latch CLOSED on the EOF/error
+        # answers so a subsequent read short-circuits.
+        n_sk: int64 = tcp_recv(sk_tcp, buf, count, 500)
+        if n_sk <= 0:
+            usock_set_state(sk_rec, USOCK_CLOSED)
+        return n_sk
     if file_idx == FD_DEVZERO_MARK:
         # /dev/zero hands back `count` zero bytes per request.
         i: uint64 = 0
@@ -1863,12 +1919,36 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # into this seat without another vfs.ad edit.
         return devproc_write(file_idx, buf, count)
     if file_idx == FD_SOCKET_MARK:
-        # U35: stub AF_UNIX socket — no kernel-side routing, no peer.
-        # Pretend the bytes were sent (the unread peer-side buffer is
-        # irrelevant since nothing ever reads from it). Returning the
-        # full count keeps glibc write loops moving instead of
-        # spinning on a short-write retry.
-        return cast[int64](count)
+        # U-socket: a socket fd backed by a live TCP connection routes
+        # write(2) into the real stack via tcp_send. fd_buf carries the
+        # u_socket_state record id (+1 encoded). A socket that was
+        # never connect()'d has no TCP slot — Linux returns -ENOTCONN
+        # for write on an unconnected stream socket; we don't have that
+        # errno wired, so -EPIPE is the closest fit (also what a
+        # closed-peer write returns). tcp_send truncates each segment
+        # at TCP_MSS, so loop until the whole buffer drains.
+        sk_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
+        if sk_rec < 0:
+            return cast[int64](EPIPE)
+        if usock_get_state(sk_rec) != USOCK_CONNECTED:
+            return cast[int64](EPIPE)
+        sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
+        if sk_tcp < 0:
+            return cast[int64](EPIPE)
+        sk_sent: uint64 = 0
+        while sk_sent < count:
+            chunk_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](buf) + sk_sent)
+            sk_rc: int64 = tcp_send(sk_tcp, chunk_ptr, count - sk_sent)
+            if sk_rc <= 0:
+                # Transport error / peer gone. Latch CLOSED. Report a
+                # short count if some bytes already made it, else EPIPE.
+                usock_set_state(sk_rec, USOCK_CLOSED)
+                if sk_sent > 0:
+                    return cast[int64](sk_sent)
+                return cast[int64](EPIPE)
+            sk_sent = sk_sent + cast[uint64](sk_rc)
+        return cast[int64](sk_sent)
     if file_idx == FD_BUFFER_MARK:
         # procfs files are read-only at this scale; writes here are
         # never meaningful so return -EROFS for parity with how Linux
@@ -2059,6 +2139,19 @@ def vfs_close(fd: int32) -> int32:
         sp_slot: int32 = sockpair_unpack_slot(sp_pkd)
         sp_dir:  int32 = sockpair_unpack_dir(sp_pkd)
         sockpair_close(sp_slot, sp_dir)
+    # U-socket: an AF_INET socket fd carrying a live TCP connection
+    # must tear that connection down (FIN handshake via tcp_close)
+    # and release its backing record BEFORE close_fd_in_task wipes the
+    # fd_buf that points at the record. close_fd_in_task knows nothing
+    # about FD_SOCKET_MARK records (core.ad is off-limits here), same
+    # rationale as the FD_P9_MARK / FD_SOCKETPAIR_MARK arms above.
+    if file_idx == FD_SOCKET_MARK:
+        sk_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
+        if sk_rec >= 0:
+            sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
+            if sk_tcp >= 0:
+                tcp_close(sk_tcp)
+            usock_free(sk_rec)
     # /proc/<pid>/<file> fds carry no per-fd backing — devproc_close
     # is a no-op success today (kept as a hook so future per-fd
     # snapshot support can land without re-plumbing the close path).

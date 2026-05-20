@@ -296,9 +296,30 @@ follow-ups:
   explicit accept queue per listener or a wider TCB table.
 - TCP window scaling + SACK + timestamps — performance options; not
   blockers for `apt`'s short single-segment requests.
-- Socket(2) API — `tcp_connect`/`tcp_listen`/`tcp_accept` are
-  callable only from in-kernel code paths; the Plan 9 `/net/tcp/clone`
-  shape (announce/listen/accept files) lands in Phase F.
+- Socket(2) API — V0 done: userland `socket`/`connect`/`write`/`read`/
+  `close` on an `AF_INET` + `SOCK_STREAM` fd are bridged to the
+  in-kernel TCP stack (`linux_abi/u_socket_state.ad` backing records;
+  the `_u_socket`/`_u_connect` bodies + `fs/vfs.ad`'s `FD_SOCKET_MARK`
+  read/write/close arms). `scripts/test_u_socket.sh` proves a user
+  binary completes a real TCP request/response. V1 backlog:
+  - Server side — `bind`/`listen`/`accept` still stubbed. The TCP
+    stack already has `tcp_listen`/`tcp_accept`; wire `bind` to record
+    the port, `listen` to call `tcp_listen`, `accept` to return
+    `tcp_accept`'s slot as a fresh socket fd.
+  - Non-blocking sockets / `O_NONBLOCK` — `socket` masks
+    `SOCK_NONBLOCK` off today; connect/read/write always block (poll
+    with a bounded deadline). Needs an `EAGAIN`-on-would-block path.
+  - `select`/`poll` on socket fds — `poll(2)` reports every open fd as
+    `POLLIN`-ready; a socket fd should consult the tcp slot's rx ring.
+  - UDP sockets (`SOCK_DGRAM`) — rejected with `-EPROTONOSUPPORT` in
+    V0; needs a `udp.ad` send/recv bridge.
+  - IPv6 (`AF_INET6`) — rejected with `-EAFNOSUPPORT`.
+  - `getsockopt`/`setsockopt` beyond no-op (e.g. real `SO_ERROR`,
+    `TCP_NODELAY`).
+  - Socket fds left open at task exit leak their TCP slot —
+    `close_fd_in_task` doesn't know about `FD_SOCKET_MARK` records.
+  - The Plan 9 `/net/tcp/clone` shape (announce/listen/accept files)
+    is the separate Phase F design.
 - HTTPS / TLS — TLS 1.2 fallback for old servers (a single-codepath
   ECDHE-RSA-AES128-GCM fallback for mirrors behind ancient stacks).
 - HTTP keep-alive (`Connection: keep-alive`) — every GET opens a

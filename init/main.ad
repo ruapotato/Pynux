@@ -126,6 +126,7 @@ from drivers.net.tcp import (
 )
 from drivers.net.http import http_init, http_get, https_get
 from drivers.net.tls import tls_init
+from linux_abi.u_socket_state import usock_init
 from fs.cpio import cpio_init, initramfs_entry_count, initramfs_entry_name
 from kernel.block.blk import (
     blk_read_sectors, blk_write_sectors, find_blockdev, blk_scan_partitions,
@@ -1730,6 +1731,12 @@ def start_kernel():
 
     # Initialise the VFS fd table BEFORE any user task issues SYS_OPEN.
     vfs_init()
+
+    # Reset the per-socket-fd backing-record pool (linux_abi/
+    # u_socket_state.ad). BSS is already zero so this is defensive —
+    # it gives socket(2)/connect(2) a known-clean record table before
+    # any Linux-ABI user binary issues its first socket call.
+    usock_init()
 
     # --- HTTPS local smoke (TLS 1.3) gated on cpio marker -----
     # Runs only when scripts/test_net_https.sh planted /etc/tls-test
