@@ -99,8 +99,15 @@ else
 fi
 
 # Secondary: arg[0] is non-empty — argv[0] resolves to a real string.
-if grep -E -q '^  arg\[0\]=.+$' "$LOG"; then
-    arg0_line=$(grep -E '^  arg\[0\]=.+$' "$LOG" | head -1)
+# The kernel's early_putc stamps every console line with a monotonic
+# "[NNNNNN] " sequence prefix (commit e664fd3), so the fixture's
+# "  arg[0]=..." line lands on serial as "[000249]   arg[0]=...".
+# Allow that optional log prefix before the two-space-indented marker
+# so the anchor stays strict (real indent + non-empty value) without
+# being defeated by the line stamp.
+arg0_re='^(\[[0-9]{6}\] )?  arg\[0\]=.+$'
+if grep -E -q "$arg0_re" "$LOG"; then
+    arg0_line=$(grep -E "$arg0_re" "$LOG" | head -1)
     echo "[test_u16_argv] OK: $arg0_line"
 else
     echo "[test_u16_argv] MISS: 'arg[0]=<non-empty>' — argv[0] string didn't resolve"
