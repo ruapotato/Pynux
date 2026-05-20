@@ -1,13 +1,13 @@
 ---
 name: feedback-working-agreements
-description: "How to collaborate on Pynux — language-extension discipline, commit discipline"
+description: "How to collaborate on Hamnix/Adder — language-extension discipline, commit discipline, fix-at-the-right-layer"
 metadata: 
   node_type: memory
   type: feedback
   originSessionId: fe0d7e45-ec05-4c40-bb83-081a2ddfe24d
 ---
 
-Working agreements for the Hamnix kernel-rewrite work (see [[project-kernel-pivot]]):
+Working agreements for the Hamnix kernel-rewrite work:
 
 - **Propose a language extension before working around an awkward kernel idiom in user code.** The language is meant to grow.
   - **Why:** Hamnix/Adder is being co-designed with the kernel port; awkwardness is signal, not noise.

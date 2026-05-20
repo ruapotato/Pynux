@@ -10,32 +10,6 @@ metadata:
 Known Adder compiler quirks surfaced during Hamnix kernel work. Real
 bugs to file, but in the meantime the workarounds are stable.
 
-## Nested class-instance fields — UNVERIFIED (2026-05-18, V2 agent claim)
-
-The V2 RSA-PSS agent at commit `3c4f152` reported that
-`class RsaPubkey { modulus: Bigint, exponent: Bigint }` had the
-exponent's writes aliasing into the modulus's tail. Worked around by
-flattening RsaPubkey to raw byte buffers + holding live bigints in
-module-scope scratch.
-
-**Attempted reproduction** (orchestrator, same day): minimal repro at
-`tests/test_compiler_nested_class_fields.ad` — two nested
-`Inner { data: Array[8, uint64] }` inside `Outer` — **PASSES**. The
-simple case is sound. The V2 agent's symptom may have been:
-- The OTHER bug they flagged: `_bigint_normalize` not scanning
-  high-limb-down after add/shl1 pushed carry past cached `n_limbs`.
-  This produces "numerically correct limbs but renders as zeros"
-  which looks aliasing-shaped at the byte boundary.
-- A subtler shape issue requiring 64×uint64 + uint64 (Bigint shape)
-  to trip. The fixture extension attempt with that shape stalled on
-  a parser issue and was not pursued further.
-
-**How to apply:** don't propagate the workaround to new code without
-reproducing the failure first. If a future kernel module hits the
-symptom, extend `test_compiler_nested_class_fields.ad` with the
-specific shape that fails — that's the regression-test discipline
-from M16.137 working as intended.
-
 ## ~~Ptr[int32] writes to `&local` get clobbered~~ FIXED 2026-05-18
 
 Was: scalar locals (int8/int16/int32) always stored with `movq` (8 bytes)
@@ -75,30 +49,45 @@ was available; V2.75 is on the queue to correct it.
 only if there's a concrete reason (interrupt-context alloc, OOM
 guarantee, very tight count bound that benefits the simpler code).
 
-## Nested fixed-size Array locals across call frames (U9, 2026-05-16)
+## ~~Nested fixed-size Array locals across call frames (U9)~~ DEAD — verified 2026-05-20
 
-Pattern that fails:
-  - `def foo()` declares `local: Array[256, uint8]`
-  - `def bar()` declares `local: Array[256, uint8]`
-  - `foo()` calls `bar()` with byte-pointer args derived from foo's local
-  - bar's `resolve_path` (which itself uses `Array[256, uint8]`) errors -ENOENT
+U9 is **not a live bug.** A core-stabilization agent built a reproducer
+with the full structural shape (caller Array → writer frame → recursion
+into a third Array normaliser → reader frame) — it PASSES — then did the
+definitive test: reverted `_u_openat`'s hand-inlined body to a plain
+`_u_open()` call (the exact pattern the U9 note said failed with
+-ENOENT), rebuilt, ran `test_u9_access.sh` → openat still PASSES.
 
-This is NOT a memory-corruption bug in `resolve_path` — the path bytes
-are intact (verified by dereferencing via printk). It's a frame-layout
-spill interaction in the Adder compiler.
+U9 was a downstream symptom of two codegen defects fixed *after* the
+original note: `224051b` (`&arr[i][j]` address-of) and `18534b2` (sized
+sub-8-byte scalar local store/load) — both documented as FIXED in their
+own sections above. No compiler change was needed. The dead `_u_openat`
+inline workaround was removed (`88320cf` → on `main` as `e8be7f6`); the
+`nested_frame_array` compiler fixture was upgraded to the cross-frame
+writer/reader shape.
 
-**Why:** Likely the compiler reuses stack slots across nested fixed-
-size Array locals without accounting for the call boundary, or the
-spill code path for byte-pointer args derived from a stack-resident
-Array gets clobbered when bar() also declares one.
+**How to apply:** nested fixed-size `Array` locals across call frames
+work — do NOT inline callees or hoist arrays to top-level BSS to dodge
+U9. If a NEW report claims a U9-shaped failure, suspect a fresh
+address-of or sized-store regression and fix codegen, don't work around.
 
-**How to apply:** When you'd write `def caller(): local: Array[N, u8];
-... callee(&local[0])` and `callee` itself has a same-shape Array,
-prefer **inlining the callee's body** into the caller instead of
-calling it. See `_u_openat` in `linux_abi/u_syscalls.ad` for the
-reference fix — it inlines the `resolve_path` + `vfs_open` shape
-instead of calling `_u_open`. Once the compiler bug is fixed this
-workaround can be undone.
+## ~~No string-literal-initialised globals~~ FIXED 2026-05-20 (`300e62e` → `61176e3`)
+
+Was: a global could not be initialised with a string literal —
+`name: Array[N, uint8] = "..."` raised `CodeGenError`; `gen_data()`'s
+`emit_init` only accepted `IntLiteral`. Strings were materialised inline
+at every use site (the `_init_*()` runtime-fill idiom in TLS / x509 /
+many drivers).
+
+Fixed in `compiler/codegen_x86.py` `emit_init`: a `StringLiteral`
+initialiser now emits its bytes as `.ascii` + `.zero` padding to the
+declared array length (1-byte element type required; overflow rejected).
+Purely additive — `IntLiteral` globals unchanged. Regression fixture:
+`tests/test_compiler_string_global.ad`.
+
+**How to apply:** `name: Array[N, uint8] = "literal"` works now. The
+existing `_init_*()` runtime-fill workarounds are dead but were left in
+place (correctness-neutral) — removing them is queued repo-wide cleanup.
 
 ## Reserved identifiers
 

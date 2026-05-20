@@ -1,20 +1,26 @@
 # Project Memory Index
 
-- [Project direction: Linux kernel rewrite](project_kernel_pivot.md) — Pynux pivoted from MCU OS to incremental x86_64 Linux kernel rewrite via .ko modules
-- [Working agreements](feedback_working_agreements.md) — how language extensions land, commit discipline, propose-extension-first rule
-- [Adder compiler quirks](feedback_compiler_quirks.md) — known compiler bugs + stable workarounds (Array-in-nested-frames, no string concat)
-- [Compiler architecture state](project_compiler_state.md) — CPython-hosted, hand-written Thumb-2 backend; x86_64 backend is new work
-- [x86_64 backend decision](project_x86_backend_decision.md) — hand-written encoder (codegen_x86.py), NOT LLVM; decided 2026-05-14
-- [M1 complete](project_m1_complete.md) — hello-world .ko works end-to-end; where the kernel/busybox caches live; gotchas baked into scripts
-- [M2 complete](project_m2_complete.md) — pure-Pynux 16550A console driver registered with the kernel; compiler features delta from M1
-- [M3 partial](project_m3_complete.md) — M3.1 /proc/pynux/state + M3.2 /dev/pynuxdisk shipped; M3.3 ramfs / M3.4 virtio-blk deferred
-- [Subsystem coverage state](project_coverage_state.md) — current breadth: 23 Pynux kernel modules across M1..M8
-- [M16.1 boot path](project_m16_boot.md) — Pynux now compiles its own bootable kernel image; QEMU multiboot1 → long mode → start_kernel() banner; key gotchas (elf32-i386 wrapper, .pgtables outside .bss)
-- [M16.69 state](project_m16_state.md) — current bare-metal kernel snapshot: ext4 r/w + 40 user binaries + /etc + /dev/null + RTC + hamsh $? — ~21 integration tests
-- [Install roadmap](project_install_roadmap.md) — FAT32 read + EXT4 read/write + block-write DONE; UEFI outstanding for real-hardware boot
+## Project direction & state
 - [Endgame: Linux ABI + Debian distro](project_endgame.md) — L-series (kernel ABI) → U-series (userspace ABI) → NVIDIA → ship as a real distro consuming Debian repos
+- [Endgame cadence](project_endgame_cadence.md) — multi-day autonomous run: hourly cron + up to 2 parallel agents, until "everything debugged"
+- [x86_64 backend decision](project_x86_backend_decision.md) — Adder's backend is a hand-written x86_64 encoder (codegen_x86.py), NOT LLVM
+- [M16 boot path](project_m16_boot.md) — boot history; kernel is now elf64-x86-64, higher-half @0xffffffff80000000, tests boot via an ISO shim
+- [Real-hardware boot](project_real_hw_boot.md) — boots on a real Asus laptop in both Legacy/BIOS and UEFI (2026-05-20); remaining gap: no keyboard input
+- [fork() — RESOLVED](project_fork_broken.md) — fork() now gives the child a real private per-process address space (eager-copy, b8e0398); COW is the remaining optimization
+- [VMA MAX_ORDER — RESOLVED](project_vma_maxorder_limit.md) — VMA allocator backs >4 MiB allocs with multiple buddy chunks (b8e0398); 8 MiB glibc pthread stacks work
+- [Core stabilization](project_core_stabilization.md) — ongoing: hunt agent-introduced workarounds and patch them out of the core fundamentally
+- [Plan 9 pivot](project_plan9_pivot.md) — per-process namespaces / 9P model; V4.1 (kernel↔userland 9P real-fd) and V4.2 (rio-shape server) still pending
+- [Rio open questions](project_rio_open_questions.md) — design Qs from docs/rio.md pending user input before the rio GUI is built
+
+## Working with this codebase
+- [Working agreements](feedback_working_agreements.md) — propose language extensions over user-code workarounds; fix bugs at the right layer; small commits that boot
+- [Adder compiler quirks](feedback_compiler_quirks.md) — compiler bug log; U9 nested-Array & string-literal globals FIXED; adjacent string-concat still unsupported
+- [Fix don't catalogue](feedback_fix_dont_catalogue.md) — fix root causes then and there; pay back tech debt found; don't accumulate "X is broken" reports
+- [Fix the language layer](feedback_fix_the_language_layer.md) — recurring agent hiccups get fixed in the Adder compiler, not worked around; keep the language simple
+- [Build hygiene](feedback_build_hygiene.md) — verify on clean builds; _build_lock.sh auto-wipes compiled outputs per test; don't kill -9 builds
+- [Sweeping single-agent jobs](feedback_sweeping_agents.md) — for large architectural topics, dispatch one agent with whole-worktree authority; don't fragment
+- [Agent git discipline](feedback_agent_git_discipline.md) — agents work in isolation:worktree; orchestrator is sole writer to main; agents never edit README/TODO/CLAUDE
+- [Agent test scope](feedback_agent_test_scope.md) — agents run the test that targets their change; orchestrator runs broad verification at cherry-pick time
+- [Agent worktree paths](feedback_agent_worktree_paths.md) — isolation:worktree agents edit their own worktree, never absolute /home/david/Hamnix paths
 - [Plan 9 namespace framing](feedback_plan9_namespace_framing.md) — no global root; namespaces are per-process bindings to file servers, not sandboxed views
-- [Endgame cadence](project_endgame_cadence.md) — multi-day (~7d) autonomous run: hourly cron + 2..8 parallel agents, no near-term stop, until "everything debugged"
-- [Plan 9 pivot](project_plan9_pivot.md) — 2026-05-18: all non-9P work paused until V0..V4 land; shelved worktree branches mineable later
-- [Rio open questions](project_rio_open_questions.md) — 4 design Qs from docs/rio.md pending user input before V4 GUI implementation
-- [Agent git discipline](feedback_agent_git_discipline.md) — every dispatched agent uses isolation:worktree; orchestrator is sole writer to main; agents must never edit README.md/TODO.md/CLAUDE.md
+- [Distro namespace](feedback_distro_namespace.md) — Linux-binary shims run in a distro-shaped namespace served by a userland distrofs 9P daemon; no global paths

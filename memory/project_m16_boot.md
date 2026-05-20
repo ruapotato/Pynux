@@ -1,10 +1,23 @@
 ---
 name: project-m16-boot
-description: "M16 — Pynux compiles its own bootable kernel image (vmlinux-equivalent). M16.1-7 shipped 2026-05-15: boot, IDT, memblock, per-CPU, PIT timer, cooperative scheduler, printk."
+description: "M16 boot history (2026-05-15, Pynux-era). PARTLY SUPERSEDED 2026-05-20: kernel is now elf64-x86-64, higher-half at 0xffffffff80000000 — the elf32 'decisions' below are stale."
 metadata: 
   node_type: memory
   type: project
   originSessionId: fe0d7e45-ec05-4c40-bb83-081a2ddfe24d
+---
+
+**SUPERSEDED IN PART 2026-05-20.** The kernel was relocated to the
+higher half (`0xffffffff80000000`, PML4 entry 511) and the boot format
+changed from `elf32-i386` to `elf64-x86-64` — commits `406c313` +
+`da065ec` on `main`. This INVALIDATES the elf32 items in "Non-obvious
+decisions" below: the build is now elf64 (`as --64`, `ld -m elf_x86_64`),
+`.quad sym` / `movabsq` ARE now used, the linker script has a LMA/VMA
+split with a low boot region + high-half kernel, and QEMU's multiboot1
+`-kernel` can't load it — tests boot via a BIOS-GRUB-ISO PATH shim
+(`scripts/_kernel_iso.sh`). The `.pgtables`-outside-`.bss` rule still
+holds. The M16.1-7 milestone history below is kept as history only.
+
 ---
 
 M16 is the pivot from "Pynux as .ko modules inside stock Linux" (M1..M15)
@@ -158,5 +171,4 @@ codegen change).
   (replace hardcoded 2..240 MiB range with e820-equivalent walk).
 - M16.12: ACPI tables (madt for SMP, fadt for shutdown).
 
-Related: [[project-kernel-pivot]], [[project-coverage-state]],
-[[project-x86-backend-decision]].
+Related: [[project-x86-backend-decision]], [[project-real-hw-boot]].
