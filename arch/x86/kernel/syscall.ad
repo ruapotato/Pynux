@@ -621,11 +621,15 @@ def do_execve(a0: uint64, a1: uint64, a2: uint64) -> int64:
     # same CR3 — the BSP identity map for [0x400000, 0x600000) is
     # still cached as a 1 GiB entry and would shadow the new finer
     # mapping otherwise.
+    # The collision guard in elf_install_user_mapping refuses BEFORE
+    # mutating the PML4, so a < 0 return here leaves cur_pml4 intact —
+    # the current task survives the -ENOEXEC return instead of the box
+    # freezing on a half-built address space.
     cur_pml4: uint64 = task_pml4(cast[int32](current_idx_get()))
     if elf_apply_last_user_mapping(cur_pml4) < 0:
-        printk0("execve: user-mapping install failed\n")
-        set_current_errstr("execve: out of memory")
-        return cast[int64](-12)            # -ENOMEM
+        printk0("execve: user-mapping install failed (kernel-image collision?)\n")
+        set_current_errstr("execve: cannot map binary")
+        return cast[int64](-8)             # -ENOEXEC
     load_cr3(cur_pml4)
     # Fresh user stack for the new program. The previous user
     # stack page is leaked for now (no per-task ustack tracking
@@ -1191,10 +1195,19 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # loaded — no explicit TLB flush needed; the load_cr3 in
         # schedule() will do it when the child first runs. ET_DYN
         # binaries make this a 0-return no-op.
+        #
+        # A < 0 return means the overlay was refused — either OOM, or
+        # (the common case for fixed-address ET_EXEC binaries linked at
+        # 0x400000) a collision with the kernel image. The task slot was
+        # ALREADY created above and is STATE_READY: if we just returned
+        # the error, schedule() would still pick the half-built task,
+        # load_cr3 to its broken PML4, and freeze the box. Reap the slot
+        # back to STATE_FREE first so the failure is clean + survivable.
         if elf_apply_last_user_mapping(task_pml4(slot)) < 0:
-            printk0("spawn: user-mapping install failed\n")
-            set_current_errstr("spawn: out of memory")
-            return cast[uint64](-12)           # -ENOMEM
+            printk0("spawn: user-mapping install failed; task slot reaped\n")
+            task_reap(slot)
+            set_current_errstr("spawn: cannot map binary (kernel-image collision?)")
+            return cast[uint64](-8)            # -ENOEXEC
         # U5: SYS_SPAWN runs in the parent's context. If the loaded
         # image is a Linux-ABI ELF, flip is_linux_userspace on the
         # *child* slot (not current) so the new task's syscalls route

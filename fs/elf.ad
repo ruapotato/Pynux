@@ -63,6 +63,16 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def load_cr3(value: uint64)
 extern def get_bsp_cr3() -> uint64
+# __bss_end from the linker — the first byte past the kernel image.
+# The kernel runs identity-mapped over [KERNEL_IMAGE_BASE, this).
+extern def kernel_image_end() -> uint64
+
+# Physical/virtual base the bare-metal kernel image is linked + loaded
+# at (arch/x86/boot/header.S multiboot entry; ELF p_vaddr of the first
+# LOAD segment). The kernel's .text/.rodata/.data/.bss all live in
+# [KERNEL_IMAGE_BASE, kernel_image_end()) and are reached at their
+# identity virtual address from CPL=0 code.
+KERNEL_IMAGE_BASE: uint64 = 0x100000
 
 
 PT_LOAD:    uint32 = 1
@@ -825,6 +835,38 @@ def elf_install_user_mapping(pml4_phys: uint64, vlow: uint64,
         return -1
     if (vhigh & (PAGE_SIZE_4K - 1)) != 0:
         printk0("elf_install_user_mapping: vhigh not 4 KiB-aligned\n")
+        return -1
+
+    # --- Kernel-image collision guard --------------------------------
+    # The overlay re-points [vlow, vhigh) at `phys_base` inside the
+    # target task's PML4. The Hamnix kernel itself runs identity-mapped
+    # over [KERNEL_IMAGE_BASE, kernel_image_end()) — its .text/.rodata/
+    # .data/.bss (and task_table, current_idx, every printk format
+    # string) are reached at their identity virtual address from CPL=0.
+    #
+    # If a fixed-address ET_EXEC binary's [vlow, vhigh) overlaps that
+    # range, then the instant schedule() does load_cr3(child_cr3) the
+    # kernel's own data/rodata vanish behind the user binary's pages —
+    # the next kernel read of a global or format string returns the
+    # user image's bytes, the kernel jumps through garbage, and the box
+    # silently freezes with interrupts effectively dead. No trap, no
+    # log: the worst possible failure mode.
+    #
+    # Standard Linux x86_64 -no-pie binaries link at 0x400000, which is
+    # squarely inside the Hamnix kernel image (currently ~12 MiB from
+    # 0x100000). Such a binary fundamentally cannot run under the
+    # current identity-mapped-low-half kernel layout — the real fix is
+    # a higher-half kernel so the entire low canonical half is free for
+    # userspace. Until that lands, REFUSE the install cleanly: the
+    # caller (SYS_SPAWN / SYS_EXECVE) turns -1 into -ENOEXEC and the
+    # system stays alive + diagnosable instead of dead-freezing.
+    kern_end: uint64 = kernel_image_end()
+    if vlow < kern_end and vhigh > KERNEL_IMAGE_BASE:
+        printk2("elf_install_user_mapping: user range [%p, %p)\n",
+                vlow, vhigh)
+        printk2("  collides with kernel image [%p, %p) — REFUSED\n",
+                KERNEL_IMAGE_BASE, kern_end)
+        printk0("  (fixed-address ET_EXEC needs a higher-half kernel)\n")
         return -1
 
     # Confine to one PML4 entry + one PDPT entry. The 1 GiB chunk
