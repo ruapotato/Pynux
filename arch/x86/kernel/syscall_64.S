@@ -78,15 +78,23 @@ syscall_entry:
     /* Save all 6 user-arg regs + nr. Linux's x86_64 syscall ABI says
      * %rdi/%rsi/%rdx/%r10/%r8/%r9 are preserved across SYSCALL.
      * Musl's __lockfile spin loop holds &f->lock in %rdi across
-     * FUTEX_WAIT and re-CASes after wake — so %rdi MUST be preserved
-     * for musl pthread mutex contention to work.
+     * FUTEX_WAIT and re-CASes after wake — and musl's open()/opendir()
+     * keep the just-opened fd in %rdi across the trailing
+     * fcntl(F_SETFD,FD_CLOEXEC) syscall and the call to __syscall_ret.
+     * So %rdi MUST be restored to the caller's value on EVERY syscall
+     * exit, exactly as %rsi/%rdx/%r10/%r8/%r9 already are.
      *
-     * However: our static-pie glibc-2.39 binaries trip a search-path
-     * malloc failure path when %rdi is preserved past arch_prctl etc.
-     * (root cause unidentified — may be a Hamnix-build quirk; reproduces
-     * deterministically). Workaround: preserve %rdi ONLY for FUTEX
-     * (nr=202); zero it for every other syscall. We stash nr at entry
-     * and branch on it at exit.
+     * (Historical note: U27 zeroed %rdi for non-FUTEX exits as a
+     * workaround for a glibc-2.39 static-pie startup failure whose
+     * root cause was never identified. That zeroing is an x86_64
+     * SYSCALL-ABI violation: it corrupted the fd musl's opendir()
+     * holds in %rdi across fcntl(), so musl's open() returned 0 and
+     * busybox `ls` enumerated nothing. The glibc failure no longer
+     * reproduces — u_glibc_hello / u_glibc_idprobe pass with %rdi
+     * preserved — so the workaround has been removed. Verified
+     * non-regressing across fork (test_u26), busybox ls (test_u32,
+     * now XPASS), musl pthreads (test_u27), signals, and the full
+     * compiler suite.)
      *
      * Push order is the reverse of pop order. 8 pushes (6 args + nr +
      * pad) keep `call` 16-byte aligned with the subsequent pad + a5. */
@@ -117,25 +125,17 @@ syscall_entry:
     /* Reclaim the 16 bytes pushed for a5 + alignment pad. */
     addq    $16, %rsp
 
-    /* Pop the second pad we added for nr-stash alignment, then read
-     * stashed nr into %rcx (which we'll overwrite with user RIP
-     * shortly anyway). */
+    /* Drop the second pad we added for nr-stash alignment, then
+     * discard the stashed nr (it was only needed by the old per-nr
+     * %rdi branch; %rdi is now restored unconditionally). */
     addq    $8, %rsp                  /* drop the inner pad */
-    popq    %rcx                      /* %rcx = stashed nr */
-    cmpq    $202, %rcx                /* SYS_futex? */
-    je      .Lrestore_rdi
+    addq    $8, %rsp                  /* drop the stashed nr */
 
-    /* Non-FUTEX path: zero %rdi (matches the prior pre-bisect kernel
-     * behavior that glibc-2.39 static-pie depends on for reasons not
-     * yet understood). Skip the saved %rdi slot. */
-    addq    $8, %rsp                  /* skip saved %rdi */
-    xorq    %rdi, %rdi
-    jmp     .Lrestore_rest
-
-.Lrestore_rdi:
-    popq    %rdi                      /* user a0 — preserved for FUTEX */
-
-.Lrestore_rest:
+    /* Restore the full caller-saved syscall-arg set to the user's
+     * values. The x86_64 SYSCALL ABI guarantees %rdi/%rsi/%rdx/%r10/
+     * %r8/%r9 survive `syscall`; %rax already holds do_syscall's
+     * return value and is intentionally NOT restored. */
+    popq    %rdi                      /* user a0 — restore (ABI) */
     popq    %rsi
     popq    %rdx
     popq    %r10

@@ -28,9 +28,10 @@
  *   up at frame_top with signum at the top of the stack.
  *
  *   On entry:
- *     %rdi: zero (syscall_64.S forces it on the non-FUTEX exit path,
- *           so the signum-in-%rdi convention is restored by the popq
- *           below, NOT inherited from the SYS_kill return slot)
+ *     %rdi: caller's %rdi as restored by syscall_64.S's ABI-correct
+ *           exit path (syscall_64.S no longer zeroes %rdi). Its
+ *           value here is irrelevant: the `popq %rdi` below
+ *           immediately overwrites it with `signum` from our frame.
  *     %rsi..%r11: per the SYSRETQ contract — caller-saved, may carry
  *                stale syscall-return scratch values
  *     RFLAGS: 0x202 (IF=1, reserved bit), forced by SYSRETQ
