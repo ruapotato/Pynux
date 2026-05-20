@@ -30,11 +30,12 @@
 #   The +2.2 MB stripped overhead buys complete self-containment.
 #
 # REQUIRES (build host):
-#   - gcc + make + libc6-dev with static-libc (libc.a) available
+#   - musl-gcc (Debian: apt-get install musl-tools) + make
 #   - wget or curl (to fetch the upstream tarball)
 #   - tar + xz-utils
+#   - host python3.11 (to run Tools/scripts/freeze_modules.py)
 #   - ~500 MB free disk for the source + build tree
-#   - 15-30 minutes wall time on a modern x86_64 host
+#   - 10-20 minutes wall time on a modern x86_64 host
 #
 # If any of those are missing the install target prints a clear SKIP
 # note and exits 0 -- mirrors the U22/U24/U39/U40 fixture pattern so
@@ -42,22 +43,40 @@
 #
 # Output stamping: e_ident[EI_OSABI] is rewritten to ELFOSABI_LINUX
 # (3) so Hamnix's U1 ELF-detect path (elf_is_linux_binary) returns 1
-# unambiguously -- host gcc emits OSABI=0 (SysV) by default.
+# unambiguously -- musl-gcc emits OSABI=0 (SysV) by default.
 #
-# Why "-static" not "-static-pie"?
+# Why musl `-static-pie` (NOT glibc `-static`)?
 #
-# Debian trixie's libpython3.x.a IS built with -fPIC -- but the
-# upstream CPython source's own Modules/_decimal/libmpdec, Modules/zlib,
-# Modules/expat trees compile with the project's CFLAGS, which we set
-# to `-fPIC` here. Even so, a few linker objects (e.g.
-# Programs/_freeze_module.o) end up with R_X86_64_32 relocations that
-# `-static-pie` rejects. Plain `-static` accepts them. Hamnix's ELF
-# loader handles both static and static-pie ELFs (U19); we go with the
-# more robust path.
+# Hamnix's ELF loader (fs/elf.ad) can ONLY run ET_DYN binaries. An
+# ET_EXEC binary linked at the fixed 0x400000 collides with Hamnix's
+# ~12 MiB identity-mapped kernel image and is REFUSED by the
+# kernel-image collision guard added in commit 653d962. So u_cpython
+# MUST be ET_DYN (static-PIE) -- the same ELF shape as the working
+# U39 MicroPython fixture.
 #
-# If a future agent needs static-pie (e.g. for ASLR inside Hamnix),
-# rebuild with `LDFLAGS="-static-pie -fPIE"` and CFLAGS="-fPIC -fPIE".
-# Expect link-time failures unless ALL transitive .o's are PIC.
+# A glibc `-static-pie` build of CPython 3.11 *links* cleanly, but the
+# resulting binary carries 2 dynamic R_X86_64_TPOFF64 relocations
+# (against glibc's own `errno` / `__libc_dlerror_result` TLS symbols,
+# pulled in from libc.a). Debian trixie's glibc 2.41
+# `_dl_relocate_static_pie` mishandles those: it calls
+# `_dl_allocate_static_tls` during early self-relocation, which fails
+# into `_dl_signal_error` BEFORE the error-catch frame exists -- the
+# binary SIGSEGVs before main() even on the host. The working U39
+# MicroPython fixture has ZERO TPOFF64 relocs, which is why it is
+# unaffected.
+#
+# Building CPython with musl-gcc sidesteps the glibc TLS bug entirely:
+# musl 1.2.5's static-pie startup resolves TLS without the buggy
+# `_dl_allocate_static_tls` path. The musl build produces a clean
+# ET_DYN, static-pie, no-PT_INTERP `python` with 0 TPOFF64 relocs that
+# runs both on the host and on Hamnix.
+#
+# Note: CPython 3.11's configure aborts on a "platform triplet"
+# mismatch under musl-gcc (musl-gcc's wrapper reports the host gcc
+# multiarch `x86_64-linux-gnu` while CPython's compiler probe yields
+# `x86_64-linux-musl`). The configure-patch step below neutralises
+# that check the same way Alpine Linux does -- trust the compiler
+# probe's triplet.
 
 PY_VERSION  := 3.11.10
 PY_TARBALL  := Python-$(PY_VERSION).tar.xz
@@ -67,11 +86,12 @@ PY_OUT      := $(PY_SRCDIR)/python
 
 WGET     := $(shell command -v wget 2>/dev/null)
 CURL     := $(shell command -v curl 2>/dev/null)
-GCC      := $(shell command -v gcc 2>/dev/null)
+MUSLGCC  := $(shell command -v musl-gcc 2>/dev/null)
 MAKE_BIN := $(shell command -v make 2>/dev/null)
-HAS_LIBC_A := $(shell test -f /usr/lib/x86_64-linux-gnu/libc.a && echo yes || echo no)
+# host python3.11 is required to run Tools/scripts/freeze_modules.py
+PY311    := $(shell command -v python3.11 2>/dev/null)
 
-.PHONY: all install clean stdlib-path freeze-patch
+.PHONY: all install clean stdlib-path freeze-patch configure-patch
 
 all: hello
 
@@ -115,7 +135,30 @@ assert old2 in s, "freeze_modules.py site section drifted; refresh patch"; \
 s = s.replace(old2, new2); \
 open(p, "w").write(s); \
 print("[cpython] patched freeze_modules.py")'; \
-	    cd $(PY_SRCDIR) && python3.11 ./Tools/scripts/freeze_modules.py; \
+	    cd $(PY_SRCDIR) && $(PY311) ./Tools/scripts/freeze_modules.py; \
+	fi
+
+# Patch the generated `configure` script so building against musl-gcc
+# does not abort on the "platform triplet" check. musl-gcc's wrapper
+# reports the host gcc multiarch (x86_64-linux-gnu) while CPython's
+# compiler-characteristics probe yields x86_64-linux-musl; upstream
+# treats the mismatch as a hard error. Alpine Linux resolves this by
+# trusting the compiler-probe triplet -- we do the same. Idempotent:
+# checks for the sentinel before re-applying.
+configure-patch: $(PY_SRCDIR)/configure
+	@if grep -q "HAMNIX U41: building against musl-gcc" \
+	    $(PY_SRCDIR)/configure; then \
+	    echo "[cpython] configure-patch already applied"; \
+	else \
+	    echo "[cpython] applying Hamnix configure triplet patch"; \
+	    $(PY311) -c 'p = "$(PY_SRCDIR)/configure"; \
+s = open(p).read(); \
+old = "if test x$$PLATFORM_TRIPLET != x && test x$$MULTIARCH != x; then\n  if test x$$PLATFORM_TRIPLET != x$$MULTIARCH; then\n    as_fn_error $$? \"internal configure error for the platform triplet, please file a bug report\" \"$$LINENO\" 5\n  fi\nelif test x$$PLATFORM_TRIPLET != x && test x$$MULTIARCH = x; then\n  MULTIARCH=$$PLATFORM_TRIPLET\nfi"; \
+new = "# HAMNIX U41: building against musl-gcc, whose wrapper reports the\n# host gcc multiarch (x86_64-linux-gnu) while CPython index probe\n# yields x86_64-linux-musl. Trust the compiler-probe triplet.\nif test x$$PLATFORM_TRIPLET != x; then\n  MULTIARCH=$$PLATFORM_TRIPLET\nfi"; \
+assert old in s, "configure platform-triplet block drifted; refresh patch"; \
+s = s.replace(old, new); \
+open(p, "w").write(s); \
+print("[cpython] patched configure")'; \
 	fi
 
 # `hello` is the fixture-target name (matches u_hello / u_python /
@@ -140,61 +183,71 @@ $(PY_SRCDIR)/configure: build/$(PY_TARBALL)
 	cd build && tar xf $(PY_TARBALL)
 	@touch $@
 
-$(PY_OUT): $(PY_SRCDIR)/configure freeze-patch
-ifeq ($(GCC),)
-	@echo "[cpython] SKIP: gcc not on PATH"
+$(PY_OUT): $(PY_SRCDIR)/configure configure-patch freeze-patch
+ifeq ($(MUSLGCC),)
+	@echo "[cpython] SKIP: musl-gcc not on PATH."
+	@echo "[cpython]   apt-get install -y musl-tools  (needs sudo)"
 	@exit 0
 else
-ifeq ($(HAS_LIBC_A),no)
-	@echo "[cpython] SKIP: /usr/lib/x86_64-linux-gnu/libc.a not present."
-	@echo "[cpython]   apt-get install -y libc6-dev  (needs sudo)"
+ifeq ($(PY311),)
+	@echo "[cpython] SKIP: python3.11 not on PATH"
+	@echo "[cpython]   (needed to run Tools/scripts/freeze_modules.py)"
 	@exit 0
 else
-	# Configure CPython for a fully-static build. Key flags:
+	# Configure CPython for a fully-static, position-independent
+	# (static-PIE / ET_DYN) build against musl. Key flags:
+	#   CC=musl-gcc            -- musl, NOT glibc. glibc 2.41's static-pie
+	#                             _dl_relocate_static_pie SIGSEGVs on
+	#                             CPython's R_X86_64_TPOFF64 relocs; musl
+	#                             does not. See the header comment.
+	#   CFLAGS=-fPIE           -- position-independent code for the PIE.
+	#   LDFLAGS=-static-pie    -- produce ET_DYN, statically linked, no
+	#                             PT_INTERP. This is the ONLY ELF shape
+	#                             Hamnix's loader can run for u_cpython
+	#                             (an ET_EXEC @0x400000 collides with the
+	#                             kernel image and is refused).
 	#   --disable-shared       -- no libpython3.x.so; everything in one ELF.
 	#   --without-pymalloc-debug -- trim debug bookkeeping (smaller binary).
 	#   --without-doc-strings  -- drop the ~1 MB of __doc__ tables in stdlib.
 	#   --disable-test-modules -- don't build _testcapi / _testbuffer / ...
-	#                             (they're for CPython's own test suite).
-	#   CFLAGS=-fPIC          -- belt + braces; some PIC-needing libs need it.
-	#   LDFLAGS=-static       -- the actual static link flag.
+	#   --with-system-libmpdec -- use the host libmpdec rather than
+	#                             rebuilding the bundled _decimal tree.
 	#
 	# --enable-optimizations (PGO + LTO) is INTENTIONALLY OMITTED:
-	#   it lengthens the build from ~5 min to ~25 min on a modern host,
-	#   and PGO needs to run the test interpreter which doesn't add up
-	#   for our use case (boot-once-and-exit on Hamnix's serial). If a
-	#   future agent wants a faster runtime + ~5% size cut, append
-	#   `--enable-optimizations` here. Document the trade-off in the
-	#   commit + HOWTO.
-	cd $(PY_SRCDIR) && CFLAGS="-fPIC" ./configure \
+	#   it lengthens the build and PGO needs to run the test interpreter.
+	cd $(PY_SRCDIR) && CC="musl-gcc" CXX="musl-gcc" \
+	    CFLAGS="-fPIE" LDFLAGS="-static-pie" ./configure \
 	    --disable-shared \
 	    --without-pymalloc-debug \
 	    --without-doc-strings \
 	    --disable-test-modules \
-	    LDFLAGS="-static"
-	# Build. Parallel make helps the compile phase; the link is
-	# serial. ~5-10 min on a modern (8+ core) x86_64 host without
-	# PGO; ~25 min if --enable-optimizations is added above.
+	    --with-system-libmpdec
+	# Build. The first `make` links `python`; `regen-frozen` then
+	# bakes the widened FROZEN module set (encodings.* etc.) into
+	# Python/frozen_modules/*.h, and the second `make` re-links the
+	# interpreter with those headers compiled in.
+	$(MAKE_BIN) -C $(PY_SRCDIR) -j$$(nproc)
+	$(MAKE_BIN) -C $(PY_SRCDIR) regen-frozen
 	$(MAKE_BIN) -C $(PY_SRCDIR) -j$$(nproc)
 endif
 endif
 
 install: hello
-ifeq ($(GCC),)
-	@echo "[cpython] SKIP install (no gcc)"
+ifeq ($(MUSLGCC),)
+	@echo "[cpython] SKIP install (no musl-gcc)"
 else
-ifeq ($(HAS_LIBC_A),no)
-	@echo "[cpython] SKIP install (no libc.a)"
+ifeq ($(PY311),)
+	@echo "[cpython] SKIP install (no python3.11)"
 else
 	@if [ ! -f "$(PY_OUT)" ]; then \
 	    echo "[cpython] SKIP install (build failed -- see build log)"; \
 	    exit 0; \
 	fi
 	cp $(PY_OUT) ../../u_cpython
-	# Strip aggressively. With the widened frozen-modules set,
-	# CPython is ~29 MB before strip, ~7.9 MB after. We keep
-	# symbols off the staged binary; the build dir retains the
-	# unstripped copy for debugging.
+	# Strip aggressively. With the widened frozen-modules set the
+	# musl static-pie CPython is ~20 MB before strip, ~9.3 MB after.
+	# We keep symbols off the staged binary; the build dir retains
+	# the unstripped copy for debugging.
 	strip --strip-all ../../u_cpython || true
 	# Stamp e_ident[EI_OSABI] = ELFOSABI_LINUX (3). Same trick the
 	# other u_* fixtures use so the U1 detect path is unambiguous.
