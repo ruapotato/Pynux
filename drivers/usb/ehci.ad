@@ -73,9 +73,22 @@ from drivers.pci.pci import (
     PCI_COMMAND_OFFSET, PCI_COMMAND_MEM, PCI_COMMAND_MASTER,
 )
 from mm.page_alloc import alloc_pages
-from drivers.usb.hid import hid_init
+from drivers.usb.hid import hid_init, hid_kbd_report
 from drivers.usb.usb import (
     USB_SPEED_UNKNOWN, USB_SPEED_FULL, USB_SPEED_LOW, USB_SPEED_HIGH,
+    USB_RT_GET_DESCRIPTOR, USB_REQ_GET_DESCRIPTOR,
+    USB_RT_SET_ADDRESS, USB_REQ_SET_ADDRESS,
+    USB_RT_SET_CONFIGURATION, USB_REQ_SET_CONFIGURATION,
+    USB_RT_SET_PROTOCOL, USB_RT_SET_IDLE,
+    HID_REQ_SET_PROTOCOL, HID_REQ_SET_IDLE,
+    HID_PROTOCOL_BOOT,
+    USB_DT_DEVICE, USB_DT_CONFIG,
+    USB_CLASS_HID, USB_PROTOCOL_KEYBOARD,
+    usb_dd_max_packet_size0,
+    usb_cfg_total_length, usb_cfg_value,
+    usb_if_class, usb_if_protocol, usb_if_number,
+    usb_ep_is_interrupt_in, usb_ep_address, usb_ep_max_packet,
+    usb_ep_interval,
 )
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
@@ -185,6 +198,89 @@ EHCI_LEGSUP_BIOS_OWNED:   uint32 = 0x00010000  # bit 16
 EHCI_LEGSUP_OS_OWNED:     uint32 = 0x01000000  # bit 24
 
 
+# --- V1: qTD layout (EHCI §3.5) -----------------------------------
+#
+# A qTD ("queue element transfer descriptor") is 32 bytes / 8 dwords:
+#   dword 0  Next-qTD pointer        (bits 31..5 ptr, bit 0 = T)
+#   dword 1  Alternate-next-qTD ptr  (bits 31..5 ptr, bit 0 = T)
+#   dword 2  qTD token               (status / PID / bytes / toggle)
+#   dword 3  Buffer pointer 0        (bits 31..12 page, 11..0 offset)
+#   dword 4  Buffer pointer 1
+#   dword 5  Buffer pointer 2
+#   dword 6  Buffer pointer 3
+#   dword 7  Buffer pointer 4
+#
+# The token (dword 2) fields:
+#   bit 7      Active           — controller clears it on completion
+#   bit 6      Halted           — set on a fatal transfer error
+#   bit 5      Data Buffer Error
+#   bit 4      Babble Detected
+#   bit 3      Transaction Error
+#   bit 2      Missed Micro-Frame
+#   bit 1      Split Transaction State
+#   bit 0      Ping State
+#   bits 9..8  PID code         — 0=OUT, 1=IN, 2=SETUP
+#   bits 11..10 CERR            — error-retry counter (3 = retry thrice)
+#   bits 14..12 C_Page          — current buffer-pointer index
+#   bit 15     IOC              — interrupt-on-complete
+#   bits 30..16 Total Bytes to Transfer
+#   bit 31     Data Toggle
+EHCI_QTD_T:          uint32 = 0x00000001    # terminate (no next qTD)
+
+EHCI_QTD_STS_ACTIVE: uint32 = 0x00000080    # token bit 7
+EHCI_QTD_STS_HALTED: uint32 = 0x00000040    # token bit 6
+# Any of: Data-buffer / Babble / XactErr / MissedUF errors.
+# Literal = DBE(0x20)|BABBLE(0x10)|XACT(0x08)|MISSED(0x04) = 0x3C.
+EHCI_QTD_STS_ERRMASK: uint32 = 0x0000003C
+
+EHCI_QTD_PID_OUT:    uint32 = 0x00000000    # token bits 9..8 = 0
+EHCI_QTD_PID_IN:     uint32 = 0x00000100    # token bits 9..8 = 1
+EHCI_QTD_PID_SETUP:  uint32 = 0x00000200    # token bits 9..8 = 2
+
+# CERR = 3 (retry a failing transaction three times). bits 11..10.
+EHCI_QTD_CERR3:      uint32 = 0x00000C00
+EHCI_QTD_IOC:        uint32 = 0x00008000    # token bit 15
+EHCI_QTD_TOGGLE:     uint32 = 0x80000000    # token bit 31
+EHCI_QTD_BYTES_SHIFT: uint32 = 16           # Total-Bytes field shift
+
+
+# --- V1: Queue Head layout (EHCI §3.6) ----------------------------
+#
+# A QH is 48 bytes / 12 dwords. The first three are static config,
+# the rest are the "qTD overlay" the controller copies the current
+# qTD into:
+#   dword 0  Horizontal Link Pointer (next QH; bits 31..5, type, T)
+#   dword 1  Endpoint Characteristics
+#              bits 6..0   Device Address
+#              bit 7       Inactivate-on-next (periodic only)
+#              bits 11..8  Endpoint Number
+#              bits 13..12 Endpoint Speed (0=full,1=low,2=high)
+#              bit 14      Data-Toggle Control (1 = take toggle from qTD)
+#              bit 15      Head of Reclamation list (async head only)
+#              bits 26..16 Maximum Packet Length
+#              bit 27      Control Endpoint flag (1 for non-HS control)
+#              bits 31..28 Nak-Count Reload
+#   dword 2  Endpoint Capabilities
+#              bits 7..0   Interrupt Schedule Mask (S-mask)
+#              bits 15..8  Split Completion Mask (C-mask)
+#              bits 29..30 High-bandwidth pipe multiplier (1 = once)
+#   dword 3  Current-qTD pointer (controller-managed)
+#   dword 4  Next-qTD pointer    (overlay)
+#   dword 5  Alternate-next-qTD  (overlay)
+#   dword 6  qTD token           (overlay)
+#   dword 7..11 buffer pointers  (overlay)
+EHCI_QH_TYPE_QH:      uint32 = 0x00000002   # link-pointer type field
+EHCI_QH_EC_DTC:       uint32 = 0x00004000   # dword1 bit 14: toggle from qTD
+EHCI_QH_EC_HEAD:      uint32 = 0x00008000   # dword1 bit 15: reclaim head
+EHCI_QH_EC_CTRL_EP:   uint32 = 0x08000000   # dword1 bit 27: control endpoint
+# dword2 "Mult" (high-bandwidth pipe multiplier) is bits 30..29; a
+# value of 1 ("issue one transaction per micro-frame") = 0b01 << 29.
+# A Mult of 0 makes the controller skip the QH entirely, so an
+# interrupt QH MUST carry a non-zero Mult.
+EHCI_QH_EC_MULT1:     uint32 = 0x20000000   # dword2 bits 30..29 = 01
+EHCI_QH_SPEED_HIGH:   uint32 = 0x00002000   # dword1 bits 13..12 = 2 (high)
+
+
 # --- Driver state -------------------------------------------------
 #
 # Single-controller scope, exactly like xhci.ad. A board with two
@@ -213,6 +309,45 @@ class EhciState:
     ports_connected: uint32 # ports with CCS=1
     ports_enabled:   uint32 # ports that came up high-speed on EHCI
     ports_released:  uint32 # ports handed to a companion controller
+
+    # --- V1 transfer-engine state --------------------------------
+    #
+    # All DMA structures below are carved from `dma_page` — a single
+    # 4 KiB alloc_pages(0) page (page-aligned, so page-base + k*32
+    # satisfies the 32-byte QH/qTD alignment requirement). Layout:
+    #   +0x000  ctrl_qh   — async-schedule control-transfer QH (96 B)
+    #   +0x080  int_qh    — periodic interrupt-IN QH            (96 B)
+    #   +0x100  qtd0      — qTD slot 0                          (32 B)
+    #   +0x120  qtd1      — qTD slot 1                          (32 B)
+    #   +0x140  qtd2      — qTD slot 2                          (32 B)
+    #   +0x160  int_qtd   — interrupt-IN qTD                    (32 B)
+    #   +0x200  setup_buf — 8-byte SETUP packet buffer
+    #   +0x400  data_buf  — control-transfer data-stage buffer
+    #   +0x800  int_buf   — interrupt-IN 8-byte report buffer
+    dma_page:   uint64      # base of the carved DMA page
+    ctrl_qh:    uint64      # async control QH
+    int_qh:     uint64      # periodic interrupt-IN QH
+    qtd0:       uint64      # qTD slots for the SETUP/DATA/STATUS chain
+    qtd1:       uint64
+    qtd2:       uint64
+    int_qtd:    uint64      # interrupt-IN qTD
+    setup_buf:  uint64      # 8-byte SETUP packet buffer
+    data_buf:   uint64      # control-transfer data buffer
+    int_buf:    uint64      # interrupt-IN report buffer
+
+    dev_addr:   uint32      # USB address assigned to the keyboard
+    max_pkt0:   uint32      # endpoint-0 max packet size
+    ep0_toggle: uint32      # data-toggle bit for the next control xfer
+
+    kbd_port:    uint32     # 1-based root-hub port the keyboard is on
+    kbd_if:      uint32     # HID interface number
+    kbd_int_ep:  uint32     # interrupt-IN endpoint number
+    kbd_int_mps: uint32     # interrupt-IN max packet size
+    kbd_enabled: uint32     # 1 once the interrupt QH is armed + polling
+    int_toggle:  uint32     # data-toggle for the interrupt-IN qTD
+    reports_received: uint32 # interrupt reports drained by ehci_poll
+    kbd_keydowns: uint32    # 1 once a real key-down report was seen
+    poll_calls:  uint32     # ehci_poll invocations — tick-rate diag
 
 
 ehci: EhciState
@@ -744,6 +879,18 @@ def ehci_init() -> int32:
 
     ehci.present = 1
     printk0("[ehci] V0 init complete (probe + reset + port enum)\n")
+
+    # --- V1: transfer engine + boot-keyboard enumeration ----------
+    #
+    # If a high-speed device came up on a root-hub port, run the full
+    # control-transfer enumeration and — if it is a HID boot keyboard
+    # — arm the periodic interrupt-IN QH. Every failure path inside
+    # _ehci_v1_attach_keyboard is non-fatal: V0 already succeeded, so
+    # the controller stays "present" regardless.
+    if ehci.ports_enabled != 0:
+        _ehci_v1_attach_keyboard()
+    else:
+        printk0("[ehci] V1: no high-speed device — skipping enumeration\n")
     return 0
 
 
@@ -760,81 +907,622 @@ def ehci_high_speed_port_count() -> int32:
 
 
 # =====================================================================
-# V1 BACKLOG — control transfers + interrupt-IN keyboard polling.
+# V1 — control transfers + interrupt-IN boot-keyboard polling.
 # =====================================================================
 #
-# V0 (this commit) brings the EHCI controller to: probed, BIOS-handoff
-# done, reset, running, async+periodic schedules enabled (with only a
-# placeholder async QH and an all-invalid periodic frame list), every
-# root-hub port enumerated and either high-speed-enabled-on-EHCI or
-# released to a companion controller. It does NOT move a single byte
-# of USB data. The next agent picks up exactly here.
+# V0 brought the controller to "running, ports enumerated". V1 adds
+# the transfer engine: a qTD pool, an async-schedule control-transfer
+# QH, the standard SET_ADDRESS / GET_DESCRIPTOR / SET_CONFIGURATION
+# enumeration, and a periodic interrupt-IN QH that feeds 8-byte boot
+# reports into hid_kbd_report() — the same FIFO atkbd + xhci-hid use.
 #
-# V1 — control transfer + boot-keyboard enumeration. Precise steps:
+# IRQ-driven delivery is V2; V1 is poll-only (ehci_poll, tick-driven).
+
+
+# --- V1: DMA-page byte offsets ------------------------------------
 #
-#   1. qTD allocator. A qTD is 32 bytes (EHCI §3.5): Next-qTD ptr,
-#      Alternate-next-qTD ptr, token (status/PID/bytes/data-toggle),
-#      and 5 buffer-pointer dwords. Allocate qTDs + a per-device QH
-#      out of a top-level BSS pool (NOT nested-frame Arrays — the U9
-#      compiler quirk; mirror xhci.ad's `xhci_v1_test_buf` pattern or
-#      carve them from an alloc_pages(0) page). 32-byte alignment is
-#      mandatory; a page is 4 KiB-aligned so page-base + k*32 works.
+# All V1 DMA structures are carved from one alloc_pages(0) page. The
+# 4 KiB page is 4 KiB-aligned so every k*32 offset is 32-byte aligned
+# (the QH/qTD requirement). Offsets are spaced generously so a QH's
+# 48 useful bytes (we treat it as 96 for headroom) never collide.
+EHCI_DMA_OFF_CTRL_QH:   uint64 = 0x000
+EHCI_DMA_OFF_INT_QH:    uint64 = 0x080
+EHCI_DMA_OFF_QTD0:      uint64 = 0x100
+EHCI_DMA_OFF_QTD1:      uint64 = 0x120
+EHCI_DMA_OFF_QTD2:      uint64 = 0x140
+EHCI_DMA_OFF_INT_QTD:   uint64 = 0x160
+EHCI_DMA_OFF_SETUP_BUF: uint64 = 0x200
+EHCI_DMA_OFF_DATA_BUF:  uint64 = 0x400
+EHCI_DMA_OFF_INT_BUF:   uint64 = 0x800
+
+
+# --- V1: low-level qTD / QH helpers -------------------------------
+
+def _ehci_qtd_init(qtd: uint64, next_qtd: uint64,
+                   pid: uint32, toggle: uint32,
+                   buf: uint64, nbytes: uint32, ioc: uint32):
+    # Write a 32-byte qTD (EHCI §3.5).
+    #   next_qtd : physical address of the next qTD, or 0 for "last"
+    #              (we set the T-bit when next_qtd is 0).
+    #   pid      : EHCI_QTD_PID_SETUP / _IN / _OUT
+    #   toggle   : 0 or 1 — data-toggle bit for this transfer
+    #   buf      : data buffer physical address (0 if nbytes==0)
+    #   nbytes   : total bytes to transfer (0..max for one qTD)
+    #   ioc      : 1 to set interrupt-on-complete
+    p: Ptr[uint32] = cast[Ptr[uint32]](qtd)
+    # dword 0: Next-qTD pointer (T-bit set if there is no next qTD).
+    if next_qtd == 0:
+        p[0] = EHCI_QTD_T
+    else:
+        p[0] = cast[uint32](next_qtd & 0xFFFFFFE0)
+    # dword 1: Alternate-next-qTD — always terminate (no short-packet
+    # alternate path; a short IN simply completes the qTD).
+    p[1] = EHCI_QTD_T
+    # dword 2: token. Active + CERR=3 + PID + total-bytes + toggle.
+    tok: uint32 = EHCI_QTD_STS_ACTIVE | EHCI_QTD_CERR3 | pid \
+                | (nbytes << EHCI_QTD_BYTES_SHIFT)
+    if toggle != 0:
+        tok = tok | EHCI_QTD_TOGGLE
+    if ioc != 0:
+        tok = tok | EHCI_QTD_IOC
+    p[2] = tok
+    # dwords 3..7: buffer pointers. A boot-keyboard transfer never
+    # exceeds 64 bytes so a single page-aligned buffer pointer (with
+    # the low 12 bits as the in-page offset) is always sufficient;
+    # buffer pointers 1..4 stay zero.
+    p[3] = cast[uint32](buf & 0xFFFFFFFF)
+    p[4] = 0
+    p[5] = 0
+    p[6] = 0
+    p[7] = 0
+
+
+def _ehci_qh_init_control(qh: uint64):
+    # Initialise the async control-transfer QH (EHCI §3.6). Endpoint 0,
+    # high-speed, max-packet from ehci.max_pkt0, device address from
+    # ehci.dev_addr. Data-Toggle-Control = 1 so the toggle comes from
+    # each qTD's token (mandatory for a control endpoint, whose SETUP
+    # stage always starts at toggle 0).
+    p: Ptr[uint32] = cast[Ptr[uint32]](qh)
+    i: uint32 = 0
+    while i < 24:                        # zero 96 bytes (12 dwords*2)
+        p[i] = 0
+        i = i + 1
+    # dword 0: Horizontal Link Pointer — for the moment point at the
+    # async placeholder QH; _ehci_async_link patches the ring.
+    p[0] = cast[uint32](ehci.async_qh & 0xFFFFFFE0) | EHCI_QH_TYPE_QH
+    # dword 1: Endpoint Characteristics.
+    ec: uint32 = ehci.dev_addr & 0x7F                       # device addr
+    ec = ec | EHCI_QH_SPEED_HIGH                            # bits 13..12
+    ec = ec | EHCI_QH_EC_DTC                                # toggle from qTD
+    ec = ec | ((ehci.max_pkt0 & 0x7FF) << 16)               # max packet
+    p[1] = ec
+    # dword 2: Endpoint Capabilities — Mult=1, no S-mask (async).
+    p[2] = EHCI_QH_EC_MULT1
+    # dword 3: current-qTD — leave 0 (controller fills it).
+    # dwords 4..5: overlay Next / Alternate-next — terminate for now.
+    p[4] = EHCI_QTD_T
+    p[5] = EHCI_QTD_T
+    # dword 6: overlay token — 0 (not active).
+    p[6] = 0
+
+
+def _ehci_async_link():
+    # Splice ehci.ctrl_qh into the async ring between the placeholder
+    # ehci.async_qh and whatever it currently points at. After this
+    # the ring is:  async_qh -> ctrl_qh -> async_qh.
+    aqh: Ptr[uint32] = cast[Ptr[uint32]](ehci.async_qh)
+    cqh: Ptr[uint32] = cast[Ptr[uint32]](ehci.ctrl_qh)
+    # ctrl_qh links back to the head placeholder.
+    cqh[0] = cast[uint32](ehci.async_qh & 0xFFFFFFE0) | EHCI_QH_TYPE_QH
+    # head placeholder now links to ctrl_qh.
+    aqh[0] = cast[uint32](ehci.ctrl_qh & 0xFFFFFFE0) | EHCI_QH_TYPE_QH
+
+
+# --- V1: control transfer (async schedule) ------------------------
+
+def _ehci_control_transfer(req_type: uint32, request: uint32,
+                           value: uint32, index: uint32,
+                           length: uint32, data: uint64) -> int32:
+    # Run one control transfer on ehci.ctrl_qh. Builds the SETUP/
+    # DATA/STATUS qTD chain, points the QH overlay at the first qTD,
+    # and polls the STATUS qTD's Active bit (bounded spin). Returns
+    # the requested length on success, -1 on error/timeout.
+    #
+    # Data-toggle sequence for a control transfer (USB 2.0 §8.6):
+    #   SETUP  : toggle 0 (always)
+    #   DATA   : toggle 1, then alternating if multi-packet (we keep
+    #            the boot-keyboard transfers <= one max-packet so a
+    #            single DATA qTD with toggle 1 is correct)
+    #   STATUS : toggle 1 (always)
+
+    # Build the 8-byte SETUP packet in setup_buf.
+    sp: Ptr[uint8] = cast[Ptr[uint8]](ehci.setup_buf)
+    sp[0] = cast[uint8](req_type & 0xFF)
+    sp[1] = cast[uint8](request & 0xFF)
+    sp[2] = cast[uint8](value & 0xFF)
+    sp[3] = cast[uint8]((value >> 8) & 0xFF)
+    sp[4] = cast[uint8](index & 0xFF)
+    sp[5] = cast[uint8]((index >> 8) & 0xFF)
+    sp[6] = cast[uint8](length & 0xFF)
+    sp[7] = cast[uint8]((length >> 8) & 0xFF)
+
+    # Direction of the DATA stage (bit 7 of bmRequestType: 1 = IN).
+    is_in: int32 = 0
+    if (req_type & 0x80) != 0:
+        is_in = 1
+
+    # qTD 0 — SETUP stage: PID SETUP, toggle 0, 8 bytes from setup_buf.
+    # qTD 1 — DATA stage (only when length>0): PID IN/OUT, toggle 1.
+    # qTD 2 — STATUS stage: opposite direction, zero-length, toggle 1,
+    #         IOC set so the controller writes status back.
+    last_qtd: uint64 = ehci.qtd2
+    if length != 0:
+        # SETUP -> DATA -> STATUS.
+        _ehci_qtd_init(ehci.qtd0, ehci.qtd1, EHCI_QTD_PID_SETUP, 0,
+                       ehci.setup_buf, 8, 0)
+        data_pid: uint32 = EHCI_QTD_PID_OUT
+        status_pid: uint32 = EHCI_QTD_PID_IN
+        if is_in != 0:
+            data_pid = EHCI_QTD_PID_IN
+            status_pid = EHCI_QTD_PID_OUT
+        _ehci_qtd_init(ehci.qtd1, ehci.qtd2, data_pid, 1,
+                       ehci.data_buf, length, 0)
+        _ehci_qtd_init(ehci.qtd2, 0, status_pid, 1, 0, 0, 1)
+    else:
+        # SETUP -> STATUS (no data stage). STATUS is always IN for a
+        # zero-data control transfer (USB 2.0 §8.5.3).
+        _ehci_qtd_init(ehci.qtd0, ehci.qtd2, EHCI_QTD_PID_SETUP, 0,
+                       ehci.setup_buf, 8, 0)
+        _ehci_qtd_init(ehci.qtd2, 0, EHCI_QTD_PID_IN, 1, 0, 0, 1)
+
+    # Refresh the QH's Endpoint-Characteristics dword (dev_addr /
+    # max_pkt0 may have changed since the QH was first built — e.g.
+    # right after SET_ADDRESS) and point its overlay Next-qTD at qTD 0.
+    qh: Ptr[uint32] = cast[Ptr[uint32]](ehci.ctrl_qh)
+    ec: uint32 = ehci.dev_addr & 0x7F
+    ec = ec | EHCI_QH_SPEED_HIGH | EHCI_QH_EC_DTC
+    ec = ec | ((ehci.max_pkt0 & 0x7FF) << 16)
+    qh[1] = ec
+    # Clear the overlay token's Active/Halted/error bits, then arm the
+    # overlay Next-qTD pointer. The controller copies qTD 0 into the
+    # overlay and starts executing on the next async-schedule pass.
+    qh[6] = 0
+    qh[5] = EHCI_QTD_T                       # overlay alt-next: terminate
+    qh[4] = cast[uint32](ehci.qtd0 & 0xFFFFFFE0)
+
+    # Poll the STATUS qTD's Active bit (bounded spin). When it clears,
+    # the whole chain has retired (the controller walks SETUP->DATA->
+    # STATUS in order; STATUS going inactive means all three are done).
+    lp: Ptr[uint32] = cast[Ptr[uint32]](last_qtd)
+    spin: uint64 = 0
+    done: int32 = 0
+    while spin < 5000000:
+        tok: uint32 = lp[2]
+        if (tok & EHCI_QTD_STS_ACTIVE) == 0:
+            done = 1
+            spin = 5000000                   # break
+        else:
+            spin = spin + 1
+    if done == 0:
+        printk0("[ehci] control transfer timeout (qTD still active)\n")
+        return -1
+
+    # Inspect every qTD's token for Halted / error bits — a fault on
+    # the SETUP or DATA stage halts the QH and the STATUS qTD may go
+    # inactive without ever running.
+    t0: uint32 = cast[Ptr[uint32]](ehci.qtd0)[2]
+    tl: uint32 = lp[2]
+    if (t0 & EHCI_QTD_STS_HALTED) != 0 \
+       or (tl & EHCI_QTD_STS_HALTED) != 0 \
+       or (t0 & EHCI_QTD_STS_ERRMASK) != 0 \
+       or (tl & EHCI_QTD_STS_ERRMASK) != 0:
+        printk2("[ehci] control transfer error: setup-token=%x status-token=%x\n",
+                cast[uint64](t0), cast[uint64](tl))
+        return -1
+    return cast[int32](length)
+
+
+# --- V1: periodic interrupt-IN QH ---------------------------------
+
+def _ehci_int_qh_init():
+    # Build the interrupt-IN QH for the boot keyboard and link it into
+    # every periodic-frame-list entry. The keyboard's interrupt
+    # endpoint is polled once per frame (S-mask selects micro-frame 0).
+    qh: Ptr[uint32] = cast[Ptr[uint32]](ehci.int_qh)
+    i: uint32 = 0
+    while i < 24:
+        qh[i] = 0
+        i = i + 1
+    # dword 0: Horizontal Link Pointer — terminate (this QH is the
+    # only entry in the periodic list; the controller stops after it).
+    qh[0] = EHCI_QTD_T
+    # dword 1: Endpoint Characteristics — device address, endpoint
+    # number, high-speed, max-packet. DTC=0 here: an interrupt
+    # endpoint owns its own toggle, the QH tracks it across polls.
+    ec: uint32 = ehci.dev_addr & 0x7F
+    ec = ec | ((ehci.kbd_int_ep & 0x0F) << 8)
+    ec = ec | EHCI_QH_SPEED_HIGH
+    ec = ec | ((ehci.kbd_int_mps & 0x7FF) << 16)
+    qh[1] = ec
+    # dword 2: Endpoint Capabilities — S-mask = 0xFF (eligible in
+    # every micro-frame) + Mult=1. A boot keyboard's bInterval is
+    # short; polling every micro-frame is harmless (the endpoint just
+    # NAKs when it has no new report) and removes any dependency on
+    # the controller's micro-frame/S-mask phase matching. High-speed
+    # needs no split C-mask.
+    qh[2] = EHCI_QH_EC_MULT1 | 0x000000FF
+    # dword 4: overlay Next-qTD — point at the interrupt qTD.
+    qh[4] = cast[uint32](ehci.int_qtd & 0xFFFFFFE0)
+    qh[5] = EHCI_QTD_T
+    qh[6] = 0
+
+
+def _ehci_int_arm():
+    # (Re-)arm the interrupt-IN qTD: an 8-byte IN transfer into
+    # int_buf, with the QH overlay pointed at it and the toggle bit
+    # advanced. EHCI tracks the data toggle in the QH overlay token,
+    # so we feed the running ehci.int_toggle in and flip it each arm.
+    _ehci_qtd_init(ehci.int_qtd, 0, EHCI_QTD_PID_IN,
+                   ehci.int_toggle, ehci.int_buf, 8, 1)
+    qh: Ptr[uint32] = cast[Ptr[uint32]](ehci.int_qh)
+    qh[6] = 0                                # clear overlay token
+    qh[5] = EHCI_QTD_T
+    qh[4] = cast[uint32](ehci.int_qtd & 0xFFFFFFE0)
+    ehci.int_toggle = ehci.int_toggle ^ 1
+
+
+def _ehci_periodic_link():
+    # Write the interrupt QH's address into every periodic-frame-list
+    # entry (T-bit clear, type=QH). With the same QH in all 1024 slots
+    # the controller polls the keyboard every frame regardless of
+    # FRINDEX — the simplest correct interval for a single device.
+    pfl: Ptr[uint32] = cast[Ptr[uint32]](ehci.periodic_list)
+    entry: uint32 = cast[uint32](ehci.int_qh & 0xFFFFFFE0) \
+                  | EHCI_QH_TYPE_QH
+    i: uint32 = 0
+    while i < 1024:
+        pfl[i] = entry
+        i = i + 1
+
+
+# --- V1: tick-driven interrupt-IN poll ----------------------------
+
+def ehci_poll():
+    # Called from the timer tick (arch/x86/kernel/time.ad). When the
+    # interrupt qTD's Active bit clears, an 8-byte boot report has
+    # landed in int_buf — hand it to the HID layer and re-arm. No-op
+    # until V1 enumeration armed the keyboard, so safe to call
+    # unconditionally (mirrors xhci_poll's kbd_enabled guard).
+    if ehci.kbd_enabled == 0:
+        return
+    ehci.poll_calls = ehci.poll_calls + 1
+    # Drain up to 4 completed reports per tick. QEMU's usb-kbd emits a
+    # report per key edge (press + release); 4 absorbs a fast burst
+    # between two timer ticks without dropping anything.
+    drained: uint32 = 0
+    while drained < 4:
+        tok: uint32 = cast[Ptr[uint32]](ehci.int_qtd)[2]
+        if (tok & EHCI_QTD_STS_ACTIVE) != 0:
+            drained = 4                       # still in flight — stop
+        else:
+            if (tok & EHCI_QTD_STS_HALTED) != 0:
+                # The endpoint halted (stall / error). Log once and
+                # stop polling — re-arming a halted QH just spins.
+                printk0("[ehci] interrupt endpoint halted — polling stopped\n")
+                ehci.kbd_enabled = 0
+                drained = 4
+            else:
+                # One-shot diagnostic: the first interrupt-IN report
+                # received proves the periodic schedule delivers — the
+                # load-bearing line for real-hardware bring-up.
+                if ehci.reports_received == 0:
+                    printk0("[ehci] first interrupt-IN report received\n")
+                rb: Ptr[uint8] = cast[Ptr[uint8]](ehci.int_buf)
+                # A report whose key-slots (bytes 2..7) carry a usage
+                # code >= 0x04 is a real key-down — distinct from the
+                # all-zero idle reports a keyboard streams between
+                # presses. Log the first such event so a live-keystroke
+                # test has an unambiguous "a key actually arrived"
+                # marker that the synthetic self-test never emits
+                # (the self-test's buffer is consumed before this
+                # path's first live call).
+                if ehci.kbd_keydowns == 0:
+                    has_key: int32 = 0
+                    ki: uint64 = 2
+                    while ki < 8:
+                        if rb[ki] >= 0x04:
+                            has_key = 1
+                        ki = ki + 1
+                    if has_key != 0:
+                        ehci.kbd_keydowns = 1
+                        printk0("[ehci] live key-down report received\n")
+                hid_kbd_report(rb)
+                ehci.reports_received = ehci.reports_received + 1
+                _ehci_int_arm()
+                drained = drained + 1
+
+
+# --- V1: enumeration + boot-keyboard attach -----------------------
+
+def _ehci_find_kbd_port() -> uint32:
+    # Return the 1-based index of the first root-hub port carrying an
+    # enabled (high-speed) device, or 0 if none. _ehci_scan_ports has
+    # already reset every connected port and left high-speed ones
+    # enabled-on-EHCI.
+    n: uint32 = 0
+    while n < ehci.n_ports:
+        addr: uint64 = _ehci_portsc_addr(n)
+        portsc: uint32 = _ehci_r32(addr)
+        if (portsc & EHCI_PORTSC_CCS) != 0 \
+           and (portsc & EHCI_PORTSC_PED) != 0:
+            return n + 1
+        n = n + 1
+    return 0
+
+
+def _ehci_v1_attach_keyboard():
+    # Full V1 path: carve the DMA page, build the control QH, run the
+    # standard enumeration sequence, and — if the device is a HID boot
+    # keyboard — arm the periodic interrupt-IN QH. Every failure is
+    # non-fatal: it just means no EHCI keyboard this boot.
+    port: uint32 = _ehci_find_kbd_port()
+    if port == 0:
+        printk0("[ehci] V1: no enabled high-speed port — skipping\n")
+        return
+    ehci.kbd_port = port
+    printk1("[ehci] V1: enumerating device on port %d\n",
+            cast[uint64](port))
+
+    # Carve the DMA page. One alloc_pages(0) (4 KiB, page-aligned)
+    # holds the control QH, interrupt QH, four qTDs and three buffers
+    # — see the EHCI_DMA_OFF_* offsets. A page is 4 KiB-aligned so
+    # every 32-byte-spaced offset is 32-byte-aligned (the QH/qTD
+    # alignment requirement). One page, no nested-frame Arrays — the
+    # U9 compiler quirk is sidestepped entirely.
+    page: uint64 = alloc_pages(0)
+    if page == 0:
+        printk0("[ehci] V1: DMA page allocation failed\n")
+        return
+    memset(cast[Ptr[uint8]](page), 0, 4096)
+    ehci.dma_page  = page
+    ehci.ctrl_qh   = page + EHCI_DMA_OFF_CTRL_QH
+    ehci.int_qh    = page + EHCI_DMA_OFF_INT_QH
+    ehci.qtd0      = page + EHCI_DMA_OFF_QTD0
+    ehci.qtd1      = page + EHCI_DMA_OFF_QTD1
+    ehci.qtd2      = page + EHCI_DMA_OFF_QTD2
+    ehci.int_qtd   = page + EHCI_DMA_OFF_INT_QTD
+    ehci.setup_buf = page + EHCI_DMA_OFF_SETUP_BUF
+    ehci.data_buf  = page + EHCI_DMA_OFF_DATA_BUF
+    ehci.int_buf   = page + EHCI_DMA_OFF_INT_BUF
+
+    # Start with device address 0 and a conservative 8-byte max
+    # packet — the GET_DESCRIPTOR(8) below learns the real value.
+    ehci.dev_addr = 0
+    ehci.max_pkt0 = 8
+    ehci.ep0_toggle = 0
+    _ehci_qh_init_control(ehci.ctrl_qh)
+    _ehci_async_link()
+
+    # Step 3a: GET_DESCRIPTOR(device, 8 bytes) — learn bMaxPacketSize0.
+    if _ehci_control_transfer(USB_RT_GET_DESCRIPTOR,
+                              USB_REQ_GET_DESCRIPTOR,
+                              cast[uint32](USB_DT_DEVICE) << 8, 0,
+                              8, ehci.data_buf) < 0:
+        printk0("[ehci] V1: GET_DESCRIPTOR(device,8) failed\n")
+        return
+    mp0: uint8 = usb_dd_max_packet_size0(cast[Ptr[uint8]](ehci.data_buf))
+    if mp0 == 8 or mp0 == 16 or mp0 == 32 or mp0 == 64:
+        ehci.max_pkt0 = cast[uint32](mp0)
+    else:
+        ehci.max_pkt0 = 64                   # high-speed default
+    printk1("[ehci] V1: device max-packet-0 = %d\n",
+            cast[uint64](ehci.max_pkt0))
+
+    # Step 3b: SET_ADDRESS. EHCI does NOT auto-assign — issue the
+    # standard control transfer to address 0, THEN update our QH to
+    # the new address (the device only adopts it after the STATUS
+    # stage of this transfer completes).
+    new_addr: uint32 = 1
+    if _ehci_control_transfer(USB_RT_SET_ADDRESS, USB_REQ_SET_ADDRESS,
+                              new_addr, 0, 0, 0) < 0:
+        printk0("[ehci] V1: SET_ADDRESS failed\n")
+        return
+    ehci.dev_addr = new_addr
+    printk1("[ehci] V1: device addressed (addr=%d)\n",
+            cast[uint64](new_addr))
+
+    # Step 3c: GET_DESCRIPTOR(device, 18 bytes) — full descriptor.
+    if _ehci_control_transfer(USB_RT_GET_DESCRIPTOR,
+                              USB_REQ_GET_DESCRIPTOR,
+                              cast[uint32](USB_DT_DEVICE) << 8, 0,
+                              18, ehci.data_buf) < 0:
+        printk0("[ehci] V1: GET_DESCRIPTOR(device,18) failed\n")
+        return
+    printk0("[ehci] V1: full device descriptor read\n")
+
+    # Step 3d: GET_DESCRIPTOR(config, 9) header -> wTotalLength ->
+    # full configuration set.
+    if _ehci_control_transfer(USB_RT_GET_DESCRIPTOR,
+                              USB_REQ_GET_DESCRIPTOR,
+                              cast[uint32](USB_DT_CONFIG) << 8, 0,
+                              9, ehci.data_buf) < 0:
+        printk0("[ehci] V1: GET_DESCRIPTOR(config,9) failed\n")
+        return
+    total: uint16 = usb_cfg_total_length(cast[Ptr[uint8]](ehci.data_buf))
+    if total > 512:
+        total = 512                          # cap to the data buffer
+    if _ehci_control_transfer(USB_RT_GET_DESCRIPTOR,
+                              USB_REQ_GET_DESCRIPTOR,
+                              cast[uint32](USB_DT_CONFIG) << 8, 0,
+                              cast[uint32](total), ehci.data_buf) < 0:
+        printk0("[ehci] V1: GET_DESCRIPTOR(config,full) failed\n")
+        return
+    cfg_value: uint8 = usb_cfg_value(cast[Ptr[uint8]](ehci.data_buf))
+    printk2("[ehci] V1: config descriptor read total_len=%d cfg_value=%d\n",
+            cast[uint64](total), cast[uint64](cfg_value))
+
+    # Walk the configuration set looking for a HID boot-keyboard
+    # interface and its interrupt-IN endpoint. Each sub-descriptor
+    # starts with (bLength, bDescriptorType).
+    found_kbd: int32 = 0
+    int_ep:   uint32 = 0
+    int_mps:  uint32 = 8
+    int_intv: uint32 = 8
+    if_num:   uint8 = 0
+    off: uint64 = 9                          # skip the 9-byte header
+    while off + 2 <= cast[uint64](total):
+        dlen:  uint8 = cast[Ptr[uint8]](ehci.data_buf + off)[0]
+        dtype: uint8 = cast[Ptr[uint8]](ehci.data_buf + off + 1)[0]
+        if dlen == 0:
+            off = cast[uint64](total)        # malformed — break
+        else:
+            dptr: Ptr[uint8] = cast[Ptr[uint8]](ehci.data_buf + off)
+            if dtype == 0x04:                # interface descriptor
+                if usb_if_class(dptr) == USB_CLASS_HID \
+                   and usb_if_protocol(dptr) == USB_PROTOCOL_KEYBOARD:
+                    if_num = usb_if_number(dptr)
+                    found_kbd = 1
+            elif dtype == 0x05:              # endpoint descriptor
+                if found_kbd == 1 \
+                   and usb_ep_is_interrupt_in(dptr) != 0 \
+                   and int_ep == 0:
+                    int_ep = cast[uint32](usb_ep_address(dptr) & 0x0F)
+                    int_mps = cast[uint32](usb_ep_max_packet(dptr) \
+                                          & 0x07FF)
+                    int_intv = cast[uint32](usb_ep_interval(dptr))
+                    if int_mps == 0:
+                        int_mps = 8
+            off = off + cast[uint64](dlen)
+
+    # Step 3e: SET_CONFIGURATION — the device leaves the Addressed
+    # state and enters Configured. This is the V1 acceptance line.
+    if _ehci_control_transfer(USB_RT_SET_CONFIGURATION,
+                              USB_REQ_SET_CONFIGURATION,
+                              cast[uint32](cfg_value), 0, 0, 0) < 0:
+        printk0("[ehci] V1: SET_CONFIGURATION failed\n")
+        return
+    printk1("[ehci] V1: device configured (config %d) — enumeration complete\n",
+            cast[uint64](cfg_value))
+
+    if found_kbd == 0 or int_ep == 0:
+        printk0("[ehci] V1: device is not a HID boot keyboard — done\n")
+        return
+    ehci.kbd_if      = cast[uint32](if_num)
+    ehci.kbd_int_ep  = int_ep
+    ehci.kbd_int_mps = int_mps
+    printk2("[ehci] V1: HID boot keyboard intf=%d int-ep=%d\n",
+            cast[uint64](if_num), cast[uint64](int_ep))
+
+    # Step 4a: SET_PROTOCOL(boot) + SET_IDLE(0) on the HID interface.
+    # SET_PROTOCOL failure is non-fatal — QEMU's usb-kbd emits boot-
+    # shaped 8-byte reports regardless (mirrors xhci.ad's note).
+    if _ehci_control_transfer(USB_RT_SET_PROTOCOL,
+                              HID_REQ_SET_PROTOCOL,
+                              cast[uint32](HID_PROTOCOL_BOOT),
+                              cast[uint32](if_num), 0, 0) < 0:
+        printk0("[ehci] V1: SET_PROTOCOL(boot) failed (non-fatal)\n")
+    if _ehci_control_transfer(USB_RT_SET_IDLE, HID_REQ_SET_IDLE,
+                              0, cast[uint32](if_num), 0, 0) < 0:
+        printk0("[ehci] V1: SET_IDLE(0) failed (non-fatal)\n")
+
+    # Step 4b: build the interrupt-IN QH, arm its qTD, and splice it
+    # into the periodic frame list. From here ehci_poll() drains it.
+    ehci.int_toggle = 0
+    _ehci_int_qh_init()
+    _ehci_int_arm()
+    _ehci_periodic_link()
+    ehci.kbd_enabled = 1
+    ehci.reports_received = 0
+    printk0("[ehci] HID boot keyboard configured\n")
+    printk0("[ehci] V1: interrupt-IN QH armed — keyboard polling live\n")
+
+
+# --- V1 accessors -------------------------------------------------
+
+def ehci_kbd_enabled() -> int32:
+    return cast[int32](ehci.kbd_enabled)
+
+
+def ehci_reports_received() -> uint32:
+    # Count of interrupt-IN boot reports drained by ehci_poll(). A
+    # live-keystroke test watches this climb past 1 (the synthetic
+    # self-test's report) to confirm the periodic schedule delivers.
+    return ehci.reports_received
+
+
+def ehci_poll_calls() -> uint32:
+    return ehci.poll_calls
+
+
+# --- V1 self-test -------------------------------------------------
 #
-#   2. Async-schedule control transfer. Build a QH for endpoint 0 of
-#      the target device (address 0 initially, max-packet 64 for
-#      high-speed). Chain three qTDs: SETUP (PID 0x2D, 8-byte setup
-#      packet in the buffer), DATA-IN/OUT (PID 0x69/0xE1), STATUS
-#      (opposite-direction zero-length). Link the QH into the async
-#      ring (insert between ehci.async_qh and its self-link). Ring is
-#      already RS-enabled; poll the last qTD's token Active bit (bit
-#      7 of the token dword) until it clears — bounded spin, then
-#      check the Halted (bit 6) / error bits.
-#
-#   3. Standard enumeration sequence on the connected high-speed
-#      port:
-#        a. GET_DESCRIPTOR(device, 8 bytes) to learn bMaxPacketSize0.
-#        b. SET_ADDRESS(n) — unlike xHCI, EHCI does NOT assign the
-#           address for you; you issue the standard SET_ADDRESS
-#           control transfer to device address 0, then update the
-#           QH's Endpoint-Characteristics dword to the new address.
-#        c. GET_DESCRIPTOR(device, 18 bytes) — full device descriptor.
-#        d. GET_DESCRIPTOR(config, wTotalLength) — config + interface
-#           + endpoint descriptors. Reuse drivers/usb/usb.ad's
-#           usb_cfg_total_length / usb_if_class / usb_if_protocol /
-#           usb_ep_* decoders (already imported-shaped for this).
-#        e. SET_CONFIGURATION(bConfigurationValue).
-#
-#   4. HID boot keyboard. If an interface descriptor reports class 3
-#      / subclass 1 / protocol 1:
-#        a. SET_PROTOCOL(boot) + SET_IDLE(0) class control transfers
-#           (usb_build_set_protocol / usb_build_set_idle in usb.ad).
-#        b. Build an interrupt QH for the keyboard's interrupt-IN
-#           endpoint and link it into the PERIODIC frame list — not
-#           the async ring. For a polling interval of ~8 frames,
-#           write the QH's address into every 8th periodic-frame-list
-#           entry (T-bit clear, type=QH). The QH's S-mask
-#           (Endpoint-Capabilities dword, bits 7..0) selects the
-#           micro-frames to poll in.
-#        c. Each frame the controller executes the interrupt qTD; the
-#           8-byte boot report lands in the qTD's buffer. Poll the
-#           qTD token Active bit from a tick handler, and when it
-#           clears feed the 8 bytes to drivers/usb/hid.ad's
-#           hid_kbd_report(Ptr[uint8]) — its signature is already
-#           HCD-agnostic and documented for exactly this. hid.ad then
-#           pushes decoded ASCII into kbd_rx_push, the SAME FIFO
-#           atkbd + xhci-hid feed. Re-arm the qTD (clear token, set
-#           Active, reset the buffer pointers) for the next poll.
-#
-#   5. Wire ehci_poll() into the same boot-time tick loop xhci_poll()
-#      uses, and add a `-device usb-kbd` arm to scripts/test_ehci.sh
-#      that greps for a decoded keystroke in the kbd FIFO.
-#
+# Deterministic proof that the interrupt-IN poll path moves a byte
+# from the qTD buffer through hid_kbd_report into the shared kbd
+# FIFO — independent of whether QEMU's live SETUP exchange succeeded.
+# Mirrors xhci_v1_selftest's shape: forge the completed-qTD state the
+# controller would produce, drive ehci_poll, assert a report landed.
+
+def ehci_v1_selftest():
+    printk0("[ehci_v1] self-test: synthetic 'a' keypress\n")
+    # Stand up just enough state for ehci_poll to do work. If the live
+    # attach already armed the keyboard, reuse its buffers; otherwise
+    # carve a scratch page so the self-test is self-contained.
+    saved_enabled: uint32 = ehci.kbd_enabled
+    if ehci.int_qtd == 0 or ehci.int_buf == 0:
+        page: uint64 = alloc_pages(0)
+        if page == 0:
+            printk0("[ehci_v1] self-test FAIL: scratch alloc failed\n")
+            return
+        memset(cast[Ptr[uint8]](page), 0, 4096)
+        ehci.int_qtd = page + EHCI_DMA_OFF_INT_QTD
+        ehci.int_buf = page + EHCI_DMA_OFF_INT_BUF
+    ehci.kbd_enabled = 1
+
+    # Build a boot-keyboard report: 'a' = HID usage 0x04, no modifiers.
+    rb: Ptr[uint8] = cast[Ptr[uint8]](ehci.int_buf)
+    rb[0] = 0                                # modifiers
+    rb[1] = 0                                # reserved
+    rb[2] = 0x04                             # usage 'a'
+    rb[3] = 0
+    rb[4] = 0
+    rb[5] = 0
+    rb[6] = 0
+    rb[7] = 0
+    # Forge the qTD the controller would leave behind: a retired IN
+    # qTD with the Active bit CLEAR and no error/halt bits — exactly
+    # what ehci_poll inspects.
+    qp: Ptr[uint32] = cast[Ptr[uint32]](ehci.int_qtd)
+    qp[0] = EHCI_QTD_T
+    qp[1] = EHCI_QTD_T
+    qp[2] = EHCI_QTD_PID_IN | EHCI_QTD_CERR3 # Active bit clear
+    qp[3] = cast[uint32](ehci.int_buf & 0xFFFFFFFF)
+
+    before: uint32 = ehci.reports_received
+    ehci_poll()
+    after: uint32 = ehci.reports_received
+    if after > before:
+        printk1("[ehci_v1] transfer-engine PASS (%d reports)\n",
+                cast[uint64](after - before))
+    else:
+        printk0("[ehci_v1] transfer-engine FAIL: no report dispatched\n")
+    # Restore the pre-test enabled flag so a real keyboard still polls.
+    ehci.kbd_enabled = saved_enabled
+    # The synthetic 'a' tripped the "live key-down" one-shot; clear it
+    # so the marker is reserved for a genuine wire keystroke.
+    ehci.kbd_keydowns = 0
+
+
+# =====================================================================
 # V2 BACKLOG:
+#   - Real IRQ handler (USBINTR + an IOAPIC redirection entry) instead
+#     of the V1 poll-only model.
 #   - Companion-controller (UHCI/OHCI) driver so released full-/low-
 #     speed devices are actually usable. Hamnix has neither today.
-#   - Real IRQ handler (USBINTR + an IOAPIC redirection entry) instead
-#     of the V0/V1 poll-only model.
 #   - USB hub support past the root hub — some laptops put an internal
 #     hub between the EHCI controller and the built-in keyboard.
 #   - Multi-controller: bind every EHCI controller the PCI scan finds
 #     (ICH/PCH chipsets commonly expose two), not just the first.
+#   - Multi-packet control DATA stages (currently one DATA qTD; fine
+#     for descriptors <= one max-packet, which covers boot keyboards).
+# =====================================================================

@@ -28,6 +28,9 @@ from drivers.input.atkbd import atkbd_poll, atkbd_diag_tick
 # transfer completions to the HID layer. No-op when no USB keyboard
 # was successfully attached at boot (xhci.kbd_enabled stays 0).
 from drivers.usb.xhci import xhci_poll
+# V1 USB 2.0 HID: drain the EHCI periodic interrupt-IN qTD. No-op
+# when no USB 2.0 keyboard was attached at boot (ehci.kbd_enabled 0).
+from drivers.usb.ehci import ehci_poll
 
 PIT_CHANNEL0_DATA: int32 = 0x40
 PIT_CMD:           int32 = 0x43
@@ -93,6 +96,9 @@ def timer_interrupt():
     # completions. xhci_poll() is a no-op if V1 enumeration didn't
     # reach kbd_enabled — so this is safe to call unconditionally.
     xhci_poll()
+    # V1 USB 2.0 HID: drain the EHCI interrupt-IN qTD the same way.
+    # ehci_poll() is a no-op if EHCI V1 didn't arm a keyboard.
+    ehci_poll()
     lapic_send_eoi()
     schedule()
 

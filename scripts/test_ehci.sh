@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/test_ehci.sh — V0 regression for the EHCI (USB 2.0) host
+# scripts/test_ehci.sh — V0+V1 regression for the EHCI (USB 2.0) host
 # controller driver (drivers/usb/ehci.ad).
 #
 # Why this driver exists:
@@ -23,10 +23,13 @@
 #     e. walks the root-hub PORTSC array — with usb-kbd attached, one
 #        port must come up "[ehci] port N: reset done, enabled=1".
 #
-# V0 deliberately stops at "controller running, ports enumerated,
-# high-speed device link-trained and EHCI-owned". No USB transfer is
-# performed — a decoded keystroke is V1 (see the V1 backlog block at
-# the end of drivers/usb/ehci.ad).
+#   V1 then runs the transfer engine: the async-schedule control
+#   transfers drive the standard enumeration (GET_DESCRIPTOR /
+#   SET_ADDRESS / GET_DESCRIPTOR(config) / SET_CONFIGURATION), and the
+#   HID boot keyboard is configured with a periodic interrupt-IN QH.
+#   This script asserts the enumeration reached SET_CONFIGURATION and
+#   the keyboard was configured; the live-keystroke round-trip lives
+#   in scripts/test_ehci_kbd.sh.
 #
 # Regression invariant: a panic / unexpected trap between PCI scan
 # and init completion would also be caught here.
@@ -144,6 +147,38 @@ if grep -F -q "[ehci] V0 init complete" "$LOG"; then
     echo "[test_ehci] OK: ehci_init() ran to completion"
 else
     echo "[test_ehci] MISS: '[ehci] V0 init complete' banner absent"
+    fail=1
+fi
+
+# --- V1: control-transfer enumeration ---------------------------------
+# The transfer engine must drive the standard enumeration through
+# SET_CONFIGURATION. This line proves SETUP/DATA/STATUS qTD chains on
+# the async schedule actually moved bytes and the device transitioned
+# to the Configured state.
+if grep -F -q "[ehci] V1: device configured" "$LOG"; then
+    echo "[test_ehci] OK: V1 enumeration reached SET_CONFIGURATION"
+else
+    echo "[test_ehci] MISS: '[ehci] V1: device configured' banner absent"
+    fail=1
+fi
+
+# --- V1: HID boot keyboard configured ---------------------------------
+# usb-kbd enumerates as a HID boot keyboard (class 3 / proto 1); V1
+# must find its interrupt-IN endpoint and arm the periodic QH.
+if grep -F -q "[ehci] HID boot keyboard configured" "$LOG"; then
+    echo "[test_ehci] OK: HID boot keyboard configured on EHCI"
+else
+    echo "[test_ehci] MISS: '[ehci] HID boot keyboard configured' absent"
+    fail=1
+fi
+
+# --- V1: synthetic transfer-engine self-test --------------------------
+# Deterministic proof the interrupt-IN qTD -> hid_kbd_report -> kbd
+# FIFO path moves a byte, independent of the live wire exchange.
+if grep -F -q "[ehci_v1] transfer-engine PASS" "$LOG"; then
+    echo "[test_ehci] OK: V1 synthetic transfer-engine self-test PASS"
+else
+    echo "[test_ehci] MISS: '[ehci_v1] transfer-engine PASS' absent"
     fail=1
 fi
 

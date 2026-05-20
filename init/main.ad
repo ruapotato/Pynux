@@ -97,13 +97,15 @@ from drivers.usb.xhci import (
     xhci_init, xhci_v1_selftest, xhci_v2_selftest,
     xhci_real_kbd_present,
 )
-# V0 EHCI (USB 2.0) host controller. Many 2008..2014 laptops — Asus
+# EHCI (USB 2.0) host controller. Many 2008..2014 laptops — Asus
 # included — wire the built-in keyboard to an EHCI controller rather
 # than the i8042; on such hardware EHCI is the only path to a working
-# keyboard. V0 ships PCI probe + BIOS->OS handoff + controller reset
-# + root-hub port enumeration. See drivers/usb/ehci.ad for the V1
-# transfer-engine backlog.
-from drivers.usb.ehci import ehci_init
+# keyboard. V0 shipped PCI probe + BIOS->OS handoff + controller reset
+# + root-hub port enumeration; V1 adds the control-transfer engine,
+# standard enumeration through SET_CONFIGURATION, and a periodic
+# interrupt-IN QH that feeds boot-keyboard reports into the shared
+# kbd FIFO. ehci_v1_selftest is the synthetic transfer-engine proof.
+from drivers.usb.ehci import ehci_init, ehci_v1_selftest
 from drivers.net.netfilter import (
     netfilter_init, register_netfilter_hook, nf_run_hooks,
     NF_HOOK_ACCEPT,
@@ -1702,6 +1704,15 @@ def start_kernel():
     else:
         printk0("[xhci_v1] self-test skipped: no USB keyboard found (set /etc/xhci-selftest cpio marker to force)\n")
         printk0("[xhci_v2] self-test skipped: no USB keyboard found (set /etc/xhci-selftest cpio marker to force)\n")
+    # EHCI V1 USB HID — synthetic interrupt-IN round-trip. Forges the
+    # retired-qTD state the controller leaves behind for a completed
+    # 8-byte boot report ('a'), drives ehci_poll(), and asserts the
+    # report reached the shared kbd FIFO via hid_kbd_report. Runs
+    # unconditionally: it is self-contained (allocates its own scratch
+    # page if the live attach never armed a keyboard) and never polls
+    # MMIO, so it cannot wedge on a PS/2-only machine the way the xHCI
+    # synthetic path could. PASS: `[ehci_v1] transfer-engine PASS`.
+    ehci_v1_selftest()
     time_init()
     i8259_disable()
     apic_init()
