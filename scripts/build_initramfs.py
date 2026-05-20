@@ -87,6 +87,17 @@ if os.environ.get("ENABLE_TCP_FIN_WAIT2_SMOKE") == "1":
     FILES.append(("/etc/tcp-finwait2-test", b"1\n"))
     FILES.append(("/etc/skip-https-internet-smoke", b"1\n"))
 
+# TCP back-to-back-connect regression. Gated the same way as the TCP
+# ring / FIN_WAIT_2 markers above. The fixture (scripts/test_tcp_
+# reconnect.sh) boots with a guestfwd to host `cat` at 10.0.2.100:7
+# and the kernel's tcp_reconnect_smoke_test fires 6 back-to-back
+# connect/echo/close cycles with NO delay between them — the
+# regression for the ephemeral-source-port-rotation fix in
+# drivers/net/tcp.ad. Only that one harness sets this; default boot
+# and other tests run without the marker.
+if os.environ.get("ENABLE_TCP_RECONNECT_SMOKE") == "1":
+    FILES.append(("/etc/tcp-reconnect-test", b"1\n"))
+
 # DHCP renew/rebind/expiry smoke. Gated the same way as the TLS / TCP
 # ring markers above. The renew smoke leaves DHCP state at IDLE on
 # exit, which breaks any downstream test that requires state == BOUND

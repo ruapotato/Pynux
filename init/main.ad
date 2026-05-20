@@ -787,6 +787,72 @@ def tcp_fin_wait2_smoke_test():
     printk0("[tcp_fin_wait2] PASS\n")
 
 
+def tcp_reconnect_smoke_test():
+    # Back-to-back active-open regression (the apt-agent wedge).
+    #
+    # Performs 6 consecutive connect -> send -> recv -> close cycles
+    # to the SAME SLIRP-forwarded echo target at 10.0.2.100:7 with
+    # NO artificial delay between iterations. Pre-fix, drivers/net/
+    # tcp.ad derived the ephemeral source port from the slot index
+    # (TCP_EPHEMERAL_BASE + slot) and _tcp_alloc_slot kept handing
+    # back slot 0 for these short-lived connections — so every
+    # connection presented the IDENTICAL 4-tuple and SLIRP wedged
+    # the 3rd/4th handshake. The fix rotates the source port over
+    # the IANA dynamic range per connect, so each cycle uses a
+    # distinct 4-tuple and completes immediately.
+    #
+    # Expected kernel-side trace (one block per iteration 0..5):
+    #   [tcp_reconnect] smoke test starting
+    #   [tcp_reconnect] iter=N connected slot=M
+    #   [tcp_reconnect] iter=N echo ok
+    #   ...
+    #   [tcp_reconnect] PASS 6/6 back-to-back connects
+    #
+    # The harness greps for "[tcp_reconnect] PASS 6/6". A wedge
+    # leaves the count short and the smoke prints a FAIL line.
+    printk0("[tcp_reconnect] smoke test starting\n")
+    ok_count: uint64 = 0
+    iter: uint64 = 0
+    while iter < 6:
+        # 200 jiffies @ HZ=100 = 2 s — same budget tcp_smoke_test
+        # uses. Pre-fix the 3rd/4th of these would burn the whole
+        # budget and return -1.
+        slot: int32 = tcp_connect(10, 0, 2, 100, 7, 200)
+        if slot < 0:
+            printk1("[tcp_reconnect] iter=%d connect FAILED\n", iter)
+            iter = 6                       # break — wedge reproduced
+        else:
+            printk2("[tcp_reconnect] iter=%d connected slot=%d\n",
+                    iter, cast[uint64](slot))
+            # Tiny request — `cat` echoes it straight back.
+            msg: Array[3, uint8]
+            msg[0] = 0x68                  # 'h'
+            msg[1] = 0x69                  # 'i'
+            msg[2] = 0x0A                  # '\n'
+            msg_ptr: Ptr[uint8] = cast[Ptr[uint8]](&msg[0])
+            nsent: int64 = tcp_send(slot, msg_ptr, 3)
+            if nsent < 0:
+                printk1("[tcp_reconnect] iter=%d send FAILED\n", iter)
+                tcp_close(slot)
+                iter = 6                   # break
+            else:
+                rxbuf: Array[16, uint8]
+                rxbuf_ptr: Ptr[uint8] = cast[Ptr[uint8]](&rxbuf[0])
+                nrecv: int64 = tcp_recv(slot, rxbuf_ptr, 16, 100)
+                if nrecv > 0:
+                    printk1("[tcp_reconnect] iter=%d echo ok\n", iter)
+                    ok_count = ok_count + 1
+                else:
+                    printk1("[tcp_reconnect] iter=%d no echo\n", iter)
+                tcp_close(slot)
+                iter = iter + 1
+    if ok_count == 6:
+        printk0("[tcp_reconnect] PASS 6/6 back-to-back connects\n")
+    else:
+        printk1("[tcp_reconnect] FAIL only %d/6 connects succeeded\n",
+                ok_count)
+
+
 def http_smoke_test():
     # In-kernel HTTP/1.1 GET smoke test. Fetches the root of
     # http://example.com/ (RFC 2606's reserved-for-examples domain,
@@ -1897,6 +1963,40 @@ def start_kernel():
         tcp_fin_wait2_smoke_test()
     else:
         printk0("[tcp_fin_wait2] skipped (no /etc/tcp-finwait2-test marker)\n")
+
+    # --- TCP back-to-back-connect regression gated on cpio marker --
+    # Runs only when scripts/test_tcp_reconnect.sh planted
+    # /etc/tcp-reconnect-test in the initramfs
+    # (ENABLE_TCP_RECONNECT_SMOKE=1) AND a guestfwd to 10.0.2.100:7
+    # is configured. Same gating pattern as /etc/tcp-ring-test above
+    # — without the marker the smoke skips so unrelated test runs
+    # don't ARP-stall on a peer they don't expect. This is the
+    # regression for the ephemeral-source-port-rotation fix in
+    # drivers/net/tcp.ad (back-to-back connects used to wedge the
+    # 3rd/4th handshake under SLIRP).
+    rc_marker_found: int32 = 0
+    rc_idx: uint64 = 0
+    rc_count: uint64 = initramfs_entry_count()
+    while rc_idx < rc_count:
+        rc_name: Ptr[char] = initramfs_entry_name(rc_idx)
+        ok_rc: int32 = 1
+        rc_target: Ptr[uint8] = "/etc/tcp-reconnect-test"
+        rc_j: uint64 = 0
+        while rc_j < 24:                            # 23 chars + NUL
+            if cast[uint8](rc_name[rc_j]) != rc_target[rc_j]:
+                ok_rc = 0
+                rc_j = 24                            # break
+            else:
+                rc_j = rc_j + 1
+        if ok_rc == 1:
+            rc_marker_found = 1
+            rc_idx = rc_count                        # break
+        else:
+            rc_idx = rc_idx + 1
+    if rc_marker_found == 1:
+        tcp_reconnect_smoke_test()
+    else:
+        printk0("[tcp_reconnect] skipped (no /etc/tcp-reconnect-test marker)\n")
 
     # --- HTTP 3xx redirect-follow smoke gated on cpio marker --------
     # Runs only when scripts/test_net_http_redirect.sh planted

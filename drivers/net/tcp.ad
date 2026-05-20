@@ -28,10 +28,19 @@
 # Connection table: static 8-entry TCB array. With a single listener
 # slot allocated, the remaining 7 slots are available for accepted
 # connections — the practical cap until per-listener accept queues land.
-# Ephemeral source ports 50000..50007 for active-open (one per slot,
-# so the slot index is also the port offset; saves a separate
-# allocator); passive-open uses the listener's bound port for the
-# local port across all accepted slots.
+# Active-open ephemeral source ports ROTATE over the IANA dynamic
+# range 49152..65535 via a monotonic counter (_tcp_ephemeral_next) —
+# every tcp_connect gets the next port, wrapping at the top. This is
+# the standard TCP behavior and the fix for the back-to-back-connect
+# wedge: when consecutive short-lived connections reuse the same low
+# slot, a fixed slot-derived source port would present an IDENTICAL
+# 4-tuple to the peer (and to SLIRP) before the previous connection
+# fully drained — SLIRP / strict TCP treat that as a duplicate and
+# wedge the 3rd/4th rapid handshake. Rotating the source port gives
+# each connection a distinct 4-tuple, which also sidesteps any
+# TIME_WAIT-style "just-closed 4-tuple can't be reused yet" concern
+# — exactly why real stacks rotate. Passive-open still uses the
+# listener's bound port for the local port across all accepted slots.
 # M16.109 added per-segment retransmission (RFC 6298 RTO + exponential
 # backoff, capped at 5 retries). Still no congestion control beyond
 # cwnd=1 segment, no SACK, no timestamps, no window scaling.
@@ -133,7 +142,23 @@ TCP_DEFAULT_WIN:    uint16 = 0x4000
 # scalar accesses simple (and to dodge any 2-D Array codegen
 # surprises). 8 slots fits 256 bytes of state — comfortably static.
 TCP_NUM_SLOTS:      uint64 = 8
-TCP_EPHEMERAL_BASE: uint16 = 50000
+# IANA dynamic / ephemeral port range (RFC 6335 §6). Active-open
+# source ports rotate monotonically across [TCP_EPHEMERAL_LO,
+# TCP_EPHEMERAL_HI] inclusive, wrapping at the top. 16384 distinct
+# ports — a multi-package `apt install` cycles through a handful
+# of back-to-back connections per boot and never revisits a port,
+# so no two in-flight connections to the same server ever collide.
+TCP_EPHEMERAL_LO:   uint16 = 49152
+TCP_EPHEMERAL_HI:   uint16 = 65535
+
+# Monotonic ephemeral-port cursor. Lazy-seeded on the first
+# tcp_connect (see _tcp_ephemeral_next) from the ISN generator so
+# two boots don't start on the same port; thereafter it advances
+# by one per active-open and wraps back to TCP_EPHEMERAL_LO once it
+# passes TCP_EPHEMERAL_HI. Top-level (BSS) — keeps it out of any
+# call frame, same dodge the slot tables and tcp_isn_state use.
+tcp_ephemeral_cur:  uint16 = 0
+tcp_ephemeral_init: uint8  = 0
 
 tcp_slot_state:    Array[8, uint32]      # TCP_CLOSED..TCP_TIME_WAIT
 tcp_slot_local_p:  Array[8, uint16]      # local port (host order)
@@ -338,6 +363,37 @@ def _tcp_isn_next() -> uint32:
     x = x ^ (x << 17)
     tcp_isn_state = x
     return cast[uint32](x & 0xFFFFFFFF)
+
+
+def _tcp_ephemeral_next() -> uint16:
+    # Hand out the next active-open source port, rotating
+    # monotonically across the IANA dynamic range
+    # [TCP_EPHEMERAL_LO, TCP_EPHEMERAL_HI] and wrapping at the top.
+    #
+    # This is the fix for the back-to-back-connect wedge: every
+    # tcp_connect gets a DIFFERENT source port, so two consecutive
+    # connections to the same server present distinct 4-tuples even
+    # when the slot allocator reuses the same low slot. SLIRP (and
+    # strict TCP) no longer see what looks like a duplicate
+    # connection, and there is no just-closed-4-tuple reuse window.
+    #
+    # Lazy-seed the cursor on first use from the ISN generator so
+    # the starting port varies boot to boot — harmless for
+    # correctness (any port in range works) but avoids two boots
+    # racing on the same first port against a long-lived SLIRP.
+    if tcp_ephemeral_init == 0:
+        span: uint32 = cast[uint32](TCP_EPHEMERAL_HI) \
+                       - cast[uint32](TCP_EPHEMERAL_LO) + 1
+        seed: uint32 = _tcp_isn_next() % span
+        tcp_ephemeral_cur = TCP_EPHEMERAL_LO + cast[uint16](seed)
+        tcp_ephemeral_init = 1
+    port: uint16 = tcp_ephemeral_cur
+    # Advance the cursor for the next caller, wrapping at HI.
+    if tcp_ephemeral_cur >= TCP_EPHEMERAL_HI:
+        tcp_ephemeral_cur = TCP_EPHEMERAL_LO
+    else:
+        tcp_ephemeral_cur = tcp_ephemeral_cur + 1
+    return port
 
 
 def _tcp_alloc_slot() -> int32:
@@ -972,7 +1028,10 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
                         printk0("[tcp] ARP for target timed out\n")
                         return TCP_ERR_ARP
     isn: uint32 = _tcp_isn_next()
-    local_port: uint16 = TCP_EPHEMERAL_BASE + cast[uint16](slot)
+    # Rotate the ephemeral source port — see _tcp_ephemeral_next.
+    # Back-to-back connects to the same server now present distinct
+    # 4-tuples even when _tcp_alloc_slot keeps handing back slot 0.
+    local_port: uint16 = _tcp_ephemeral_next()
 
     tcp_slot_state[slot] = TCP_SYN_SENT
     tcp_slot_local_p[slot] = local_port
@@ -990,8 +1049,12 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
     tcp_slot_rx_head[slot] = 0
     tcp_slot_rx_tail[slot] = 0
     tcp_slot_saw_fin[slot] = 0
-    # Fresh per-slot retransmission state. The first SYN we send
-    # gets armed by _tcp_send_segment; if no SYN-ACK comes back the
+    tcp_slot_last_act[slot] = get_jiffies()
+    # Fresh per-slot retransmission state. A slot just returned to
+    # the pool by tcp_close can carry stale RTO / RTT / pending-
+    # segment fields; wipe ALL of them here so nothing leaks into
+    # the new connection on this slot. The first SYN we send gets
+    # armed by _tcp_send_segment; if no SYN-ACK comes back the
     # connect-side polling loop fires _tcp_check_retrans.
     tcp_slot_unacked[slot] = 0
     tcp_slot_retries[slot] = 0
@@ -999,6 +1062,7 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
     tcp_slot_have_rtt[slot] = 0
     tcp_slot_srtt[slot] = 0
     tcp_slot_rttvar[slot] = 0
+    tcp_slot_last_send[slot] = 0
     tcp_slot_pend_flags[slot] = 0
     tcp_slot_pend_len[slot] = 0
     tcp_slot_pend_seq[slot] = 0
@@ -1179,8 +1243,10 @@ def tcp_close(slot_signed: int32) -> int32:
         tcp_slot_state[slot] = TCP_FIN_WAIT_1
     # Poll until CLOSED or TIME_WAIT (treat TIME_WAIT as CLOSED for
     # the slot-free purpose — we don't honor the 2*MSL quiet period
-    # because SLIRP source ports collide-free for our 50000..50007
-    # range and we cycle through fewer than 8 connections per boot).
+    # because tcp_connect rotates the ephemeral source port on every
+    # active-open: the next connection on this slot uses a fresh
+    # port, so its 4-tuple can't collide with this just-closed one
+    # and there's no straggling-segment window the slot must absorb).
     #
     # FIN_WAIT_2 timeout (RFC 793 §3.5 / RFC 7414 §2.17): if the
     # peer ACKs our FIN but never sends its own FIN (common with
@@ -1391,6 +1457,8 @@ def tcp_init():
     tcp_resets_out = 0
     tcp_isn_init   = 0
     tcp_isn_state  = 0
+    tcp_ephemeral_cur  = 0
+    tcp_ephemeral_init = 0
     i: uint64 = 0
     while i < TCP_NUM_SLOTS:
         tcp_slot_state[i] = TCP_CLOSED
