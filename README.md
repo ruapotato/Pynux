@@ -64,24 +64,50 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
   hamsh prompt end-to-end on the UEFI path under QEMU+OVMF (M16.126,
   M16.138). UEFI on the real Asus is not yet re-confirmed.
 - **Linux ABI**: ~250 syscall numbers wired; 24 stock Debian `.ko`
-  modules load cleanly; musl-static, glibc-static-pie, and CPython
-  3.11 (frozen-stdlib build) all run real ELF binaries.
+  modules load cleanly. CPython 3.11.10 and busybox 1.36 both run as
+  musl static-PIE ELF binaries — `python3 -c "print(...)"` and a
+  multi-applet `busybox sh` pipeline work in QEMU. (busybox `ls`
+  directory enumeration is an open XFAIL — see "Known blockers".)
 - **Network stack**: virtio-net / e1000e / r8169 drivers; e1000e and
   r8169 both have a TX path (reset + TX ring + ARP round-trip) and an
   MSI single-vector path; ARP/IP/UDP/TCP/ICMP/DHCP (with
   renew+rebind)/DNS/HTTP/TLS 1.3 client with HTTPS GET working
   end-to-end. HTTP follows 3xx redirects and inflates gzip responses.
+- **USB**: native-Adder EHCI (USB 2.0) host-controller driver — probe
+  + port enumeration (V0), control transfers + HID boot keyboard (V1),
+  and an interrupt-driven MSI/INTx path (V2; the IRQ path is
+  code-inspection-verified only, since QEMU's `usb-ehci` exposes no
+  PCI capability list — the keyboard runs off a poll fallback under
+  QEMU). Sits beside the existing xHCI driver.
+- **Userland networking**: `socket`/`connect`/`read`/`write`/`close`
+  (client) and `bind`/`listen`/`accept` (server) bridged to the
+  in-kernel TCP stack for both native and Linux-ABI binaries; DNS
+  resolution via `sys_resolve`; `tls_connect(2)` gives userland HTTPS
+  through the in-kernel TLS 1.3 stack.
+- **Package tooling** (all native Adder, verified in QEMU): a native
+  `apt` — `apt update` / `apt show` / `apt pkgnames` / `apt install`
+  with transitive `Depends:` resolution and SHA-256 verification, over
+  **HTTP and HTTPS**; `dpkg` (`-i`/`-l`/`-s`/`-L`/`-r`) and `dpkg-deb`
+  (`-x`/`-I`/`-c`); an `httpd` static-file HTTP server.
 - **Block stack**: AHCI + NVMe, MBR + GPT read+write, FAT32 read,
   EXT4 read+write, partition-aware block-device naming (`sd0p1`,
   `nvme0n1p2`).
-- **dpkg userland**: `dpkg-deb` (`-x`/`-I`/`-c`) and a `dpkg` tool with
-  `-i` (control parse + status database + file manifest) and the
-  query subcommands `-l`/`-s`/`-L` — the apt-path groundwork.
-- **Plan 9 base**: codec + spec, kernel 9P client, per-process Pgrps
-  (heap-allocated), `/srv` / `/n` / `/proc/<pid>/ns` namespace
-  primitives, userspace recipe-driven init, `sys_srv_post`/`sys_srv_open`
-  syscalls, end-to-end userspace-server → kernel-client → read-bytes
-  loop verified.
+- **Package userland**: `dpkg-deb` (`-x`/`-I`/`-c`); a `dpkg` tool with
+  `-i` (control parse + status database + file manifest, stanza dedup),
+  the query subcommands `-l`/`-s`/`-L`, and `-r` (remove); a native
+  `apt` (`update`/`show`/`pkgnames`/`install`) with transitive
+  `Depends:` resolution + SHA-256 verification over HTTP and HTTPS;
+  an `httpd` static-file server. All verified in QEMU.
+- **Plan 9 base**: codec + spec, kernel 9P client (V4.1 — `create`
+  over a real fd; connection table released on unmount + task exit),
+  per-process Pgrps (heap-allocated), `/srv` / `/n` / `/proc/<pid>/ns`
+  namespace primitives, userspace recipe-driven init,
+  `sys_srv_post`/`sys_srv_open` syscalls, end-to-end userspace-server →
+  kernel-client → read-bytes loop verified. `distrofs` is a userland
+  9P file-server daemon exporting a distro-shaped (`/var`,`/usr`,`/etc`)
+  tree; `nsrun` launches a program in a private namespace
+  (`rfork(RFNAMEG)` + mount `distrofs`) so it sees that tree through
+  9P, isolated from the parent.
 - **Userspace**: hamsh shell with control flow, `$?`, `$VAR`, PATH
   walker; ~60 GNU-style binaries; per-process namespaces verified to
   isolate.
@@ -109,31 +135,37 @@ Concretely this means closing four named gates:
    keyboard, and the ring-3-transition triple-fault fix in M16.156.
    Still open on metal: the laptop's **built-in keyboard does not
    work** (leading hypothesis: it's on the EHCI USB 2.0 controller,
-   not the i8042 — unverified), and **UEFI boot on the real Asus is
-   not yet re-confirmed** (only Legacy/BIOS is). `docs/REAL_HARDWARE.md`
-   has the USB-stick recipe + firmware checklist.
+   not the i8042 — a native EHCI driver has since landed and is
+   verified under QEMU but **not yet tested on the Asus**), and
+   **UEFI boot on the real Asus is not yet re-confirmed** (only
+   Legacy/BIOS is). `docs/REAL_HARDWARE.md` has the USB-stick recipe
+   + firmware checklist.
 2. **TLS-CERT — X.509 + RSA-PSS / ECDSA verify with a baked CA store.**
-   **Closed.** V0..V6 + V5.1/V5.2/V5.3 (commits `f47449e` → `dc7676c`).
+   **Closed.** V0..V7 + V5.1/V5.2/V5.3/V5.4 (commits `f47449e` →
+   `dc7676c`, `7bc0ddd`, `f0b26b2`).
    ASN.1 parser, X.509 walker, RSA-PSS-SHA256, ECDSA-P256 (binary-GCD
    modular inverse — ~1 s verify in QEMU), PKCS#1 v1.5 SHA-256, chain
    builder + 8-anchor CA store + validity window, CertificateVerify
    transcript binding (V5.1), multi-record handshake stitching (V5.2),
    TCP per-slot RX ring so multi-segment chains accumulate cleanly
-   (V5.3), CMOS RTC backing `_tls_now_unix` so clock-rollback attacks
-   don't fly. HTTP/1.1 chunked transfer-encoding decoder and gzip
-   inflater (`lib/zlib/inflate.ad`) wired into `http_get` so real
-   `Packages.gz` decompresses transparently. Outstanding before
-   real-world `apt update` against Cloudflare-fronted Debian mirrors:
-   AES-256-GCM-SHA384 cipher suite (currently clean-fails on
-   unsupported suites per RFC 8446 §6.2 — no crash); HTTP redirects
-   (in flight); apt-glue itself (Release → Packages.gz → .deb →
-   dpkg — userland work atop a working transport).
+   (V5.3), AES-256-GCM-SHA384 cipher suite + RSA-4096/ISRG chain
+   (V6/V7), CMOS RTC backing `_tls_now_unix` so clock-rollback attacks
+   don't fly. HTTP/1.1 chunked transfer-encoding decoder, 3xx
+   redirect-follow, and gzip inflater (`lib/zlib/inflate.ad`) wired
+   into `http_get` so real `Packages.gz` decompresses transparently.
+   The apt-glue (Release → Packages.gz → .deb → dpkg) is now built
+   too: a native `apt` runs the whole chain over HTTP and HTTPS in
+   QEMU. Outstanding before a real-world `apt update` against a live
+   Debian mirror: `Release`/`InRelease` GPG signature verification.
 3. **USB HID continuous polling** so a real `sendkey x` keystroke
    reaches hamsh stdin. **Closed structurally** in M16.139 V0/V1/V2
    (xHCI controller + transfer engine + interrupt-IN timer-tick poll
-   + HID → atkbd FIFO). Verified synthetically; wire-side `sendkey`
-   in the test harness is pending `socat` install on the host (the
-   kernel path itself is sound).
+   + HID → atkbd FIFO), with a native EHCI (USB 2.0) driver since
+   added (V0 probe/port-enum, V1 control transfers + HID boot
+   keyboard, V2 interrupt-driven MSI/INTx) — a live `sendkey`
+   keystroke reaches the kbd FIFO through EHCI under QEMU `usb-ehci` +
+   `usb-kbd`. Not yet exercised on the real Asus, where the built-in
+   keyboard remains the open hardware blocker.
 4. **Inbound SSH.** Not yet started. The crypto primitives are in
    place (ChaCha20-Poly1305, AES-128-GCM, X25519, SHA-256, ECDSA-P256,
    RSA-PSS, the inflater, the validated TLS stack), but the SSH
@@ -156,11 +188,13 @@ beyond MVP.
 | Gate | Status | Impact |
 |--|--|--|
 | **TLS cert validation** | **Closed** — apt-over-HTTPS against LE-signed mirrors is MITM-resistant | Full chain validation V0..V7: ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify, ECDSA-P256 verify, PKCS#1 v1.5 verify, chain builder + CA store + validity window, CertificateVerify transcript binding per RFC 8446 §4.4.3, multi-record handshake stitching, TCP per-slot RX ring. V6 added the AES-256-GCM-SHA384 cipher suite (codepoint 0x1302) + SHA-384; V6.1/V7 fixed ISRG Root X1 / RSA-4096 chain validation (x509 SPKI buffer cap + bigint limb count). Remaining real-world fragilities: (a) no CRL/OCSP (intentional per RFC 5280 §6 — out of scope); (b) timing-channel hardening still pending in primitives; (c) `_tls_now_unix` falls back to a build epoch when RTC is unavailable, opening a clock-rolled-back attack on expired certs. |
-| **Real-hardware keyboard** | Open blocker | Hamnix boots to `hamsh` on the real Asus laptop, but the built-in keyboard produces nothing. The atkbd path got an i8042 controller bring-up handshake + IRQ 1 wiring + an ISA-edge IOAPIC redirect fix (`dbd40e6`), all confirmed under QEMU; on the real laptop the keyboard still does not respond. Leading hypothesis: the keyboard is on the EHCI USB 2.0 controller, not the i8042 — **unverified**. An EHCI driver is in flight. |
+| **Real-hardware keyboard** | Open blocker | Hamnix boots to `hamsh` on the real Asus laptop, but the built-in keyboard produces nothing. The atkbd path got an i8042 controller bring-up handshake + IRQ 1 wiring + an ISA-edge IOAPIC redirect fix (`dbd40e6`), all confirmed under QEMU; on the real laptop the keyboard still does not respond. Leading hypothesis: the keyboard is on the EHCI USB 2.0 controller, not the i8042. A native-Adder EHCI driver has since landed (V0 probe/port-enum, V1 control transfers + HID boot keyboard, V2 interrupt-driven delivery) — all verified under QEMU `usb-ehci` + `usb-kbd`, but **not yet tested on the real Asus**. |
 | **UEFI real-hardware boot** | Not re-confirmed | UEFI direct boot reaches `hamsh` under QEMU+OVMF. Legacy/BIOS boot is confirmed on the real Asus; the UEFI path on that laptop has not been re-verified after the M16.151–156 wave. |
-| **`apt update` end-to-end** | Not yet exercised | The transport (TLS 1.3 + cert validation + HTTP redirects + gzip inflate) and the dpkg userland (`dpkg-deb`, `dpkg -i`/`-l`/`-s`/`-L`) are in place, but a real `apt update` against a live Debian mirror has not been run end-to-end. |
+| **`apt` against a live Debian mirror** | Works in QEMU vs. a fixture repo; not run vs. a live mirror | A native `apt` (`update`/`show`/`pkgnames`/`install` with transitive `Depends:` + SHA-256 verify, over HTTP **and HTTPS** via `tls_connect(2)`) is verified under QEMU against a local fake Debian repo. A real `apt update` against `deb.debian.org` is not yet exercised — and the `Release`/`InRelease` GPG signature is not verified, so the index is currently trusted on transport security alone. |
+| **apt/dpkg/httpd under a namespace** | Open — global-path debt | The native `apt`/`dpkg`/`httpd` tools still write *global* paths (a global `/var` tmpfs, `/tmp/...`). Per the Namespace law they must run *under* `nsrun` so `/var/lib/dpkg`, `/var/cache/apt`, `/var/www` resolve through a private `distrofs` namespace. `distrofs` + `nsrun` exist; migrating the tools onto them is open work. |
+| **`syscall_64.S` `%rdi` ABI fix** | Proposed — pending maintainer review, NOT landed | A fix to preserve `%rdi` across the syscall entry stub exists on a worktree branch but is held pending review (it touches a fenced file). Symptom it addresses: musl `open()` with `O_CLOEXEC` returns 0. |
 | **Inbound SSH** | Not yet started | Needed for "useful server OS" but no SSH protocol code exists. Crypto primitives are in place (ChaCha20-Poly1305, AES-128/256-GCM, X25519, SHA-256/384, ECDSA-P256, RSA-PSS); the SSH layer itself isn't. |
-| **Static Python / musl-busybox follow-ons** | Open | CPython runs (frozen-stdlib static build); a fuller apt-installable Python and broader musl-busybox applet coverage remain. |
+| **busybox `ls` enumeration** | Open XFAIL | CPython 3.11.10 and busybox 1.36 run as musl static-PIE binaries in QEMU; `python3 -c` and a multi-applet `busybox sh` pipeline pass. But `busybox ls` directory enumeration prints nothing — musl's `opendir`/`readdir` round-trip the directory fd incorrectly (a direct `getdents64` syscall enumerates fine). busybox `sh`'s *internal* pipeline (`sh -c "a \| b"`) also trips a `#GP`. Both are marked XFAIL in the U-track tests. |
 | **U9 nested-frame Array spill** | Active compiler bug | `Array[N, T]` locals with the same shape in caller + callee miscompile. Workaround: inline the callee. See [`memory/feedback_compiler_quirks.md`](memory/feedback_compiler_quirks.md). |
 
 Four other compiler bugs landed proper fixes during the recent sessions
@@ -313,7 +347,7 @@ drivers/         Native Adder drivers
   net/            virtio-net, e1000e, r8169 + ARP/IP/UDP/TCP/ICMP/DHCP/DNS/HTTP/TLS
   block/          partition table parser (MBR+GPT, read+write)
   input/          atkbd (PS/2), auxmouse (PS/2)
-  usb/            xHCI + HID boot keyboard
+  usb/            xHCI + EHCI (USB 2.0) + HID boot keyboard
   tty/serial/     16550A UART
   video/console/  VGA text + EFI GOP framebuffer text mode
   pci/            PCI config-space scan

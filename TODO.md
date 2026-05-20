@@ -4,10 +4,10 @@ Open work items not yet scheduled to a specific milestone. Items here
 are fair game for any contributor — human or AI agent.
 
 > **Before picking an item, check [`STATUS.md`](STATUS.md) first.**
-> This file was pruned as of M16.157 + the dpkg-userland wave; the
-> entries below are believed open, but `STATUS.md` is the source of
-> truth for what shipped. Recent waves that closed large chunks of
-> this file:
+> This file was pruned as of the apt / EHCI / userland-sockets wave
+> (commit `a73e5fb`); the entries below are believed open, but
+> `STATUS.md` is the source of truth for what shipped. Recent waves
+> that closed large chunks of this file:
 >
 > - **Real-hardware boot (M16.156).** Hamnix boots to `hamsh` on a
 >   real Asus i5-4210U laptop in Legacy/BIOS mode. The ring-3
@@ -15,12 +15,26 @@ are fair game for any contributor — human or AI agent.
 >   corruption, and xHCI-no-keyboard hang are all fixed.
 > - The Plan 9 native-syscall surface (`rfork`/`bind`/`mount` bodies,
 >   per-process namespaces, `sys_srv_post`/`sys_srv_open`,
->   `sys_socketpair`) is done end-to-end.
+>   `sys_socketpair`) is done end-to-end. 9P V4.1 adds `create` over
+>   a real fd; the connection table is released on unmount + task
+>   exit. `distrofs` (userland 9P file server) + `nsrun` (private-
+>   namespace shim launcher) have shipped.
 > - TLS cert validation is closed for LE-signed chains (PSS + ECDSA
 >   + PKCS#1 v1.5 + chain builder + CA store + CertificateVerify
 >   binding + multi-record stitching + AES-256-GCM-SHA384 + RSA-4096).
->   HTTP follows 3xx redirects and inflates gzip. dpkg userland
->   (`dpkg-deb`, `dpkg -i`/`-l`/`-s`/`-L`) is the apt-path groundwork.
+>   HTTP follows 3xx redirects and inflates gzip.
+> - **Package userland (verified in QEMU):** `dpkg-deb`, `dpkg`
+>   (`-i`/`-l`/`-s`/`-L`/`-r`), a native `apt`
+>   (`update`/`show`/`pkgnames`/`install` with transitive `Depends:`
+>   + SHA-256 verify over HTTP **and HTTPS**), and an `httpd`
+>   static-file server.
+> - **Userland networking:** `socket`/`connect`/`read`/`write`/`close`
+>   (client) and `bind`/`listen`/`accept` (server) bridged to the
+>   in-kernel TCP stack; `sys_resolve` DNS; `tls_connect(2)` for
+>   userland HTTPS. CPython 3.11.10 and busybox 1.36 run as musl
+>   static-PIE binaries.
+> - **EHCI (USB 2.0) driver** — V0 probe/port-enum, V1 control
+>   transfers + HID boot keyboard, V2 interrupt-driven MSI/INTx.
 > - The compiler `Ptr[T]`-to-`&local` clobber, `&arr[i][j]` lower-to-
 >   NULL, signed-only compare quirks, and stack-protector hardening
 >   are all in. Driver-code workarounds are retired.
@@ -78,8 +92,11 @@ it has to honour.
 >
 > Historical debt being corrected: the native `apt`/`dpkg`/`httpd`
 > tools and commit `86a13bd` (global `/var` tmpfs) were built against
-> global paths before this law was written down. They are tracked for
-> migration into the `distrofs` namespace under Phase C.5.
+> global paths before this law was written down. The `distrofs` 9P
+> daemon and the `nsrun` shim launcher have since shipped — but the
+> tools have **not** yet been migrated to run *under* `nsrun`; they
+> still write global paths. That migration is tracked under Phase C.5
+> and is genuinely-open work.
 
 ## Language
 
@@ -188,21 +205,26 @@ the parent still reads `hamnix/0.1`. Open follow-ups:
 - `/bin/python3` from Debian — lands after the libdl follow-up.
 
 **Distrofs namespace migration (correcting the global-path debt):**
-- `distrofs` 9P daemon — a userland 9P file server exporting a
-  distro-shaped tree (`/var`, `/usr`, `/etc`, ...). Plan 9-pure, a
-  daemon like `rio`/`hamwd`. (V0 in flight: `user/distrofs.ad`.)
-- Migrate the native `apt`/`dpkg`/`httpd` tools off global paths:
-  each must be launched in a private namespace (`rfork(RFNAMEG)` +
-  mount `distrofs`) so `/var/lib/dpkg`, `/var/cache/apt`, `/var/www`
-  resolve through the namespace to the `distrofs` server. Today they
-  write a global `/tmp/...` or global `/var/...` — wrong shape.
-- Supersede commit `86a13bd` (global `/var` tmpfs subtree) — once
-  `distrofs` + the namespace launch path land, the global `/var`
-  is removed; nothing should depend on a global `/var`.
-- Shim launcher — a small `rfork(RFNAMEG)` + `mount(distrofs)` +
-  `exec` front-end that every Linux-binary / package tool runs
-  behind. Probably needs 9P V4.1 (kernel-side `_p9_send`/`_p9_recv`
-  real-fd dispatch — see `memory/project_plan9_pivot.md`).
+
+The `distrofs` 9P daemon (`user/distrofs.ad`) and the `nsrun` shim
+launcher (`user/nsrun.ad` — `rfork(RFNAMEG)` + mount `distrofs` so a
+child sees `/var`,`/usr`,`/etc` through 9P) have **shipped**, as has
+9P V4.1 (`create` over a real fd). The genuinely-open work is the
+*migration* of the package tools onto them:
+
+- **Migrate the native `apt`/`dpkg`/`httpd` tools off global paths.**
+  They still write a global `/var/...` / `/tmp/...` today — wrong
+  shape. Each must be launched *under* `nsrun` so `/var/lib/dpkg`,
+  `/var/cache/apt`, `/var/www` resolve through the private namespace
+  to the `distrofs` server. This is the largest open Namespace-law
+  debt.
+- Supersede commit `86a13bd` (global `/var` tmpfs subtree) — once the
+  tools run under `nsrun`, the global `/var` is removed; nothing
+  should depend on a global `/var`.
+- `distrofs` persistence — `distrofs` serves a tmpfs-backed tree that
+  does not survive a reboot. A persistent backing store (an ext4
+  partition, or a disk-backed image) is needed before an installed
+  package survives a power cycle.
 - Phase D follow-up: once `chan_attach` speaks 9P, replace the four
   per-subdir binds in `distrorun.ad` with a single
   `mount(srvfd, -1, "/", MREPL, "")` call.
@@ -280,6 +302,20 @@ implementation is gated on the open design questions in
 
 ## Kernel / L-track
 
+- **`syscall_64.S` `%rdi`-preservation ABI fix — PROPOSED, pending
+  maintainer review, NOT landed.** A fix to preserve `%rdi` across
+  the syscall entry stub exists on a worktree branch but is held: it
+  touches a fenced file (`arch/x86/kernel/syscall_64.S`). Symptom it
+  addresses: musl `open()` with `O_CLOEXEC` returns 0, which breaks
+  `busybox ls` directory enumeration. Do not mark done until it has
+  been reviewed and landed on `main`.
+- **Higher-half kernel** — the kernel image is identity-mapped low,
+  so `fs/elf.ad` must *refuse* any fixed-address ET_EXEC whose LOAD
+  range collides with it (`653d962`). Moving the kernel to the
+  canonical higher-half (`0xffffffff80000000`) would free the low
+  address space and let fixed-address ET_EXEC binaries (glibc
+  `-static` at 0x400000) load. Until then only ET_DYN static-PIE
+  Linux binaries run.
 - `MAX_EXPORTS=512` ceiling — bump again when we cross ~450 used.
 - nf_conntrack core (~155 UND) — blocking conntrack helpers.
 - `8021q.ko` (~118 UND, VLAN).
@@ -345,16 +381,15 @@ follow-ups:
   explicit accept queue per listener or a wider TCB table.
 - TCP window scaling + SACK + timestamps — performance options; not
   blockers for `apt`'s short single-segment requests.
-- Socket(2) API — V0 done: userland `socket`/`connect`/`write`/`read`/
-  `close` on an `AF_INET` + `SOCK_STREAM` fd are bridged to the
-  in-kernel TCP stack (`linux_abi/u_socket_state.ad` backing records;
-  the `_u_socket`/`_u_connect` bodies + `fs/vfs.ad`'s `FD_SOCKET_MARK`
-  read/write/close arms). `scripts/test_u_socket.sh` proves a user
-  binary completes a real TCP request/response. V1 backlog:
-  - Server side — `bind`/`listen`/`accept` still stubbed. The TCP
-    stack already has `tcp_listen`/`tcp_accept`; wire `bind` to record
-    the port, `listen` to call `tcp_listen`, `accept` to return
-    `tcp_accept`'s slot as a fresh socket fd.
+- Socket(2) API — V0 + server side done: userland `socket`/`connect`/
+  `read`/`write`/`close` (client) and `bind`/`listen`/`accept`
+  (server) on an `AF_INET` + `SOCK_STREAM` fd are bridged to the
+  in-kernel TCP stack, for both native Adder and Linux-ABI binaries
+  (`linux_abi/u_socket_state.ad` backing records; `fs/vfs.ad`'s
+  `FD_SOCKET_MARK` arms). `tls_connect(2)` (`SYS_TLS_CONNECT 277`)
+  gives userland HTTPS through the in-kernel TLS stack;
+  `scripts/test_u_socket.sh` / `test_u_server.sh` / `test_u_tls.sh`
+  cover it. Open backlog:
   - Non-blocking sockets / `O_NONBLOCK` — `socket` masks
     `SOCK_NONBLOCK` off today; connect/read/write always block (poll
     with a bounded deadline). Needs an `EAGAIN`-on-would-block path.
@@ -425,19 +460,30 @@ MSI single-vector paths (V1/V2). Open follow-ups:
 - Real vDSO blob (mapped page advertised via `AT_SYSINFO_EHDR`),
   replacing the U11-era kernel-side `_lookup_dynsym` hack retired
   in U20.
-- **U41 CPython follow-ups.** CPython 3.11.10 runs as a frozen-stdlib
-  `-static` ELF. Open: trim the frozen set (the `<encodings.*>` glob
+- **U41 CPython follow-ups.** CPython 3.11.10 runs as a musl
+  static-PIE (ET_DYN) frozen-stdlib ELF — `python3 -c "print(...)"`
+  works in QEMU. Open: trim the frozen set (the `<encodings.*>` glob
   pulls in ~1 MB of bytecode the boot path doesn't touch);
   `--enable-optimizations` (PGO+LTO); C extensions (`_ssl`,
   `_hashlib`, `_socket`, `_curses` — need a U-track `ld.so` or
   static-linked extensions).
-- **musl-busybox follow-ups.** The banner + `busybox echo` round-trip
-  cleanly, but a directory-walking applet (`busybox ls /etc`) trips a
-  `#GP` in the libc exit-cleanup / `getdents64` path. Fix candidates:
-  (a) trace musl's `exit_group` → `set_robust_list` → `rseq`
-  teardown and stub the missing syscall numbers; (b) implement
-  `getdents64` (217) with a real body. Also: CPython-via-musl, an
-  `apt`-static via musl, broader busybox applet coverage.
+- **busybox `ls` enumeration — open XFAIL.** busybox 1.36 runs as a
+  musl static-PIE; the u29/u32/u33/u36/u37 tests pass (multi-call
+  banner, `echo`/`cat`/`pwd`/`uname` applets, `sh -c`, a 3-stage
+  hamsh pipeline). But `busybox ls` directory enumeration prints
+  nothing — musl's `opendir`/`readdir` hand `getdents64` the wrong
+  fd (a direct `SYS_getdents64` syscall enumerates a directory
+  cleanly, so `getdents64` itself is correct; the gap is the musl
+  DIR-struct fd round-trip). Tracked by the held `syscall_64.S`
+  `%rdi`-preservation fix (see Kernel / L-track) — musl `open()`
+  with `O_CLOEXEC` returning 0 is the suspected root cause. Marked
+  XFAIL in u32/u33.
+- **busybox `sh` internal pipeline `#GP`.** `busybox sh -c "a | b"`
+  trips a `#GP` that halts the kernel. The u37 test deliberately
+  drives the strictly-wider hamsh-driven 3-process pipeline instead,
+  which passes. Open: diagnose the `#GP` (likely a clone/exec path
+  busybox's internal pipeline takes that the hamsh path doesn't).
+- Broader busybox applet coverage; an `apt`-static via musl.
 
 ## Storage
 
@@ -474,7 +520,8 @@ shipped. Open follow-ups:
 
 PS/2 keyboard (extended scancodes + modifiers + i8042 bring-up + IRQ 1
 wiring), PS/2 mouse (3-byte protocol, IRQ 12, `/dev/mouse` cdev), and
-USB HID via xHCI (V0/V1/V2) have all shipped. The IRQ 1 / IRQ 12
+USB HID via xHCI (V0/V1/V2) **and EHCI** (V0/V1/V2) have all shipped.
+The IRQ 1 / IRQ 12
 ISA-edge IOAPIC redirect bug is fixed (`dbd40e6` / `9ec996c`). Open
 follow-ups:
 
@@ -482,8 +529,12 @@ follow-ups:
   the real Asus i5-4210U laptop does not respond — atkbd's i8042
   handshake, RESET (0xFF), and IDENTIFY (0xF2) probes return nothing
   on metal. Leading hypothesis: the keyboard is on the **EHCI USB 2.0
-  controller**, not the i8042. An EHCI USB 2.0 host-controller driver
-  is in flight. The atkbd path is confirmed working under QEMU.
+  controller**, not the i8042. A native-Adder EHCI driver has since
+  landed (V0 probe/port-enum, V1 control transfers + HID boot
+  keyboard, V2 interrupt-driven MSI/INTx) and is verified under QEMU
+  `usb-ehci` + `usb-kbd` — but it has **not yet been tested on the
+  real Asus**; the keyboard there may or may not now work. The atkbd
+  path is confirmed working under QEMU.
 - International keyboard layouts (Dvorak, AZERTY, German QWERTZ, UK)
   — `sc1_to_ascii` / `sc1_to_shifted` are hard-coded US-104; a
   `kbd_set_layout(name)` entry point + a registry of compiled-in
@@ -508,11 +559,13 @@ boot is confirmed** — an Asus i5-4210U boots to `hamsh` in Legacy/BIOS
 mode (M16.156). Open follow-ups:
 
 - **Real-hardware keyboard** — see the Input section. The leading
-  hypothesis is an EHCI-routed built-in keyboard; an EHCI USB 2.0
-  host-controller driver is in flight.
+  hypothesis is an EHCI-routed built-in keyboard; the EHCI USB 2.0
+  host-controller driver (V0/V1/V2) has landed and is QEMU-verified
+  but not yet tested on the real Asus.
 - **UEFI on the real Asus** — Legacy/BIOS boot is confirmed; the UEFI
   direct-boot path on that laptop has not been re-verified since the
-  M16.151–156 wave. Re-test it.
+  M16.151–156 wave. Re-test it. (See also the real-hardware keyboard
+  retest above — both want a fresh on-metal run.)
 - **EFI memory-map walker** in `e820.ad` — the stub saves the 16 KiB
   descriptor buffer at `efi_mmap_buf` (+ `efi_mmap_descsize`), but
   `e820_init()` still installs a hardcoded 2..240 MiB memblock window
@@ -531,6 +584,14 @@ mode (M16.156). Open follow-ups:
 - **Drop the FAT12 32 MiB ESP cap** by conditionally using the
   GPT-ESP direct-mount path modern OVMF supports — eliminates the
   ceiling on initramfs growth.
-- **`apt update` end-to-end** — the transport (TLS 1.3 + cert
-  validation + redirects + gzip) and dpkg userland are in place;
-  run a real `apt update` against a live Debian mirror.
+- **`apt` against a live Debian mirror** — the native `apt`
+  (`update`/`show`/`pkgnames`/`install` with transitive `Depends:`
+  + SHA-256 verify, over HTTP and HTTPS) is verified under QEMU
+  against a local fixture repo. Run it against a real mirror
+  (`deb.debian.org`). Blocked behind the next item.
+- **`apt` `Release`/`InRelease` GPG signature verification.** apt
+  currently trusts the repo index on transport security (HTTPS +
+  cert validation) alone — it does not verify the detached GPG
+  signature on `Release` / the inline-signed `InRelease`. A real
+  `apt update` against an untrusted mirror needs an OpenPGP
+  signature verifier + a baked Debian-archive keyring.
