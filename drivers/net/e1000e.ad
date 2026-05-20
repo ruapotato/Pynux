@@ -70,6 +70,10 @@ from arch.x86.kernel.apic import ioapic_redirect
 from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from mm.slab import kmalloc
+# Higher-half kernel: device DMA targets must be physical addresses.
+# alloc_pages/kmalloc return low (== physical) addresses already; a
+# buffer that is a kernel global needs virt_to_phys() rebasing.
+from arch.x86.mm.pgtable import virt_to_phys
 from drivers.net.eth import eth_rx
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
@@ -475,8 +479,13 @@ def _e1000e_desc_set(ring: uint64, idx: uint64, buf_addr: uint64):
     # Zero-out the per-descriptor 16-byte slot and plant only the
     # buffer address. status/err/length stay zero — the device
     # writes them when it deposits a frame.
+    #
+    # Higher-half kernel: the descriptor's buffer-address field is a
+    # PHYSICAL address the NIC DMAs into. virt_to_phys() rebases a
+    # high-half kernel address; a kmalloc'd RX buffer is already low
+    # and passes through unchanged.
     d: uint64 = ring + idx * RX_DESC_BYTES
-    cast[Ptr[uint64]](d +  0)[0] = buf_addr
+    cast[Ptr[uint64]](d +  0)[0] = virt_to_phys(buf_addr)
     cast[Ptr[uint64]](d +  8)[0] = 0
 
 
@@ -1066,7 +1075,9 @@ def e1000e_tx_packets() -> uint64:
 def _e1000e_tx_desc_set(ring: uint64, idx: uint64,
                         buf_addr: uint64, length: uint16):
     d: uint64 = ring + idx * TX_DESC_BYTES
-    cast[Ptr[uint64]](d +  0)[0] = buf_addr
+    # Higher-half kernel: the TX buffer is the e1000e_tx_buf global (a
+    # high-half VA); the NIC DMAs from a PHYSICAL address. Rebase it.
+    cast[Ptr[uint64]](d +  0)[0] = virt_to_phys(buf_addr)
     cast[Ptr[uint16]](d +  8)[0] = length
     # CSO (+10) = 0; CMD (+11) = EOP|IFCS|RS.
     cast[Ptr[uint8]](d + 10)[0] = 0

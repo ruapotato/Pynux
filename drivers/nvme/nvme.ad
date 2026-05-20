@@ -54,6 +54,10 @@ from arch.x86.kernel.apic import ioapic_redirect
 from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from mm.slab import kmalloc
+# Higher-half kernel: a caller-supplied DMA buffer that is a kernel
+# global needs virt_to_phys() rebasing before the NVMe controller
+# DMAs to it (PRP entries hold physical addresses).
+from arch.x86.mm.pgtable import virt_to_phys
 from kernel.block.blk import (
     BlockDeviceOps, register_blockdev, find_blockdev,
     blk_read_sectors, blk_write_sectors, SECTOR_SIZE,
@@ -770,9 +774,15 @@ def _nvme_read_lba(lba: uint64, nblocks: uint16, dst: uint64) -> int32:
     cdw12: uint32 = cast[uint32](nblocks - 1) & 0xFFFF
     # V4.2: pass the byte length so _io_submit_buf_and_wait can resolve
     # PRP1 + PRP2 + (if needed) a PRP-list page for the transfer.
+    #
+    # Higher-half kernel: the NVMe controller DMAs to PHYSICAL
+    # addresses. `dst` is the caller's buffer — the block layer may
+    # hand us a kernel global (high-half VA). virt_to_phys() rebases
+    # it; an alloc_pages/kmalloc buffer is already low and unchanged.
+    dst_phys: uint64 = virt_to_phys(dst)
     buf_len: uint64 = cast[uint64](nblocks) * SECTOR_SIZE
     status: uint32 = _io_submit_buf_and_wait(
-        NVME_IO_READ, NVME_IO_QID, dst, buf_len,
+        NVME_IO_READ, NVME_IO_QID, dst_phys, buf_len,
         cdw10, cdw11, cdw12, 0, 0, 0)
     if status != 0:
         printk1("[nvme] I/O READ failed (status=%x)\n",
@@ -802,9 +812,12 @@ def _nvme_write_lba(lba: uint64, nblocks: uint16, src: uint64) -> int32:
     cdw11: uint32 = cast[uint32](lba >> 32)
     cdw12: uint32 = cast[uint32](nblocks - 1) & 0xFFFF
     # V4.2: byte-length-aware PRP resolution (see _nvme_read_lba).
+    # Higher-half kernel: rebase the caller's source buffer to a
+    # physical address for the controller's DMA (see _nvme_read_lba).
+    src_phys: uint64 = virt_to_phys(src)
     buf_len: uint64 = cast[uint64](nblocks) * SECTOR_SIZE
     status: uint32 = _io_submit_buf_and_wait(
-        NVME_IO_WRITE, NVME_IO_QID, src, buf_len,
+        NVME_IO_WRITE, NVME_IO_QID, src_phys, buf_len,
         cdw10, cdw11, cdw12, 0, 0, 0)
     if status != 0:
         printk1("[nvme] I/O WRITE failed (status=%x)\n",

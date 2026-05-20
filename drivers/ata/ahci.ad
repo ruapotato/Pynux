@@ -63,6 +63,9 @@ from arch.x86.kernel.apic import ioapic_redirect
 from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from mm.slab import kmalloc
+# Higher-half kernel: a caller-supplied DMA buffer that is a kernel
+# global needs virt_to_phys() rebasing before the AHCI engine sees it.
+from arch.x86.mm.pgtable import virt_to_phys
 from kernel.block.blk import (
     BlockDeviceOps, register_blockdev, find_blockdev,
     blk_read_sectors, blk_write_sectors, SECTOR_SIZE,
@@ -356,9 +359,16 @@ def _build_prdt(ct_base: uint64, dba: uint64, bytecount: uint32):
     # Single PRD entry at CT + 0x80. 16 bytes. dbc encodes (count-1)
     # in bits 0..21; bit 31 is IOC (interrupt on completion — fine
     # to leave 0 since we poll).
+    #
+    # Higher-half kernel: `dba` is the caller's data buffer, and the
+    # AHCI engine DMAs to/from a PHYSICAL address. The block-layer
+    # caller may hand us a buffer that is a kernel global (high-half
+    # VA) — e.g. the ext4 mkfs scratch block. virt_to_phys() rebases
+    # it; an alloc_pages/kmalloc buffer is already low and unchanged.
+    dba_phys: uint64 = virt_to_phys(dba)
     p: Ptr[uint32] = cast[Ptr[uint32]](ct_base + CT_PRDT_OFF)
-    p[0] = cast[uint32](dba & 0xFFFFFFFF)
-    p[1] = cast[uint32](dba >> 32)
+    p[0] = cast[uint32](dba_phys & 0xFFFFFFFF)
+    p[1] = cast[uint32](dba_phys >> 32)
     p[2] = 0
     p[3] = (bytecount - 1) & 0x3FFFFF       # bits 0..21
 

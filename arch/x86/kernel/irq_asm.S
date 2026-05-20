@@ -110,55 +110,57 @@ common_irq:
     iretq
 
 /* ---------- irq_stub_table --------------------------------------- *
- * Sixteen entries, one per legacy IRQ vector (32..47). Same .long+0
- * encoding as trap_stub_table to dodge elf32-i386's 64-bit reloc
- * limitation. Consumed by idt_init() via get_irq_stub() to populate
- * IDT gates 32..47.
+ * Forty entries, one per IRQ vector (32..71). Consumed by idt_init()
+ * via get_irq_stub() to populate IDT gates 32..71. Each entry is the
+ * full 64-bit virtual address of the stub; the kernel is a true
+ * elf64-x86-64 object so `.quad sym` (R_X86_64_64) works directly —
+ * no more `.long sym; .long 0` split (the kernel is linked in the
+ * higher half now, where the addresses genuinely need 64 bits).
  */
     .section .rodata
     .align 8
     .globl irq_stub_table
 irq_stub_table:
-    .long irq_stub_32; .long 0
-    .long irq_stub_33; .long 0
-    .long irq_stub_34; .long 0
-    .long irq_stub_35; .long 0
-    .long irq_stub_36; .long 0
-    .long irq_stub_37; .long 0
-    .long irq_stub_38; .long 0
-    .long irq_stub_39; .long 0
-    .long irq_stub_40; .long 0
-    .long irq_stub_41; .long 0
-    .long irq_stub_42; .long 0
-    .long irq_stub_43; .long 0
-    .long irq_stub_44; .long 0
-    .long irq_stub_45; .long 0
-    .long irq_stub_46; .long 0
-    .long irq_stub_47; .long 0
-    .long irq_stub_48; .long 0
-    .long irq_stub_49; .long 0
-    .long irq_stub_50; .long 0
-    .long irq_stub_51; .long 0
-    .long irq_stub_52; .long 0
-    .long irq_stub_53; .long 0
-    .long irq_stub_54; .long 0
-    .long irq_stub_55; .long 0
-    .long irq_stub_56; .long 0
-    .long irq_stub_57; .long 0
-    .long irq_stub_58; .long 0
-    .long irq_stub_59; .long 0
-    .long irq_stub_60; .long 0
-    .long irq_stub_61; .long 0
-    .long irq_stub_62; .long 0
-    .long irq_stub_63; .long 0
-    .long irq_stub_64; .long 0
-    .long irq_stub_65; .long 0
-    .long irq_stub_66; .long 0
-    .long irq_stub_67; .long 0
-    .long irq_stub_68; .long 0
-    .long irq_stub_69; .long 0
-    .long irq_stub_70; .long 0
-    .long irq_stub_71; .long 0
+    .quad irq_stub_32
+    .quad irq_stub_33
+    .quad irq_stub_34
+    .quad irq_stub_35
+    .quad irq_stub_36
+    .quad irq_stub_37
+    .quad irq_stub_38
+    .quad irq_stub_39
+    .quad irq_stub_40
+    .quad irq_stub_41
+    .quad irq_stub_42
+    .quad irq_stub_43
+    .quad irq_stub_44
+    .quad irq_stub_45
+    .quad irq_stub_46
+    .quad irq_stub_47
+    .quad irq_stub_48
+    .quad irq_stub_49
+    .quad irq_stub_50
+    .quad irq_stub_51
+    .quad irq_stub_52
+    .quad irq_stub_53
+    .quad irq_stub_54
+    .quad irq_stub_55
+    .quad irq_stub_56
+    .quad irq_stub_57
+    .quad irq_stub_58
+    .quad irq_stub_59
+    .quad irq_stub_60
+    .quad irq_stub_61
+    .quad irq_stub_62
+    .quad irq_stub_63
+    .quad irq_stub_64
+    .quad irq_stub_65
+    .quad irq_stub_66
+    .quad irq_stub_67
+    .quad irq_stub_68
+    .quad irq_stub_69
+    .quad irq_stub_70
+    .quad irq_stub_71
 
     .section .text, "ax"
     .align 16

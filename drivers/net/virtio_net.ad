@@ -49,6 +49,8 @@ from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from mm.slab import kmalloc
 from drivers.net.eth import eth_rx, nd_mac
+# Higher-half kernel: device DMA targets must be physical addresses.
+from arch.x86.mm.pgtable import virt_to_phys
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 
@@ -188,8 +190,13 @@ def _vnet_desc_set(vq: Ptr[VNetVQ], idx: uint16,
               addr: uint64, length: uint32, flags: uint16,
               nxt: uint16):
     # 16-byte descriptor: u64 addr | u32 len | u16 flags | u16 next.
+    # The address field is a PHYSICAL address the device DMAs to/from.
+    # Higher-half kernel: a TX buffer that is a kernel global
+    # (vnet_tx_buf) is a high-half VA; virt_to_phys() rebases it to low
+    # physical RAM. A kmalloc'd RX buffer is already low and passes
+    # through unchanged.
     d: uint64 = vq[0].desc_addr + cast[uint64](idx) * 16
-    cast[Ptr[uint64]](d +  0)[0] = addr
+    cast[Ptr[uint64]](d +  0)[0] = virt_to_phys(addr)
     cast[Ptr[uint32]](d +  8)[0] = length
     cast[Ptr[uint16]](d + 12)[0] = flags
     cast[Ptr[uint16]](d + 14)[0] = nxt

@@ -78,8 +78,13 @@ tss_init:
     shlq    $56, %r10
     orq     %r10, %rax                 /* | base[31:24] << 56        */
 
-    /* Store low quad at gdt64 + 0x28. */
-    leaq    gdt64(%rip), %r8
+    /* Store low quad at gdt64 + 0x28. gdt64 lives in the LOW boot
+     * region (.boot.data, VMA ~0x10xxxx); this code runs in the
+     * higher half, so a RIP-relative leaq would overflow the ±2 GiB
+     * displacement. Materialise the absolute address with movabsq
+     * (R_X86_64_64) instead — the kernel is a true elf64 object, so
+     * the 64-bit absolute relocation is representable. */
+    movabsq $gdt64, %r8
     movq    %rax, 0x28(%r8)
 
     /* High quad = base[63:32] (zero for our < 4 GiB TSS). */

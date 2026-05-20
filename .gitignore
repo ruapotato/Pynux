@@ -39,6 +39,10 @@ env/
 *.o
 *.s
 !runtime/*.s
+# ISO images — the higher-half kernel can't be `qemu -kernel`-booted
+# (64-bit ELF); the test harness wraps it in a throwaway GRUB ISO
+# (scripts/_kernel_iso.sh), often written next to a kernel .elf.
+*.iso
 
 # QEMU
 *.img

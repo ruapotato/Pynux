@@ -16,6 +16,11 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
+# Higher-half kernel boot shim: routes a `qemu -kernel <elf64>` call
+# through a BIOS GRUB ISO (QEMU's -kernel rejects 64-bit ELFs). This
+# script does not source _build_lock.sh, so source the shim directly.
+. "$PROJ_ROOT/scripts/_kernel_iso.sh"
+
 mkdir -p build
 ELF=build/hamnix-vmlinux.elf
 

@@ -222,6 +222,14 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
     hand-written boot stubs under arch/x86/boot/header.S and
     arch/x86/kernel/head_64.S, then links with arch/x86/kernel/vmlinux.lds
     into an ELF that multiboot1-capable loaders (QEMU -kernel, GRUB) accept.
+
+    HIGHER-HALF KERNEL: this now produces a true `elf64-x86-64` ELF
+    (assembled with `as --64`, linked `ld -m elf_x86_64`). The kernel
+    proper is LINKED at 0xffffffff80000000+offset but LOADED at low
+    physical addresses; the elf32-i386 wrapper used previously could
+    not represent symbol addresses above 4 GiB. GRUB's multiboot1 ELF
+    loader accepts ELFCLASS64 and loads PT_LOAD segments by p_paddr
+    (a 64-bit field), so the VMA/LMA split rides through cleanly.
     """
     as_cmd = "as"
     ld_cmd = "ld"
@@ -260,12 +268,13 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
         main_o = tmpdir / "main.o"
 
         # Adder's emitted .S is 64-bit code but has no leading `.code64`
-        # (the codegen is target-mode-agnostic). For the bare-metal target
-        # we assemble with `as --32` to produce an elf32-i386 .o that the
-        # multiboot1 loader will accept, while a leading `.code64` tells
-        # the assembler to encode 64-bit instructions. The same prepend is
-        # applied to head_64.S below by way of the file already declaring
-        # `.code64`. The boot stub (header.S) starts in `.code32`.
+        # (the codegen is target-mode-agnostic). `as --64` defaults to
+        # 64-bit instruction encoding, so a leading `.code64` is no
+        # longer strictly required, but keep it as a belt-and-braces
+        # marker — it is harmless in a 64-bit assembly. header.S itself
+        # declares `.code32` for its boot prologue and `.code64` for
+        # the long-mode trampoline tail, both of which `as --64`
+        # honours per-section.
         hamnix_s = tmpdir / "hamnix_main.S"
         hamnix_s.write_text(".code64\n" + asm_file.read_text())
 
@@ -277,7 +286,7 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
         for src, obj in [(boot_s, boot_o), (head_s, head_o),
                          (hamnix_s, main_o)] + list(zip(extra_s, extra_objs)):
             result = subprocess.run(
-                [as_cmd, "--32", "-o", str(obj), str(src)],
+                [as_cmd, "--64", "-o", str(obj), str(src)],
                 capture_output=True, text=True,
             )
             if result.returncode != 0:
@@ -288,8 +297,12 @@ def assemble_and_link_x86_bare(asm_file: Path, output: Path,
         # Order matters: header.o first so multiboot magic lands at the top
         # of .head.text; the linker script enforces section order but listing
         # header.o first eliminates any cross-section ambiguity in the input.
+        # `-z noexecstack` silences the GNU-stack-note warning; `-n` is not
+        # used (we want the default page-aligned section layout the
+        # multiboot1 loader expects).
         link_cmd = [
-            ld_cmd, "-m", "elf_i386", "-nostdlib", "-static",
+            ld_cmd, "-m", "elf_x86_64", "-nostdlib", "-static",
+            "-z", "noexecstack", "-z", "max-page-size=4096",
             "-T", str(lds), "-o", str(output),
             str(boot_o), str(head_o), str(main_o),
         ] + [str(o) for o in extra_objs]

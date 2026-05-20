@@ -85,22 +85,30 @@ read_cr4:
     movq    %cr4, %rax
     ret
 
-/* The linker symbols __ap_trampoline_load / __ap_trampoline_start /
- * __ap_trampoline_size are abs/large values; reach them the same way
- * we reach __per_cpu_template_start - stash as .long words in .rodata
- * that get resolved at link time, then load via leaq + movl. */
+/* The linker symbols __ap_trampoline_load / __ap_trampoline_size and
+ * the trampoline-local ap_cr3_value / ap_landing_addr / ap_stack_top
+ * are absolute values we can't name directly from Adder. We stash
+ * them as link-time-resolved words in .rodata and expose accessors.
+ *
+ * HIGHER-HALF: these are stored as `.quad sym` (R_X86_64_64) rather
+ * than `.long sym`. __ap_trampoline_load is a low physical LMA and
+ * ap_* are .ap_trampoline symbols at VMA 0x8000 — both fit in 32 bits
+ * — but storing every linker-symbol word uniformly as a 64-bit quad
+ * keeps the encoding correct regardless of which half a symbol lands
+ * in, and the kernel is a true elf64 object so .quad sym is valid.
+ * The accessors load with movq. */
     .section .rodata
-    .align 4
+    .align 8
 __ap_trampoline_load_word:
-    .long __ap_trampoline_load
+    .quad __ap_trampoline_load
 __ap_trampoline_size_word:
-    .long __ap_trampoline_size
+    .quad __ap_trampoline_size
 __ap_cr3_value_addr_word:
-    .long ap_cr3_value
+    .quad ap_cr3_value
 __ap_landing_addr_addr_word:
-    .long ap_landing_addr
+    .quad ap_landing_addr
 __ap_stack_top_addr_word:
-    .long ap_stack_top
+    .quad ap_stack_top
 
     .section .text, "ax"
 
@@ -108,35 +116,35 @@ __ap_stack_top_addr_word:
     .globl ap_trampoline_load_addr
 ap_trampoline_load_addr:
     leaq    __ap_trampoline_load_word(%rip), %rax
-    movl    (%rax), %eax
+    movq    (%rax), %rax
     ret
 
     .align 16
     .globl ap_trampoline_size
 ap_trampoline_size:
     leaq    __ap_trampoline_size_word(%rip), %rax
-    movl    (%rax), %eax
+    movq    (%rax), %rax
     ret
 
     .align 16
     .globl ap_cr3_value_addr
 ap_cr3_value_addr:
     leaq    __ap_cr3_value_addr_word(%rip), %rax
-    movl    (%rax), %eax
+    movq    (%rax), %rax
     ret
 
     .align 16
     .globl ap_landing_addr_addr
 ap_landing_addr_addr:
     leaq    __ap_landing_addr_addr_word(%rip), %rax
-    movl    (%rax), %eax
+    movq    (%rax), %rax
     ret
 
     .align 16
     .globl ap_stack_top_addr
 ap_stack_top_addr:
     leaq    __ap_stack_top_addr_word(%rip), %rax
-    movl    (%rax), %eax
+    movq    (%rax), %rax
     ret
 
 /* ---------- ap_main_64: 64-bit AP entry --------------------------

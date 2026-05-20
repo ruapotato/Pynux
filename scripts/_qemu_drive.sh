@@ -19,6 +19,13 @@
 # sends each command, with a hard timeout backstop. Boot can take 2 s
 # or 20 s — the driver adapts.
 #
+# HIGHER-HALF KERNEL NOTE: the Hamnix kernel is now a true elf64
+# higher-half image, and QEMU's built-in `-kernel` multiboot1 loader
+# REJECTS 64-bit ELFs. qemu_drive therefore wraps the kernel ELF in a
+# minimal BIOS GRUB ISO (via scripts/_kernel_iso.sh) and boots it with
+# `-cdrom` — GRUB's multiboot1 loader handles ELFCLASS64 fine. This is
+# transparent to callers: they still pass a kernel ELF path.
+#
 # USAGE
 #
 #   . "$(dirname "$0")/_qemu_drive.sh"
@@ -26,7 +33,7 @@
 #              -- <cmd1> <after1> <cmd2> <after2> ...
 #
 #   logfile         where QEMU's serial output is written (caller owns it)
-#   kernel-elf      the -kernel image
+#   kernel-elf      the kernel image (wrapped in a GRUB ISO internally)
 #   ready-marker    a literal substring the driver waits for on the log
 #                   before sending cmd1 (use hamsh's banner:
 #                   "[hamsh] M16.35 shell ready")
@@ -40,6 +47,12 @@
 # -no-reboot, serial to the logfile.
 #
 # Returns QEMU's exit code in the global QEMU_DRIVE_RC.
+
+# Pull in the higher-half kernel boot shim. _kernel_iso.sh installs a
+# build/binshim/qemu-system-x86_64 wrapper and prepends it to PATH, so
+# the `qemu-system-x86_64` call below transparently boots the elf64
+# kernel from a BIOS GRUB ISO (QEMU's `-kernel` rejects 64-bit ELFs).
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_kernel_iso.sh"
 
 qemu_drive() {
     local logfile="$1"; shift
@@ -100,6 +113,9 @@ qemu_drive() {
     local feeder_pid=$!
 
     # --- QEMU ---------------------------------------------------------
+    # The build/binshim qemu-system-x86_64 wrapper (installed by
+    # _kernel_iso.sh, prepended to PATH) transparently turns this
+    # `-kernel <elf64>` into a `-cdrom <iso>` GRUB boot.
     local qrc=0
     # shellcheck disable=SC2086
     timeout "${overall_timeout}s" qemu-system-x86_64 \

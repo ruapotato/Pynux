@@ -48,20 +48,22 @@ read_cpu_id_percpu:
  * around the Hamnix-side .data..percpu block. setup_per_cpu_areas()
  * reads these to memcpy() the master template into each CPU's area.
  *
- * Hamnix has no extern-variable syntax, and absolute references
- * (`movl sym, %eax`) blow up under elf32-i386 (BFD_RELOC_X86_64_32S).
- * Workaround: stash the values as plain `.long sym` words in .rodata
- * where the relocation resolves to a literal 32-bit address at link
- * time, then expose accessor functions that load from there. Both
- * target addresses fit in 32 bits (~0x10xxxx) and the difference is
- * at most a few hundred bytes for the foreseeable future.
- */
+ * Hamnix has no extern-variable syntax. We stash the linker symbol
+ * VALUES as `.quad sym` words in .rodata (resolved at link time),
+ * then expose accessor functions that load from there.
+ *
+ * HIGHER-HALF: the kernel is linked at 0xffffffff80000000+, so
+ * __per_cpu_template_start / __per_cpu_template_end are 64-bit VMAs.
+ * They are stored as `.quad sym` (R_X86_64_64) and loaded with movq.
+ * get_per_cpu_load returns the template's higher-half VMA — every
+ * caller (setup_per_cpu_areas) reads the bytes through that virtual
+ * address, which is mapped by the kernel high-half PML4 entry. */
     .section .rodata
-    .align 4
+    .align 8
 __per_cpu_template_start_word:
-    .long __per_cpu_template_start
+    .quad __per_cpu_template_start
 __per_cpu_template_end_word:
-    .long __per_cpu_template_end
+    .quad __per_cpu_template_end
 
     .section .text, "ax"
 
@@ -69,14 +71,14 @@ __per_cpu_template_end_word:
     .globl get_per_cpu_load
 get_per_cpu_load:
     leaq    __per_cpu_template_start_word(%rip), %rax
-    movl    (%rax), %eax              /* zero-extends to %rax */
+    movq    (%rax), %rax
     ret
 
     .align 16
     .globl get_per_cpu_size
 get_per_cpu_size:
     leaq    __per_cpu_template_end_word(%rip), %rax
-    movl    (%rax), %eax
+    movq    (%rax), %rax
     leaq    __per_cpu_template_start_word(%rip), %rcx
-    subl    (%rcx), %eax              /* uses zero-extended sub     */
+    subq    (%rcx), %rax
     ret

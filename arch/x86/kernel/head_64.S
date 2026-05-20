@@ -1,58 +1,34 @@
 /*
- * arch/x86/kernel/head_64.S - Hamnix 64-bit kernel entry.
+ * arch/x86/kernel/head_64.S - Hamnix 64-bit kernel entry (higher-half).
  *
- * Mirrors Linux's arch/x86/kernel/head_64.S: it is the first 64-bit code
- * that runs as "the kernel proper" after the bootloader / decompressor
- * hands off. For Hamnix the handoff comes from arch/x86/boot/header.S's
- * long_mode_start, which jumps here once long mode is live, segments are
- * reloaded, and the boot stack is anchored.
+ * Mirrors Linux's arch/x86/kernel/head_64.S: the first 64-bit code
+ * that runs as "the kernel proper". By the time control reaches here
+ * RIP is already executing in the HIGHER HALF (0xffffffff80000000+):
  *
- * Two entry points live here:
+ *   - Multiboot1/BIOS path: arch/x86/boot/header.S's long_mode_start
+ *     does `movabsq $start_kernel_asm_entry; jmpq *%rax`, which lands
+ *     RIP at the high-half VMA of start_kernel_asm_entry below.
+ *   - UEFI path: arch/x86/boot/efi_stub.S builds page tables with the
+ *     same PML4[0] low-identity + PML4[511] high-half split, then
+ *     far-jumps to the high-half VMA of _x86_start_after_loader.
  *
- *   1. start_kernel_asm_entry — the multiboot1 entry. arch/x86/boot/
- *      header.S's long_mode_start tail-jumps here after the 32-to-64-bit
- *      transition. Performs BSS zeroing then falls through to the
- *      common path below.
+ * Two entry points:
  *
- *   2. _x86_start_after_loader — the COMMON post-loader path. Any
- *      future entry point that arrives in long mode with kernel
- *      .bss already zeroed (UEFI: firmware NOBITS-zeroes our image's
- *      .bss before transferring control; PE/COFF .bss is the same
- *      NOBITS shape ELF uses) should `jmp _x86_start_after_loader`
- *      INSTEAD of `jmp start_kernel_asm_entry` — otherwise the
- *      BSS-zero loop will redundantly re-zero RAM the loader
- *      already cleared.
+ *   1. start_kernel_asm_entry — multiboot1 entry. Zeroes the high-half
+ *      .bss, then falls through to the common path.
  *
- * Why expose the common symbol explicitly:
- *   The EFI direct-boot path (arch/x86/boot/efi_stub.S) needs a
- *   stable kernel-side hook to merge into the post-loader-specific
- *   work without re-doing the BSS-zero loop. The hook is here so
- *   that whichever path eventually unblocks UEFI-to-start_kernel
- *   handoff can use a one-line `jmp _x86_start_after_loader` rather
- *   than duplicating the post-loader plumbing.
+ *   2. _x86_start_after_loader — common post-loader path. The UEFI
+ *      path's firmware already NOBITS-zeroes the image .bss, so the
+ *      EFI stub jumps here directly (skipping the redundant re-zero).
  *
- *   Post-M16.124 honest diagnosis: the M16.120-era plan
- *   "merge the EFI stub + kernel ELF into one image" turns out to
- *   be blocked by a stack of independent constraints. The full
- *   diagnosis is recorded in arch/x86/boot/efi_stub.S's header
- *   comment (blockers B1..B4 — file-magic conflict, LMA/VMA split
- *   in .ap_trampoline, image-base relocation, GDT handoff). Two
- *   real paths forward (a UEFI-side ELF loader baked into the .efi
- *   stub, OR a separate bzImage-style flat binary) are documented
- *   there. _x86_start_after_loader remains the right join point
- *   either way — neither path needs the BSS-zero loop, both arrive
- *   in long mode with a valid kernel GDT.
+ * Responsibilities of the common path: call start_kernel(); halt if it
+ * ever returns. GDT / CR3 / page tables are programmed by the loader.
  *
- * Responsibilities of the common path:
- *   1. Call the Hamnix-emitted start_kernel().
- *   2. If start_kernel ever returns, halt the CPU.
- *
- *   GDT / CR3 / page tables are NOT (re)programmed in the common
- *   path: each loader is responsible for arriving with a working
- *   long-mode environment. The multiboot1 path's header.S already
- *   loads the kernel GDT + builds the identity page tables; an
- *   eventual UEFI path will reuse those same structures (they're
- *   placed in .pgtables, NOBITS-zeroed identically).
+ * All symbols here are linked in the higher half; RIP-relative
+ * references (R_X86_64_PC32) between high-half code and high-half data
+ * resolve cleanly. The kernel is a true elf64-x86-64 object, so the
+ * full 64-bit absolute relocations (R_X86_64_64) used elsewhere for
+ * higher-half symbol address words are representable too.
  */
 
     .section .text, "ax"
@@ -60,16 +36,10 @@
 
     .globl  start_kernel_asm_entry
 start_kernel_asm_entry:
-    /* Zero kernel BSS: [__bss_start, __bss_end). Both symbols are
-     * defined by arch/x86/kernel/vmlinux.lds. Using `rep stosq` so we
-     * move 8 bytes at a time; the linker script aligns __bss_start
-     * and __bss_end to 8.
-     *
-     * Only the multiboot1 path needs this: QEMU's `-kernel` loader
-     * and grub-mkrescue's multiboot1 path are supposed to NOBITS-load
-     * for us, but historically not every loader has zeroed reliably
-     * (some multiboot1 implementations skip NOBITS PT_LOAD segments
-     * and leave stale memory). The explicit clear is defensive. */
+    /* Zero the high-half kernel BSS: [__bss_start, __bss_end). Both
+     * symbols are higher-half VMAs defined by vmlinux.lds; we run in
+     * the higher half, so leaq RIP-relative reaches them directly.
+     * `rep stosq` — the linker aligns both ends to 8. */
     leaq    __bss_start(%rip), %rdi
     leaq    __bss_end(%rip),   %rcx
     subq    %rdi, %rcx
@@ -80,16 +50,18 @@ start_kernel_asm_entry:
 
     /* Fall through to the common post-loader path. */
 
-    .globl  _x86_start_after_loader
-_x86_start_after_loader:
-    /* Common path joined by:
-     *   - start_kernel_asm_entry above (fall-through)
-     *   - the eventual EFI direct-boot path (jmp from efi_stub.S)
-     *
-     * Hand off to the Hamnix kernel. SysV AMD64: no args, no return
-     * value. start_kernel() walks the boot info (multiboot mmap via
-     * mb_info, or — in a future commit — the EFI memory map saved by
-     * efi_stub.S) and brings every subsystem up. */
+    /* _x86_start_after_loader_high — the HIGH-half common post-loader
+     * path. The multiboot1 path falls through from
+     * start_kernel_asm_entry above. The UEFI path arrives here via the
+     * LOW shim `_x86_start_after_loader` (arch/x86/boot/header.S):
+     * the EFI handoff table can only carry a 32-bit address, so it
+     * points the firmware at the low shim, which `movabsq`-jumps up
+     * to here. */
+    .globl  _x86_start_after_loader_high
+_x86_start_after_loader_high:
+    /* Common path. Hand off to the Hamnix kernel. SysV AMD64: no args,
+     * no return value. start_kernel() walks boot info and brings every
+     * subsystem up. */
     call    start_kernel
 
     /* If start_kernel returns (it shouldn't yet), halt forever. */
@@ -99,26 +71,33 @@ halt_loop:
     jmp     halt_loop
 
 /* ---------- kernel_image_end() ----------------------------------- *
- * Returns the physical address one past the last byte the kernel
- * image occupies (= __bss_end). The kernel is identity-mapped, so
- * VMA == LMA == physical. mm/memblock callers bump their pool's base
- * past this so freshly-allocated pages can't overlap kernel
- * .text / .rodata / .data / .pgtables / .bss.
+ * Returns the PHYSICAL address one past the last byte the kernel
+ * image occupies in low RAM. mm/memblock callers bump their pool's
+ * base past this so freshly-allocated pages can't overlap the kernel
+ * .text/.rodata/.data/.pgtables/.bss.
  *
- * Same trick as arch/x86/kernel/smp_asm.S's accessors: the linker
- * symbol is an absolute value, so we stash it as a 32-bit word in
- * .rodata and load via leaq + movl. That sidesteps the ELF32 R_X86_64
- * relocation gap our elf32-i386 OUTPUT_FORMAT can't represent.
- */
-    .section .rodata
-    .align 4
-__bss_end_word:
-    .long __bss_end
+ * Higher-half subtlety: __bss_end is a high VMA (0xffffffff80...), but
+ * memblock needs a PHYSICAL address. The kernel image is LINKED high
+ * but LOADED low; the high-half base 0xffffffff80000000 maps to
+ * physical 0 (see header.S pdpt_high). So:
+ *
+ *     phys(__bss_end) = __bss_end - KERNEL_VBASE
+ *
+ * The .bss is NOBITS — it has no LMA file bytes — but it is the last
+ * thing the image needs zero-backed RAM for, and the loader reserves
+ * [LMA(.bss), LMA(.bss)+memsz). Its physical extent therefore ends at
+ * (__bss_end - KERNEL_VBASE).
+ *
+ * KERNEL_VBASE = 0xffffffff80000000. We compute the subtraction with
+ * a movabsq immediate (R_X86_64_64-free — it's a plain constant) so no
+ * relocation is involved. __bss_end's address is loaded RIP-relative. */
+    .equ KERNEL_VBASE_HI, 0xffffffff80000000
 
     .section .text, "ax"
     .align 16
     .globl kernel_image_end
 kernel_image_end:
-    leaq    __bss_end_word(%rip), %rax
-    movl    (%rax), %eax
+    leaq    __bss_end(%rip), %rax
+    movabsq $KERNEL_VBASE_HI, %rcx
+    subq    %rcx, %rax
     ret

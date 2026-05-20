@@ -152,25 +152,28 @@
     .equ HAMNIX_HANDOFF_MAGIC,  0x484D4158      /* "HAMX" */
     .equ MULTIBOOT1_MAGIC,      0x1BADB002
 
-    /* ELF constants (elf32-i386 layout — Hamnix kernel format). */
+    /* ELF constants (elf64-x86-64 layout — the Hamnix kernel is now a
+     * true 64-bit higher-half ELF; see arch/x86/kernel/vmlinux.lds). */
     .equ EI_MAG0,           0
     .equ ELFMAG0,           0x7f
     .equ ELFMAG1,           0x45    /* 'E' */
     .equ ELFMAG2,           0x4c    /* 'L' */
     .equ ELFMAG3,           0x46    /* 'F' */
     .equ EI_CLASS,          4
-    .equ ELFCLASS32,        1
-    .equ E_ENTRY32,         24      /* uint32, file offset in ELF32 hdr */
-    .equ E_PHOFF32,         28
-    .equ E_PHENTSIZE32,     42      /* uint16 */
-    .equ E_PHNUM32,         44
-    /* ELF32 Phdr fields */
+    .equ ELFCLASS64,        2
+    /* ELF64 header fields */
+    .equ E_ENTRY64,         24      /* uint64 */
+    .equ E_PHOFF64,         32      /* uint64 */
+    .equ E_PHENTSIZE64,     54      /* uint16 */
+    .equ E_PHNUM64,         56      /* uint16 */
+    /* ELF64 Phdr fields (Elf64_Phdr is 56 bytes) */
     .equ P_TYPE,            0       /* uint32 */
-    .equ P_OFFSET,          4
-    .equ P_VADDR,           8
-    .equ P_PADDR,           12
-    .equ P_FILESZ,          16
-    .equ P_MEMSZ,           20
+    .equ P_FLAGS,           4       /* uint32 */
+    .equ P_OFFSET,          8       /* uint64 */
+    .equ P_VADDR,           16      /* uint64 */
+    .equ P_PADDR,           24      /* uint64 */
+    .equ P_FILESZ,          32      /* uint64 */
+    .equ P_MEMSZ,           40      /* uint64 */
     .equ PT_LOAD,           1
 
     .section .text, "ax"
@@ -316,7 +319,7 @@ efi_main:
     leaq    efi_msg_elfread(%rip), %rsi
     call    efi_serial_puts
 
-    /* ----- 4g. Verify ELF magic + ELFCLASS32 ------------------------ */
+    /* ----- 4g. Verify ELF magic + ELFCLASS64 ------------------------ */
     movq    efi_kernel_buf(%rip), %rax
     cmpb    $ELFMAG0, 0(%rax)
     jne     .Lefi_elf_bad
@@ -326,40 +329,48 @@ efi_main:
     jne     .Lefi_elf_bad
     cmpb    $ELFMAG3, 3(%rax)
     jne     .Lefi_elf_bad
-    cmpb    $ELFCLASS32, EI_CLASS(%rax)
+    cmpb    $ELFCLASS64, EI_CLASS(%rax)
     jne     .Lefi_elf_bad
 
     /* ----- 4h. Walk program headers, copy PT_LOAD segments ----------
      *
-     * For an ELF32:
-     *   e_phoff       at file offset 28 (uint32)
-     *   e_phentsize   at file offset 42 (uint16)
-     *   e_phnum       at file offset 44 (uint16)
+     * The Hamnix kernel is a true elf64-x86-64 higher-half image. For
+     * an ELF64:
+     *   e_phoff       at file offset 32 (uint64)
+     *   e_phentsize   at file offset 54 (uint16)
+     *   e_phnum       at file offset 56 (uint16)
      *
-     * Each Phdr (Elf32_Phdr) is 32 bytes:
-     *   off 0  p_type
-     *   off 4  p_offset
-     *   off 8  p_vaddr
-     *   off 12 p_paddr
-     *   off 16 p_filesz
-     *   off 20 p_memsz
+     * Each Phdr (Elf64_Phdr) is 56 bytes:
+     *   off 0  p_type   (u32)
+     *   off 4  p_flags  (u32)
+     *   off 8  p_offset (u64)
+     *   off 16 p_vaddr  (u64)  <- HIGH (0xffffffff80...) for the kernel
+     *   off 24 p_paddr  (u64)  <- LOW physical load address
+     *   off 32 p_filesz (u64)
+     *   off 40 p_memsz  (u64)
+     *
+     * We copy to p_paddr (the LOW physical address) — exactly the
+     * VMA/LMA split the higher-half linker script encodes. The 32-bit
+     * boot stub of a multiboot1 boot maps p_paddr at both the low
+     * identity address and the high half; on the UEFI path STEP 8
+     * below builds the same dual mapping.
      *
      * For each phdr with p_type == PT_LOAD:
      *   memcpy(p_paddr, buffer + p_offset, p_filesz)
      *   memset(p_paddr + p_filesz, 0, p_memsz - p_filesz)
      */
     movq    efi_kernel_buf(%rip), %rax
-    movl    E_PHOFF32(%rax), %r10d          /* r10 = e_phoff (zero-ext) */
-    movzwl  E_PHENTSIZE32(%rax), %r11d      /* r11 = e_phentsize */
-    movzwl  E_PHNUM32(%rax), %r12d          /* r12 = e_phnum */
+    movq    E_PHOFF64(%rax), %r10           /* r10 = e_phoff (u64) */
+    movzwq  E_PHENTSIZE64(%rax), %r11       /* r11 = e_phentsize */
+    movzwq  E_PHNUM64(%rax), %r12           /* r12 = e_phnum */
 
     /* r13 = current phdr pointer = buffer + e_phoff. */
     leaq    (%rax, %r10), %r13
     /* r14 = phdr index. */
-    xorl    %r14d, %r14d
+    xorq    %r14, %r14
 
 .Lphdr_loop:
-    cmpl    %r12d, %r14d
+    cmpq    %r12, %r14
     jae     .Lphdr_done
 
     /* p_type test. */
@@ -369,30 +380,27 @@ efi_main:
 
     /* Compute source = buffer + p_offset. */
     movq    efi_kernel_buf(%rip), %rsi
-    movl    P_OFFSET(%r13), %eax            /* zero-extend uint32 */
-    addq    %rax, %rsi
-    /* Destination = p_paddr (zero-extended uint32 → 64-bit phys). */
-    movl    P_PADDR(%r13), %edi
-    /* filesz, memsz. */
-    movl    P_FILESZ(%r13), %ecx
-    movl    P_MEMSZ(%r13), %edx
+    addq    P_OFFSET(%r13), %rsi
+    /* Destination = p_paddr (the LOW physical load address). */
+    movq    P_PADDR(%r13), %rdi
+    /* filesz: bytes to copy. */
+    movq    P_FILESZ(%r13), %rcx
 
-    /* memcpy %ecx bytes from %rsi to %rdi. */
+    /* memcpy %rcx bytes from %rsi to %rdi. */
     cld
     rep movsb                               /* rsi/rdi/rcx all auto-update */
 
     /* Trailing-BSS zero: rdi now points just past the copied bytes.
      * Zero (memsz - filesz) trailing bytes. */
-    movl    P_MEMSZ(%r13), %eax
-    movl    P_FILESZ(%r13), %r8d
-    subl    %r8d, %eax                      /* eax = trailing zero count */
-    movl    %eax, %ecx
+    movq    P_MEMSZ(%r13), %rax
+    subq    P_FILESZ(%r13), %rax            /* rax = trailing zero count */
+    movq    %rax, %rcx
     xorl    %eax, %eax
     rep stosb
 
 .Lphdr_skip:
     addq    %r11, %r13                      /* next phdr (r11 = phentsize) */
-    incl    %r14d
+    incq    %r14
     jmp     .Lphdr_loop
 
 .Lphdr_done:
@@ -453,8 +461,12 @@ efi_main:
      * kernel's 7-entry GDT (not this stub's 3-entry private one) so
      * tss_init's ltr $0x28 — and SYSRET's reliance on selectors 0x18
      * / 0x20 — find live descriptors instead of trapping #GP for an
-     * out-of-limit selector. Stored as uint32 because the kernel is
-     * elf32-i386 (VMAs < 4 GiB) and we identity-map below 4 GiB. */
+     * out-of-limit selector. Read as uint32: the kernel is now a true
+     * higher-half elf64, but EVERY handoff-table target (the
+     * _x86_start_after_loader shim, boot_via_efi, gdt64, efi_fb_info)
+     * deliberately lives in the LOW boot region (.head.text /
+     * .boot.text / .boot.data, VMA ~0x10xxxx), so a 32-bit slot still
+     * holds the full address and movl zero-extension is correct. */
     movl    60(%rsi), %eax                  /* gdt64_addr */
     movl    %eax, efi_kernel_gdt_addr(%rip)
     /* GOP capture: pull &efi_fb_info out of the +64 handoff slot. The
@@ -681,6 +693,34 @@ efi_main:
     leaq    efi_pml4(%rip), %rdi
     movq    %rax, (%rdi)
 
+    /* ----- Higher-half kernel mapping (PML4[511]) -------------------
+     * The kernel proper is LINKED at 0xffffffff80000000+offset. Its
+     * PT_LOAD segments were just copied to their LOW p_paddr above.
+     * To run the kernel at its high link-time VMA we map PML4[511]
+     * (covers 0xffffff8000000000..top) at a fresh PDPT, then stamp
+     * that PDPT's entries 510 and 511 as 1 GiB pages at physical 0
+     * and 1 GiB. That makes 0xffffffff80000000 -> phys 0, so the
+     * kernel's VMA 0xffffffff80000000+offset resolves to phys
+     * 0+offset == the LMA the PT_LOAD copy targeted.
+     *
+     *   0xffffffff80000000: PML4 idx 511, PDPT idx 510
+     *   0xffffffffc0000000: PML4 idx 511, PDPT idx 511
+     *
+     * PML4 slot 511 is at byte offset 511*8 = 0xFF8. */
+    leaq    efi_pdpt_high(%rip), %rax
+    orq     $0x7, %rax                      /* US|RW|P */
+    leaq    efi_pml4(%rip), %rdi
+    movq    %rax, 0xFF8(%rdi)               /* PML4[511] -> efi_pdpt_high */
+
+    /* efi_pdpt_high[510] -> 1 GiB page @ phys 0
+     * efi_pdpt_high[511] -> 1 GiB page @ phys 1 GiB
+     * Flags 0x87 = PS|US|RW|P (matches header.S pdpt_high). */
+    leaq    efi_pdpt_high(%rip), %rdi
+    movq    $0x87, %rax                     /* PS|US|RW|P, phys 0 */
+    movq    %rax, (510 * 8)(%rdi)
+    movq    $0x40000087, %rax               /* PS|US|RW|P, phys 1 GiB */
+    movq    %rax, (511 * 8)(%rdi)
+
     /* PDPT entries 0..511: 1 GiB pages spanning [0, 512 GiB).
      *
      * M16.152 (Asus UEFI real-hw fix): the prior version of this loop
@@ -824,10 +864,13 @@ efi_main:
     xorl    %ecx, %ecx
     xorl    %edx, %edx
 
-    /* Jump to _x86_start_after_loader. The handoff table stashed
-     * its absolute address in efi_kernel_entry; the value is a 32-bit
-     * kernel-VMA (kernel is linked elf32-i386 with VMAs < 4 GiB), and
-     * we identity-map the first 4 GiB, so a direct 64-bit jump works. */
+    /* Jump to _x86_start_after_loader — the LOW UEFI entry shim in
+     * arch/x86/boot/header.S (.boot.text). efi_kernel_entry holds its
+     * address from the +52 handoff slot; the shim lives in the LOW
+     * boot region (VMA ~0x10xxxx), reachable through efi_pdpt's
+     * identity map. The shim's only job is to movabsq-jump up to the
+     * higher-half kernel head — and STEP 8's efi_pdpt_high makes that
+     * high-half target mapped. */
     movl    efi_kernel_entry(%rip), %eax
     jmpq    *%rax
 
@@ -1115,4 +1158,12 @@ efi_pml4:
     .skip 4096
     .globl efi_pdpt
 efi_pdpt:
+    .skip 4096
+    /* efi_pdpt_high: the PDPT for PML4[511], the higher-half kernel
+     * mapping. Entries 510/511 are stamped as 1 GiB pages in STEP 8 so
+     * 0xffffffff80000000 resolves to physical 0. The rest stay P=0
+     * (firmware NOBITS-zeroes the page). 4 KiB aligned (page-table
+     * granularity). */
+    .globl efi_pdpt_high
+efi_pdpt_high:
     .skip 4096

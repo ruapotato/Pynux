@@ -53,6 +53,56 @@ extern def get_mb_magic() -> uint64
 extern def get_bsp_cr3() -> uint64
 extern def load_cr3(value: uint64)
 
+# --- virt_to_phys / phys_to_virt -----------------------------------
+#
+# Hamnix is a HIGHER-HALF kernel: its .text/.rodata/.data/.bss are
+# LINKED and run at KERNEL_VBASE (0xffffffff80000000) + offset, but the
+# image is LOADED into low physical RAM. The boot stub maps the kernel
+# image at BOTH the low identity address AND the high half; it also
+# keeps a full low identity map (PML4[0]) so the kernel can touch
+# physical RAM directly.
+#
+# Consequence for DMA: hardware (virtio, AHCI, NVMe, NICs, USB HCs)
+# DMAs to/from PHYSICAL addresses. A pointer to a kernel GLOBAL is now
+# a high-half virtual address (0xffffffff80...); handing that to a
+# device as a DMA target makes the device write to physical
+# 0xffffffff80... — garbage. Every address passed to a device must
+# first go through virt_to_phys().
+#
+# Two address regimes the kernel deals with:
+#   - High-half kernel image addresses (>= KERNEL_VBASE): a global, a
+#     function, a .bss buffer. phys = va - KERNEL_VBASE.
+#   - Low addresses (< KERNEL_VBASE): already physical. alloc_page() /
+#     kmalloc() / memblock_alloc() all return LOW physical addresses
+#     (which are also valid VAs via the low identity map). These pass
+#     through unchanged.
+#
+# phys_to_virt() is the inverse for the high-half image only; a low
+# physical address maps to itself (identity). Most kernel code can
+# dereference a low physical address directly, so phys_to_virt() is
+# mainly a documentation/asymmetry helper.
+PGT_KERNEL_VBASE: uint64 = 0xffffffff80000000
+
+
+def virt_to_phys(va: uint64) -> uint64:
+    # Convert a kernel virtual address to the physical address a device
+    # can DMA to. High-half image addresses are rebased to low physical
+    # RAM; low addresses (alloc_page/kmalloc/memblock results, already
+    # identity-mapped == physical) pass through unchanged.
+    if va >= PGT_KERNEL_VBASE:
+        return va - PGT_KERNEL_VBASE
+    return va
+
+
+def phys_to_virt(pa: uint64) -> uint64:
+    # Inverse of virt_to_phys for addresses inside the kernel image's
+    # physical footprint. A low physical address is also a valid
+    # virtual address through the low identity map, so callers that
+    # just want to dereference physical RAM can use `pa` directly; this
+    # helper exists for symmetry and for code that specifically wants
+    # the high-half alias of an image byte.
+    return pa + PGT_KERNEL_VBASE
+
 # Multiboot1 constants (mirror arch/x86/kernel/e820.ad — kept inline
 # rather than imported to avoid coupling to e820.ad's private surface).
 PGT_MB_MAGIC:        uint64 = 0x2BADB002

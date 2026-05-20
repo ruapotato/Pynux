@@ -63,16 +63,21 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def load_cr3(value: uint64)
 extern def get_bsp_cr3() -> uint64
-# __bss_end from the linker — the first byte past the kernel image.
-# The kernel runs identity-mapped over [KERNEL_IMAGE_BASE, this).
+# kernel_image_end() — the first PHYSICAL byte past the kernel image
+# in low RAM. The kernel is now a HIGHER-HALF kernel: it is LINKED and
+# runs at 0xffffffff80000000+offset, but its image is LOADED into low
+# physical RAM starting at KERNEL_IMAGE_PHYS_BASE. kernel_image_end()
+# returns the physical end so mm/memblock can keep the page allocator
+# off the kernel's physical footprint.
 extern def kernel_image_end() -> uint64
 
-# Physical/virtual base the bare-metal kernel image is linked + loaded
-# at (arch/x86/boot/header.S multiboot entry; ELF p_vaddr of the first
-# LOAD segment). The kernel's .text/.rodata/.data/.bss all live in
-# [KERNEL_IMAGE_BASE, kernel_image_end()) and are reached at their
-# identity virtual address from CPL=0 code.
-KERNEL_IMAGE_BASE: uint64 = 0x100000
+# Physical base the bare-metal kernel image is loaded at (the LMA of
+# the first multiboot PT_LOAD; arch/x86/boot/header.S _start runs
+# here in 32-bit mode). The kernel's VIRTUAL base is the higher half,
+# 0xffffffff80000000 — not this. This constant is retained only to
+# document the physical load address; user mappings live entirely in
+# the lower canonical half and never approach the kernel.
+KERNEL_IMAGE_PHYS_BASE: uint64 = 0x100000
 
 
 PT_LOAD:    uint32 = 1
@@ -878,37 +883,27 @@ def elf_install_user_mapping(pml4_phys: uint64, vlow: uint64,
         printk0("elf_install_user_mapping: vhigh not 4 KiB-aligned\n")
         return -1
 
-    # --- Kernel-image collision guard --------------------------------
-    # The overlay re-points [vlow, vhigh) at `phys_base` inside the
-    # target task's PML4. The Hamnix kernel itself runs identity-mapped
-    # over [KERNEL_IMAGE_BASE, kernel_image_end()) — its .text/.rodata/
-    # .data/.bss (and task_table, current_idx, every printk format
-    # string) are reached at their identity virtual address from CPL=0.
+    # --- Kernel-image collision: no longer possible ------------------
+    # Hamnix now runs as a HIGHER-HALF kernel: its .text/.rodata/.data/
+    # .bss are linked and run at 0xffffffff80000000+offset (PML4 entry
+    # 511, the top 2 GiB). The ENTIRE lower canonical half — every
+    # address a user task could ever map — is free for userspace.
     #
-    # If a fixed-address ET_EXEC binary's [vlow, vhigh) overlaps that
-    # range, then the instant schedule() does load_cr3(child_cr3) the
-    # kernel's own data/rodata vanish behind the user binary's pages —
-    # the next kernel read of a global or format string returns the
-    # user image's bytes, the kernel jumps through garbage, and the box
-    # silently freezes with interrupts effectively dead. No trap, no
-    # log: the worst possible failure mode.
+    # The kernel image's PHYSICAL pages still sit in low RAM (the boot
+    # stub maps them at both the low identity address AND the high
+    # half), but a user mapping only ever rewrites PML4 entries 0..255
+    # of the task's address space. PML4[511]'s kernel high-half subtree
+    # is shared verbatim from the BSP PML4 and never touched by an
+    # overlay install. So a fixed-address ET_EXEC linked at 0x400000
+    # can be installed safely — its [vlow, vhigh) lives in PML4[0]'s
+    # subtree, nowhere near the kernel.
     #
-    # Standard Linux x86_64 -no-pie binaries link at 0x400000, which is
-    # squarely inside the Hamnix kernel image (currently ~12 MiB from
-    # 0x100000). Such a binary fundamentally cannot run under the
-    # current identity-mapped-low-half kernel layout — the real fix is
-    # a higher-half kernel so the entire low canonical half is free for
-    # userspace. Until that lands, REFUSE the install cleanly: the
-    # caller (SYS_SPAWN / SYS_EXECVE) turns -1 into -ENOEXEC and the
-    # system stays alive + diagnosable instead of dead-freezing.
-    kern_end: uint64 = kernel_image_end()
-    if vlow < kern_end and vhigh > KERNEL_IMAGE_BASE:
-        printk2("elf_install_user_mapping: user range [%p, %p)\n",
-                vlow, vhigh)
-        printk2("  collides with kernel image [%p, %p) — REFUSED\n",
-                KERNEL_IMAGE_BASE, kern_end)
-        printk0("  (fixed-address ET_EXEC needs a higher-half kernel)\n")
-        return -1
+    # The old "fixed-address ET_EXEC needs a higher-half kernel" refusal
+    # that lived here is exactly the constraint this higher-half move
+    # removed; the guard is therefore deleted. kernel_image_end() is
+    # still used by mm/memblock to keep the page allocator off the
+    # kernel's PHYSICAL footprint — that is a separate, still-valid
+    # concern and is untouched.
 
     # Confine to one PML4 entry + one PDPT entry. The 1 GiB chunk
     # containing vlow must also contain vhigh - 1.

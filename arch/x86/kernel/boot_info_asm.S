@@ -4,7 +4,8 @@
  * info stashed by the UEFI stub.
  *
  * header.S's 32-bit entry path saves the multiboot magic (EAX) and
- * info pointer (EBX) into two .long slots in .data:
+ * info pointer (EBX) into two .long slots in the LOW boot region
+ * (.boot.data):
  *      .globl mb_magic
  *      mb_magic: .long 0
  *      .globl mb_info
@@ -18,63 +19,73 @@
  * ExitBootServices(), boot-services calls (including LocateProtocol)
  * are no longer legal, so this is the only place we can capture GOP.
  *
- * Why a struct instead of separate flag globals: the EFI stub writes
- * five values at once; one base address + offset writes is fewer asm
- * relocations than five separate symbol references.
- *
  * Hamnix currently has no "extern variable" syntax, so we read those
- * symbols out via tiny accessor functions instead. Both slots store
- * 32-bit values that we zero-extend into a uint64 for the Hamnix
- * caller. The multiboot info struct lives below 4 GiB (multiboot1
- * spec) so the upper bits are genuinely zero.
+ * symbols out via tiny accessor functions instead.
+ *
+ * HIGHER-HALF NOTE: mb_magic / mb_info / boot_via_efi / efi_fb_info
+ * all live in the LOW boot region (.boot.data, VMA ~0x10xxxx) so the
+ * 32-bit boot stub and the EFI handoff table can reference them with
+ * 32-bit addresses. THIS file's code is linked in the higher half
+ * (0xffffffff80...). A RIP-relative `leaq sym(%rip)` from high code to
+ * a low boot symbol would overflow the ±2 GiB PC-relative
+ * displacement, so every accessor below materialises the absolute
+ * address with `movabsq $sym` (an R_X86_64_64 relocation — valid now
+ * that the kernel links as a true elf64-x86-64 object). The multiboot
+ * info struct and the EFI framebuffer base may be anywhere in 64-bit
+ * RAM, hence the 64-bit-clean loads.
  */
 
     .code64
     .section .text, "ax"
 
-    /* Use leaq+movl rather than `movl sym, %eax` to dodge the
-     * BFD_RELOC_X86_64_32S that bare absolute addressing generates
-     * (elf32-i386 can't represent that). leaq RIP-relative produces
-     * R_386_PC32 which fits cleanly. */
     .align 16
     .globl get_mb_magic
 get_mb_magic:
-    leaq    mb_magic(%rip), %rax
+    movabsq $mb_magic, %rax
     movl    (%rax), %eax              /* movl zero-extends to %rax  */
     ret
 
     .align 16
     .globl get_mb_info
 get_mb_info:
-    leaq    mb_info(%rip), %rax
+    movabsq $mb_info, %rax
     movl    (%rax), %eax
+    ret
+
+    /* ---- boot_via_efi accessors ---------------------------------------
+     *
+     * boot_via_efi is a LOW-boot-region int32 flag (.boot.data),
+     * default 0. The EFI stub patches it to 1 via the +56 handoff
+     * slot before jumping to the kernel; arch/x86/kernel/e820.ad reads
+     * it through get_boot_via_efi() and can also set it via
+     * set_boot_via_efi_asm() (kept for the documented future API). */
+    .align 16
+    .globl get_boot_via_efi
+get_boot_via_efi:
+    movabsq $boot_via_efi, %rax
+    movl    (%rax), %eax
+    ret
+
+    .align 16
+    .globl set_boot_via_efi_asm
+set_boot_via_efi_asm:
+    movabsq $boot_via_efi, %rax
+    movl    $1, (%rax)
     ret
 
     /* ---- EFI GOP framebuffer accessors --------------------------------
      *
-     * efi_fb_info layout (.data, populated by arch/x86/boot/efi_stub.S
-     * right before ExitBootServices; zero on the multiboot1 BIOS path):
+     * efi_fb_info layout (.boot.data, populated by arch/x86/boot/
+     * efi_stub.S right before ExitBootServices; zero on multiboot1):
      *
-     *   off  0: uint32 present       (1 = populated, 0 = no GOP captured)
+     *   off  0: uint32 present       (1 = populated, 0 = no GOP)
      *   off  4: uint32 width         (HorizontalResolution)
      *   off  8: uint32 height        (VerticalResolution)
-     *   off 12: uint32 pitch_bytes   (PixelsPerScanLine × bytes_per_pixel,
-     *                                 i.e. the actual byte stride between
-     *                                 successive scanlines — UEFI 2.10
-     *                                 §12.9.2 says PixelsPerScanLine is
-     *                                 *pixels*, so we must multiply by
-     *                                 bytes_per_pixel in the stub before
-     *                                 storing here)
-     *   off 16: uint32 pixel_format  (0 = RGB, 1 = BGR, 2 = BitMask,
-     *                                 3 = BltOnly — per
-     *                                 EFI_GRAPHICS_PIXEL_FORMAT)
-     *   off 20: uint32 bpp           (always 32 today — GOP-reported
-     *                                 RGB/BGR formats are 8-bit per
-     *                                 channel plus 8-bit reserved)
-     *   off 24: uint64 base          (FrameBufferBase — may be above
-     *                                 4 GiB on some real hardware; full
-     *                                 64-bit slot)
-     *   off 32: uint64 size          (FrameBufferSize — total bytes)
+     *   off 12: uint32 pitch_bytes   (PixelsPerScanLine × bytes_per_px)
+     *   off 16: uint32 pixel_format  (0 RGB, 1 BGR, 2 BitMask, 3 Blt)
+     *   off 20: uint32 bpp           (always 32 today)
+     *   off 24: uint64 base          (FrameBufferBase — may be > 4 GiB)
+     *   off 32: uint64 size          (FrameBufferSize)
      *
      * Total: 40 bytes. The efi_stub.S writes the whole struct in one
      * pass via offset stores from a base register pointing here.
@@ -82,74 +93,70 @@ get_mb_info:
     .align 16
     .globl get_efi_fb_present
 get_efi_fb_present:
-    leaq    efi_fb_info(%rip), %rax
+    movabsq $efi_fb_info, %rax
     movl    0(%rax), %eax
     ret
 
     .align 16
     .globl get_efi_fb_width
 get_efi_fb_width:
-    leaq    efi_fb_info(%rip), %rax
+    movabsq $efi_fb_info, %rax
     movl    4(%rax), %eax
     ret
 
     .align 16
     .globl get_efi_fb_height
 get_efi_fb_height:
-    leaq    efi_fb_info(%rip), %rax
+    movabsq $efi_fb_info, %rax
     movl    8(%rax), %eax
     ret
 
     .align 16
     .globl get_efi_fb_pitch_bytes
 get_efi_fb_pitch_bytes:
-    leaq    efi_fb_info(%rip), %rax
+    movabsq $efi_fb_info, %rax
     movl    12(%rax), %eax
     ret
 
     .align 16
     .globl get_efi_fb_pixel_format
 get_efi_fb_pixel_format:
-    leaq    efi_fb_info(%rip), %rax
+    movabsq $efi_fb_info, %rax
     movl    16(%rax), %eax
     ret
 
     .align 16
     .globl get_efi_fb_bpp
 get_efi_fb_bpp:
-    leaq    efi_fb_info(%rip), %rax
+    movabsq $efi_fb_info, %rax
     movl    20(%rax), %eax
     ret
 
-    /* base + size are 64-bit. Use a paired-load pattern: caller gets
-     * the full 64-bit value in %rax. */
+    /* base + size are 64-bit. Caller gets the full 64-bit value. */
     .align 16
     .globl get_efi_fb_base
 get_efi_fb_base:
-    leaq    efi_fb_info(%rip), %rcx
+    movabsq $efi_fb_info, %rcx
     movq    24(%rcx), %rax
     ret
 
     .align 16
     .globl get_efi_fb_size
 get_efi_fb_size:
-    leaq    efi_fb_info(%rip), %rcx
+    movabsq $efi_fb_info, %rcx
     movq    32(%rcx), %rax
     ret
 
     /* ---- EFI GOP framebuffer storage ----------------------------------
      *
-     * .data (NOT .bss) so the EFI stub doesn't have to clear it before
-     * writing — the .data init pattern leaves it zero at boot and the
-     * stub writes the populated fields atomically before ExitBootServices.
-     * BIOS multiboot1 boot never touches this region; `present` stays 0
-     * and the Adder accessor short-circuits.
-     *
-     * Address must be reachable via a R_386_32 / 32-bit absolute
-     * relocation from the multiboot handoff table planted by header.S
-     * (kernel is elf32-i386; VMAs all < 4 GiB).
+     * Lives in .boot.data (the LOW boot region) so the EFI handoff
+     * table's 32-bit +64 slot can carry its address and the EFI stub
+     * can write it by that low physical address before jumping to the
+     * kernel. .boot.data is loaded zero-initialised; BIOS multiboot1
+     * boot never touches this region (`present` stays 0 and the Adder
+     * accessor short-circuits).
      */
-    .section .data
+    .section .boot.data, "aw"
     .align 8
     .globl efi_fb_info
 efi_fb_info:

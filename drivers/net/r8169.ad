@@ -75,6 +75,9 @@ from arch.x86.kernel.apic import ioapic_redirect
 from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from drivers.net.eth import eth_rx
+# Higher-half kernel: descriptor rings + DMA buffers that are kernel
+# globals need virt_to_phys() rebasing before the NIC sees them.
+from arch.x86.mm.pgtable import virt_to_phys
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -979,11 +982,14 @@ def _r8169_tx_8139(buf: Ptr[uint8], length: uint64) -> int32:
     # 1. Copy frame body into the slot's scratch buffer.
     buf_addr: uint64 = _r8139_slot_buf_addr(slot)
     memcpy(cast[Ptr[uint8]](buf_addr), buf, length)
-    # 2. Plant the 32-bit DMA address. The scratch buffer lives in
-    #    identity-mapped BSS below 4 GiB so the host-virt pointer
-    #    doubles as the bus address.
+    # 2. Plant the 32-bit DMA address. Higher-half kernel: the scratch
+    #    buffer is a kernel global (high-half VA); the chip DMAs from a
+    #    PHYSICAL address, so rebase via virt_to_phys before writing
+    #    TSAD. The kernel image is loaded in low physical RAM, so the
+    #    rebased address fits the 32-bit TSAD register.
+    buf_phys: uint64 = virt_to_phys(buf_addr)
     _r_outl(iobase, RTL8139_TSAD0 + slot * 4,
-            cast[uint32](buf_addr & 0xFFFFFFFF))
+            cast[uint32](buf_phys & 0xFFFFFFFF))
     # 3. Write TSDx with (size | ERTXTH<<16). Writing TSD clears
     #    the OWN bit, which triggers the chip to DMA the frame.
     tsd: uint32 = cast[uint32](tx_len & 0x1FFF) \
@@ -1152,14 +1158,24 @@ def _r8169_setup_rx_gigabit():
     #   [+12] u32 addr_hi = high half of buffer DMA address
     # The buffer block is one contiguous 32 KiB BSS region carved into
     # 16 × 2 KiB slices; slot i lives at r8169g_rx_bufs + i*2048.
+    # Higher-half kernel: the RX ring + RX buffers are kernel globals
+    # (high-half VAs). The NIC's descriptor walker and DMA engine see
+    # PHYSICAL addresses, so RDSAR and the per-descriptor buffer-addr
+    # fields below must carry virt_to_phys()-rebased values. We keep
+    # r8169_state.rx_ring as the VIRTUAL address (the kernel touches
+    # the ring through it) and rebase only at the register/descriptor
+    # write sites.
     ring: uint64 = cast[uint64](&r8169g_rx_ring[0])
     buf_base: uint64 = cast[uint64](&r8169g_rx_bufs[0])
+    ring_phys: uint64 = virt_to_phys(ring)
     r8169_state.rx_ring = ring
 
     i: uint64 = 0
     while i < R8169G_NR_DESCS:
         bufp: uint64 = buf_base + i * R8169G_RX_BUF_BYTES
         r8169_state.rx_buf_addrs[i] = bufp
+        # Physical address of this RX buffer for the descriptor.
+        bufp_phys: uint64 = virt_to_phys(bufp)
         d: uint64 = ring + i * R8169G_DESC_BYTES
         opts1: uint32 = RTL8169_DESC_OWN \
                       | cast[uint32](R8169G_RX_BUF_BYTES & 0xFFFF)
@@ -1167,17 +1183,17 @@ def _r8169_setup_rx_gigabit():
             opts1 = opts1 | RTL8169_DESC_EOR
         cast[Ptr[uint32]](d +  0)[0] = opts1
         cast[Ptr[uint32]](d +  4)[0] = 0
-        cast[Ptr[uint32]](d +  8)[0] = cast[uint32](bufp & 0xFFFFFFFF)
-        cast[Ptr[uint32]](d + 12)[0] = cast[uint32](bufp >> 32)
+        cast[Ptr[uint32]](d +  8)[0] = cast[uint32](bufp_phys & 0xFFFFFFFF)
+        cast[Ptr[uint32]](d + 12)[0] = cast[uint32](bufp_phys >> 32)
         i = i + 1
 
     bar2: uint64 = r8169_state.bar2
     # RDSAR (Receive Descriptor Start Address Register) — 64-bit
-    # split across LO/HI registers at 0xE4/0xE8.
+    # split across LO/HI registers at 0xE4/0xE8. Physical address.
     _r8169_mmio_w32(bar2 + RTL8169_RDSAR_LO,
-                    cast[uint32](ring & 0xFFFFFFFF))
+                    cast[uint32](ring_phys & 0xFFFFFFFF))
     _r8169_mmio_w32(bar2 + RTL8169_RDSAR_HI,
-                    cast[uint32](ring >> 32))
+                    cast[uint32](ring_phys >> 32))
     # RMS = 1536 — biggest RX frame the chip will accept (MTU 1500
     # + 14-byte L2 header + 4-byte VLAN tag + 4-byte CRC + slack).
     _r8169_mmio_w16(bar2 + RTL8169_RMS, 1536)
@@ -1194,7 +1210,11 @@ def _r8169_setup_tx_gigabit():
     # the last descriptor with EOR so the chip wraps the ring instead
     # of running off the end. Frames are submitted via _r8169_tx_gigabit
     # which sets OWN|FS|LS and the length on a single descriptor.
+    # Higher-half kernel: r8169g_tx_ring is a kernel global; the NIC's
+    # TNPDS register needs the PHYSICAL address. tx_ring stays virtual
+    # for the kernel's own descriptor writes.
     ring: uint64 = cast[uint64](&r8169g_tx_ring[0])
+    ring_phys: uint64 = virt_to_phys(ring)
     r8169_state.tx_ring = ring
     r8169_state.tx_idx  = 0
 
@@ -1212,11 +1232,11 @@ def _r8169_setup_tx_gigabit():
 
     bar2: uint64 = r8169_state.bar2
     # TNPDS (Transmit Normal-Priority Descriptor Start) — 64-bit
-    # split across LO/HI at 0x20/0x24.
+    # split across LO/HI at 0x20/0x24. Physical address.
     _r8169_mmio_w32(bar2 + RTL8169_TNPDS_LO,
-                    cast[uint32](ring & 0xFFFFFFFF))
+                    cast[uint32](ring_phys & 0xFFFFFFFF))
     _r8169_mmio_w32(bar2 + RTL8169_TNPDS_HI,
-                    cast[uint32](ring >> 32))
+                    cast[uint32](ring_phys >> 32))
     # TxConfig — IFG 0b11 (96 bit times) + MaxDMA 0b111 (unlimited).
     # Other bits left at chip default.
     txcfg: uint32 = RTL8169_TXCFG_IFG_96 | RTL8169_TXCFG_MAXDMA_UNL
@@ -1234,9 +1254,11 @@ def _r8169_tx_gigabit(buf: Ptr[uint8], length: uint64) -> int32:
         return -1
     if length < 1:
         return -1
-    # Copy frame into the shared TX scratch.
+    # Copy frame into the shared TX scratch. The descriptor's buffer
+    # address is a PHYSICAL address — r8169g_tx_buf is a kernel global
+    # (high-half VA), so rebase via virt_to_phys.
     memcpy(cast[Ptr[uint8]](&r8169g_tx_buf[0]), buf, length)
-    addr: uint64 = cast[uint64](&r8169g_tx_buf[0])
+    addr: uint64 = virt_to_phys(cast[uint64](&r8169g_tx_buf[0]))
 
     ring: uint64 = r8169_state.tx_ring
     idx:  uint64 = cast[uint64](r8169_state.tx_idx) % R8169G_NR_DESCS

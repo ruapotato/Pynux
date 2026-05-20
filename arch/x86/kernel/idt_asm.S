@@ -135,53 +135,49 @@ common_trap:
 
 /* ---------- trap_stub_table -------------------------------------- *
  * Array of 32 quad pointers, one per vector. Consumed by idt_init().
- * Note that each entry is the FULL 64-bit virtual address of the
- * stub — but in our elf32-i386 wrapper they're really 32-bit-zero-
- * extended (we live below 4 GiB), and storing them as .quad keeps
- * the format compatible if/when we grow into the higher half.
+ * Each entry is the FULL 64-bit virtual address of the stub.
+ *
+ * HIGHER-HALF: the kernel is now linked at 0xffffffff80000000+, so
+ * each stub address genuinely needs all 64 bits. The kernel is a true
+ * elf64-x86-64 object, so `.quad sym` (an R_X86_64_64 relocation) is
+ * representable — no more `.long sym; .long 0` split.
  */
     .section .rodata
     .align 8
     .globl trap_stub_table
-    /* Each slot is 8 bytes: low 32 = stub address, high 32 = 0.
-     * `.quad sym` would create a 64-bit relocation that elf32-i386
-     * can't represent, so we split into `.long sym; .long 0`. All
-     * stub addresses live below 4 GiB (we load at 1 MiB), so the
-     * high half is genuinely zero — get_trap_stub reads the whole
-     * 8-byte slot via `movq` and yields the correct 64-bit value. */
 trap_stub_table:
-    .long trap_stub_0;  .long 0
-    .long trap_stub_1;  .long 0
-    .long trap_stub_2;  .long 0
-    .long trap_stub_3;  .long 0
-    .long trap_stub_4;  .long 0
-    .long trap_stub_5;  .long 0
-    .long trap_stub_6;  .long 0
-    .long trap_stub_7;  .long 0
-    .long trap_stub_8;  .long 0
-    .long trap_stub_9;  .long 0
-    .long trap_stub_10; .long 0
-    .long trap_stub_11; .long 0
-    .long trap_stub_12; .long 0
-    .long trap_stub_13; .long 0
-    .long trap_stub_14; .long 0
-    .long trap_stub_15; .long 0
-    .long trap_stub_16; .long 0
-    .long trap_stub_17; .long 0
-    .long trap_stub_18; .long 0
-    .long trap_stub_19; .long 0
-    .long trap_stub_20; .long 0
-    .long trap_stub_21; .long 0
-    .long trap_stub_22; .long 0
-    .long trap_stub_23; .long 0
-    .long trap_stub_24; .long 0
-    .long trap_stub_25; .long 0
-    .long trap_stub_26; .long 0
-    .long trap_stub_27; .long 0
-    .long trap_stub_28; .long 0
-    .long trap_stub_29; .long 0
-    .long trap_stub_30; .long 0
-    .long trap_stub_31; .long 0
+    .quad trap_stub_0
+    .quad trap_stub_1
+    .quad trap_stub_2
+    .quad trap_stub_3
+    .quad trap_stub_4
+    .quad trap_stub_5
+    .quad trap_stub_6
+    .quad trap_stub_7
+    .quad trap_stub_8
+    .quad trap_stub_9
+    .quad trap_stub_10
+    .quad trap_stub_11
+    .quad trap_stub_12
+    .quad trap_stub_13
+    .quad trap_stub_14
+    .quad trap_stub_15
+    .quad trap_stub_16
+    .quad trap_stub_17
+    .quad trap_stub_18
+    .quad trap_stub_19
+    .quad trap_stub_20
+    .quad trap_stub_21
+    .quad trap_stub_22
+    .quad trap_stub_23
+    .quad trap_stub_24
+    .quad trap_stub_25
+    .quad trap_stub_26
+    .quad trap_stub_27
+    .quad trap_stub_28
+    .quad trap_stub_29
+    .quad trap_stub_30
+    .quad trap_stub_31
 
 /* ---------- idt_load: build descriptor on stack, lidt ------------ *
  * Hamnix's asm_volatile() is zero-operand, so byte-packing the 10-byte

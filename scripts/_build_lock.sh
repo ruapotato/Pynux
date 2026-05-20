@@ -40,6 +40,16 @@ mkdir -p "$_HAMNIX_BUILD_LOCK_DIR"
 _HAMNIX_BUILD_LOCK="$_HAMNIX_BUILD_LOCK_DIR/.build_lock"
 _HAMNIX_BUILD_LOCK_TIMEOUT="${HAMNIX_BUILD_LOCK_TIMEOUT:-120}"
 
+# Higher-half kernel boot shim. The Hamnix kernel is now a true elf64
+# higher-half image, which QEMU's `-kernel` multiboot1 loader refuses
+# to load. _kernel_iso.sh defines a `qemu-system-x86_64` shell function
+# that transparently boots an ELFCLASS64 `-kernel` target from a BIOS
+# GRUB ISO instead. Sourced here — before the reentrancy return below —
+# so every test_*.sh that sources _build_lock.sh (as its first action)
+# picks the shim up. Real Linux bzImages and `-cdrom`/`-bios` boots are
+# passed through untouched. See scripts/_kernel_iso.sh.
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_kernel_iso.sh"
+
 # Reentrancy guard: many test_*.sh scripts source us AND invoke
 # scripts/build_iso.sh which also sources us. The child process
 # inherits fd 200 from the parent, but the child's `flock -x 200`

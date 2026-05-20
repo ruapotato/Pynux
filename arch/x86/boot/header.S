@@ -1,23 +1,42 @@
 /*
- * arch/x86/boot/header.S - Hamnix multiboot1 entry + 32->64 long-mode transition.
+ * arch/x86/boot/header.S - Hamnix multiboot1 entry + 32->64 long-mode
+ *                          transition into a HIGHER-HALF kernel.
  *
- * Mirrors the role of Linux's arch/x86/boot/header.S (boot protocol header)
- * and arch/x86/boot/compressed/head_64.S (long-mode setup), collapsed into
- * one file for the simpler multiboot1 path. Once the kernel grows enough
- * to justify the split, the long-mode portion will move out.
+ * Mirrors the role of Linux's arch/x86/boot/header.S (boot protocol
+ * header) and arch/x86/boot/compressed/head_64.S (long-mode setup),
+ * collapsed into one file for the simpler multiboot1 path.
  *
- * Control flow on a QEMU `-kernel` boot:
- *   1. QEMU acts as a multiboot1 loader. It locates the magic header below,
- *      loads the ELF, and jumps to _start in 32-bit protected mode with
- *      paging off, EAX=0x2BADB002, EBX=&multiboot_info.
- *   2. We set up a small stack, identity-map the first 1 GiB with 2 MiB
- *      pages, enable PAE + EFER.LME + CR0.PG to enter IA-32e compatibility
- *      mode, then far-jump through a 64-bit GDT to land in long mode.
- *   3. The far-jump target is `long_mode_start`, which tail-calls into
- *      arch/x86/kernel/head_64.S's start_kernel_asm_entry.
+ * Control flow on a QEMU `-kernel` / GRUB multiboot1 boot:
+ *   1. The loader acts as a multiboot1 loader. It locates the magic
+ *      header below, loads the (elf64-x86-64) ELF's PT_LOAD segments
+ *      by their p_paddr (LOW physical addresses), and jumps to the ELF
+ *      e_entry = `_start` (this file, .head.text) in 32-bit protected
+ *      mode with paging off, EAX=0x2BADB002, EBX=&multiboot_info.
+ *   2. _start runs at a LOW physical/virtual address (identity). It
+ *      builds 4-level page tables that map the kernel image TWICE:
+ *        - PML4[0]   -> low identity (so this in-flight 32-bit code,
+ *                       the page tables, the boot stack, and physical
+ *                       RAM all stay reachable), and
+ *        - PML4[511] -> the higher half 0xffffffff80000000, where the
+ *                       kernel proper is LINKED.
+ *      It enables PAE + EFER.LME + CR0.PG, then far-jumps through the
+ *      64-bit GDT to `long_mode_start` (also low / identity — the
+ *      far-jump just flushes CS into 64-bit mode).
+ *   3. long_mode_start re-anchors the stack and does an absolute
+ *      indirect jump to the HIGH-half virtual address of
+ *      start_kernel_asm_entry (arch/x86/kernel/head_64.S). From that
+ *      point on RIP runs in the higher half and every kernel symbol
+ *      resolves to its 0xffffffff80000000+offset link-time VMA.
  *
- * Everything here is hand-written GNU `as` AT&T syntax; the Hamnix compiler
- * itself never emits 32-bit code.
+ * The low identity map of PML4[0] is intentionally KEPT after the
+ * transition: the kernel still needs to touch physical RAM directly
+ * (page allocator, e820 walk, AP trampoline at 0x8000, framebuffer).
+ * Only the kernel-image-runs-low assumption is gone.
+ *
+ * Everything here is hand-written GNU `as` AT&T syntax. The whole
+ * kernel is now assembled with `as --64` and linked `ld -m elf_x86_64`
+ * (a true 64-bit ELF), so 64-bit absolute relocations (R_X86_64_64)
+ * for the higher-half symbols are representable.
  */
 
     .section .head.text, "ax"
@@ -31,38 +50,26 @@
  *   bit 2 (0x00000004) MULTIBOOT_VIDEO_MODE    — request a video mode
  *   bit 16 (0x00010000) MULTIBOOT_AOUT_KLUDGE  — use header_addr fields
  *
- * Only bit 2 is set here: we want a linear framebuffer (mode_type=0)
- * at "any" geometry (width=height=depth=0 → loader picks). When the
- * kernel is booted by GRUB-EFI (UEFI), this is what convinces GRUB
- * to call EFI's GOP and hand us a populated framebuffer block in the
- * multiboot info struct at offsets 88..109. Without bit 2, GRUB-EFI
- * leaves the framebuffer fields zeroed and the kernel sees a dark
- * screen on real hardware (UART still works for those with a cable).
+ * Only bit 2 is set: request a linear framebuffer (mode_type=0). Bit
+ * 16 (AOUT kludge) is deliberately NOT set — the kernel is a true
+ * elf64 ELF and the loaders that consume it (GRUB's multiboot1 ELF
+ * loader on the BIOS-via-ISO path, the native PE/COFF stub on the
+ * UEFI path) both handle ELFCLASS64 and the program-header VMA/LMA
+ * split natively. QEMU's built-in `-kernel` loader rejects 64-bit
+ * ELFs, so the test harness boots the kernel from a BIOS GRUB ISO
+ * (scripts/_kernel_iso.sh) rather than via `-kernel`.
  *
- * Layout — the spec requires fields at fixed offsets even when the
- * gating flag bit isn't set, because the loader walks by offset:
- *   off  0 magic
- *   off  4 flags
- *   off  8 checksum
- *   off 12 header_addr   ┐
- *   off 16 load_addr     │ ignored (bit 16 clear) but slot must exist
- *   off 20 load_end_addr │
- *   off 24 bss_end_addr  │
- *   off 28 entry_addr    ┘
- *   off 32 mode_type     ┐ video request (bit 2 set):
- *   off 36 width         │   mode_type = 0 → linear graphics framebuffer
- *   off 40 height        │   width = height = depth = 0 → loader's choice
- *   off 44 depth         ┘
+ * Layout — fields at spec-mandated fixed offsets even when the gating
+ * flag bit isn't set (the loader walks by offset):
+ *   off  0 magic / 4 flags / 8 checksum
+ *   off 12..28 header_addr..entry_addr (unused, bit 16 clear)
+ *   off 32..44 mode_type/width/height/depth (video request)
  */
     .equ    MB_MAGIC,    0x1BADB002
     .equ    MB_FLAGS,    0x00000004        /* VIDEO_MODE */
     .equ    MB_CHECKSUM, -(MB_MAGIC + MB_FLAGS)
 
-    /* Hamnix EFI handoff table magic ("HAMX" little-endian). The EFI
-     * stub (arch/x86/boot/efi_stub.S, M16.125 PATH A) scans the first
-     * 8 KiB of the loaded kernel image for the multiboot1 magic, then
-     * reads the handoff table at multiboot_header + 48 to learn the
-     * post-loader entry point and the address of `boot_via_efi`. */
+    /* Hamnix EFI handoff table magic ("HAMX" little-endian). */
     .equ    HAMNIX_HANDOFF_MAGIC, 0x484D4158
 
     .align 4
@@ -70,111 +77,86 @@ multiboot_header:
     .long   MB_MAGIC                /* off  0 */
     .long   MB_FLAGS                /* off  4 */
     .long   MB_CHECKSUM             /* off  8 */
-    /* header_addr..entry_addr — unused (bit 16 clear), but placeholders
-     * keep the next group of fields at the spec-mandated offsets. */
     .long   0x00000000              /* off 12 header_addr   */
     .long   0x00000000              /* off 16 load_addr     */
     .long   0x00000000              /* off 20 load_end_addr */
     .long   0x00000000              /* off 24 bss_end_addr  */
     .long   0x00000000              /* off 28 entry_addr    */
-    /* Video request — linear framebuffer, loader picks geometry. */
     .long   0x00000000              /* off 32 mode_type = 0 (linear FB) */
     .long   0x00000000              /* off 36 width  = any              */
     .long   0x00000000              /* off 40 height = any              */
     .long   0x00000000              /* off 44 depth  = any              */
 
-    /* ---- Hamnix EFI handoff table (M16.125, PATH A) -----------------
-     *
-     * Lives at fixed offset 48 from multiboot_header. The EFI stub
-     * (arch/x86/boot/efi_stub.S) scans the loaded kernel image for the
-     * multiboot1 magic, then reads:
+    /* ---- Hamnix EFI handoff table (fixed offset 48) -----------------
      *
      *   +48  uint32  HAMNIX_HANDOFF_MAGIC ("HAMX")
      *   +52  uint32  efi_entry_addr   = &_x86_start_after_loader
      *   +56  uint32  boot_via_efi_addr = &boot_via_efi
      *   +60  uint32  gdt64_addr       = &gdt64
-     *   +64  uint32  efi_fb_info_addr = &efi_fb_info (GOP capture target)
+     *   +64  uint32  efi_fb_info_addr = &efi_fb_info (GOP capture)
      *
-     * The +60 slot was reserved until M16.126: the EFI stub now has to
-     * install the kernel's own gdt64 (with all 7 entries: null, kernel
-     * CS/DS, user DS/CS, TSS-low, TSS-high) BEFORE jumping to the
-     * kernel — otherwise tss_init's `ltr $0x28` (and SYSRET later)
-     * #GPs because the stub's private 3-entry GDT has no slot 5.
-     * Passing &gdt64 through the handoff table lets the stub
-     * lgdt-load the kernel's own GDT instead of guessing at offsets.
-     *
-     * The +64 slot (this commit) lets the EFI stub query GOP before
-     * ExitBootServices and write the captured framebuffer geometry
-     * (base, pitch_bytes, width, height, pixel_format) into the
-     * kernel's `efi_fb_info` struct (arch/x86/kernel/boot_info_asm.S).
-     * Without this, the UEFI direct-boot path arrives at start_kernel
-     * with no framebuffer info at all — the multiboot fields are zero,
-     * mb_fb_present() returns 0, fb_init never runs, and the kernel's
-     * on-screen output is silent. On a real laptop this looks like
-     * "slaughtered" text because the VGA fallback (0xB8000) scribbles
-     * into whatever the firmware left in low memory.
-     *
-     * Why pack these into the kernel image instead of having the EFI
-     * stub parse the ELF symbol table:
-     *   - Cheaper: a 2 KiB dword-scan vs. a multi-KB section-header /
-     *     string-table walk.
-     *   - Robust against linker behaviour: the multiboot1 magic is
-     *     already a stable scan target on the BIOS side; the stub
-     *     just reuses the same scan window.
-     *   - The kernel ELF format stays untouched — every existing
-     *     `qemu -kernel hamnix-vmlinux.elf` test keeps working.
-     *
-     * On the multiboot1 BIOS path the loader skips these bytes entirely
-     * (bit 16 is clear, so it stops reading the multiboot header at
-     * offset 48). They're inert padding from the loader's perspective.
+     * EVERY symbol referenced here lives in the LOW boot region
+     * (.head.text / .boot.text / .boot.data), so each .long resolves
+     * to a real 32-bit address even though the kernel proper is now
+     * linked in the higher half. The EFI stub patches/reads these by
+     * their LOW physical address (= LMA = VMA for the boot region).
      */
     .long   HAMNIX_HANDOFF_MAGIC    /* off 48 */
     .long   _x86_start_after_loader /* off 52 */
     .long   boot_via_efi            /* off 56 */
-    .long   gdt64                   /* off 60 — &gdt64 (M16.126) */
-    .long   efi_fb_info             /* off 64 — &efi_fb_info (GOP target) */
+    .long   gdt64                   /* off 60 */
+    .long   efi_fb_info             /* off 64 */
 
 /* ---------- 32-bit protected-mode entry ---------------------------- */
     .globl  _start
 _start:
     cli
-    /* Set up a tiny 32-bit stack in .bss. boot_stack_top is provided by
-     * the linker script. */
+    /* Tiny 32-bit stack in the low boot region. */
     movl    $boot_stack_top, %esp
 
-    /* Stash multiboot magic + info ptr for diagnostics; we don't parse
-     * the info struct yet but want it available later. */
+    /* Stash multiboot magic + info ptr. */
     movl    %eax, mb_magic
     movl    %ebx, mb_info
 
-    /* Verify we were booted by a multiboot loader. If not, halt loudly. */
+    /* Verify we were booted by a multiboot loader. */
     cmpl    $0x2BADB002, %eax
     jne     hang32
 
-    /* ----- Build identity-mapped page tables ------------------------ *
-     * Layout (PAE/long mode 4-level paging):
-     *   PML4[0]  -> PDPT
-     *   PDPT[0]  -> PD   (covers first 1 GiB via 2 MiB pages)
-     *   PD[i]    -> 2 MiB page at i << 21, for i in 0..511
-     * Total identity-mapped: 1 GiB. Hamnix is well under that for M16.x.   */
+    /* ----- Build 4-level page tables -------------------------------- *
+     * Layout:
+     *   PML4[0]   -> pdpt_low   : 4 GiB low identity (PS=1, 4× 1 GiB)
+     *   PML4[511] -> pdpt_high  : the higher half. Within pdpt_high,
+     *                entry 510 maps 0xffffffff80000000 and entry 511
+     *                maps 0xffffffffc0000000, both to physical 0 / 1
+     *                GiB via PS=1 1 GiB pages. That makes the kernel's
+     *                link-time VMA 0xffffffff80000000+offset resolve
+     *                to physical 0+offset — exactly the LMA the loader
+     *                packed the high-half PT_LOAD segments into.
+     *
+     * PML4 index math for 0xffffffff80000000:
+     *   bits[47:39] = 0x1FF (511)  -> PML4[511]
+     *   bits[38:30] = 0x1FE (510)  -> pdpt_high[510]
+     * and 0xffffffffc0000000 -> PML4[511], pdpt_high[511].
+     */
+
+    /* PML4[0] -> pdpt_low */
     movl    $pml4, %edi
-    movl    $pdpt, %eax
+    movl    $pdpt_low, %eax
     orl     $0x7, %eax              /* US | RW | P */
     movl    %eax, (%edi)
+    movl    $0, 4(%edi)
 
-    /* Fill PDPT with 4 entries, each a 1 GiB page mapping (PS=1).
-     * That gets us a 4 GiB identity map in just four entries — enough
-     * to reach the LAPIC MMIO window at 0xFEE00000 and any HPET/IOAPIC
-     * MMIO that lives just below 4 GiB. The PD table allocated below
-     * is now unused at runtime; we keep its storage so the linker
-     * doesn't shrink .pgtables and offsets stay stable.
-     *
-     *   bit 0: P  - present
-     *   bit 1: RW - writable
-     *   bit 2: US - user/supervisor (1 = user accessible)
-     *   bit 7: PS - 1 GiB page (terminal entry at PDPT level)
-     */
-    movl    $pdpt, %edi
+    /* PML4[511] -> pdpt_high. Slot 511 is at byte offset 511*8 = 0xFF8. */
+    movl    $pml4, %edi
+    addl    $0xFF8, %edi
+    movl    $pdpt_high, %eax
+    orl     $0x7, %eax              /* US | RW | P */
+    movl    %eax, (%edi)
+    movl    $0, 4(%edi)
+
+    /* pdpt_low: 4 entries, each a 1 GiB identity page (PS=1).
+     *   bit 0 P, bit 1 RW, bit 2 US, bit 7 PS (1 GiB terminal). */
+    movl    $pdpt_low, %edi
     movl    $0, %ecx
     movl    $0x87, %eax             /* PS | US | RW | P; phys base = 0 */
 1:
@@ -186,17 +168,25 @@ _start:
     cmpl    $4, %ecx
     jne     1b
 
+    /* pdpt_high[510] -> 1 GiB page @ phys 0   (0xffffffff80000000)
+     * pdpt_high[511] -> 1 GiB page @ phys 1 G (0xffffffffc0000000)
+     * Kernel-only (US=0) is correct for the higher half, but we keep
+     * US=1 to exactly mirror pdpt_low — the per-task PML4 clone in
+     * kernel/sched/core.ad copies PML4[511] verbatim, and US-bit
+     * uniformity sidesteps any walk-time surprises. */
+    movl    $pdpt_high, %edi
+    addl    $(510 * 8), %edi
+    movl    $0x87, %eax             /* PS|US|RW|P, phys 0 */
+    movl    %eax, (%edi)
+    movl    $0, 4(%edi)
+    movl    $0x40000087, %eax       /* PS|US|RW|P, phys 0x40000000 */
+    movl    %eax, 8(%edi)
+    movl    $0, 12(%edi)
+
     /* ----- Enable PAE, load CR3, set EFER.LME, then CR0.PG ---------- */
     movl    %cr4, %eax
     orl     $(1 << 5), %eax         /* CR4.PAE */
-    /* U13: enable SSE/SSE2 hardware. Without these bits any xmm-touching
-     * instruction (incl. musl's pxor %xmm0,%xmm0 in _start_c) traps #UD
-     * at CPL=3. We set them here, BEFORE CR0.PG / long-mode entry, so
-     * the BSP enters 64-bit code with FXSAVE/FXRSTOR + #XF wired up.
-     *   bit 9  CR4.OSFXSR       — OS supports FXSAVE/FXRSTOR; enables SSE
-     *   bit 10 CR4.OSXMMEXCPT   — OS supports unmasked SIMD FP exception
-     * Context-switch save/restore of xmm state is deferred to U14; U12's
-     * binary exits before any preemption so the lazy approach is safe. */
+    /* SSE/SSE2 hardware: OSFXSR (bit 9) + OSXMMEXCPT (bit 10). */
     orl     $(1 << 9) | (1 << 10), %eax
     movl    %eax, %cr4
 
@@ -210,20 +200,13 @@ _start:
 
     movl    %cr0, %eax
     orl     $(1 << 31), %eax        /* CR0.PG  - paging on, enter IA-32e */
-    /* U13: also normalise CR0 for SSE.
-     *   bit 1 CR0.MP = 1   pair with CR4.OSFXSR; #NM on WAIT/FWAIT only
-     *                      if TS is set (it isn't), harmless to set
-     *   bit 2 CR0.EM = 0   do NOT emulate x87 — required for SSE
-     *   bit 3 CR0.TS = 0   no "task switched" lazy-FPU flag; SSE wouldn't
-     *                      trap #NM today, but be explicit
-     * Reset values are MP=0, EM=0, TS=0, so the meaningful change is MP=1.
-     * Clearing EM/TS is defensive against future code accidentally setting
-     * them before reaching userspace. */
     orl     $(1 << 1), %eax         /* CR0.MP */
     andl    $~((1 << 2) | (1 << 3)), %eax  /* clear CR0.EM, CR0.TS */
     movl    %eax, %cr0
 
-    /* Load 64-bit GDT and far-jump to flush CS into the 64-bit segment. */
+    /* Load 64-bit GDT and far-jump to flush CS into the 64-bit segment.
+     * long_mode_start lives in .boot.text (low identity) — the jump is
+     * still to a LOW address; it only switches CS to 64-bit. */
     lgdt    gdt64_descriptor
     ljmp    $0x08, $long_mode_start
 
@@ -232,13 +215,17 @@ hang32:
     hlt
     jmp     hang32
 
-/* ---------- 64-bit code path -------------------------------------- */
+/* ---------- 64-bit long-mode trampoline tail ---------------------- *
+ * Lives in .boot.text — still fetched at the LOW identity address in
+ * the brief window after the far-jump. Its sole job is to re-anchor
+ * RIP into the higher half by an absolute indirect jump to the
+ * high-half VMA of start_kernel_asm_entry. */
+    .section .boot.text, "ax"
     .code64
     .align 8
+    .globl long_mode_start
 long_mode_start:
-    /* Reload data segments with the 64-bit data selector (0x10). In long
-     * mode segment bases are ignored for DS/ES/SS but the descriptor must
-     * still be loadable.  */
+    /* Reload data segments with the 64-bit data selector (0x10). */
     movw    $0x10, %ax
     movw    %ax, %ds
     movw    %ax, %es
@@ -246,88 +233,117 @@ long_mode_start:
     movw    %ax, %gs
     movw    %ax, %ss
 
-    /* Re-anchor the stack. The 32-bit ESP we set earlier already
-     * zero-extended into RSP on the mode switch, but use an explicit
-     * 32-bit immediate so the relocation fits in elf32-i386. The address
-     * is below 4 GiB so the upper 32 bits stay zero. */
+    /* Re-anchor the (low) boot stack — still identity-mapped. */
     movl    $boot_stack_top, %esp
 
-    /* Tail-call into the 64-bit head stub, which performs BSS zeroing
-     * and finally invokes the Hamnix start_kernel(). */
-    jmp     start_kernel_asm_entry
+    /* Jump to the HIGHER-HALF virtual address of the kernel head.
+     * `movabsq` materialises the full 64-bit link-time VMA of
+     * start_kernel_asm_entry (an R_X86_64_64 relocation, representable
+     * now that we link a true elf64). The indirect `jmpq *%rax` then
+     * lands RIP in the higher half. From here on every kernel symbol
+     * is reached at its 0xffffffff80000000+offset address. */
+    movabsq $start_kernel_asm_entry, %rax
+    jmpq    *%rax
+
+/* ---------- _x86_start_after_loader — LOW UEFI entry shim --------- *
+ * The EFI handoff table (in the multiboot header above) can only carry
+ * a 32-bit address, so it points the UEFI firmware / efi_stub.S at
+ * THIS low symbol rather than the high-half kernel head directly.
+ *
+ * arch/x86/boot/efi_stub.S far-jumps here in 64-bit long mode after it
+ * has: copied the kernel PT_LOAD segments to their p_paddr, built page
+ * tables that map BOTH the low identity range AND the higher half
+ * (PML4[0] + PML4[511]), loaded CR3, and lgdt'd the kernel's gdt64.
+ *
+ * All this shim does is re-anchor RIP into the higher half by an
+ * absolute indirect jump to _x86_start_after_loader_high
+ * (arch/x86/kernel/head_64.S). It deliberately does NOT re-zero .bss
+ * (UEFI firmware NOBITS-zeroes the image for us). */
+    .globl  _x86_start_after_loader
+_x86_start_after_loader:
+    movabsq $_x86_start_after_loader_high, %rax
+    jmpq    *%rax
 
 /* ---------- 64-bit GDT used to enter long mode -------------------- *
- * Layout chosen for SYSCALL/SYSRET compatibility:
- *   0x00 = null
- *   0x08 = kernel code  (CS for ring 0; SYSCALL CS = STAR[47:32])
- *   0x10 = kernel data  (SS for ring 0; SYSCALL SS = STAR[47:32] + 8)
- *   0x18 = user data    (SYSRET SS = STAR[63:48] + 8 = 0x18 with RPL=3)
- *   0x20 = user code    (SYSRET CS = STAR[63:48] + 16 = 0x20 with RPL=3)
- * With STAR[63:48] = 0x10 these selectors align with the SYSRET
- * hardware-imposed +8/+16 offsets. M16.17 introduces the syscall path
- * that depends on this layout.
- */
+ *   0x00 null / 0x08 kernel code / 0x10 kernel data
+ *   0x18 user data / 0x20 user code / 0x28+0x30 TSS (filled at runtime)
+ * Lives in .boot.data (low VMA) so the .head.text 32-bit stub's
+ * `lgdt gdt64_descriptor` and the handoff table's `.long gdt64` both
+ * resolve to 32-bit addresses. */
+    .section .boot.data, "aw"
     .align 8
     .globl gdt64
 gdt64:
     .quad   0x0000000000000000      /* 0x00: null */
-    /* 0x08: 64-bit code: P=1, DPL=0, S=1, type=code/exec/read, L=1 */
-    .quad   0x00AF9A000000FFFF
-    /* 0x10: 64-bit data: P=1, DPL=0, S=1, type=data/rw           */
-    .quad   0x00CF92000000FFFF
-    /* 0x18: user 64-bit data: P=1, DPL=3, S=1, type=data/rw      */
-    .quad   0x00CFF2000000FFFF
-    /* 0x20: user 64-bit code: P=1, DPL=3, S=1, type=code/exec/read, L=1 */
-    .quad   0x00AFFA000000FFFF
-    /* 0x28: TSS descriptor low half  (filled in by tss_init at runtime).
-     * 0x30: TSS descriptor high half (filled in by tss_init at runtime).
-     * 64-bit system descriptors occupy two consecutive GDT slots. We
-     * reserve the space here so the GDT's limit stays correct from
-     * boot; the contents are zero until tss_init programs them. */
-    .quad   0x0000000000000000
-    .quad   0x0000000000000000
+    .quad   0x00AF9A000000FFFF      /* 0x08: 64-bit kernel code */
+    .quad   0x00CF92000000FFFF      /* 0x10: 64-bit kernel data */
+    .quad   0x00CFF2000000FFFF      /* 0x18: user 64-bit data   */
+    .quad   0x00AFFA000000FFFF      /* 0x20: user 64-bit code   */
+    .quad   0x0000000000000000      /* 0x28: TSS low  (runtime) */
+    .quad   0x0000000000000000      /* 0x30: TSS high (runtime) */
 gdt64_end:
 
 gdt64_descriptor:
     .word   gdt64_end - gdt64 - 1
+    /* Base is a LOW 32-bit address (.boot.data) — a .long is correct
+     * and the lgdt operand format expects a 4-byte base in 32-bit mode
+     * anyway. */
     .long   gdt64
 
-/* ---------- Bookkeeping globals (.data) --------------------------- */
-    .section .data
+/* ---------- Bookkeeping globals (.boot.data) ---------------------- *
+ * mb_magic / mb_info / boot_via_efi / efi_fb_info live in the LOW
+ * boot region so the 32-bit stub can write mb_magic/mb_info and the
+ * EFI handoff table can carry their 32-bit addresses. The kernel
+ * proper reaches them via accessor functions (arch/x86/kernel/
+ * boot_info_asm.S) using RIP-relative addressing, which works from
+ * the higher half too (the boot region is within ±2 GiB of the
+ * kernel image in physical RAM, but the RIP-relative displacement is
+ * computed against the *virtual* layout — see boot_info_asm.S). */
+    .section .boot.data, "aw"
     .globl  mb_magic
 mb_magic: .long 0
     .globl  mb_info
 mb_info:  .long 0
 
+    /* boot_via_efi: int32 flag, default 0 ("multiboot path"). The EFI
+     * stub patches it to 1 via the +56 handoff slot. Kept here (not as
+     * an Adder global) so the handoff table's 32-bit `.long` is valid.
+     * arch/x86/kernel/e820.ad reads it via the get_boot_via_efi() /
+     * set_boot_via_efi_asm() accessors in boot_info_asm.S. */
+    .align 4
+    .globl  boot_via_efi
+boot_via_efi: .long 0
+
 /* ---------- Page tables (.pgtables) -------------------------------- *
- * The page tables MUST live outside .bss: head_64.S's bss-zero loop
- * runs with paging already enabled, so if pml4/pdpt/pd were in .bss
- * the very act of zeroing them would invalidate the active CR3-rooted
- * tree, triple-fault on the next memory access, and reset the box.
- * Putting them in a dedicated `.pgtables` section keeps them out of
- * [__bss_start, __bss_end) while still NOBITS (zero-init at load).
- * Each table is 4 KiB aligned because CR3 / page-table walks require
- * 4 KiB granularity.                                                  */
+ * NOBITS section, kept OUT of .bss: head_64.S's bss-zero loop runs
+ * with paging already enabled, so zeroing pml4/pdpt_* would invalidate
+ * the active CR3-rooted tree. Each table is 4 KiB aligned.
+ *
+ *   pml4       PML4[0] -> pdpt_low, PML4[511] -> pdpt_high
+ *   pdpt_low   4 GiB low identity (4× 1 GiB pages)
+ *   pdpt_high  the higher half (entries 510, 511 -> phys 0 / 1 GiB)
+ */
     .section .pgtables, "aw", @nobits
     .align 4096
     .globl pml4
 pml4:
     .skip 4096
-    .globl pdpt
-pdpt:
+    .globl pdpt_low
+pdpt_low:
     .skip 4096
-    .globl pd
-pd:
+    .globl pdpt_high
+pdpt_high:
     .skip 4096
 
-/* ---------- Boot stack (.bss) ------------------------------------- *
- * Boot stack lives in .bss; it's accessed only via %rsp/%esp so the
- * BSS-zero pass clearing it before start_kernel is fine — by then we
- * have a fresh stack pointer set just above this region.              */
-    .section .bss
+/* ---------- Boot stack (.boot.bss) -------------------------------- *
+ * The boot stack lives in the LOW boot region (.boot.bss), accessed
+ * only via %esp/%rsp. It is identity-mapped and never high-half
+ * relocated; head_64.S's high-half BSS-zero pass clears only
+ * [__bss_start,__bss_end), which is the high-half .bss — not this. */
+    .section .boot.bss, "aw", @nobits
     .align 16
     .globl boot_stack_bottom
 boot_stack_bottom:
-    .skip 16384                 /* 16 KiB boot stack — plenty for M16.x */
+    .skip 16384                 /* 16 KiB boot stack */
     .globl boot_stack_top
 boot_stack_top:

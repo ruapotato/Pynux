@@ -103,30 +103,31 @@ EFI_FALLBACK_LIMIT:  uint64 = 0x0F000000     # 240 MiB
 
 # --- boot_via_efi flag --------------------------------------------
 #
-# Set to 1 by the EFI entry path BEFORE start_kernel() runs (today
-# the EFI stub halts post-ExitBootServices; a follow-up commit will
-# merge stub + kernel into one image and set this flag from the
-# stub before jumping to _x86_start_after_loader). Read by
-# e820_init() to choose between the multiboot1 mmap parser and the
-# EFI fallback above.
+# Set to 1 by the EFI stub BEFORE start_kernel() runs (it patches the
+# flag via the +56 multiboot-handoff slot). Read by e820_init() to
+# choose between the multiboot1 mmap parser and the EFI fallback above.
 #
-# Default 0 = "entered via multiboot1 / QEMU -kernel". The flag is
-# a .bss global, so the multiboot path naturally sees 0 with no
-# explicit init.
-boot_via_efi: int32 = 0
+# HIGHER-HALF NOTE: the flag is NOT an Adder global any more. The EFI
+# handoff table in arch/x86/boot/header.S carries a 32-bit address of
+# `boot_via_efi`, which only works if the symbol lives in the LOW boot
+# region. So `boot_via_efi` is now a hand-written .boot.data symbol
+# (defined in arch/x86/boot/header.S); the kernel reaches it through
+# the get_boot_via_efi() / set_boot_via_efi_asm() accessors in
+# arch/x86/kernel/boot_info_asm.S (which use movabsq, since a
+# RIP-relative reference from the higher half can't reach low memory).
+extern def get_boot_via_efi() -> int32
+extern def set_boot_via_efi_asm()
 
 
 def set_boot_via_efi():
     # Callable from any path that has determined the boot was UEFI.
-    # Today's EFI stub halts before reaching kernel code so this is
-    # never invoked at runtime; exists so the follow-up handoff
-    # commit has a stable kernel-side API to flip the flag without
-    # touching e820 internals.
-    boot_via_efi = 1
+    # The EFI stub patches the flag directly; this exists as a stable
+    # kernel-side API.
+    set_boot_via_efi_asm()
 
 
 def is_boot_via_efi() -> int32:
-    return boot_via_efi
+    return get_boot_via_efi()
 
 
 def _type_name(t: uint64) -> Ptr[char]:
@@ -154,7 +155,7 @@ def e820_init():
     # hardcoded usable-RAM window. The kernel-image-end clamp below
     # still applies — kernel + initramfs blob never overlap the
     # allocator pool.
-    if boot_via_efi != 0:
+    if get_boot_via_efi() != 0:
         printk0("e820: EFI boot path; installing fallback RAM window\n")
         efi_kern_end: uint64 = kernel_image_end()
         efi_kern_end = (efi_kern_end + 4095) & ~cast[uint64](4095)

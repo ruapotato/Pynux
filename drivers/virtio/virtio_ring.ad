@@ -26,6 +26,13 @@ from kernel.printk.printk import printk0, printk1, printk2
 from drivers.virtio.virtio_pci import (
     virtio_select_queue, virtio_set_queue_pfn, virtio_notify,
 )
+# Higher-half kernel: a buffer that is a kernel GLOBAL lives at a
+# high-half virtual address; the virtio device DMAs to PHYSICAL
+# addresses, so every descriptor's buffer address must be rebased
+# through virt_to_phys(). alloc_pages() already returns a LOW physical
+# address, so the ring storage itself needs no conversion — but the
+# caller-supplied VirtBuf addresses can be high-half globals.
+from arch.x86.mm.pgtable import virt_to_phys
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 
@@ -179,7 +186,15 @@ def _desc_set(vq: Ptr[VirtQueue], idx: uint16,
               addr: uint64, length: uint32, flags: uint16,
               next: uint16):
     d: uint64 = vq[0].desc_addr + cast[uint64](idx) * VIRTQ_DESC_SIZE
-    cast[Ptr[uint64]](d +  0)[0] = addr
+    # The descriptor's address field is a PHYSICAL address the device
+    # DMAs to/from. `addr` arrives as a kernel virtual address — for a
+    # caller buffer that is a kernel global it is a high-half VA
+    # (0xffffffff80...). virt_to_phys() rebases it to low physical RAM;
+    # a buffer that was alloc_page()'d is already low and passes
+    # through unchanged. This is the single choke point for every
+    # virtio buffer address, so converting here covers virtio-blk,
+    # virtio-net, and any future virtio driver.
+    cast[Ptr[uint64]](d +  0)[0] = virt_to_phys(addr)
     cast[Ptr[uint32]](d +  8)[0] = length
     cast[Ptr[uint16]](d + 12)[0] = flags
     cast[Ptr[uint16]](d + 14)[0] = next

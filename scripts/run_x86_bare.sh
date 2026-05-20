@@ -49,11 +49,20 @@ if ! od -An -tx4 -N8192 "$ELF" | tr -s ' \n' '\n' | grep -q '^1badb002$'; then
 fi
 echo "[run_x86_bare] Multiboot magic OK."
 
+echo "[run_x86_bare] Wrapping kernel in a BIOS GRUB ISO."
+# The Hamnix kernel is now a true elf64-x86-64 higher-half image;
+# QEMU's `-kernel` multiboot1 loader rejects 64-bit ELFs ("Cannot
+# load x86-64 image"). GRUB's multiboot1 loader handles ELFCLASS64
+# fine, so we boot a tiny BIOS GRUB ISO wrapping the kernel.
+# shellcheck source=_kernel_iso.sh
+source "$PROJ_ROOT/scripts/_kernel_iso.sh"
+KISO="$(kernel_iso "$ELF")"
+
 echo "[run_x86_bare] Booting in QEMU (10s timeout)..."
 # -no-reboot stops QEMU exiting on triple fault; we use a hard timeout
 # instead since success means "kernel halted after banner".
 timeout 10s qemu-system-x86_64 \
-    -kernel "$ELF" \
+    -cdrom "$KISO" \
     -smp 2 \
     -nographic \
     -no-reboot \
