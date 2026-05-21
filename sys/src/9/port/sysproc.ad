@@ -370,7 +370,10 @@ def do_rfork(flags: int32, user_rbp: uint64) -> int32:
                         parent_user_rsp) < 0:
         set_current_errstr("rfork: address-space COW share OOM")
         return -12                              # -ENOMEM
-    # Anonymous + file-backed mmap VMAs.
+    # Anonymous + file-backed mmap VMAs — COW-shared between parent and
+    # child by vma_fork_copy (read-only + COW in both PML4s; first write
+    # faults and copies one page), same lazy scheme as the three fixed
+    # regions above.
     if vma_fork_copy(cslot, pidx, child_pml4) < 0:
         set_current_errstr("rfork: vma copy OOM")
         return -12                              # -ENOMEM

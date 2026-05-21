@@ -962,9 +962,12 @@ def do_clone(flags: uint64, child_stack: uint64,
         return cast[int64](-12)               # -ENOMEM
 
     # Copy 4: anonymous + file-backed mmap VMAs (glibc-malloc arenas,
-    # ld.so DSO maps). Each VMA's backing pages are copied and remapped
-    # at the same vaddr, and a mirrored VmaNode lands on the child's
-    # list so the child's own munmap / mremap stays honest.
+    # ld.so DSO maps). vma_fork_copy COW-shares each VMA's pages between
+    # parent and child — read-only + COW-marked in both PML4s, the first
+    # write by either side faults into do_page_fault and copies just
+    # that page — and lands a mirrored VmaNode on the child's list so
+    # the child's own munmap / mremap stays honest. This makes the WHOLE
+    # address space (image + brk + stack + mmap) copy-on-write on fork.
     if vma_fork_copy(cslot, parent_idx, child_pml4) < 0:
         set_current_errstr("fork: vma copy OOM")
         return cast[int64](-12)               # -ENOMEM

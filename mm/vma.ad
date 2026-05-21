@@ -17,10 +17,12 @@
 #   a per-task namespace of names. There is no master vma table that
 #   the kernel consults out-of-band; the only ground truth about
 #   "what is mapped where" is whatever the current task's vma_list
-#   says. Forks (rfork RFPROC without RFMEM) deep-copy the list; the
-#   thread path (RFMEM) shares it. Init's task is born with an empty
-#   list; every subsequent VMA is created either by mmap from
-#   userspace or by the ELF loader on do_execve.
+#   says. Forks (rfork RFPROC without RFMEM) give the child its own
+#   VMA list mirroring the parent's, with every mmap page COPY-ON-WRITE
+#   shared (see vma_fork_copy); the thread path (RFMEM) shares the list
+#   itself. Init's task is born with an empty list; every subsequent
+#   VMA is created either by mmap from userspace or by the ELF loader
+#   on do_execve.
 #
 # Shape
 #
@@ -58,8 +60,9 @@ from kernel.sched.core import (
     current_idx_get, task_pml4,
 )
 from mm.slab import kmalloc, kfree
-from mm.page_alloc import alloc_pages, free_pages
-from fs.elf import vm_fork_copy_install, elf_install_user_mapping
+from mm.page_alloc import alloc_pages, free_pages, free_page
+from mm.cow import cow_drop_page, cow_pte_bit
+from fs.elf import elf_install_user_mapping, vm_cow_share_range
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -97,6 +100,13 @@ VMA_MAX_CHUNK:    uint64 = 0x400000          # 4 MiB == 2^MAX_ORDER pages
 # and pointed to by VmaNode.chunks. Single-chunk / alias VMAs leave
 # chunks == 0 and nchunks == 0 and use the legacy backing/order fields.
 VMA_CHUNK_SIZE:   uint64 = 16
+
+# x86_64 page-table constants — mirror fs/elf.ad's PT_FLAG_* / PT_ADDR_MASK.
+# Used by the COW-aware free path (_vma_pte_lookup / _vma_free_cow_range)
+# to walk a task's PML4 and read the physical page behind each VMA page.
+VMA_PT_FLAG_P:    uint64 = 0x1                   # Present
+VMA_PT_FLAG_PS:   uint64 = 0x80                  # Page-Size (huge leaf)
+VMA_PT_ADDR_MASK: uint64 = 0x000FFFFFFFFFF000    # bits [51:12]: phys base
 
 # Virtual-address window for multi-chunk VMAs.
 #
@@ -153,7 +163,16 @@ class VmaNode:
     file_fd:     int32
     order:       int32
     nchunks:     int32
-    pad0:        int32
+    # is_cow: 1 once this node's pages have been COW-shared on fork
+    # (in either the parent or the child). A COW node's `backing` /
+    # `chunks` physical addresses are no longer the authority for what
+    # to free — COW resolution can repoint individual PTEs at fresh
+    # pages outside the original buddy run — so _vma_node_free frees a
+    # COW node by walking the owning task's page table page-by-page and
+    # routing each physical page through cow_drop_page. A non-COW node
+    # (0) keeps the fast bulk free_pages path. Replaces the old `pad0`
+    # padding slot, so the struct size (72 bytes) is unchanged.
+    is_cow:      int32
 
 
 # ---------------------------------------------------------------------
@@ -183,7 +202,7 @@ def _vma_node_set(node: uint64, start: uint64, end: uint64,
     cast[Ptr[VmaNode]](node)[0].next        = 0
     cast[Ptr[VmaNode]](node)[0].chunks      = 0
     cast[Ptr[VmaNode]](node)[0].nchunks     = 0
-    cast[Ptr[VmaNode]](node)[0].pad0        = 0
+    cast[Ptr[VmaNode]](node)[0].is_cow      = 0
 
 
 def _vma_node_get_next(node: uint64) -> uint64:
@@ -202,15 +221,120 @@ def _vma_node_end(node: uint64) -> uint64:
     return cast[Ptr[VmaNode]](node)[0].end
 
 
-def _vma_node_free(node: uint64):
+# ---------------------------------------------------------------------
+# COW-aware page-table walk for the free path
+# ---------------------------------------------------------------------
+#
+# Once a VMA's pages have been COW-shared on fork (is_cow == 1) the
+# node's `backing` / `chunks` physical addresses no longer describe
+# what the owning task actually maps: a COW write fault (cow_resolve_pte
+# in fs/elf.ad) allocates a FRESH page outside the original buddy run
+# and repoints just that one PTE. So freeing a COW node by its recorded
+# backing run would (a) leak every COW-resolved fresh page and (b)
+# unconditionally free pages still mapped COW in another process — a
+# use-after-free.
+#
+# The ground truth for a COW node is the page table itself. The free
+# path walks the owning task's PML4 over the VMA's virtual range and,
+# for each present 4 KiB PTE, routes the physical page through
+# cow_drop_page: the page is returned to the buddy allocator (one
+# order-0 free, which the buddy merge re-coalesces) ONLY when its
+# refcount falls to 0. A still-shared page is left untouched for the
+# other holder. A COW-resolved fresh page is refcount-0 (untracked) so
+# cow_drop_page returns 1 and it is freed correctly too.
+#
+# vm_cow_share_range cracks every huge-page entry it touches down to
+# 4 KiB granularity, so every page of a COW node is reached through a
+# private 4 KiB PTE — _vma_pte_lookup never needs to handle a huge leaf
+# here (it returns 0 on one, defensively skipping the page).
+
+def _vma_pte_lookup(pml4_phys: uint64, vaddr: uint64) -> uint64:
+    # Return the value of the 4 KiB PTE mapping `vaddr` in `pml4_phys`,
+    # or 0 if any level is not-present or the leaf is a huge page.
+    # Read-only: it never allocates or cracks a table — used by the
+    # COW-aware free path, which must not mutate page tables.
+    if pml4_phys == 0:
+        return 0
+    pml4_idx: uint64 = (vaddr >> 39) & 0x1FF
+    pdpt_idx: uint64 = (vaddr >> 30) & 0x1FF
+    pd_idx:   uint64 = (vaddr >> 21) & 0x1FF
+    pt_idx:   uint64 = (vaddr >> 12) & 0x1FF
+
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys & VMA_PT_ADDR_MASK)
+    pml4e: uint64 = pml4[pml4_idx]
+    if (pml4e & VMA_PT_FLAG_P) == 0:
+        return 0
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](pml4e & VMA_PT_ADDR_MASK)
+    pdpte: uint64 = pdpt[pdpt_idx]
+    if (pdpte & VMA_PT_FLAG_P) == 0:
+        return 0
+    if (pdpte & VMA_PT_FLAG_PS) != 0:
+        return 0
+    pd: Ptr[uint64] = cast[Ptr[uint64]](pdpte & VMA_PT_ADDR_MASK)
+    pde: uint64 = pd[pd_idx]
+    if (pde & VMA_PT_FLAG_P) == 0:
+        return 0
+    if (pde & VMA_PT_FLAG_PS) != 0:
+        return 0
+    pt: Ptr[uint64] = cast[Ptr[uint64]](pde & VMA_PT_ADDR_MASK)
+    pte: uint64 = pt[pt_idx]
+    if (pte & VMA_PT_FLAG_P) == 0:
+        return 0
+    return pte
+
+
+def _vma_free_cow_range(pml4_phys: uint64, vlo: uint64, vhi: uint64):
+    # Free every present 4 KiB page of a COW node in [vlo, vhi) through
+    # the COW refcount. cow_drop_page(phys) returns 1 when this was the
+    # last holder (refcount fell to 0) — only then is the page returned
+    # to the buddy allocator. A page another process still maps COW
+    # (refcount > 1) drops to a lower count and is left alone.
+    #
+    # Each surviving page of the original buddy run is freed at order 0;
+    # free_pages' buddy-merge logic re-coalesces neighbouring free pages
+    # back into the larger run, so no fragmentation accumulates once a
+    # run is fully released.
+    vaddr: uint64 = vlo
+    while vaddr < vhi:
+        pte: uint64 = _vma_pte_lookup(pml4_phys, vaddr)
+        if pte != 0:
+            phys: uint64 = pte & VMA_PT_ADDR_MASK
+            if phys != 0:
+                if cow_drop_page(phys) != 0:
+                    free_page(phys)
+        vaddr = vaddr + VMA_PAGE_SIZE
+
+
+def _vma_node_free(node: uint64, pml4_phys: uint64):
     # Release the node's backing pages (if any) then the node itself.
     # backing == 0 marks "no kernel-owned pages here" (an alias node
     # for a MAP_FIXED slice inside an enclosing region; only the
     # enclosing node owns the pages).
     #
+    # COW node (is_cow == 1): the node's pages were COW-shared on fork,
+    # so the recorded backing run is stale (COW resolution can repoint
+    # PTEs at fresh pages). Free by walking the owning task's page
+    # table over [start, end) and routing each physical page through
+    # cow_drop_page — see _vma_free_cow_range. `pml4_phys` is the PML4
+    # of the task that owns this VMA list.
+    #
     # A multi-chunk VMA (nchunks > 0) instead owns an array of VmaChunk
     # descriptors; free every chunk at its own order, then release the
     # descriptor array. backing/order are unused for such nodes.
+    is_cow: int32 = cast[Ptr[VmaNode]](node)[0].is_cow
+    if is_cow != 0:
+        v_start: uint64 = cast[Ptr[VmaNode]](node)[0].start
+        v_end:   uint64 = cast[Ptr[VmaNode]](node)[0].end
+        _vma_free_cow_range(pml4_phys, v_start, v_end)
+        # The COW node never owns a separate backing run / chunk array
+        # of its own (vma_fork_copy clears both on the share path), so
+        # there is nothing else to release but the descriptor blocks.
+        carr: uint64 = cast[Ptr[VmaNode]](node)[0].chunks
+        if carr != 0:
+            kfree(carr)
+        kfree(node)
+        return
+
     nchunks: int32 = cast[Ptr[VmaNode]](node)[0].nchunks
     if nchunks > 0:
         carr: uint64 = cast[Ptr[VmaNode]](node)[0].chunks
@@ -344,6 +468,10 @@ def _vma_carve_range(slot: uint64, start: uint64, end: uint64):
     # overlap -> drop the whole node and free its pages. No partial-
     # range split: no current Linux userspace consumer munmaps a
     # partial range from the middle of a VMA.
+    #
+    # A COW-shared node frees through the refcount, so _vma_node_free
+    # needs the owning task's PML4 to walk its page table.
+    pml4: uint64 = task_pml4(cast[int32](slot))
     cur: uint64 = task_vma_list_head(slot)
     done: int32 = 0
     while cur != 0 and done == 0:
@@ -352,7 +480,7 @@ def _vma_carve_range(slot: uint64, start: uint64, end: uint64):
         e: uint64 = _vma_node_end(cur)
         if s < end and start < e:
             _vma_unlink(slot, cur)
-            _vma_node_free(cur)
+            _vma_node_free(cur, pml4)
             cur = nxt
         elif s >= end:
             done = 1
@@ -630,126 +758,69 @@ def vma_protect(slot: uint64, addr: uint64, len_in: uint64,
 # ---------------------------------------------------------------------
 
 def vma_clear(slot: uint64):
+    # execve / task-teardown path: free EVERY VMA the task holds.
+    # A COW-shared node frees through the refcount, so _vma_node_free
+    # is handed the task's PML4 to walk its page table — a still-shared
+    # page (mapped COW in a forked relative) is left for that holder
+    # instead of being freed out from under it.
+    pml4: uint64 = task_pml4(cast[int32](slot))
     cur: uint64 = task_vma_list_head(slot)
     while cur != 0:
         nxt: uint64 = _vma_node_get_next(cur)
-        _vma_node_free(cur)
+        _vma_node_free(cur, pml4)
         cur = nxt
     set_task_vma_list_head(slot, 0)
 
 
 # ---------------------------------------------------------------------
-# fork(): deep-copy a parent's VMA list into a child
+# fork(): COW-share a parent's VMA list into a child
 # ---------------------------------------------------------------------
 #
-# vma_fork_copy() gives a forked child a PRIVATE copy of every anonymous
-# / file-backed mmap the parent holds. For each parent VMA that owns
-# backing pages it:
+# vma_fork_copy() gives a forked child its own VMA list mirroring the
+# parent's, with every mmap page COPY-ON-WRITE shared instead of eager-
+# copied. This is the mmap-VMA counterpart of fs/elf.ad::vm_cow_share_all
+# (which COW-shares the ELF image / brk / stack); together they make the
+# WHOLE address space copy-on-write on fork.
 #
-#   1. allocates fresh backing pages at the same order,
-#   2. copies the parent's bytes (the parent's VMA range is identity-
-#      mapped, so a memcpy from the vaddr reads the parent's physical
-#      memory),
-#   3. installs a mapping in the CHILD's PML4 re-pointing the SAME
-#      virtual range at the fresh pages (so inherited absolute pointers
-#      into mmap'd memory stay valid for the child),
-#   4. links a child VmaNode mirroring the parent's metadata.
+# For every parent VMA that OWNS backing pages (single-chunk: backing
+# != 0; multi-chunk: nchunks > 0) it:
+#
+#   1. links a child VmaNode mirroring the parent's metadata,
+#   2. calls vm_cow_share_range over the VMA's [start, end): every
+#      present user page is cracked to 4 KiB granularity, marked
+#      READ-ONLY + COW (PTE bit 9) in BOTH the parent's and the child's
+#      PML4, both pointing at the SAME physical page, and the page's
+#      per-PFN refcount is bumped (mm/cow.ad). The first write by either
+#      side faults into the productive #PF handler, which copies just
+#      that one 4 KiB page.
+#   3. marks BOTH the parent's VMA node and the child's node is_cow,
+#      because each now holds COW references — their pages must be
+#      freed through cow_drop_page (see _vma_node_free).
+#
+# A COW-shared child node does NOT own a private backing run / chunk
+# array: it shares the parent's physical pages until a write fault
+# resolves them. backing / chunks / order / nchunks are all cleared on
+# the child node; _vma_node_free's COW path frees purely by walking the
+# page table, so those fields are vestigial for a COW node.
 #
 # Alias VMAs (backing == 0, nchunks == 0 — a MAP_FIXED slice inside an
-# enclosing region) are copied as metadata only; the enclosing node
-# already carried the bytes.
+# enclosing region) are copied as METADATA ONLY: their pages belong to
+# the enclosing owner node, which COW-shares the whole range including
+# the alias slice. COW-sharing an alias range too would bump the
+# refcount of those pages a SECOND time and leak them, so alias nodes
+# are deliberately skipped by the share pass.
 #
-# A MULTI-CHUNK VMA (nchunks > 0) is fork-copied chunk-by-chunk: the
-# child gets its own VmaChunk array, a fresh buddy allocation per
-# chunk, the parent's bytes copied into each, and a per-chunk overlay
-# installed into the child PML4 so the child's [p_start, p_end) is the
-# same contiguous virtual range — see _vma_fork_copy_chunks.
+# Single-chunk and multi-chunk VMAs take the SAME path here — both are
+# just a contiguous virtual range that is fully mapped in the parent's
+# (currently live) PML4, which is exactly what vm_cow_share_range walks.
 #
-# Returns 0 on success, -1 on OOM.
-
-
-def _vma_fork_copy_chunks(parent_node: uint64, child_node: uint64,
-                          child_pml4: uint64) -> int32:
-    # Give `child_node` a private, fully-mapped copy of every chunk a
-    # multi-chunk `parent_node` owns. The parent's [p_start, p_end) is
-    # contiguously mapped in the parent's (currently live) PML4, so a
-    # memcpy from p_start + off reads the parent's chunk bytes.
-    # Returns 0 on success, -1 on OOM (caller frees child_node).
-    p_start:  uint64 = cast[Ptr[VmaNode]](parent_node)[0].start
-    p_end:    uint64 = cast[Ptr[VmaNode]](parent_node)[0].end
-    nchunks:  int32  = cast[Ptr[VmaNode]](parent_node)[0].nchunks
-    p_carr:   uint64 = cast[Ptr[VmaNode]](parent_node)[0].chunks
-    if nchunks <= 0 or p_carr == 0:
-        return -1
-    length: uint64 = p_end - p_start
-
-    c_carr: uint64 = kmalloc(cast[uint64](nchunks) * VMA_CHUNK_SIZE)
-    if c_carr == 0:
-        return -1
-    memset(cast[Ptr[uint8]](c_carr), 0,
-           cast[uint64](nchunks) * VMA_CHUNK_SIZE)
-
-    i: int32 = 0
-    while i < nchunks:
-        p_ce: uint64 = p_carr + cast[uint64](i) * VMA_CHUNK_SIZE
-        c_order: int32  = cast[Ptr[VmaChunk]](p_ce)[0].order
-        c_phys:  uint64 = alloc_pages(c_order)
-        if c_phys == 0:
-            printk1("vma_fork: OOM copying chunk order=%d\n",
-                    cast[uint64](c_order))
-            # Roll back the chunks we already grabbed.
-            j: int32 = 0
-            while j < i:
-                jce: uint64 = c_carr + cast[uint64](j) * VMA_CHUNK_SIZE
-                free_pages(cast[Ptr[VmaChunk]](jce)[0].phys,
-                           cast[Ptr[VmaChunk]](jce)[0].order)
-                j = j + 1
-            kfree(c_carr)
-            return -1
-        off: uint64 = cast[uint64](i) * VMA_MAX_CHUNK
-        # Logical chunk size — what the parent actually mapped for this
-        # chunk (min(4 MiB, bytes left), matching _vma_alloc_large). The
-        # physical buddy run (2^c_order pages) may be larger; copying
-        # only the logical span avoids reading past the VMA.
-        remain: uint64 = length - off
-        csize: uint64 = VMA_MAX_CHUNK
-        if remain < csize:
-            csize = remain
-        # Copy the parent's contiguous virtual sub-range into the
-        # child's fresh physical chunk.
-        memcpy(cast[Ptr[uint8]](c_phys),
-               cast[Ptr[uint8]](p_start + off), csize)
-        # Overlay [p_start + off, ...) -> c_phys in the child PML4 so
-        # the child sees the same contiguous virtual range.
-        if elf_install_user_mapping(child_pml4, p_start + off,
-                                    p_start + off + csize,
-                                    c_phys) < 0:
-            printk1("vma_fork: chunk remap failed at %d\n",
-                    cast[uint64](i))
-            free_pages(c_phys, c_order)
-            j2: int32 = 0
-            while j2 < i:
-                jce: uint64 = c_carr + cast[uint64](j2) * VMA_CHUNK_SIZE
-                free_pages(cast[Ptr[VmaChunk]](jce)[0].phys,
-                           cast[Ptr[VmaChunk]](jce)[0].order)
-                j2 = j2 + 1
-            kfree(c_carr)
-            return -1
-        c_ce: uint64 = c_carr + cast[uint64](i) * VMA_CHUNK_SIZE
-        cast[Ptr[VmaChunk]](c_ce)[0].phys  = c_phys
-        cast[Ptr[VmaChunk]](c_ce)[0].order = c_order
-        cast[Ptr[VmaChunk]](c_ce)[0].pad   = 0
-        i = i + 1
-
-    cast[Ptr[VmaNode]](child_node)[0].chunks  = c_carr
-    cast[Ptr[VmaNode]](child_node)[0].nchunks = nchunks
-    cast[Ptr[VmaNode]](child_node)[0].backing = 0
-    cast[Ptr[VmaNode]](child_node)[0].order   = 0
-    return 0
+# Returns 0 on success, -1 on OOM (vm_cow_share_range failed to crack a
+# table — the caller aborts the fork).
 
 
 def vma_fork_copy(child_slot: uint64, parent_slot: uint64,
                   child_pml4: uint64) -> int32:
+    parent_pml4: uint64 = task_pml4(cast[int32](parent_slot))
     cur: uint64 = task_vma_list_head(parent_slot)
     while cur != 0:
         p_start:  uint64 = cast[Ptr[VmaNode]](cur)[0].start
@@ -759,42 +830,43 @@ def vma_fork_copy(child_slot: uint64, parent_slot: uint64,
         p_fd:     int32  = cast[Ptr[VmaNode]](cur)[0].file_fd
         p_off:    uint64 = cast[Ptr[VmaNode]](cur)[0].file_offset
         p_back:   uint64 = cast[Ptr[VmaNode]](cur)[0].backing
-        p_order:  int32  = cast[Ptr[VmaNode]](cur)[0].order
         p_nchunks: int32 = cast[Ptr[VmaNode]](cur)[0].nchunks
         node: uint64 = _vma_node_new()
         if node == 0:
             return -1
+
+        owns_pages: int32 = 0
         if p_nchunks > 0:
-            # Multi-chunk VMA: copy EVERY chunk into the child.
+            owns_pages = 1
+        elif p_back != 0:
+            owns_pages = 1
+
+        if owns_pages != 0:
+            # Owner VMA — COW-share every page across [p_start, p_end)
+            # between parent and child. The child node mirrors the
+            # parent's metadata but owns NO private backing run: it
+            # shares the parent's physical pages COW. Both nodes are
+            # flagged is_cow so _vma_node_free routes their frees
+            # through cow_drop_page.
             _vma_node_set(node, p_start, p_end, p_prot, p_flags,
                           p_fd, p_off, 0, 0)
-            if _vma_fork_copy_chunks(cur, node, child_pml4) < 0:
+            cast[Ptr[VmaNode]](node)[0].is_cow = 1
+            if vm_cow_share_range(parent_pml4, child_pml4,
+                                  p_start, p_end) < 0:
+                printk1("vma_fork: COW share OOM for VMA @ 0x%x\n",
+                        p_start)
                 kfree(node)
                 return -1
+            # The parent's pages are now COW-shared too — its node must
+            # also free through the refcount from here on.
+            cast[Ptr[VmaNode]](cur)[0].is_cow = 1
             _vma_insert_sorted(child_slot, node)
         else:
-            child_back: uint64 = 0
-            if p_back != 0:
-                # Private copy of the single backing run.
-                child_back = alloc_pages(p_order)
-                if child_back == 0:
-                    printk1("vma_fork: OOM copying VMA backing order=%d\n",
-                            cast[uint64](p_order))
-                    kfree(node)
-                    return -1
-                span: uint64 = p_end - p_start
-                memcpy(cast[Ptr[uint8]](child_back),
-                       cast[Ptr[uint8]](p_start), span)
-                # Remap [p_start, p_end) -> child_back in the child PML4.
-                if vm_fork_copy_install(child_pml4, p_start, p_end,
-                                        child_back) < 0:
-                    printk1("vma_fork: remap failed for VMA @ 0x%x\n",
-                            p_start)
-                    free_pages(child_back, p_order)
-                    kfree(node)
-                    return -1
+            # Alias VMA (MAP_FIXED slice in an enclosing region): pure
+            # metadata copy. Its pages were COW-shared via the enclosing
+            # owner node's range, so we must NOT share them again here.
             _vma_node_set(node, p_start, p_end, p_prot, p_flags,
-                          p_fd, p_off, child_back, p_order)
+                          p_fd, p_off, 0, 0)
             _vma_insert_sorted(child_slot, node)
         cur = cast[Ptr[VmaNode]](cur)[0].next
     return 0
