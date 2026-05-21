@@ -69,6 +69,7 @@ extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
                      envp: Ptr[uint64]) -> int32
 extern def sys_get_jiffies() -> uint64
 extern def sys_getpid() -> int32
+extern def sys_yield() -> int32
 
 
 # Guest port the daemon listens on. SSH's well-known port.
@@ -1352,15 +1353,24 @@ def _await_peer_close():
 
 
 def _short_sleep():
-    # Spin until ~1 jiffy has elapsed. The bridge loop is otherwise a
-    # tight poll; this yields enough that hamsh and the TCP stack get
-    # CPU between probes without a real sleep syscall.
-    start: uint64 = sys_get_jiffies()
-    spins: uint64 = 0
-    while spins < 200000:
-        if sys_get_jiffies() != start:
-            return
-        spins = spins + 1
+    # Idle-poll throttle for the bridge loop. Hamnix multitasks
+    # COOPERATIVELY — there is no working timer preemption, so a task
+    # only ever loses the CPU inside a blocking syscall or an explicit
+    # SYS_YIELD. The bridge is a non-blocking poll loop (SYS_READ_NB on
+    # both the socket and the pipe), so without an explicit yield here
+    # sshd would monopolise the CPU and the very shell it is bridging
+    # to — hamsh, plus every command hamsh spawns — would be STATE_READY
+    # but never scheduled, and no command output would ever come back.
+    #
+    # sys_yield() drops the CPU to any other ready task; when nobody
+    # else wants it the kernel does an sti/hlt/cli so UART RX and the
+    # virtio-net IRQ still make progress. We call it a few times so a
+    # multi-stage hamsh pipeline (hamsh -> cmd -> ...) gets several
+    # scheduling turns per idle bridge iteration before we poll again.
+    i: uint64 = 0
+    while i < 4:
+        sys_yield()
+        i = i + 1
 
 
 # An encrypted-packet reader that honours an already-peeked socket

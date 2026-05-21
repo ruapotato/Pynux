@@ -201,6 +201,7 @@ SYS_GETCWD:      uint64 = 20                   # a0=buf, a1=count; returns bytes
 SYS_UNLINK:      uint64 = 21                   # a0=path; returns 0 / -errno
 SYS_MKDIR:       uint64 = 22                   # a0=path; real for tmpfs (V1 tree)
 SYS_READ_NB:     uint64 = 23                   # a0=fd, a1=buf, a2=count; non-blocking read: >0 bytes, 0 would-block, -1 EOF/error
+SYS_YIELD:       uint64 = 24                   # cooperative yield: drop the CPU to any other ready task; returns 0
 
 # Phase B / M16.93: Plan 9-shape native syscall number block. Reserved
 # 256..274 in docs/native-api.md (Phase B). All but SYS_ERRSTR are
@@ -1274,6 +1275,22 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         n: int64 = vfs_read_nb(cast[int32](a0),
                                cast[Ptr[uint8]](a1), a2)
         return cast[uint64](n)
+    if nr == SYS_YIELD:
+        # Cooperative yield. Hamnix multitasks COOPERATIVELY: a task
+        # only gives up the CPU inside a blocking syscall (SYS_WAITPID,
+        # a blocking pipe / stdin read) — there is no working timer
+        # preemption to rotate the runqueue underneath a task that
+        # never blocks. A single-threaded non-blocking event-loop
+        # daemon (user/sshd.ad's SSH<->hamsh bridge) therefore MUST
+        # call SYS_YIELD explicitly on every idle poll iteration, or
+        # it monopolises the CPU and the very task it is bridging to
+        # (hamsh, and every command hamsh spawns) is starved forever —
+        # STATE_READY but never scheduled. yield_to_others() rotates
+        # to any other ready task and, when nobody else wants the CPU,
+        # does an sti/hlt/cli so interrupts (UART RX, virtio-net) can
+        # still make progress. Returns 0 unconditionally.
+        yield_to_others()
+        return 0
     if nr == SYS_CLOSE:
         rc: int32 = vfs_close(cast[int32](a0))
         if rc < 0:

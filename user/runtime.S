@@ -136,6 +136,21 @@ sys_read_nb:
     .size sys_read_nb, .-sys_read_nb
 
 
+    /* --- sys_yield() -> int32 ---------------------------------------
+     * Cooperative yield: drop the CPU to any other ready task. Hamnix
+     * multitasks cooperatively (no working timer preemption), so a
+     * single-threaded non-blocking event-loop daemon MUST call this on
+     * every idle poll iteration or it starves every other task. Always
+     * returns 0. */
+    .globl sys_yield
+    .type sys_yield, @function
+sys_yield:
+    movq    $24, %rax               /* SYS_YIELD */
+    syscall
+    ret
+    .size sys_yield, .-sys_yield
+
+
     /* --- sys_open(path) -> int32 ------------------------------------- */
     .globl sys_open
     .type sys_open, @function

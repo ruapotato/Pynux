@@ -14,17 +14,20 @@
 #      with password auth (sshpass if available) and a one-shot command.
 #
 # Success tiers (the script reports the highest tier reached):
-#   TIER 1 (minimum): the SSH client's verbose log shows the key
+#   TIER 1          : the SSH client's verbose log shows the key
 #                     exchange completing — "expecting SSH2_MSG_NEWKEYS"
 #                     plus the guest log shows
 #                     "[sshd] key exchange complete".
 #   TIER 2          : authentication succeeds ("[sshd] authentication
 #                     succeeded").
+#   TIER 2.5        : a session channel opened and hamsh was spawned
+#                     and bridged to it.
 #   TIER 3 (full)   : the remote command's output comes back over the
-#                     SSH channel.
+#                     SSH channel — a genuinely interactive session.
 #
-# The script PASSES at TIER 1 or above (KEX + NEWKEYS is the milestone
-# floor per the task brief); it reports whichever higher tier it hit.
+# The script PASSES only at TIER 3: a session that authenticates but
+# cannot round-trip a command's output is still broken. TIER 1/2/2.5
+# are reported as diagnostic milestones on the way there.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -251,12 +254,23 @@ if grep -F -q "TRAP: vector" "$LOG"; then
     grep -F "TRAP: vector" "$LOG" | head -5 || true
 fi
 
-if [ "$tier" -ge 1 ]; then
-    echo "[test_sshd] PASS (tier $tier) — Hamnix sshd reached at least KEX + NEWKEYS"
+# The deliverable is a fully INTERACTIVE SSH session: `ssh` in, run a
+# command, and get its output back. That is TIER 3. TIER 1/2/2.5 are
+# only diagnostic milestones — a session that authenticates but cannot
+# round-trip a command is still broken, so the script now REQUIRES
+# tier 3 to pass.
+if [ "$tier" -ge 3 ]; then
+    echo "[test_sshd] PASS (tier $tier) — interactive SSH session works:" \
+         "ssh in, ran 'uname', output came back over the channel"
     exit 0
 fi
 
-echo "[test_sshd] FAIL (qemu rc=$rc) — KEX did not complete"
+if [ "$tier" -ge 1 ]; then
+    echo "[test_sshd] FAIL (tier $tier) — reached KEX/auth but the remote" \
+         "command's output never came back over the SSH channel"
+else
+    echo "[test_sshd] FAIL (qemu rc=$rc) — KEX did not complete"
+fi
 echo "[test_sshd] --- full kernel log (last 200 lines) ---"
 tail -n 200 "$LOG"
 exit 1
