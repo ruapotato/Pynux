@@ -110,11 +110,32 @@ from kernel.sched.core import task_struct_at
 # V1: in-kernel 9P client surface — vfs.ad dispatches FD_P9_MARK fds
 # through these. 9p_client.ad's FD_P9_MARK lives next to the dev*.ad
 # trio's marks (same pattern, see comment above the devstat import).
+# Phase D: the V1-era 9P open helpers (p9c_walk_open_path /
+# p9c_walk_create_path / p9c_encode_fd_buf) moved out of vfs.ad —
+# sys/src/9/port/namec.ad owns the 9P-mounted open path now. vfs.ad
+# keeps only the read/write/clunk + fd-buf decoders for the retained
+# FD_P9_MARK *dispatch* fallback arms (no code installs FD_P9_MARK
+# fds anymore, but the arms stay as a non-regressing safety net).
 from sys.src.port9.port.9p_client import (
-    p9c_walk_open_path, p9c_walk_create_path,
     p9c_read, p9c_write, p9c_clunk,
-    p9c_encode_fd_buf, p9c_decode_srvfd, p9c_decode_fid,
+    p9c_decode_srvfd, p9c_decode_fid,
     FD_P9_MARK,
+)
+# Phase D — the universal resource path. namec() resolves an open
+# through the calling process's Pgrp mount table to a Chan, dispatching
+# devtab[] for a local cdev and mountrpc (9P T-messages) for a mounted
+# 9P server — the SAME Chan type and the SAME read/write/close
+# interface for both. vfs_open routes cdev + 9P-mounted opens through
+# namec and installs ONE FD_CHAN_MARK fd; vfs_read/write/close dispatch
+# FD_CHAN_MARK fds back into namec_read/write/close. This is the Plan 9
+# inversion: the dozen FD_<NAME>_MARK special-cases stop being the
+# substrate and become a single chan-backed path. The legacy
+# FD_<NAME>_MARK arms below stay as a non-regressing fallback for any
+# call site (e.g. `#X` aliases) not yet routed through namec.
+from sys.src.port9.port.namec import (
+    namec, namec_create, namec_read, namec_write, namec_close,
+    namec_chan_is_mounted, namec_chan_dev_type,
+    FD_CHAN_MARK, NAMEC_FALLTHROUGH, NAMEC_ENOENT, NAMEC_EMFILE,
 )
 from fs.cpio import (
     cpio_init,
@@ -402,70 +423,29 @@ def vfs_open(name: Ptr[char]) -> int32:
         return _open_dev_marked(FD_DEVNULL_MARK)
     if _path_eq_const(name, "/dev/zero", 9) != 0:
         return _open_dev_marked(FD_DEVZERO_MARK)
-    # M16.94: first Plan 9-style cdev. Same shape as /dev/null —
-    # stateless, no slot to track, dispatch on the mark alone. The
-    # native-api spec says /dev/cons is r/w from one path: open here
-    # for the read side AND from vfs_open_write below for the write
-    # side, both routing to FD_CONS_MARK.
-    if _path_eq_const(name, "/dev/cons", 9) != 0:
-        return _open_dev_marked(FD_CONS_MARK)
-    # M16.95: three more stateless cdevs land alongside /dev/cons. All
-    # follow the same shape — recognise the path, hand back an fd
-    # marked with the corresponding FD_*_MARK, no per-fd slot. Reads
-    # call devXXX_read; writes call devXXX_write (-1 for time/pid,
-    # entropy-mix for random).
-    if _path_eq_const(name, "/dev/time", 9) != 0:
-        return _open_dev_marked(FD_TIME_MARK)
-    if _path_eq_const(name, "/dev/pid", 8) != 0:
-        return _open_dev_marked(FD_PID_MARK)
-    if _path_eq_const(name, "/dev/random", 11) != 0:
-        return _open_dev_marked(FD_RANDOM_MARK)
-    # M16.130: /dev/mouse wraps the drivers/input/auxmouse.ad event
-    # ring. Stateless — reads pop one event off the ring (or return 0
-    # if empty). Writes return -1 (read-only).
-    if _path_eq_const(name, "/dev/mouse", 10) != 0:
-        return _open_dev_marked(FD_MOUSE_MARK)
-    # System-introspection cdevs (Plan 9 source-of-truth). /dev/cpuinfo
-    # synthesises vendor / family / model / brand / cpus_online /
-    # rdrand / rdseed; /dev/meminfo synthesises MemTotal / MemFree /
-    # MemUsed / Pages / PagesFree / KmallocLive. Both stateless — every
-    # read regenerates a fresh text snapshot. Writes are rejected by
-    # the FD_*_MARK arms in vfs_write below.
-    if _path_eq_const(name, "/dev/cpuinfo", 12) != 0:
-        return _open_dev_marked(FD_CPUINFO_MARK)
-    if _path_eq_const(name, "/dev/meminfo", 12) != 0:
-        return _open_dev_marked(FD_MEMINFO_MARK)
-    # M16.132: /dev/uptime + /dev/loadavg — same stateless cdev family.
-    # devuptime_read emits "<secs>.<CC> <idle>.<CC>\n"; devloadavg_read
-    # emits "<L1> <L5> <L15> <running>/<total> <lastpid>\n". Both
-    # writes return -1 — read-only.
-    if _path_eq_const(name, "/dev/uptime", 11) != 0:
-        return _open_dev_marked(FD_UPTIME_MARK)
-    if _path_eq_const(name, "/dev/loadavg", 12) != 0:
-        return _open_dev_marked(FD_LOADAVG_MARK)
-    # M16.133: /dev/version + /dev/hostname — identity-introspection
-    # cdevs. devversion_read emits "hamnix/0.1 (M16.132+)\n" (stateless);
-    # devhostname_read emits "<hostname>\n" backed by a kernel-RAM
-    # buffer that devhostname_write mutates. /dev/hostname accepts
-    # writes — see vfs_open_write below.
-    if _path_eq_const(name, "/dev/version", 12) != 0:
-        return _open_dev_marked(FD_VERSION_MARK)
-    if _path_eq_const(name, "/dev/hostname", 13) != 0:
-        return _open_dev_marked(FD_HOSTNAME_MARK)
-    # M16.135: /dev/stat + /dev/mounts + /dev/diskstats — system-
-    # introspection trio. devstat_read emits Linux /proc/stat shape
-    # (cpu / cpu0 / intr / ctxt / btime / processes lines);
-    # devmounts_read emits /proc/mounts shape (synthetic
-    # "rootfs / cpio ro 0 0" + every live mnttab entry);
-    # devdiskstats_read emits /proc/diskstats shape (14 fields per
-    # registered blockdev_table slot). All three are read-only —
-    # writes return -1.
-    if _path_eq_const(name, "/dev/stat", 9) != 0:
-        return _open_dev_marked(FD_STAT_MARK)
-    if _path_eq_const(name, "/dev/mounts", 11) != 0:
-        return _open_dev_marked(FD_MOUNTS_MARK)
-    if _path_eq_const(name, "/dev/diskstats", 14) != 0:
-        return _open_dev_marked(FD_DISKSTATS_MARK)
+    # Phase D: the universal namec open path. namec() walks the
+    # calling process's Pgrp mount table; if `name` falls under a 9P
+    # SRV-kind mount it produces a mounted-9P Chan, and if `name` is a
+    # well-known local cdev (/dev/cons, /dev/time, /dev/pid,
+    # /dev/random, /dev/mouse, /dev/cpuinfo, /dev/meminfo, /dev/uptime,
+    # /dev/loadavg, /dev/version, /dev/hostname, /dev/stat, /dev/mounts,
+    # /dev/diskstats) it produces a local-device Chan — the SAME Chan
+    # type either way. _namec_open installs ONE FD_CHAN_MARK fd; the
+    # consumer (vfs_read / vfs_write) dispatches it back through
+    # namec_read / namec_write, which route devtab vs. mountrpc
+    # internally. This single probe REPLACES the dozen
+    # _open_dev_marked(FD_<NAME>_MARK) cdev arms AND the old
+    # _try_open_p9 arm — the Plan 9 inversion. A P9_NO_MOUNT result
+    # means namec does not own this path; we fall through to the
+    # on-disk routing below.
+    #
+    # Ordering: this sits AFTER the `#X`-alias and /dev/null,/dev/zero
+    # arms (those are not namec devtab entries) but BEFORE every
+    # on-disk route, so a mount or a cdev shadows a same-named local
+    # file exactly as Plan 9's namec walk does.
+    chan_fd: int32 = _namec_open(name, 0)              # OREAD
+    if chan_fd != P9_NO_MOUNT:
+        return chan_fd
     # V3.5: the V3-era `/srv`, `/srv/<name>`, `/n` direct routing arms
     # are gone. Those paths now come in here as `#s`, `#s/<name>`,
     # `#/` (rewritten by chan_resolve_prefix after the userspace init
@@ -495,16 +475,12 @@ def vfs_open(name: Ptr[char]) -> int32:
     # currently ship one, but the layering is the right way round).
     if is_proc_path(name) != 0:
         return _open_proc(name)
-    # V1: 9P SRV-kind mount probe. Plan 9's mount(srvfd, ..., /n/foo)
-    # binds an in-kernel 9P client at /n/foo; opens of /n/foo/... walk
-    # through the client and return a FD_P9_MARK fd. We probe BEFORE
-    # the local-FS routes so a mount at /n/foo doesn't get shadowed by
-    # a hypothetical local /n/foo. chan_find_srv_prefix surfaces
-    # (srvfd, root_fid, prefix_len) — we compute the relative path
-    # past the prefix and hand it to p9c_walk_open_path.
-    p9_fd: int32 = _try_open_p9(name)
-    if p9_fd != -10000:
-        return p9_fd
+    # Phase D: the V1-era 9P SRV-kind mount probe (_try_open_p9 →
+    # FD_P9_MARK) is gone — _namec_open above already routes a 9P-
+    # mounted path to a Chan via the same chan_find_srv_prefix +
+    # p9c_walk_open_path walk, and installs a unified FD_CHAN_MARK fd
+    # instead. One open path, one fd kind, for local devices and
+    # mounted servers alike.
     # V2: tmpfs owns /tmp/* and /var/*. /tmp is tmpfs-authoritative
     # (cpio has no /tmp). /var, however, can ALSO have cpio-baked
     # entries (e.g. an httpd docroot staged at /var/www in the
@@ -799,58 +775,30 @@ def vfs_open_write(name: Ptr[char]) -> int32:
         return _open_dev_marked(FD_DEVNULL_MARK)
     if _path_eq_const(name, "/dev/zero", 9) != 0:
         return _open_dev_marked(FD_DEVZERO_MARK)
-    # M16.94: /dev/cons routes here on the OWRITE side too — writes
-    # fan out via devcons_write → early_putc (UART + VGA/fb + printk).
-    if _path_eq_const(name, "/dev/cons", 9) != 0:
-        return _open_dev_marked(FD_CONS_MARK)
-    # M16.95: /dev/time and /dev/pid open on the OWRITE path too —
-    # the write attempt itself returns -1 inside devXXX_write so
-    # userland sees the rejection at write(2), not open(2). /dev/random
-    # accepts writes as entropy-mix.
-    if _path_eq_const(name, "/dev/time", 9) != 0:
-        return _open_dev_marked(FD_TIME_MARK)
-    if _path_eq_const(name, "/dev/pid", 8) != 0:
-        return _open_dev_marked(FD_PID_MARK)
-    if _path_eq_const(name, "/dev/random", 11) != 0:
-        return _open_dev_marked(FD_RANDOM_MARK)
-    # M16.130: /dev/mouse opens on OWRITE too so userland sees the
-    # rejection at write(2) rather than open(2). devmouse_write
-    # unconditionally returns -1.
-    if _path_eq_const(name, "/dev/mouse", 10) != 0:
-        return _open_dev_marked(FD_MOUSE_MARK)
-    # /dev/cpuinfo + /dev/meminfo: open on OWRITE so userland sees the
-    # rejection at write(2). devcpuinfo_write / devmeminfo_write each
-    # return -1 (read-only).
-    if _path_eq_const(name, "/dev/cpuinfo", 12) != 0:
-        return _open_dev_marked(FD_CPUINFO_MARK)
-    if _path_eq_const(name, "/dev/meminfo", 12) != 0:
-        return _open_dev_marked(FD_MEMINFO_MARK)
-    # M16.132: /dev/uptime + /dev/loadavg open on OWRITE so the
-    # rejection surfaces at write(2). devuptime_write / devloadavg_write
-    # each return -1.
-    if _path_eq_const(name, "/dev/uptime", 11) != 0:
-        return _open_dev_marked(FD_UPTIME_MARK)
-    if _path_eq_const(name, "/dev/loadavg", 12) != 0:
-        return _open_dev_marked(FD_LOADAVG_MARK)
-    # M16.133: /dev/version + /dev/hostname open on OWRITE too.
-    # /dev/version is read-only — devversion_write returns -1, so the
-    # rejection surfaces at write(2). /dev/hostname accepts writes:
-    # devhostname_write copies caller bytes into a kernel-RAM hostname
-    # buffer (truncated to 63 + strip trailing whitespace) and reports
-    # `count` consumed so `echo new-host > /dev/hostname` works.
-    if _path_eq_const(name, "/dev/version", 12) != 0:
-        return _open_dev_marked(FD_VERSION_MARK)
-    if _path_eq_const(name, "/dev/hostname", 13) != 0:
-        return _open_dev_marked(FD_HOSTNAME_MARK)
-    # M16.135: /dev/stat + /dev/mounts + /dev/diskstats open on OWRITE
-    # so userland sees the rejection at write(2). All three writes
-    # return -1 (read-only).
-    if _path_eq_const(name, "/dev/stat", 9) != 0:
-        return _open_dev_marked(FD_STAT_MARK)
-    if _path_eq_const(name, "/dev/mounts", 11) != 0:
-        return _open_dev_marked(FD_MOUNTS_MARK)
-    if _path_eq_const(name, "/dev/diskstats", 14) != 0:
-        return _open_dev_marked(FD_DISKSTATS_MARK)
+    # Phase D: the universal namec open path, OWRITE side. The same
+    # probe vfs_open uses for reads — namec() walks the Pgrp mount
+    # table, produces a local-device Chan for a /dev/<name> cdev or a
+    # mounted-9P Chan for a path under a 9P SRV mount, and _namec_open
+    # installs ONE FD_CHAN_MARK fd. Read-only cdevs (/dev/time,
+    # /dev/version, ...) still open cleanly here; their devtab write
+    # arm returns -1 so the rejection surfaces at write(2), exactly as
+    # it did through the old FD_<NAME>_MARK arms. /dev/hostname's
+    # devtab write arm accepts bytes. A P9_NO_MOUNT result means namec
+    # does not own this path — fall through to the FS write routing.
+    chan_wfd: int32 = _namec_open(name, 1)             # OWRITE
+    if chan_wfd != P9_NO_MOUNT:
+        if chan_wfd == ENOENT:
+            # The path is under a 9P mount but the file doesn't exist
+            # yet — create it through namec_create (Tcreate via the
+            # in-kernel 9P client). namec_create returns P9_NO_MOUNT
+            # only if the SRV-mount probe somehow misses on the retry
+            # (it won't — the prefix matched a line ago); treat that
+            # as the original ENOENT to stay deterministic.
+            chan_cfd: int32 = _namec_open_create(name)
+            if chan_cfd != P9_NO_MOUNT:
+                return chan_cfd
+            return ENOENT
+        return chan_wfd
     # /proc/<pid>/* also opens on the OWRITE path so future note(2)
     # delivery (write("/proc/<pid>/note", ...)) flows through the
     # same dispatch. devproc_write currently returns -1 across the
@@ -860,27 +808,11 @@ def vfs_open_write(name: Ptr[char]) -> int32:
         if rc < 0:
             return ENOENT
         return _install_proc_fd(cast[uint32](rc & 0xFFFFFFFF))
-    # V4.1: 9P SRV-kind mount probe on the OWRITE side. Same shape as
-    # vfs_open's probe above. We first try to walk + Topen-OWRITE an
-    # EXISTING file. If that misses (ENOENT — the leaf isn't there),
-    # fall through to a Tcreate of the leaf via p9c_walk_create_path,
-    # which walks to the parent dir and issues Tcreate. Both legs route
-    # through the in-kernel 9P client's _p9_send / _p9_recv, i.e. the
-    # real-fd pipe path — so create-on-write-open works against a
-    # userland 9P server (distrofs etc.) mounted over a real srvfd.
-    p9_wfd: int32 = _try_open_p9_write(name)
-    if p9_wfd != -10000:
-        if p9_wfd == ENOENT:
-            # The path is under a 9P mount but the file doesn't exist
-            # yet — create it. _try_create_p9 returns P9_NO_MOUNT only
-            # if the SRV-mount probe somehow misses on the retry (it
-            # won't, the prefix matched a line ago); treat that as the
-            # original ENOENT to stay deterministic.
-            p9_cfd: int32 = _try_create_p9(name)
-            if p9_cfd != -10000:
-                return p9_cfd
-            return ENOENT
-        return p9_wfd
+    # Phase D: the V4.1-era 9P SRV-mount OWRITE probe (_try_open_p9_write
+    # / _try_create_p9 → FD_P9_MARK) is gone — the _namec_open OWRITE
+    # probe above already routes a 9P-mounted path (walk+Topen, or
+    # walk+Tcreate on a miss) to a Chan and installs a unified
+    # FD_CHAN_MARK fd.
     if is_tmpfs_path(name) != 0:
         # tmpfs_open_for_write returns a negative TMPFS_E* on failure
         # (-2 missing parent dir, -17 the path is a directory, -20 a
@@ -1454,105 +1386,91 @@ def _open_dev_marked(mark: uint32) -> int32:
     return fd
 
 
-# --- V1: 9P-mount path opener -------------------------------------
+# --- Phase D: the universal namec open path -------------------------
 #
-# Probes the SRV-kind mount table for the longest from_path prefix
-# of `name`. On a hit, walks + opens through the in-kernel 9P client
-# and installs a FD_P9_MARK fd whose fd_buf carries (srvfd << 32 |
-# fid). Returns the fd on success, an errno on failure, or the
-# sentinel -10000 to mean "no SRV-mount matched this path; let the
-# caller fall through to the local-FS routing". The sentinel is
-# outside the errno range (EROFS=-30 etc.) so callers can branch on
-# the equality test without aliasing real errors.
+# _namec_open is the canonical chan-resolution entry point. It calls
+# namec() — which walks the calling process's Pgrp mount table — and
+# on a chan result installs ONE FD_CHAN_MARK fd carrying the opaque
+# chan id in fd_buf. A local cdev (/dev/cons, /dev/time, ...) and a
+# file on a mounted 9P server both arrive here and both produce an
+# FD_CHAN_MARK fd; vfs_read / vfs_write / vfs_close dispatch them back
+# into namec_read / namec_write / namec_close, which route devtab vs.
+# mountrpc internally. The fd layer never learns local-vs-mounted.
+#
+# Return: a real fd >= 0 on a chan open; the P9_NO_MOUNT sentinel
+# (-10000, == namec's NAMEC_FALLTHROUGH) when namec does NOT own the
+# path so the caller falls through to its on-disk routing; or an
+# errno (ENOENT / EMFILE) when the path IS a chan but the open failed.
+
+def _namec_open(name: Ptr[char], mode: int32) -> int32:
+    cid: int32 = namec(name, mode)
+    if cid == NAMEC_FALLTHROUGH:
+        return P9_NO_MOUNT
+    if cid == NAMEC_ENOENT:
+        return ENOENT
+    if cid == NAMEC_EMFILE:
+        return EMFILE
+    if cid < 0:
+        return ENOENT
+    # Phase D proof line: a mounted-9P Chan was resolved + opened
+    # purely through namec — no FD_<NAME>_MARK / FD_P9_MARK probe was
+    # consulted. test_namec_chan.sh greps this marker to assert the
+    # mounted-server open path is the universal namec/devtab path.
+    if namec_chan_is_mounted(cid) != 0:
+        printk0("[namec] mounted-9P chan opened via namec (DEV_MNT)\n")
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        namec_close(cid)
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu]    = FD_CHAN_MARK
+    task[0].fd_pos[fdu]    = 0
+    task[0].fd_buf[fdu]    = cast[uint64](cast[uint32](cid))
+    task[0].fd_buflen[fdu] = 0
+    return fd
+
+
+def _namec_open_create(name: Ptr[char]) -> int32:
+    # Create-on-write-open leg routed through namec. Only the 9P-mounted
+    # case is creatable; namec_create returns NAMEC_FALLTHROUGH when no
+    # mount covers the path.
+    cid: int32 = namec_create(name)
+    if cid == NAMEC_FALLTHROUGH:
+        return P9_NO_MOUNT
+    if cid < 0:
+        return ENOENT
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        namec_close(cid)
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu]    = FD_CHAN_MARK
+    task[0].fd_pos[fdu]    = 0
+    task[0].fd_buf[fdu]    = cast[uint64](cast[uint32](cid))
+    task[0].fd_buflen[fdu] = 0
+    return fd
+
+
+def _fd_chan_id(task: Ptr[TaskStruct], fdu: uint64) -> int32:
+    # Recover the namec chan id from an FD_CHAN_MARK fd's fd_buf.
+    return cast[int32](cast[uint32](task[0].fd_buf[fdu]))
+
+
+# --- 9P-mount "no mount" sentinel ---------------------------------
+#
+# Phase D: the V1-era _try_open_p9 / _try_open_p9_write /
+# _try_create_p9 helpers (which installed FD_P9_MARK fds directly)
+# are GONE — sys/src/9/port/namec.ad's namec() now owns the 9P-
+# mounted open path and installs the unified FD_CHAN_MARK fd. The
+# only survivor is the sentinel value: _namec_open returns P9_NO_MOUNT
+# (== namec's NAMEC_FALLTHROUGH, -10000) to mean "namec does not own
+# this path; fall through to the local-FS routing". It is outside the
+# errno range (EROFS=-30 etc.) so callers branch on equality without
+# aliasing a real error.
 
 P9_NO_MOUNT: int32 = -10000
-
-
-def _try_open_p9(name: Ptr[char]) -> int32:
-    return _try_open_p9_with_mode(name, 0)        # OREAD
-
-
-def _try_open_p9_write(name: Ptr[char]) -> int32:
-    return _try_open_p9_with_mode(name, 1)        # OWRITE
-
-
-# Default perm bits for a 9P Tcreate of a regular file on the
-# write-open-create path: rw-rw-rw- (0o666). DMDIR / DMAPPEND / DMEXCL
-# stay clear — a plain file. The server clamps these to whatever its
-# own policy allows; distrofs honours the low 9 verbatim.
-P9_CREATE_PERM_FILE: uint32 = 0x1B6                # 0o666
-
-
-def _try_create_p9(name: Ptr[char]) -> int32:
-    # Create-on-write-open leg for a 9P-mounted path. Same SRV-mount
-    # probe as _try_open_p9_with_mode, but on a hit it walks to the
-    # path's PARENT and issues Tcreate for the leaf via the in-kernel
-    # 9P client. Returns the installed FD_P9_MARK fd on success, an
-    # errno on failure, or the P9_NO_MOUNT sentinel when no SRV mount
-    # covers `name` (caller falls through to local-FS create routing).
-    srvfd:    int32 = -1
-    root_fid: int32 = -1
-    prefix_len: uint64 = 0
-    hit: int32 = chan_find_srv_prefix(
-        cast[Ptr[uint8]](name),
-        &srvfd, &root_fid, &prefix_len)
-    if hit == 0:
-        return P9_NO_MOUNT
-    if root_fid < 0:
-        return ENOENT
-    rel: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](name) + prefix_len)
-    new_fid: int32 = p9c_walk_create_path(srvfd, root_fid, rel,
-                                          P9_CREATE_PERM_FILE, 1)   # OWRITE
-    if new_fid < 0:
-        return EROFS
-    task: Ptr[TaskStruct] = current_task()
-    fd: int32 = _alloc_fd(task)
-    if fd < 0:
-        p9c_clunk(srvfd, new_fid)
-        return EMFILE
-    fdu: uint64 = cast[uint64](fd)
-    task[0].fd_idx[fdu]    = FD_P9_MARK
-    task[0].fd_pos[fdu]    = 0
-    task[0].fd_buf[fdu]    = p9c_encode_fd_buf(srvfd, new_fid)
-    task[0].fd_buflen[fdu] = 0
-    return fd
-
-
-def _try_open_p9_with_mode(name: Ptr[char], mode: int32) -> int32:
-    srvfd:    int32 = -1
-    root_fid: int32 = -1
-    prefix_len: uint64 = 0
-    hit: int32 = chan_find_srv_prefix(
-        cast[Ptr[uint8]](name),
-        &srvfd, &root_fid, &prefix_len)
-    if hit == 0:
-        return P9_NO_MOUNT
-    if root_fid < 0:
-        # Mount entry exists but attach hasn't completed -- surface
-        # ENOENT rather than fall through, otherwise we'd hit the
-        # local-FS routes for a path the user explicitly bound to
-        # the (broken) 9P server.
-        return ENOENT
-    # Compute the relative path: bytes past the mount prefix. e.g.
-    # name = "/n/loop/hello", prefix_len = 7  (== len("/n/loop")) →
-    # rel = "/hello". An exact prefix-match (name length == prefix
-    # length, /n/loop alone) → rel = "" → root walk.
-    rel: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](name) + prefix_len)
-    new_fid: int32 = p9c_walk_open_path(srvfd, root_fid, rel, mode)
-    if new_fid < 0:
-        return ENOENT
-    # Install the fd.
-    task: Ptr[TaskStruct] = current_task()
-    fd: int32 = _alloc_fd(task)
-    if fd < 0:
-        p9c_clunk(srvfd, new_fid)
-        return EMFILE
-    fdu: uint64 = cast[uint64](fd)
-    task[0].fd_idx[fdu]    = FD_P9_MARK
-    task[0].fd_pos[fdu]    = 0
-    task[0].fd_buf[fdu]    = p9c_encode_fd_buf(srvfd, new_fid)
-    task[0].fd_buflen[fdu] = 0
-    return fd
 
 
 def _install_proc_fd(encoded_mark: uint32) -> int32:
@@ -1698,10 +1616,25 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
 
     if file_idx == FD_CLOSED_MARK:
         return cast[int64](EBADF)
+    if file_idx == FD_CHAN_MARK:
+        # Phase D: namec Chan-backed fd. fd_buf carries the opaque
+        # chan id. namec_read dispatches devtab (local cdev) vs.
+        # mountrpc (9P T-messages over the mounted server) internally
+        # — vfs_read does not branch on local-vs-mounted. fd_pos is
+        # the byte offset (used only by the DEV_MNT mountrpc leg; an
+        # inline cdev ignores it). This single arm REPLACES the dozen
+        # FD_<NAME>_MARK cdev read arms below AND the FD_P9_MARK arm.
+        chan_id: int32 = _fd_chan_id(task, fdu)
+        coff:    uint64 = task[0].fd_pos[fdu]
+        nc: int64 = namec_read(chan_id, coff, buf, count)
+        if nc > 0:
+            task[0].fd_pos[fdu] = coff + cast[uint64](nc)
+        return nc
     if file_idx == FD_P9_MARK:
-        # V1: 9P-mounted file. fd_buf packs (srvfd << 32 | fid).
-        # Dispatch through the in-kernel 9P client; treat fd_pos as
-        # the offset so seq reads see expected stream semantics.
+        # V1 legacy 9P-mounted file path — retained as a non-regressing
+        # fallback for any FD_P9_MARK fd a not-yet-converted call site
+        # might still install. fd_buf packs (srvfd << 32 | fid); fd_pos
+        # is the offset. New opens route through FD_CHAN_MARK above.
         p9_packed: uint64 = task[0].fd_buf[fdu]
         srvfd_p9: int32 = p9c_decode_srvfd(p9_packed)
         fid_p9:   int32 = p9c_decode_fid(p9_packed)
@@ -1996,8 +1929,21 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
 
     if file_idx == FD_CLOSED_MARK:
         return cast[int64](EBADF)
+    if file_idx == FD_CHAN_MARK:
+        # Phase D: namec Chan-backed fd. namec_write dispatches devtab
+        # (local cdev) vs. mountrpc (9P over the mounted server)
+        # internally — vfs_write never branches on local-vs-mounted.
+        # Mirrors the FD_CHAN_MARK read arm. This single arm replaces
+        # the dozen FD_<NAME>_MARK cdev write arms below + FD_P9_MARK.
+        chan_id: int32 = _fd_chan_id(task, fdu)
+        coff:    uint64 = task[0].fd_pos[fdu]
+        nc: int64 = namec_write(chan_id, coff, buf, count)
+        if nc > 0:
+            task[0].fd_pos[fdu] = coff + cast[uint64](nc)
+        return nc
     if file_idx == FD_P9_MARK:
-        # V1: 9P-mounted file write. Mirror the read-side dispatch.
+        # V1 legacy 9P write path — non-regressing fallback for any
+        # surviving FD_P9_MARK fd. New opens route via FD_CHAN_MARK.
         p9_packed: uint64 = task[0].fd_buf[fdu]
         srvfd_p9: int32 = p9c_decode_srvfd(p9_packed)
         fid_p9:   int32 = p9c_decode_fid(p9_packed)
@@ -2304,6 +2250,17 @@ def vfs_close(fd: int32) -> int32:
     # uses (otherwise dup'd FD_P9_MARK fds would double-clunk on
     # second close, since close_fd_in_task doesn't know about the
     # 9P refcounting story yet — V2 lifts that).
+    if file_idx == FD_CHAN_MARK:
+        # Phase D: namec Chan-backed fd. namec_close releases the Chan
+        # — for a DEV_MNT chan it issues Tclunk over the 9P server so
+        # the fid is reclaimed; an inline cdev chan has no allocated
+        # state so close is a no-op. We DO fall through to
+        # close_fd_in_task afterwards so the per-task fd slot is zeroed
+        # by the same path every backend uses (close_fd_in_task in
+        # core.ad has no FD_CHAN_MARK arm — and must not, core.ad is
+        # off-limits — so the clunk has to happen here, exactly the
+        # same shape as the FD_P9_MARK arm below).
+        namec_close(_fd_chan_id(task, fdu))
     if file_idx == FD_P9_MARK:
         p9_packed: uint64 = task[0].fd_buf[fdu]
         srvfd_p9: int32 = p9c_decode_srvfd(p9_packed)
@@ -2445,13 +2402,15 @@ def vfs_lseek(fd: int32, offset: int64, whence: int32) -> int64:
             return cast[int64](EINVAL)
         task[0].fd_pos[fdu] = cast[uint64](new_pos)
         return new_pos
-    if file_idx == FD_P9_MARK:
-        # V1: 9P seek. SEEK_SET / SEEK_CUR just adjust fd_pos --
-        # subsequent vfs_read passes the new offset through to
-        # p9c_read's Tread. SEEK_END would need a Tstat round-trip
-        # to discover the server-side length; V2 wires that. For V1
-        # we surface EINVAL on SEEK_END so callers can fall back
-        # cleanly.
+    if file_idx == FD_P9_MARK or file_idx == FD_CHAN_MARK:
+        # 9P / namec-Chan seek. SEEK_SET / SEEK_CUR just adjust fd_pos
+        # — a subsequent vfs_read passes the new offset through to the
+        # DEV_MNT mountrpc leg's Tread (an inline cdev ignores the
+        # offset). SEEK_END would need a Tstat round-trip to discover
+        # the server-side length; not wired — surface EINVAL so
+        # callers fall back cleanly. FD_CHAN_MARK shares this arm
+        # because a 9P-mounted Chan is seekable the same way an
+        # FD_P9_MARK fd was.
         new_pos: int64 = 0
         if whence == SEEK_SET:
             new_pos = offset
