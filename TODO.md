@@ -125,12 +125,16 @@ knows which it holds.
 - [x] `futex(2)` + `%fs`-base TLS (`arch_prctl`) — **Layer 2 only**;
   glibc + musl pthreads programs verified.
 
-## §3 Signals  (real daemons live or die here)
-- [ ] Full Linux-ABI signals: `sigaction`, `sigprocmask`, masks,
-  signal-frame setup, `rt_sigreturn` (only Ctrl-C SIGINT today).
-- [ ] SIGCHLD + reaping; SIGPIPE on broken pipe/socket; SIGTERM/SIGKILL.
-- [ ] Plan 9 note follow-ups: `note_group`-wide (killable group),
-  cross-task `/proc/<pid>/note`, NDFLT action, surface handler `msg`.
+## §3 Signals
+- [x] Full Linux-ABI signals — `rt_sigaction`/`rt_sigprocmask` + masks,
+  `rt_sigframe` (siginfo + ucontext) setup, `rt_sigreturn`, `tkill`
+  (`abc5e73`).
+- [x] SIGCHLD + reaping (`wait4` pid==-1/WNOHANG, WIFSIGNALED), SIGPIPE
+  on broken pipe/socket, SIGTERM/SIGKILL (SIGKILL uncatchable)
+  (`abc5e73`).
+- [~] Plan 9 note follow-ups: `NDFLT` default action done (`abc5e73`);
+  `note_group`-wide + cross-task `/proc/<pid>/note` deferred — need a
+  deferred note-delivery hook in the native trap-return path.
 
 ## §4 Dynamic linking / loader
 - [x] `dlopen`/libdl + DT_NEEDED resolution — handled by the stock
@@ -195,8 +199,12 @@ knows which it holds.
   IPv4-only today).
 
 ## §12 Filesystem write maturity & persistence
-- [ ] ext4 `rename` (-EROFS off-tmpfs today); `truncate`/`ftruncate`;
-  per-inode mtime storage; `fsync` + barrier ordering; FAT write path.
+- [x] ext4 `rename`, `truncate`/`ftruncate`, per-inode mtime, `fsync`
+  + `blk_flush` barrier, and the FAT32 write path — `63198b2`,
+  write-then-reboot persistence verified.
+- [ ] Documented follow-ups: ext4 truncate on index-node (eh_depth>0)
+  files; growing a full ext4 directory block; multi-cluster FAT
+  directories.
 
 ## §13 cdev / proc field completions  (after the Phase D Chan conversion)
 - [ ] `/dev/uptime` idle column; `/dev/loadavg` EWMA; `/dev/stat` real
@@ -229,10 +237,11 @@ knows which it holds.
 The dependency-ordered critical path is **COMPLETE**: Phase D
 (`4964a6b`) → §1 (`e32ec28`) → §2 (futex/TLS) → §4 (dynamic loader,
 `6d9898e`) are all landed — a stock dynamically-linked binary now runs
-inside a namespace. Remaining work is off the critical path and
-parallelizable: §7, §10, §13. §3 (signals) and §12 (fs write) are
-landing now; §9, §11, §15, §16 are landed; §6 has only the vDSO item
-left. Everything in §5 is Layer-2-only per the boundary law.
+inside a namespace. Also landed: §3 (signals, `abc5e73`), §9, §11,
+§12 (fs write, `63198b2`), §15, §16. Remaining, all off the critical
+path and parallelizable: §5 (Layer-2 async), §6 (vDSO only), §7
+(entropy), §10 (networking), §13 (cdev/proc), §14, §17. Everything in
+§5 is Layer-2-only per the boundary law.
 
 ---
 
