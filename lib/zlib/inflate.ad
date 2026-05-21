@@ -18,11 +18,18 @@
 # NO HEAP. The state object contains every scratch buffer (a 32 KB
 # sliding window, the Huffman code-length tables, the literal/length
 # and distance tables). It's ~40 KB; the caller stack-allocates it at
-# the call site or parks it at module scope — both work. The user's
-# `out_buf` is also caller-owned, sized to fit the *entire* expected
-# decompressed output (the inflater errors with "out_max insufficient"
-# if it runs out of room; we don't ring-buffer the output, only the
-# 32 KB LZ77 window).
+# the call site or parks it at module scope — both work.
+#
+# OUTPUT IS STREAMING TOO. `out_buf` is caller-owned and may be SMALLER
+# than the full decompressed output: when it fills, inflate_feed
+# returns 0 (partial) — the caller drains out_buf, then calls
+# inflate_feed again with a fresh (or re-emptied) out_buf to resume.
+# Every emit site is resumable (a parked literal / a match copy_len /
+# a parked stored byte), so no decoded byte is lost across the yield.
+# A caller that DOES size out_buf to the whole output simply never
+# sees that yield. The LZ77 back-references resolve against the
+# internal 32 KB sliding window, not out_buf, so a small out_buf is
+# correct — out_buf is pure output staging.
 #
 # SCOPE (V0 caveats, documented up front so callers know what to ship):
 #   - **Single gzip member only.** RFC 1952 §2.2 allows concatenating
@@ -43,12 +50,15 @@
 #     is reserved-and-illegal per RFC 1951 §3.2.3 and we reject it.
 #
 # RETURN CODES — `inflate_feed`:
-#   0   partial: consumed some input, may have written some output;
-#       caller should top up the input buffer and call again.
+#   0   partial: consumed some input and/or filled out_buf. The caller
+#       tops up the input buffer and/or drains out_buf, then calls
+#       again. (`*out_consumed` == out_max is the "out_buf filled,
+#       drain me" signal; fewer means "input starved, feed me".)
 #  +1   stream-end: trailer verified, `*done=1`. Final byte counts in
 #       `*in_consumed`/`*out_consumed` are valid.
-#  -1   error (malformed stream, CRC mismatch, BTYPE=11, ran out of
-#       output room, or invalid Huffman tree).
+#  -1   error (malformed stream, CRC mismatch, BTYPE=11, or invalid
+#       Huffman tree). A full out_buf is NO LONGER an error — it
+#       yields with rc=0 (see OUTPUT IS STREAMING TOO above).
 #
 # WIRE-FORMAT REFERENCE:
 #   RFC 1951 (DEFLATE): https://www.rfc-editor.org/rfc/rfc1951
@@ -80,6 +90,7 @@ INF_BODY_LEN_EXTRA:      int32 = 1   # have a ll length code, need extra
 INF_BODY_DIST_SYM:       int32 = 2   # have full match_len, need dist sym
 INF_BODY_DIST_EXTRA:     int32 = 3   # have dist code, need extra
 INF_BODY_COPY:           int32 = 4   # ready to emit copy_len bytes
+INF_BODY_EMIT_LIT:       int32 = 5   # have a decoded literal, need to emit it
 
 # RFC 1951 §3.2.5 — length code (257..285) base lengths and extra bits.
 # Length codes start at code 257, so length_base[c-257] etc.
@@ -333,9 +344,25 @@ class InflateState:
     btype:      int32        # 0|1|2 (3 = error)
     body_state: int32        # INF_BODY_NORMAL or INF_BODY_COPY
 
+    # ---- streaming-output back-pressure ----
+    # out_full is set when _emit_byte hits a full out_buf. Instead of
+    # erroring (the old single-shot behaviour: out_buf had to hold the
+    # WHOLE decompressed stream), inflate_feed treats a full out_buf as
+    # a YIELD: it returns 0 with out_full=1 so the caller can drain
+    # out_buf and call inflate_feed again to resume. Every emit site is
+    # resumable — a literal is parked in lz_lit / INF_BODY_EMIT_LIT, a
+    # match-copy in copy_len, a stored byte in stored_pending — so no
+    # decoded byte is ever lost across the yield.
+    out_full:   int32        # 1 == out_buf filled, caller must drain
+
     # ---- stored-block state ----
     stored_hdr_idx: int32    # bytes of 4-byte LEN+NLEN consumed
     stored_remaining: uint32 # bytes of stored body still to copy
+    stored_pending: int32    # 1 == stored_byte holds a read-but-unemitted byte
+    stored_byte:    uint8    # the parked stored-block byte
+
+    # ---- parked literal across an out_buf-full yield ----
+    lz_lit:     uint8        # the decoded literal awaiting emit (EMIT_LIT)
 
     # ---- dynamic header decode state ----
     dyn_hlit:   int32
@@ -428,9 +455,13 @@ def inflate_init(s: Ptr[InflateState]) -> int32:
     s[0].bfinal = 0
     s[0].btype = 0
     s[0].body_state = INF_BODY_NORMAL
+    s[0].out_full = 0
+    s[0].lz_lit = 0
 
     s[0].stored_hdr_idx = 0
     s[0].stored_remaining = 0
+    s[0].stored_pending = 0
+    s[0].stored_byte = 0
 
     s[0].dyn_hlit = 0
     s[0].dyn_hdist = 0
@@ -958,15 +989,23 @@ def _stored_decode(s: Ptr[InflateState]) -> int32:
             s[0].stored_hdr_idx = s[0].stored_hdr_idx + 1
         s[0].phase = INF_PHASE_STORED_DATA
 
-    # Copy LEN bytes verbatim.
+    # Copy LEN bytes verbatim. A byte that was read from the input but
+    # could not be emitted (out_buf full) is parked in stored_byte /
+    # stored_pending so the next call re-emits it rather than losing it.
     while s[0].stored_remaining > 0:
         b2: uint8 = 0
-        if _read_byte(s, &b2) == 0:
-            return 0
+        if s[0].stored_pending != 0:
+            b2 = s[0].stored_byte
+        else:
+            if _read_byte(s, &b2) == 0:
+                return 0
         if _emit_byte(s, b2) == 0:
-            s[0].err = -1
-            s[0].phase = INF_PHASE_ERROR
-            return -1
+            # out_buf full — park the byte and yield (NOT an error).
+            s[0].stored_byte = b2
+            s[0].stored_pending = 1
+            s[0].out_full = 1
+            return 0
+        s[0].stored_pending = 0
         s[0].stored_remaining = s[0].stored_remaining - 1
 
     # Done with this block; back to block header (or trailer if BFINAL).
@@ -1142,11 +1181,10 @@ def _block_body_decode(s: Ptr[InflateState]) -> int32:
                     return -1
                 return 0
             if sym < 256:
-                # Literal.
-                if _emit_byte(s, cast[uint8](sym)) == 0:
-                    s[0].err = -1
-                    s[0].phase = INF_PHASE_ERROR
-                    return -1
+                # Literal. Park it in lz_lit and fall to EMIT_LIT, so a
+                # full out_buf yields cleanly without losing the byte.
+                s[0].lz_lit = cast[uint8](sym)
+                s[0].body_state = INF_BODY_EMIT_LIT
                 continue
             if sym == 256:
                 if s[0].bfinal != 0:
@@ -1208,17 +1246,25 @@ def _block_body_decode(s: Ptr[InflateState]) -> int32:
             s[0].body_state = INF_BODY_COPY
             continue
 
+        if s[0].body_state == INF_BODY_EMIT_LIT:
+            # Emit the parked literal. A full out_buf yields (the byte
+            # stays parked in lz_lit, body_state stays EMIT_LIT) — NOT
+            # an error. On resume the same byte is re-emitted.
+            if _emit_byte(s, s[0].lz_lit) == 0:
+                s[0].out_full = 1
+                return 0
+            s[0].body_state = INF_BODY_NORMAL
+            continue
+
         if s[0].body_state == INF_BODY_COPY:
+            # copy_len already tracks how many match bytes remain, so a
+            # full out_buf yields mid-copy and the next call resumes
+            # exactly here — no decoded byte is lost.
             while s[0].copy_len > 0:
-                if s[0].out_pos >= s[0].out_max:
-                    s[0].err = -1
-                    s[0].phase = INF_PHASE_ERROR
-                    return -1
                 b: uint8 = _window_byte_at(s, s[0].copy_dist)
                 if _emit_byte(s, b) == 0:
-                    s[0].err = -1
-                    s[0].phase = INF_PHASE_ERROR
-                    return -1
+                    s[0].out_full = 1
+                    return 0
                 s[0].copy_len = s[0].copy_len - 1
             s[0].body_state = INF_BODY_NORMAL
             continue
@@ -1250,6 +1296,9 @@ def inflate_feed(s: Ptr[InflateState],
     s[0].out_ptr = out_buf
     s[0].out_max = out_max
     s[0].out_pos = 0
+    # Clear the streaming back-pressure flag: a fresh out_buf is being
+    # offered, so any previous "out_buf full" yield is now resolved.
+    s[0].out_full = 0
     done[0] = 0
 
     while True:

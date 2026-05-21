@@ -90,24 +90,24 @@
 #      handshake via sys_tls_connect(2) (SYS_TLS_CONNECT 277 -> the
 #      in-kernel TLS stack: X25519 + server cert-chain validation
 #      against the kernel CA store + CertificateVerify transcript
-#      binding). The SNI / cert-name host is the original hostname
-#      string (not the resolved IP). After tls_connect succeeds the fd
-#      is TLS-active and write()/read() are transparently encrypted —
-#      the HTTP request/response codepath below is scheme-agnostic.
-#      Issue a raw HTTP/1.0 GET for
-#          <path>/dists/<suite>/Release
-#      HTTP/1.0 + `Connection: close` so the server FINs after the body
-#      — a clean read() EOF without Content-Length parsing. Read the
-#      whole response, then strip the HTTP headers (everything up to
-#      and including the first CRLFCRLF).
-#   3. Same fetch for
-#          <path>/dists/<suite>/main/binary-amd64/Packages.gz
-#      The body is a single gzip member; inflate it via lib/zlib/
-#      inflate.ad into the decompressed `Packages` index.
-#   4. `mkdir /tmp/apt` (tmpfs grew real nested directories — commit
-#      dcf30f3) and write the decompressed index to /tmp/apt/Packages.
-#   5. Print `apt-get: fetched index, N packages` where N counts the
-#      blank-line-separated RFC822 stanzas.
+#      binding). After tls_connect succeeds the fd is TLS-active and
+#      write()/read() are transparently encrypted — the HTTP codepath
+#      is scheme-agnostic. Fetch <path>/dists/<suite>/Release with a
+#      raw HTTP/1.0 GET (Connection: close → the server FINs after the
+#      body).
+#   3. STREAM the binary-amd64 Packages index. The gz index is the
+#      primary path: <path>/dists/<suite>/<component>/binary-amd64/
+#      Packages.gz is fetched, gzip-inflated, stanza-counted and
+#      persisted ALL INCREMENTALLY — the compressed body is drained
+#      64 KiB at a time, the resumable inflater (lib/zlib/inflate.ad)
+#      emits 64 KiB at a time, and nothing holds the whole index.
+#      `Packages.xz` is the fallback (single-shot) when a mirror has
+#      no `.gz`.
+#   4. `mkdir /tmp/apt` and write the decompressed index incrementally
+#      to /tmp/apt/Packages, bounded by the tmpfs per-file cap.
+#   5. Print `apt-get: fetched index, N packages` where N is the TRUE
+#      blank-line-separated RFC822 stanza count from the streaming
+#      pass — bounded by nothing, even for a multi-MB `main` index.
 #
 # -- apt show <pkg> / apt pkgnames -------------------------------------
 #
@@ -117,21 +117,45 @@
 # stanza whose `Package:` value equals <pkg> (stderr + non-zero exit if
 # absent); `pkgnames` prints every `Package:` value, one per line.
 #
-# -- BUFFER CAPS (documented per spec) ---------------------------------
+# -- STREAMING vs BUFFER CAPS (V2 — incremental index) -----------------
 #
-# The HTTP response and the inflated Packages index can be large. A
-# real Debian `main/binary-amd64/Packages` is tens of MB; that does NOT
-# fit here and is a V1 concern (streaming inflate straight to a file).
-# V0 budgets generously for a *test-fixture-sized* repo:
+# `apt update` no longer buffers the whole compressed download nor the
+# whole decompressed index. A real Debian `main/binary-amd64/Packages`
+# is multi-MB compressed and tens of MB decompressed — far past any
+# RAM buffer the 256 MiB guest could spare. So the download → decompress
+# → parse pipeline is INCREMENTAL:
 #
-#   HTTP_CAP   = 262144  (256 KiB)  raw HTTP response (headers + body)
-#   PKG_CAP    = 262144  (256 KiB)  decompressed Packages index
+#   * the HTTP body is drained off the socket CHUNK BY CHUNK into a
+#     fixed STAGING buffer (HTTP_STAGE, 64 KiB) — never the whole body;
+#   * each compressed chunk is fed to the streaming gzip inflater
+#     (lib/zlib/inflate.ad's inflate_feed is already resumable), which
+#     emits decompressed bytes a CHUNK at a time into a second staging
+#     buffer (PKG_STAGE, 64 KiB) — never the whole index;
+#   * each decompressed chunk is streamed straight through the RFC822
+#     stanza counter AND written incrementally to /tmp/apt/Packages.
 #
-# A response or an inflated index that exceeds its cap is a hard error
-# with a diagnostic — V0 will not silently truncate. The test fixture
-# (2-3 stanzas, a few KiB) sits far inside both caps. Buffers live in
-# top-level BSS arenas (the U9 nested-frame-Array compiler quirk:
-# large Arrays must never be parked in a nested frame).
+# Index size is therefore bounded by what apt *keeps*, not by the
+# index itself: the streaming counter holds nothing, and the persisted
+# /tmp/apt/Packages is bounded by the tmpfs per-file cap (the leading
+# bytes of the index — the entire thing for a fixture-sized repo, a
+# leading-stanzas cache for a giant `main`; a final stanza split by
+# the cap is simply skipped by the stanza parsers, which tolerate a
+# truncated tail). `apt update` reports the TRUE full stanza count
+# from the streaming pass regardless of whether the cache truncated.
+#
+#   HTTP_STAGE = 65536  (64 KiB)  one socket-drain chunk
+#   PKG_STAGE  = 65536  (64 KiB)  one inflate-output chunk
+#   PKG_CAP    = 524288 (512 KiB) the in-RAM index buffer for QUERIES
+#                                 (show / pkgnames / install) — sized
+#                                 to the tmpfs per-file cap, the most
+#                                 the persisted index can ever be.
+#
+# The single-shot xz path still buffers (xz streaming is a follow-up);
+# it is capped at PKG_CAP for both the compressed download and the
+# decompressed output. A `.xz` index past that cap is a hard error and
+# `apt update` advises the gz fallback — the gz path is unbounded.
+# Buffers live in top-level BSS arenas (the U9 nested-frame-Array
+# compiler quirk: large Arrays must never be parked in a nested frame).
 #
 # NOT in V0 (V1 backlog): signature/InRelease verification, the
 # canonical /var/lib/apt/lists/ paths, chunked transfer-encoding,
@@ -194,14 +218,54 @@ extern def sys_waitpid(pid: int32) -> int64
 # -- bounded BSS arenas (Hamnix idiom: never park large Arrays in a
 #    nested frame — memory/feedback_compiler_quirks.md U9) -------------
 
-HTTP_CAP: uint64 = 262144      # 256 KiB raw HTTP response (hdr + body)
-PKG_CAP:  uint64 = 262144      # 256 KiB decompressed Packages index
+HTTP_STAGE: uint64 = 65536      # 64 KiB socket-drain staging chunk
+PKG_STAGE:  uint64 = 65536      # 64 KiB inflate-output staging chunk
+PKG_CAP:    uint64 = 524288     # 512 KiB in-RAM index for QUERIES
 
-http_buf: Array[262144, uint8]   # raw bytes off the socket
-pkg_buf:  Array[262144, uint8]   # inflated Packages index
+# HTTP_CAP bounds the single-shot codepaths that still buffer a whole
+# body: the xz index download/decompress, and the .deb download. The
+# streaming gz `apt update` path does NOT use it.
+HTTP_CAP:   uint64 = 524288     # 512 KiB single-shot HTTP body cap
+
+http_buf: Array[524288, uint8]   # raw bytes off the socket (single-shot)
+pkg_buf:  Array[524288, uint8]   # decompressed index for queries / xz
+
+# Streaming staging buffers for the incremental gz `apt update` path.
+# http_stage holds one socket-drain chunk of the COMPRESSED body;
+# pkg_stage holds one inflate-output chunk of the DECOMPRESSED index.
+# Neither ever holds the whole index — that is the whole point.
+http_stage: Array[65536, uint8]
+pkg_stage:  Array[65536, uint8]
 
 # Streaming gzip inflater state (~40 KiB).
 inf_state: InflateState
+
+# -- incremental stanza-counter + persisted-index-writer state --------
+#
+# The streaming `apt update` pass feeds decompressed chunks through
+# _sink_feed(), which holds NO copy of the index. It tracks just
+# enough cross-chunk state to (a) count blank-line-separated RFC822
+# stanzas exactly and (b) write whole complete stanzas to the
+# persisted /tmp/apt/Packages until the tmpfs file cap is reached.
+#
+# Stanza counting is a tiny line-oriented state machine: a stanza is
+# counted on the transition from "in a blank region" to "in a stanza".
+# Because a chunk boundary can split a line, the counter carries the
+# "saw any non-blank byte on the current line" + "the line so far is
+# all CR/blank" flags across calls.
+sink_count:        uint64 = 0   # stanzas seen so far
+sink_in_stanza:    int32 = 0    # currently inside a (non-blank) stanza
+sink_line_blank:   int32 = 1    # current line is still all-blank so far
+sink_line_started: int32 = 0    # the current line has at least one byte
+
+# Persisted-index writer. _sink_feed appends decompressed bytes to the
+# open fd sink_fd at offset sink_written until the tmpfs per-file cap
+# (PKG_CAP) would be exceeded; past that it stops persisting (the
+# counter keeps going). sink_persist_full is 1 while the persisted
+# file still mirrors the index exactly, 0 once it was truncated.
+sink_fd:           int32 = -1
+sink_written:      uint64 = 0
+sink_persist_full: int32 = 1
 
 # Scratch: the HTTP request line/headers we send.
 req_buf:  Array[1024, uint8]
@@ -224,10 +288,10 @@ url_path_buf: Array[768, uint8]
 # `non-free`, ... — each with its own `<component>/binary-amd64/
 # Packages.gz`. V0 hardcoded `main`; `apt update` now takes an
 # OPTIONAL 4th argument naming the component, defaulting to `main`
-# when omitted so every existing call site is unchanged. A live
-# Debian mirror's whole `main` index is ~12 MB compressed — far past
-# the 256 KiB cap below — so the live-mirror test points at the much
-# smaller `contrib` component (~64 KiB gz) which fits inside the cap.
+# when omitted so every existing call site is unchanged. Because the
+# gz index now streams (no fixed-buffer size limit), the genuine
+# multi-MB `main` index works directly — the component argument is a
+# convenience, no longer a workaround for a small cap.
 comp_buf: Array[64, uint8]       # NUL-terminated component name
 
 # struct sockaddr_in, 16 bytes (built fresh for each connect).
@@ -656,10 +720,17 @@ def _http_expected_len(total: uint64) -> uint64:
 # caller can fall back silently. Socket-level failures still return -1
 # and still print. quiet==0 keeps the original loud behaviour.
 
-def _http_get(port: int64, body_off: Ptr[uint64], quiet: int32) -> int64:
-    # Resolve the host into the sockaddr_in octets. A dotted-quad
-    # literal is used as-is; a hostname is resolved through the
-    # in-kernel DNS resolver via sys_resolve (SYS_RESOLVE 269).
+# -- shared connect + request helpers ---------------------------------
+#
+# _http_connect resolves host_buf, opens an AF_INET stream socket,
+# connect()s to host:port and (for https) runs the TLS 1.3 handshake.
+# Returns the connected fd, or -1 on any failure (diagnostic printed).
+# _http_send_request builds the HTTP/1.0 GET for url_path_buf into
+# req_buf and writes it to `fd`; returns 0 on success, -1 on a short
+# write. Both are shared by the buffered _http_get and the streaming
+# `apt update` index fetch so the two never drift apart.
+
+def _http_connect(port: int64) -> int32:
     ip0: uint8 = 0
     ip1: uint8 = 0
     ip2: uint8 = 0
@@ -695,14 +766,7 @@ def _http_get(port: int64, body_off: Ptr[uint64], quiet: int32) -> int64:
         return -1
 
     # https: run the TLS 1.3 handshake over the connected socket before
-    # any HTTP bytes flow. tls_connect(2) does X25519 key exchange +
-    # server cert-chain validation against the kernel CA store +
-    # CertificateVerify transcript binding; the SNI / cert-name host is
-    # host_buf (the original hostname string, NOT the resolved IP). On
-    # success the fd is TLS-active and the write(GET)/read(response)
-    # below are transparently encrypted/decrypted — the rest of this
-    # function is scheme-agnostic. A handshake/cert failure is a hard
-    # error: the fetch fails with a clear diagnostic.
+    # any HTTP bytes flow.
     if url_scheme != 0:
         tls_rc: int32 = sys_tls_connect(fd, &host_buf[0],
                                         strlen_u8(&host_buf[0]))
@@ -715,13 +779,13 @@ def _http_get(port: int64, body_off: Ptr[uint64], quiet: int32) -> int64:
         write_str(1, "apt: TLS handshake ok for ")
         write_str(1, &host_buf[0])
         write_str(1, "\n")
+    return fd
 
+
+def _http_send_request(fd: int32) -> int32:
     # Build the request: HTTP/1.0 + Connection: close so the server
-    # FINs after the body. The response drain below stops on the
-    # Content-Length boundary when one is present (see
-    # _http_expected_len) and otherwise falls back to a read()==0 EOF.
-    # The string literals are materialised inline (the x86_64 backend
-    # rejects string-literal globals).
+    # FINs after the body. String literals are materialised inline (the
+    # x86_64 backend rejects string-literal globals).
     ro: uint64 = 0
     g: Ptr[uint8] = "GET "
     gi: uint64 = 0
@@ -755,6 +819,15 @@ def _http_get(port: int64, body_off: Ptr[uint64], quiet: int32) -> int64:
     wn: int64 = _write_full(fd, &req_buf[0], ro)
     if wn < 0 or cast[uint64](wn) != ro:
         write_str(2, "apt-get: short write sending HTTP request\n")
+        return -1
+    return 0
+
+
+def _http_get(port: int64, body_off: Ptr[uint64], quiet: int32) -> int64:
+    fd: int32 = _http_connect(port)
+    if fd < 0:
+        return -1
+    if _http_send_request(fd) != 0:
         sys_close(fd)
         return -1
 
@@ -794,7 +867,8 @@ def _http_get(port: int64, body_off: Ptr[uint64], quiet: int32) -> int64:
         write_str(2, "apt-get: empty HTTP response\n")
         return -1
     if total >= HTTP_CAP:
-        write_str(2, "apt-get: HTTP response exceeds 256 KiB cap (V0 limit)\n")
+        write_str(2, "apt-get: HTTP response exceeds the single-shot 512 KiB cap\n")
+        write_str(2, "apt-get: (a large gz index streams unbounded; this cap is the xz / .deb path)\n")
         return -1
 
     # The status line must be "HTTP/1.x 200 ...". Anything else (404,
@@ -832,6 +906,183 @@ def _http_get(port: int64, body_off: Ptr[uint64], quiet: int32) -> int64:
 
     body_off[0] = bo
     return cast[int64](total - bo)
+
+
+# -- streaming gzip index fetch (the unbounded `apt update` path) -----
+#
+# _http_stream_gz_index fetches url_path_buf and runs the WHOLE
+# download → gzip-inflate → stanza-count → persist pipeline
+# incrementally. Nothing in this function holds the whole compressed
+# body or the whole decompressed index — a real multi-MB Debian `main`
+# index is processed in 64 KiB staging chunks. This is the fix that
+# lifts the old fixed-RAM-buffer size limit.
+#
+# Flow:
+#   1. connect + send the GET.
+#   2. drain the socket into http_stage one chunk at a time.
+#   3. the FIRST chunks carry the HTTP headers; we accumulate just the
+#      header bytes until the CRLFCRLF terminator, validate the status
+#      line, then treat everything after the terminator as body.
+#   4. each body chunk is fed to inflate_feed; the inflater emits
+#      decompressed bytes into pkg_stage, which we drain to _sink_feed
+#      (count + persist). inflate_feed is looped until it has consumed
+#      the whole input chunk (it can stop early when pkg_stage fills).
+#   5. on read()==0 (peer FIN) or done==1 we stop.
+#
+# The persisted file fd must already be open as `sink_fd` and
+# _sink_reset() already called. Returns the decompressed byte count
+# (>= 0) on success, or -1 on any error.
+
+_HDR_MAX: uint64 = 8192          # cap on HTTP header bytes we buffer
+
+
+def _stream_drain_inflate(in_ptr: Ptr[uint8], in_len: uint64,
+                          done: Ptr[int32]) -> int64:
+    # Feed [in_ptr, in_len) to the inflater, looping so the whole input
+    # chunk is consumed even if pkg_stage fills mid-chunk; each time
+    # pkg_stage has output, drain it to the sink. Returns decompressed
+    # bytes produced (>= 0) or -1 on error. Sets *done on end-of-stream.
+    produced: int64 = 0
+    in_done: uint64 = 0
+    while in_done < in_len:
+        out_consumed: uint64 = 0
+        in_consumed: uint64 = 0
+        d: int32 = 0
+        chunk_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](in_ptr) + in_done)
+        irc: int32 = inflate_feed(&inf_state,
+                                  chunk_ptr, in_len - in_done,
+                                  &pkg_stage[0], PKG_STAGE,
+                                  &out_consumed, &in_consumed, &d)
+        if irc < 0:
+            return -1
+        if out_consumed > 0:
+            if _sink_feed(&pkg_stage[0], out_consumed) != 0:
+                return -1
+            produced = produced + cast[int64](out_consumed)
+        in_done = in_done + in_consumed
+        if d != 0:
+            done[0] = 1
+            return produced
+        # inflate_feed returns 0 when it needs more input OR when the
+        # out buffer filled. If it consumed nothing AND produced
+        # nothing, it is genuinely starved — break to refill input.
+        if in_consumed == 0 and out_consumed == 0:
+            break
+    return produced
+
+
+def _http_stream_gz_index(port: int64) -> int64:
+    fd: int32 = _http_connect(port)
+    if fd < 0:
+        return -1
+    if _http_send_request(fd) != 0:
+        sys_close(fd)
+        return -1
+
+    inflate_init(&inf_state)
+
+    # Header accumulation: http_stage[0, hdr_len) holds header bytes
+    # until the CRLFCRLF terminator is found. Once found, body bytes
+    # that arrived in the same read are forwarded straight to the
+    # inflater; later reads are pure body.
+    hdr_len: uint64 = 0
+    headers_done: int32 = 0
+    status_ok: int32 = 0
+    total_out: int64 = 0
+    stream_done: int32 = 0
+
+    while True:
+        # Read one chunk off the socket. While still in headers we read
+        # into http_stage just past the buffered header bytes; once
+        # headers are parsed we always read into http_stage[0..].
+        dst_off: uint64 = 0
+        if headers_done == 0:
+            dst_off = hdr_len
+        room: uint64 = HTTP_STAGE - dst_off
+        if room == 0:
+            write_str(2, "apt-get: HTTP headers exceed staging buffer\n")
+            sys_close(fd)
+            return -1
+        rp: Ptr[uint8] = cast[Ptr[uint8]](
+            cast[uint64](&http_stage[0]) + dst_off)
+        n: int64 = sys_read(fd, rp, room)
+        if n < 0:
+            write_str(2, "apt-get: read() error streaming the index\n")
+            sys_close(fd)
+            return -1
+        if n == 0:
+            break                                       # peer FIN
+
+        if headers_done == 0:
+            # Grow the buffered header span and hunt for CRLFCRLF.
+            hdr_len = hdr_len + cast[uint64](n)
+            term: uint64 = 0
+            found: int32 = 0
+            p: uint64 = 0
+            while p + 3 < hdr_len:
+                if http_stage[p] == 13 and http_stage[p + 1] == 10 \
+                        and http_stage[p + 2] == 13 \
+                        and http_stage[p + 3] == 10:
+                    term = p + 4
+                    found = 1
+                    break
+                p = p + 1
+            if found == 0:
+                if hdr_len > _HDR_MAX:
+                    write_str(2, "apt-get: HTTP header block too large\n")
+                    sys_close(fd)
+                    return -1
+                continue                                # need more header
+            # Validate the status line ("HTTP/1.x 200 ...").
+            if hdr_len < 12 or http_stage[0] != 72 or http_stage[1] != 84 \
+                    or http_stage[2] != 84 or http_stage[3] != 80:
+                write_str(2, "apt-get: malformed HTTP status line\n")
+                sys_close(fd)
+                return -1
+            if http_stage[9] != 50 or http_stage[10] != 48 \
+                    or http_stage[11] != 48:            # "200"
+                write_str(2, "apt-get: HTTP request did not return 200 OK\n")
+                sys_close(fd)
+                return -1
+            status_ok = 1
+            headers_done = 1
+            # Body bytes that arrived in this same read: [term, hdr_len).
+            if term < hdr_len:
+                blen: uint64 = hdr_len - term
+                bptr: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](&http_stage[0]) + term)
+                pr: int64 = _stream_drain_inflate(bptr, blen,
+                                                  &stream_done)
+                if pr < 0:
+                    write_str(2, "apt-get: gzip inflate error in stream\n")
+                    sys_close(fd)
+                    return -1
+                total_out = total_out + pr
+            if stream_done != 0:
+                break
+        else:
+            # Pure body chunk — straight into the inflater.
+            pr2: int64 = _stream_drain_inflate(&http_stage[0],
+                                               cast[uint64](n),
+                                               &stream_done)
+            if pr2 < 0:
+                write_str(2, "apt-get: gzip inflate error in stream\n")
+                sys_close(fd)
+                return -1
+            total_out = total_out + pr2
+            if stream_done != 0:
+                break
+
+    sys_close(fd)
+
+    if status_ok == 0:
+        write_str(2, "apt-get: HTTP response had no complete header block\n")
+        return -1
+    if stream_done == 0:
+        write_str(2, "apt-get: gzip stream did not reach end-of-stream\n")
+        return -1
+    return total_out
 
 
 # -- compose "<base-path>/dists/<suite>/<tail>" into url_path_buf ------
@@ -923,11 +1174,94 @@ def _build_packages_path(suite: Ptr[uint8], ext: Ptr[uint8]):
     url_path_buf[o] = 0
 
 
+# -- incremental decompressed-index sink ------------------------------
+#
+# _sink_feed(buf, n) processes one chunk of decompressed Packages-index
+# bytes from the streaming `apt update` pass. It is called repeatedly
+# with successive chunks and keeps NO copy of the index — index size
+# is bounded by what apt keeps, which here is nothing (the counter) and
+# the persisted-file cap (a partial cache for a giant index).
+#
+# Two jobs per chunk:
+#   1. Count blank-line-separated RFC822 stanzas exactly, carrying the
+#      line-state flags (sink_*) across chunk boundaries so a line or
+#      stanza split by a chunk edge still counts once.
+#   2. Append the bytes to the open persisted file (sink_fd) until the
+#      tmpfs per-file cap (PKG_CAP) would be exceeded; past that the
+#      persist stops (sink_persist_full -> 0) but counting continues.
+
+def _sink_reset():
+    sink_count = 0
+    sink_in_stanza = 0
+    sink_line_blank = 1
+    sink_line_started = 0
+    sink_written = 0
+    sink_persist_full = 1
+
+
+# Flush the line-state machine at end-of-stream: an index whose final
+# line is non-blank and carries no trailing '\n' still counts that last
+# stanza (matches the buffered _count_stanzas behaviour).
+
+def _sink_flush():
+    if sink_line_started != 0 and sink_line_blank == 0:
+        if sink_in_stanza == 0:
+            sink_count = sink_count + 1
+            sink_in_stanza = 1
+
+
+def _sink_feed(buf: Ptr[uint8], n: uint64) -> int64:
+    # --- 1. stanza counting (byte-at-a-time line state machine) ---
+    i: uint64 = 0
+    while i < n:
+        c: uint8 = buf[i]
+        if c == 10:                                     # '\n' — end of line
+            # A line counts as blank if every byte on it was a blank
+            # or CR (sink_line_blank stays 1). The empty line (no bytes
+            # at all) is blank too.
+            if sink_line_blank != 0:
+                sink_in_stanza = 0                      # blank line
+            else:
+                if sink_in_stanza == 0:
+                    sink_count = sink_count + 1
+                    sink_in_stanza = 1
+            # Reset per-line state for the next line.
+            sink_line_blank = 1
+            sink_line_started = 0
+        else:
+            sink_line_started = 1
+            # A '\r' (CRLF) does not make the line non-blank; any other
+            # byte does.
+            if c != 13:
+                sink_line_blank = 0
+        i = i + 1
+
+    # --- 2. persist to /tmp/apt/Packages until the cap ---
+    if sink_fd >= 0 and sink_persist_full != 0:
+        room: uint64 = 0
+        if sink_written < PKG_CAP:
+            room = PKG_CAP - sink_written
+        take: uint64 = n
+        if take > room:
+            take = room
+            sink_persist_full = 0                       # cache truncated
+        if take > 0:
+            wn: int64 = _write_full(sink_fd, buf, take)
+            if wn < 0:
+                return -1
+            sink_written = sink_written + cast[uint64](wn)
+            if cast[uint64](wn) != take:
+                sink_persist_full = 0
+    return 0
+
+
 # -- count RFC822 stanzas in pkg_buf[0, len) ---------------------------
 #
 # A Packages index is blank-line-separated stanzas. We count a stanza
 # for every run of non-blank lines: a transition from "inside blank
 # region" to "inside a stanza". Trailing blank lines don't add a count.
+# Used by the QUERY commands against the in-RAM pkg_buf; the streaming
+# `apt update` pass uses the incremental _sink_feed counter above.
 
 def _count_stanzas(plen: uint64) -> uint64:
     count: uint64 = 0
@@ -1227,80 +1561,92 @@ def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8],
     #    is the comp_buf global — `main` by default, set from
     #    `apt update`'s optional 4th argument).
     #
-    #    Modern Debian ships `Packages.xz` (LZMA2) as the primary
-    #    index and only keeps `Packages.gz` for compatibility — and
-    #    the `.xz` form is materially smaller, which matters against
-    #    apt's 256 KiB V0 caps. So we probe for `Packages.xz` FIRST
-    #    (a quiet GET — a 404 just means this mirror has no `.xz`),
-    #    and fall back to `Packages.gz` only if the `.xz` is absent.
+    #    GZIP IS THE PRIMARY, STREAMING PATH. A real Debian `main`
+    #    index is multi-MB compressed / tens of MB decompressed —
+    #    nothing the 256 MiB guest could buffer whole. The gzip
+    #    inflater (lib/zlib/inflate.ad) is fully resumable, so the gz
+    #    index is fetched + inflated + counted + persisted INCREMENTALLY
+    #    in 64 KiB staging chunks (_http_stream_gz_index) — index size
+    #    is bounded only by what apt keeps. Every Debian mirror ships
+    #    `Packages.gz`, so this is the path real `main` takes.
     #
-    #    pkg_len is the decompressed index length, set by whichever
-    #    branch wins.
-    pkg_len: uint64 = 0
+    #    `Packages.xz` (LZMA2) is the FALLBACK, used only when a mirror
+    #    has no `.gz`. The xz decoder is still single-shot (xz streaming
+    #    is a follow-up), so the `.xz` path is capped at the single-shot
+    #    HTTP_CAP / PKG_CAP buffers — fine for a fixture-sized or small
+    #    component, a hard error with a gz-fallback hint for a giant one.
+    #
+    #    pkg_len is the decompressed index length; for the streaming gz
+    #    path it is the count-pass byte total (the whole index need not
+    #    fit RAM). nstanzas is the TRUE stanza count regardless of
+    #    whether the persisted /tmp/apt/Packages cache was truncated.
+    pkg_len:  uint64 = 0
+    nstanzas: uint64 = 0
+    persisted_full: int32 = 1
 
-    _build_packages_path(suite, cast[Ptr[uint8]]("xz"))
-    xz_body_off: uint64 = 0
-    xz_len: int64 = _http_get(port, &xz_body_off, 1)
+    # mkdir /tmp/apt up front — both paths persist into it.
+    sys_mkdir(cast[Ptr[char]]("/tmp/apt"))
 
-    if xz_len > 0:
-        # Packages.xz is present — decompress it via the LZMA2 decoder.
+    _build_packages_path(suite, cast[Ptr[uint8]]("gz"))
+    # A quiet probe: does this mirror ship Packages.gz? We only need the
+    # status, but _http_get also drains the body — for the streaming
+    # path we discard that and re-fetch through _http_stream_gz_index.
+    # To avoid a double download we instead go straight to the streaming
+    # fetch and treat its "no 200" failure as the cue to try `.xz`.
+    gz_index_fd: int32 = sys_open_write(cast[Ptr[char]]("/tmp/apt/Packages"))
+    if gz_index_fd < 0:
+        write_str(2, "apt-get: cannot open /tmp/apt/Packages for write\n")
+        return 1
+    sink_fd = gz_index_fd
+    _sink_reset()
+    gz_out: int64 = _http_stream_gz_index(port)
+    sys_close(gz_index_fd)
+    sink_fd = -1
+
+    if gz_out >= 0:
+        # Streaming gz path won.
+        _sink_flush()
+        pkg_len = cast[uint64](gz_out)
+        nstanzas = sink_count
+        persisted_full = sink_persist_full
+        write_str(1, "apt-get: streamed gz index (")
+        write_dec_u64(1, pkg_len)
+        write_str(1, " bytes decompressed)\n")
+    else:
+        # No usable Packages.gz — fall back to the single-shot xz path.
+        # (A genuine socket error already printed; the xz attempt below
+        # will reprint if the mirror is truly unreachable.)
+        write_str(1, "apt-get: no streaming gz index — trying Packages.xz\n")
+        _build_packages_path(suite, cast[Ptr[uint8]]("xz"))
+        xz_body_off: uint64 = 0
+        xz_len: int64 = _http_get(port, &xz_body_off, 0)
+        if xz_len < 0:
+            write_str(2, "apt-get: failed to fetch Packages index (no gz, no xz)\n")
+            return 1
+        if xz_len == 0:
+            write_str(2, "apt-get: Packages.xz body is empty\n")
+            return 1
         write_str(1, "apt-get: using xz-compressed index (Packages.xz)\n")
         drc: int64 = xz_decompress(&http_buf[xz_body_off],
                                    cast[uint64](xz_len),
                                    &pkg_buf[0], PKG_CAP)
         if drc < 0:
-            write_str(2, "apt-get: Packages.xz decompress failed (corrupt or exceeds 256 KiB cap)\n")
+            write_str(2, "apt-get: Packages.xz decompress failed (corrupt, or\n")
+            write_str(2, "apt-get: larger than the 512 KiB single-shot cap — a mirror\n")
+            write_str(2, "apt-get: that also ships Packages.gz streams unbounded)\n")
             return 1
         pkg_len = cast[uint64](drc)
-    else:
-        # No Packages.xz (xz_len == -2 quiet 404, or a socket error
-        # surfaced as -1). Fall back to the gzip index.
-        if xz_len == -1:
-            # A socket-level failure already printed its own
-            # diagnostic; a retry on `.gz` would just fail the same
-            # way, so give up here.
-            write_str(2, "apt-get: failed to fetch Packages index\n")
+        # Persist the xz-decompressed index and count its stanzas.
+        wfd: int32 = sys_open_write(cast[Ptr[char]]("/tmp/apt/Packages"))
+        if wfd < 0:
+            write_str(2, "apt-get: cannot open /tmp/apt/Packages for write\n")
             return 1
-        _build_packages_path(suite, cast[Ptr[uint8]]("gz"))
-        gz_body_off: uint64 = 0
-        gz_len: int64 = _http_get(port, &gz_body_off, 0)
-        if gz_len < 0:
-            write_str(2, "apt-get: failed to fetch Packages.gz\n")
+        wn: int64 = _write_full(wfd, &pkg_buf[0], pkg_len)
+        sys_close(wfd)
+        if wn < 0 or cast[uint64](wn) != pkg_len:
+            write_str(2, "apt-get: short write storing Packages index\n")
             return 1
-        if gz_len == 0:
-            write_str(2, "apt-get: Packages.gz body is empty\n")
-            return 1
-
-        # Inflate the gzip body into pkg_buf.
-        inflate_init(&inf_state)
-        out_consumed: uint64 = 0
-        in_consumed: uint64 = 0
-        done: int32 = 0
-        irc: int32 = inflate_feed(&inf_state,
-                                  &http_buf[gz_body_off], cast[uint64](gz_len),
-                                  &pkg_buf[0], PKG_CAP,
-                                  &out_consumed, &in_consumed, &done)
-        if irc < 0:
-            write_str(2, "apt-get: Packages.gz inflate failed (corrupt or exceeds 256 KiB cap)\n")
-            return 1
-        if done == 0:
-            write_str(2, "apt-get: Packages.gz inflate did not reach end-of-stream\n")
-            return 1
-        pkg_len = out_consumed
-
-    # 4. mkdir /tmp/apt (tmpfs grew real nested directories — dcf30f3)
-    #    and store the decompressed index. mkdir of an existing dir is
-    #    harmless here; we don't fail the run if it returns non-zero.
-    sys_mkdir(cast[Ptr[char]]("/tmp/apt"))
-    wfd: int32 = sys_open_write(cast[Ptr[char]]("/tmp/apt/Packages"))
-    if wfd < 0:
-        write_str(2, "apt-get: cannot open /tmp/apt/Packages for write\n")
-        return 1
-    wn: int64 = _write_full(wfd, &pkg_buf[0], pkg_len)
-    sys_close(wfd)
-    if wn < 0 or cast[uint64](wn) != pkg_len:
-        write_str(2, "apt-get: short write storing Packages index\n")
-        return 1
+        nstanzas = _count_stanzas(pkg_len)
 
     # 4b. Persist the base-url to /tmp/apt/base-url (a one-line file)
     #     so a later `apt install` — a separate process invocation —
@@ -1318,11 +1664,18 @@ def _do_update(base_url: Ptr[uint8], suite: Ptr[uint8],
         write_str(2, "apt-get: short write storing base-url\n")
         return 1
 
-    # 5. Summary.
-    nstanzas: uint64 = _count_stanzas(pkg_len)
+    # 5. Summary. nstanzas is the TRUE full count from the streaming
+    #    (or single-shot) pass; if the persisted /tmp/apt/Packages cache
+    #    was truncated at the tmpfs file cap, say so — `apt update` still
+    #    succeeded, but later `show`/`install` only see the cached head.
     write_str(1, "apt-get: fetched index, ")
     write_dec_u64(1, nstanzas)
     write_str(1, " packages\n")
+    if persisted_full == 0:
+        write_str(1, "apt-get: note: index larger than the /tmp/apt/Packages cache cap (")
+        write_dec_u64(1, PKG_CAP)
+        write_str(1, " bytes);\n")
+        write_str(1, "apt-get: the cache holds the leading stanzas — show/install resolve those\n")
     return 0
 
 
