@@ -1,21 +1,27 @@
 ---
 name: project-fork-broken
-description: RESOLVED 2026-05-20 — fork() now gives the child a real private per-process address space (eager-copy; landed on main b8e0398). COW remains a future optimization. History below.
+description: RESOLVED 2026-05-20 — fork() gives the child a real private per-process address space, now copy-on-write (landed b8e0398 then d6a34a7). History below.
 metadata:
   node_type: memory
   type: project
   originSessionId: 87369342-5631-4e0b-b8bd-c6f8925641a7
 ---
 
-**STATUS: RESOLVED 2026-05-20.** fork() now works — `e021700`
-(`feat(mm): real per-process address space`) landed on `main` and is
-pushed (current tip `b8e0398`). The child gets a fully private address
-space: stack + ELF image + brk heap + TLS/TCB + mmap VMAs are
-eager-copied into fresh physical pages remapped at the same vaddr in
-the child's PML4. `test_u26_fork` / `test_rfork` PASS. The `%rdi`
-ABI fix (`633dad2`) shipped alongside and was verified NOT to regress
-native-Adder code. COW is the remaining optimization (eager-copy is
-~33 MiB/fork) — see [[project-core-stabilization]] / a future COW task.
+**STATUS: RESOLVED 2026-05-20.** fork() works and is copy-on-write.
+- `e021700` (`feat(mm): real per-process address space`) gave the child
+  a fully private address space (stack + ELF image + brk heap + TLS/TCB
+  + mmap VMAs), initially by eager-copy. The `%rdi` ABI fix (`633dad2`)
+  shipped alongside, verified NOT to regress native-Adder code.
+- `d6a34a7` (`feat(mm): convert fork() from eager-copy to copy-on-write`)
+  replaced the ~33 MiB/fork eager copy with COW: PTE bit-9 marker, a
+  per-PFN refcount table (`mm/cow.ad`), and a productive `#PF` handler
+  that resolves COW write faults. ELF image + brk heap + user stack are
+  COW-shared on fork; CLONE_VM threads stay distinct (shared PML4, never
+  enter COW). `test_cow_fork` / `test_u26_fork` / `test_rfork` PASS.
+- ONE piece left: mmap VMAs still eager-copy on fork — COW-sharing them
+  needs `mm/vma.ad::_vma_node_free` routed through the page refcounts.
+  A clean, bounded follow-up; the bulk of the win is already COW.
+
 The rest of this file is the diagnostic history, kept for context.
 
 ---
