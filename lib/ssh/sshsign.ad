@@ -1,0 +1,195 @@
+# lib/ssh/sshsign.ad
+#
+# ECDSA-P256 (ecdsa-sha2-nistp256) SIGNING for the Hamnix SSH server.
+#
+# lib/ecdsa/ecdsa.ad already does ECDSA *verify*; the SSH server needs
+# the other half — signing the key-exchange hash H with its host key.
+# This module adds exactly that, reusing lib/ec/p256.ad's field /
+# scalar / group arithmetic.
+#
+# FIPS 186-4 §6.4.1, signature generation:
+#   e = SHA-256(H) as a big-endian integer mod n
+#   pick a per-signature nonce k in [1, n-1]
+#   R = k*G ;  r = R.x mod n          (retry if r == 0)
+#   s = k^{-1} * (e + r*d) mod n      (retry if s == 0)
+#   signature = (r, s)
+#
+# NONCE k — DETERMINISTIC, NOT RFC 6979:
+#   Hamnix userland has no crypto-grade RNG (the /dev/random backend is
+#   an xorshift placeholder). A random k drawn from a weak PRNG would
+#   leak the private key. Instead we derive k deterministically from
+#   the private key d and the message hash:
+#       k = SHA-256(d_bytes || H || counter) mod n
+#   incrementing `counter` until k is in range. This is a SIMPLIFIED
+#   deterministic nonce — not the full HMAC-DRBG of RFC 6979 — but it
+#   is deterministic (no entropy needed) and unpredictable to anyone
+#   who does not know d, which is the security property that matters.
+#   A full RFC 6979 HMAC-DRBG is a worthwhile follow-up.
+#
+# CONST-TIME DISCLOSURE: inherits lib/ec/p256.ad's non-constant-time
+# scalar multiply. The signing nonce k IS secret, so this leaks via
+# timing. Acceptable for the Hamnix SSH V1 milestone (a single host
+# running in QEMU); flagged for the hardening pass.
+
+from lib.ec.p256 import (
+    P256Point,
+    P256_N,
+    p256_copy,
+    p256_set_zero,
+    p256_is_zero,
+    p256_be_to_limbs,
+    p256_ge,
+    p256_scalar_mul_g,
+    sn_mul,
+    sn_add,
+    sn_inv,
+    sn_in_range,
+)
+from lib.ecdsa.ecdsa import ecdsa_sha256
+
+
+# Fold a 256-bit big-endian hash into limb form, reducing once mod n if
+# it lands >= n (the hash is at most 2^256-1, n > 2^255, so one
+# subtraction suffices — identical fold to ecdsa_p256_verify's `e`).
+def _sshsign_hash_to_scalar(out: Ptr[uint64], hash32: Ptr[uint8]):
+    p256_be_to_limbs(out, hash32, cast[uint64](32))
+    if p256_ge(out, &P256_N[0]) != 0:
+        i: uint64 = 0
+        borrow: uint64 = 0
+        red: Array[4, uint64]
+        while i < 4:
+            ei: uint64 = out[i]
+            ni: uint64 = P256_N[i]
+            d: uint64 = ei - ni
+            b1: uint64 = 0
+            if ei < ni:
+                b1 = 1
+            d2: uint64 = d - borrow
+            b2: uint64 = 0
+            if d < borrow:
+                b2 = 1
+            red[i] = d2
+            borrow = b1 + b2
+            i = i + 1
+        p256_copy(out, &red[0])
+
+
+# Derive the deterministic nonce k for a given (d, digest, counter).
+# k is returned in limb form; the caller checks sn_in_range and bumps
+# counter on a miss. `digest` is the 32-byte SHA-256(message) — the
+# same e-source the signature is computed over.
+_sshsign_kmat: Array[65, uint8]    # d(32) || digest(32) || counter(1)
+_sshsign_khash: Array[32, uint8]
+
+
+def _sshsign_derive_k(out_k: Ptr[uint64], d_be: Ptr[uint8],
+                      digest: Ptr[uint8], counter: uint8):
+    i: uint64 = 0
+    while i < 32:
+        _sshsign_kmat[i] = d_be[i]
+        _sshsign_kmat[32 + i] = digest[i]
+        i = i + 1
+    _sshsign_kmat[64] = counter
+    ecdsa_sha256(&_sshsign_kmat[0], cast[uint64](65),
+                 &_sshsign_khash[0])
+    p256_be_to_limbs(out_k, &_sshsign_khash[0], cast[uint64](32))
+
+
+# Scratch for the message digest SHA-256(message).
+_sshsign_digest: Array[32, uint8]
+
+
+# ecdsa_p256_sign — sign `msg` with private scalar d, producing an
+# ecdsa-sha2-nistp256 signature. SYMMETRIC with ecdsa_p256_verify in
+# lib/ecdsa/ecdsa.ad: that routine hashes the message internally
+# (e = SHA-256(message)), so the signer MUST hash too — signing the
+# raw 32-byte input as e would not verify.
+#
+#   d_be     : 32-byte big-endian private key scalar (1 <= d < n)
+#   msg      : the message to sign. For SSH this is the exchange hash
+#              H, but ECDSA hashes whatever it is handed — so the
+#              "message" is H and e = SHA-256(H).
+#   msg_len  : length of msg in bytes.
+#   out_r    : 32-byte big-endian r  (filled on success)
+#   out_s    : 32-byte big-endian s  (filled on success)
+#
+# Returns 0 on success, -1 on failure (could not find a usable k —
+# astronomically unlikely, bounded retry of 16).
+def ecdsa_p256_sign(d_be: Ptr[uint8], msg: Ptr[uint8], msg_len: uint64,
+                    out_r: Ptr[uint8], out_s: Ptr[uint8]) -> int32:
+    # e = SHA-256(msg), reduced into the scalar field.
+    ecdsa_sha256(msg, msg_len, &_sshsign_digest[0])
+    e: Array[4, uint64]
+    _sshsign_hash_to_scalar(&e[0], &_sshsign_digest[0])
+
+    # d as a scalar.
+    d: Array[4, uint64]
+    if p256_be_to_limbs(&d[0], d_be, cast[uint64](32)) != 0:
+        return -1
+    if sn_in_range(&d[0]) == 0:
+        return -1
+
+    counter: uint8 = 0
+    while counter < 16:
+        k: Array[4, uint64]
+        _sshsign_derive_k(&k[0], d_be, &_sshsign_digest[0], counter)
+        counter = counter + 1
+        # k must be a usable scalar in [1, n-1].
+        if sn_in_range(&k[0]) == 0:
+            continue
+        # R = k*G ;  r = R.x mod n.
+        R: P256Point
+        p256_scalar_mul_g(&R, &k[0])
+        if R.infinity != 0:
+            continue
+        r: Array[4, uint64]
+        p256_copy(&r[0], &R.x[0])
+        # R.x is a base-field element; fold it into the scalar field.
+        if p256_ge(&r[0], &P256_N[0]) != 0:
+            i: uint64 = 0
+            borrow: uint64 = 0
+            red: Array[4, uint64]
+            while i < 4:
+                vi: uint64 = r[i]
+                ni: uint64 = P256_N[i]
+                dd: uint64 = vi - ni
+                b1: uint64 = 0
+                if vi < ni:
+                    b1 = 1
+                d2: uint64 = dd - borrow
+                b2: uint64 = 0
+                if dd < borrow:
+                    b2 = 1
+                red[i] = d2
+                borrow = b1 + b2
+                i = i + 1
+            p256_copy(&r[0], &red[0])
+        if p256_is_zero(&r[0]) != 0:
+            continue
+        # s = k^{-1} * (e + r*d) mod n.
+        kinv: Array[4, uint64]
+        sn_inv(&kinv[0], &k[0])
+        rd: Array[4, uint64]
+        sn_mul(&rd[0], &r[0], &d[0])
+        e_rd: Array[4, uint64]
+        sn_add(&e_rd[0], &e[0], &rd[0])
+        s: Array[4, uint64]
+        sn_mul(&s[0], &kinv[0], &e_rd[0])
+        if p256_is_zero(&s[0]) != 0:
+            continue
+        # Emit r, s as 32-byte big-endian.
+        _sshsign_limbs_to_be(out_r, &r[0])
+        _sshsign_limbs_to_be(out_s, &s[0])
+        return 0
+    return -1
+
+
+def _sshsign_limbs_to_be(out_be: Ptr[uint8], limbs: Ptr[uint64]):
+    # limb[0] is the least-significant 64 bits; emit 32 big-endian
+    # bytes (most-significant first).
+    i: uint64 = 0
+    while i < 32:
+        limb_idx: uint64 = (31 - i) / 8
+        shift: uint64 = ((31 - i) & 7) * 8
+        out_be[i] = cast[uint8]((limbs[limb_idx] >> shift) & 0xFF)
+        i = i + 1

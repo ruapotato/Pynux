@@ -1,0 +1,879 @@
+# lib/ssh/sshcrypto.ad
+#
+# Self-contained crypto primitives for the Hamnix SSH-2.0 server
+# (user/sshd.ad). Three pieces:
+#
+#   1. ChaCha20 (DJB 64-bit-counter / 64-bit-nonce variant — the one
+#      OpenSSH's chacha20-poly1305@openssh.com cipher uses, NOT the
+#      RFC 8439 96-bit-nonce variant).
+#   2. Poly1305 one-shot MAC (RFC 8439 §2.5).
+#   3. X25519 scalar multiplication (RFC 7748 §5) — Montgomery ladder
+#      over GF(2^255-19), five 51-bit limbs.
+#
+# SHA-256 is NOT here: user/sshd.ad imports lib/ecdsa/ecdsa.ad's
+# ecdsa_sha256() (a self-contained one-shot SHA-256) for the exchange
+# hash. SSH's curve25519-sha256 KDF is a sequence of one-shot hashes,
+# so one-shot SHA-256 is all that is needed.
+#
+# WHY A COPY of the ChaCha/Poly/X25519 code: drivers/net/tls.ad ships
+# proven implementations of all three, but they are module-private
+# `_tls_*` helpers wired into the kernel TLS session machine — not a
+# reusable surface, and tls.ad cannot link into a CPL-3 user binary.
+# This file is the same algorithms, re-namespaced `ssh_*` / `_ssh_*`,
+# so user/sshd.ad gets them in its own address space. The right
+# long-term fix is a shared lib/crypto/ — tracked, same as the SHA-256
+# duplication note already in lib/ecdsa/ecdsa.ad.
+#
+# CONST-TIME DISCLOSURE: not constant-time. The Montgomery ladder's
+# cswap is mask-based (constant-time) but Poly1305's final reduction
+# and ChaCha's loop bounds branch on lengths. SSH V1 accepts this; a
+# hardening pass is future work.
+
+extern def asm_volatile(code: Ptr[char])
+
+
+# =========================================================================
+# ChaCha20 — DJB variant (64-bit counter, 64-bit nonce)
+# =========================================================================
+
+_ssh_chacha_state: Array[16, uint32]
+_ssh_chacha_block_out: Array[64, uint8]
+
+
+def _ssh_rotl32(v: uint32, n: uint64) -> uint32:
+    x: uint64 = cast[uint64](v) & 0xFFFFFFFF
+    lo: uint64 = (x << n) & 0xFFFFFFFF
+    hi: uint64 = x >> (32 - n)
+    return cast[uint32](lo | hi)
+
+
+def _ssh_le_load32(buf: Ptr[uint8], off: uint64) -> uint32:
+    b0: uint32 = cast[uint32](buf[off + 0])
+    b1: uint32 = cast[uint32](buf[off + 1])
+    b2: uint32 = cast[uint32](buf[off + 2])
+    b3: uint32 = cast[uint32](buf[off + 3])
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+
+def _ssh_le_store32(buf: Ptr[uint8], off: uint64, v: uint32):
+    buf[off + 0] = cast[uint8](v & 0xFF)
+    buf[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    buf[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    buf[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _ssh_chacha_qr(a_idx: uint64, b_idx: uint64,
+                   c_idx: uint64, d_idx: uint64):
+    a: uint64 = cast[uint64](_ssh_chacha_state[a_idx]) & 0xFFFFFFFF
+    b: uint64 = cast[uint64](_ssh_chacha_state[b_idx]) & 0xFFFFFFFF
+    c: uint64 = cast[uint64](_ssh_chacha_state[c_idx]) & 0xFFFFFFFF
+    d: uint64 = cast[uint64](_ssh_chacha_state[d_idx]) & 0xFFFFFFFF
+
+    a = (a + b) & 0xFFFFFFFF
+    d = d ^ a
+    d = cast[uint64](_ssh_rotl32(cast[uint32](d), 16))
+
+    c = (c + d) & 0xFFFFFFFF
+    b = b ^ c
+    b = cast[uint64](_ssh_rotl32(cast[uint32](b), 12))
+
+    a = (a + b) & 0xFFFFFFFF
+    d = d ^ a
+    d = cast[uint64](_ssh_rotl32(cast[uint32](d), 8))
+
+    c = (c + d) & 0xFFFFFFFF
+    b = b ^ c
+    b = cast[uint64](_ssh_rotl32(cast[uint32](b), 7))
+
+    _ssh_chacha_state[a_idx] = cast[uint32](a)
+    _ssh_chacha_state[b_idx] = cast[uint32](b)
+    _ssh_chacha_state[c_idx] = cast[uint32](c)
+    _ssh_chacha_state[d_idx] = cast[uint32](d)
+
+
+def _ssh_chacha_block(key: Ptr[uint8], counter: uint64, nonce: Ptr[uint8]):
+    # ChaCha20 block, DJB layout: state[12..13] = 64-bit block counter
+    # (little-endian), state[14..15] = 64-bit nonce. `nonce` is 8 bytes.
+    # Produces 64 keystream bytes into _ssh_chacha_block_out.
+    _ssh_chacha_state[0] = 0x61707865
+    _ssh_chacha_state[1] = 0x3320646E
+    _ssh_chacha_state[2] = 0x79622D32
+    _ssh_chacha_state[3] = 0x6B206574
+    _ssh_chacha_state[4]  = _ssh_le_load32(key, 0)
+    _ssh_chacha_state[5]  = _ssh_le_load32(key, 4)
+    _ssh_chacha_state[6]  = _ssh_le_load32(key, 8)
+    _ssh_chacha_state[7]  = _ssh_le_load32(key, 12)
+    _ssh_chacha_state[8]  = _ssh_le_load32(key, 16)
+    _ssh_chacha_state[9]  = _ssh_le_load32(key, 20)
+    _ssh_chacha_state[10] = _ssh_le_load32(key, 24)
+    _ssh_chacha_state[11] = _ssh_le_load32(key, 28)
+    _ssh_chacha_state[12] = cast[uint32](counter & 0xFFFFFFFF)
+    _ssh_chacha_state[13] = cast[uint32]((counter >> 32) & 0xFFFFFFFF)
+    _ssh_chacha_state[14] = _ssh_le_load32(nonce, 0)
+    _ssh_chacha_state[15] = _ssh_le_load32(nonce, 4)
+
+    orig: Array[16, uint32]
+    i: uint64 = 0
+    while i < 16:
+        orig[i] = _ssh_chacha_state[i]
+        i = i + 1
+
+    r: uint64 = 0
+    while r < 10:
+        _ssh_chacha_qr(0, 4, 8, 12)
+        _ssh_chacha_qr(1, 5, 9, 13)
+        _ssh_chacha_qr(2, 6, 10, 14)
+        _ssh_chacha_qr(3, 7, 11, 15)
+        _ssh_chacha_qr(0, 5, 10, 15)
+        _ssh_chacha_qr(1, 6, 11, 12)
+        _ssh_chacha_qr(2, 7, 8, 13)
+        _ssh_chacha_qr(3, 4, 9, 14)
+        r = r + 1
+
+    i = 0
+    while i < 16:
+        sum_w: uint64 = ((cast[uint64](_ssh_chacha_state[i]) & 0xFFFFFFFF)
+                         + (cast[uint64](orig[i]) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        _ssh_le_store32(cast[Ptr[uint8]](&_ssh_chacha_block_out[0]),
+                        i * 4, cast[uint32](sum_w))
+        i = i + 1
+
+
+def ssh_chacha20_xor(key: Ptr[uint8], counter_start: uint64,
+                     nonce: Ptr[uint8],
+                     dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
+    # XOR-encrypt n bytes from src into dst, starting at the given DJB
+    # block counter. Encrypt and decrypt are the same operation.
+    block_ptr: Ptr[uint8] = cast[Ptr[uint8]](&_ssh_chacha_block_out[0])
+    pos: uint64 = 0
+    counter: uint64 = counter_start
+    while pos < n:
+        _ssh_chacha_block(key, counter, nonce)
+        chunk: uint64 = 64
+        if n - pos < chunk:
+            chunk = n - pos
+        j: uint64 = 0
+        while j < chunk:
+            dst[pos + j] = src[pos + j] ^ block_ptr[j]
+            j = j + 1
+        pos = pos + chunk
+        counter = counter + 1
+
+
+def ssh_chacha20_keystream(key: Ptr[uint8], counter: uint64,
+                           nonce: Ptr[uint8], out: Ptr[uint8],
+                           n: uint64):
+    # Emit n raw keystream bytes (no XOR). Used to derive the per-packet
+    # Poly1305 key. n <= 64 in practice.
+    _ssh_chacha_block(key, counter, nonce)
+    i: uint64 = 0
+    while i < n:
+        out[i] = _ssh_chacha_block_out[i]
+        i = i + 1
+
+
+# =========================================================================
+# Poly1305 one-shot MAC (RFC 8439 §2.5)
+# =========================================================================
+
+def ssh_poly1305(out_tag: Ptr[uint8], key: Ptr[uint8],
+                 msg: Ptr[uint8], n: uint64):
+    # 16-byte tag over msg with 32-byte one-time key = (r || s).
+    rkey: Array[16, uint8]
+    skey: Array[16, uint8]
+    i: uint64 = 0
+    while i < 16:
+        rkey[i] = key[i]
+        skey[i] = key[16 + i]
+        i = i + 1
+    rkey[3]  = rkey[3]  & 15
+    rkey[7]  = rkey[7]  & 15
+    rkey[11] = rkey[11] & 15
+    rkey[15] = rkey[15] & 15
+    rkey[4]  = rkey[4]  & 252
+    rkey[8]  = rkey[8]  & 252
+    rkey[12] = rkey[12] & 252
+    r0: uint64 = (cast[uint64](rkey[0])
+                  | (cast[uint64](rkey[1]) << 8)
+                  | (cast[uint64](rkey[2]) << 16)
+                  | (cast[uint64](rkey[3] & 0x03) << 24))
+    r1: uint64 = ((cast[uint64](rkey[3]) >> 2)
+                  | (cast[uint64](rkey[4]) << 6)
+                  | (cast[uint64](rkey[5]) << 14)
+                  | (cast[uint64](rkey[6] & 0x0F) << 22))
+    r2: uint64 = ((cast[uint64](rkey[6]) >> 4)
+                  | (cast[uint64](rkey[7]) << 4)
+                  | (cast[uint64](rkey[8]) << 12)
+                  | (cast[uint64](rkey[9] & 0x3F) << 20))
+    r3: uint64 = ((cast[uint64](rkey[9]) >> 6)
+                  | (cast[uint64](rkey[10]) << 2)
+                  | (cast[uint64](rkey[11]) << 10)
+                  | (cast[uint64](rkey[12]) << 18))
+    r4: uint64 = (cast[uint64](rkey[13])
+                  | (cast[uint64](rkey[14]) << 8)
+                  | (cast[uint64](rkey[15]) << 16))
+    s1: uint64 = r1 * 5
+    s2: uint64 = r2 * 5
+    s3: uint64 = r3 * 5
+    s4: uint64 = r4 * 5
+
+    h0: uint64 = 0
+    h1: uint64 = 0
+    h2: uint64 = 0
+    h3: uint64 = 0
+    h4: uint64 = 0
+
+    pos: uint64 = 0
+    mask26: uint64 = 0x3FFFFFF
+    while pos < n:
+        blen: uint64 = 16
+        if n - pos < blen:
+            blen = n - pos
+        blk: Array[17, uint8]
+        i = 0
+        while i < 17:
+            blk[i] = 0
+            i = i + 1
+        i = 0
+        while i < blen:
+            blk[i] = msg[pos + i]
+            i = i + 1
+        blk[blen] = 1
+        b0: uint64 = (cast[uint64](blk[0])
+                      | (cast[uint64](blk[1]) << 8)
+                      | (cast[uint64](blk[2]) << 16)
+                      | (cast[uint64](blk[3] & 0x03) << 24))
+        b1: uint64 = ((cast[uint64](blk[3]) >> 2)
+                      | (cast[uint64](blk[4]) << 6)
+                      | (cast[uint64](blk[5]) << 14)
+                      | (cast[uint64](blk[6] & 0x0F) << 22))
+        b2: uint64 = ((cast[uint64](blk[6]) >> 4)
+                      | (cast[uint64](blk[7]) << 4)
+                      | (cast[uint64](blk[8]) << 12)
+                      | (cast[uint64](blk[9] & 0x3F) << 20))
+        b3: uint64 = ((cast[uint64](blk[9]) >> 6)
+                      | (cast[uint64](blk[10]) << 2)
+                      | (cast[uint64](blk[11]) << 10)
+                      | (cast[uint64](blk[12]) << 18))
+        b4: uint64 = (cast[uint64](blk[13])
+                      | (cast[uint64](blk[14]) << 8)
+                      | (cast[uint64](blk[15]) << 16)
+                      | (cast[uint64](blk[16]) << 24))
+        h0 = h0 + b0
+        h1 = h1 + b1
+        h2 = h2 + b2
+        h3 = h3 + b3
+        h4 = h4 + b4
+
+        d0: uint64 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+        d1: uint64 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+        d2: uint64 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+        d3: uint64 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+        d4: uint64 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+        c: uint64 = d0 >> 26
+        h0 = d0 & mask26
+        d1 = d1 + c
+        c = d1 >> 26
+        h1 = d1 & mask26
+        d2 = d2 + c
+        c = d2 >> 26
+        h2 = d2 & mask26
+        d3 = d3 + c
+        c = d3 >> 26
+        h3 = d3 & mask26
+        d4 = d4 + c
+        c = d4 >> 26
+        h4 = d4 & mask26
+        h0 = h0 + c * 5
+        c = h0 >> 26
+        h0 = h0 & mask26
+        h1 = h1 + c
+
+        pos = pos + blen
+
+    c: uint64 = h1 >> 26
+    h1 = h1 & mask26
+    h2 = h2 + c
+    c = h2 >> 26
+    h2 = h2 & mask26
+    h3 = h3 + c
+    c = h3 >> 26
+    h3 = h3 & mask26
+    h4 = h4 + c
+    c = h4 >> 26
+    h4 = h4 & mask26
+    h0 = h0 + c * 5
+    c = h0 >> 26
+    h0 = h0 & mask26
+    h1 = h1 + c
+    g0: uint64 = h0 + 5
+    c = g0 >> 26
+    g0 = g0 & mask26
+    g1: uint64 = h1 + c
+    c = g1 >> 26
+    g1 = g1 & mask26
+    g2: uint64 = h2 + c
+    c = g2 >> 26
+    g2 = g2 & mask26
+    g3: uint64 = h3 + c
+    c = g3 >> 26
+    g3 = g3 & mask26
+    g4: uint64 = h4 + c
+    use_g: uint64 = (g4 >> 26) & 1
+    g4 = g4 & mask26
+    if use_g == 1:
+        h0 = g0
+        h1 = g1
+        h2 = g2
+        h3 = g3
+        h4 = g4
+
+    w0: uint64 = (h0 | (h1 << 26)) & 0xFFFFFFFF
+    w1: uint64 = ((h1 >> 6) | (h2 << 20)) & 0xFFFFFFFF
+    w2: uint64 = ((h2 >> 12) | (h3 << 14)) & 0xFFFFFFFF
+    w3: uint64 = ((h3 >> 18) | (h4 << 8)) & 0xFFFFFFFF
+    sk0: uint64 = (cast[uint64](skey[0])
+                   | (cast[uint64](skey[1]) << 8)
+                   | (cast[uint64](skey[2]) << 16)
+                   | (cast[uint64](skey[3]) << 24))
+    sw1: uint64 = (cast[uint64](skey[4])
+                   | (cast[uint64](skey[5]) << 8)
+                   | (cast[uint64](skey[6]) << 16)
+                   | (cast[uint64](skey[7]) << 24))
+    sw2: uint64 = (cast[uint64](skey[8])
+                   | (cast[uint64](skey[9]) << 8)
+                   | (cast[uint64](skey[10]) << 16)
+                   | (cast[uint64](skey[11]) << 24))
+    sw3: uint64 = (cast[uint64](skey[12])
+                   | (cast[uint64](skey[13]) << 8)
+                   | (cast[uint64](skey[14]) << 16)
+                   | (cast[uint64](skey[15]) << 24))
+    f0: uint64 = w0 + sk0
+    f1: uint64 = w1 + sw1 + (f0 >> 32)
+    f2: uint64 = w2 + sw2 + (f1 >> 32)
+    f3: uint64 = w3 + sw3 + (f2 >> 32)
+    f0 = f0 & 0xFFFFFFFF
+    f1 = f1 & 0xFFFFFFFF
+    f2 = f2 & 0xFFFFFFFF
+    f3 = f3 & 0xFFFFFFFF
+    out_tag[0]  = cast[uint8](f0 & 0xFF)
+    out_tag[1]  = cast[uint8]((f0 >> 8) & 0xFF)
+    out_tag[2]  = cast[uint8]((f0 >> 16) & 0xFF)
+    out_tag[3]  = cast[uint8]((f0 >> 24) & 0xFF)
+    out_tag[4]  = cast[uint8](f1 & 0xFF)
+    out_tag[5]  = cast[uint8]((f1 >> 8) & 0xFF)
+    out_tag[6]  = cast[uint8]((f1 >> 16) & 0xFF)
+    out_tag[7]  = cast[uint8]((f1 >> 24) & 0xFF)
+    out_tag[8]  = cast[uint8](f2 & 0xFF)
+    out_tag[9]  = cast[uint8]((f2 >> 8) & 0xFF)
+    out_tag[10] = cast[uint8]((f2 >> 16) & 0xFF)
+    out_tag[11] = cast[uint8]((f2 >> 24) & 0xFF)
+    out_tag[12] = cast[uint8](f3 & 0xFF)
+    out_tag[13] = cast[uint8]((f3 >> 8) & 0xFF)
+    out_tag[14] = cast[uint8]((f3 >> 16) & 0xFF)
+    out_tag[15] = cast[uint8]((f3 >> 24) & 0xFF)
+
+
+# =========================================================================
+# X25519 (RFC 7748 §5)
+# =========================================================================
+
+def _ssh_fe_zero(fe: Ptr[uint64]):
+    fe[0] = 0
+    fe[1] = 0
+    fe[2] = 0
+    fe[3] = 0
+    fe[4] = 0
+
+
+def _ssh_fe_one(fe: Ptr[uint64]):
+    fe[0] = 1
+    fe[1] = 0
+    fe[2] = 0
+    fe[3] = 0
+    fe[4] = 0
+
+
+def _ssh_fe_copy(dst: Ptr[uint64], src: Ptr[uint64]):
+    dst[0] = src[0]
+    dst[1] = src[1]
+    dst[2] = src[2]
+    dst[3] = src[3]
+    dst[4] = src[4]
+
+
+def _ssh_fe_cswap(swap: uint64, a: Ptr[uint64], b: Ptr[uint64]):
+    mask: uint64 = 0
+    if swap == 1:
+        mask = 0xFFFFFFFFFFFFFFFF
+    i: uint64 = 0
+    while i < 5:
+        diff: uint64 = mask & (a[i] ^ b[i])
+        a[i] = a[i] ^ diff
+        b[i] = b[i] ^ diff
+        i = i + 1
+
+
+def _ssh_fe_carry(fe: Ptr[uint64]):
+    mask51: uint64 = 0x7FFFFFFFFFFFF
+    c0: uint64 = fe[0] >> 51
+    fe[0] = fe[0] & mask51
+    fe[1] = fe[1] + c0
+    c1: uint64 = fe[1] >> 51
+    fe[1] = fe[1] & mask51
+    fe[2] = fe[2] + c1
+    c2: uint64 = fe[2] >> 51
+    fe[2] = fe[2] & mask51
+    fe[3] = fe[3] + c2
+    c3: uint64 = fe[3] >> 51
+    fe[3] = fe[3] & mask51
+    fe[4] = fe[4] + c3
+    c4: uint64 = fe[4] >> 51
+    fe[4] = fe[4] & mask51
+    fe[0] = fe[0] + c4 * 19
+
+
+def _ssh_fe_add(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
+    r[0] = a[0] + b[0]
+    r[1] = a[1] + b[1]
+    r[2] = a[2] + b[2]
+    r[3] = a[3] + b[3]
+    r[4] = a[4] + b[4]
+    _ssh_fe_carry(r)
+
+
+def _ssh_fe_sub(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
+    big0: uint64 = 0xFFFFFFFFFFFDA
+    big1: uint64 = 0xFFFFFFFFFFFFE
+    big2: uint64 = 0xFFFFFFFFFFFFE
+    big3: uint64 = 0xFFFFFFFFFFFFE
+    big4: uint64 = 0xFFFFFFFFFFFFE
+    r[0] = (a[0] + big0) - b[0]
+    r[1] = (a[1] + big1) - b[1]
+    r[2] = (a[2] + big2) - b[2]
+    r[3] = (a[3] + big3) - b[3]
+    r[4] = (a[4] + big4) - b[4]
+    _ssh_fe_carry(r)
+
+
+# 128-bit multiply via x86_64 MUL. Module-globals because asm_volatile
+# is operandless; single-threaded (X25519 runs once per handshake).
+ssh_mul128_a:  uint64 = 0
+ssh_mul128_b:  uint64 = 0
+ssh_mul128_lo: uint64 = 0
+ssh_mul128_hi: uint64 = 0
+
+
+def _ssh_mul128():
+    asm_volatile("""
+        movq ssh_mul128_a(%rip), %rax
+        mulq ssh_mul128_b(%rip)
+        movq %rax, ssh_mul128_lo(%rip)
+        movq %rdx, ssh_mul128_hi(%rip)
+    """)
+
+
+_ssh_fe_mul_acc_lo: Array[5, uint64]
+_ssh_fe_mul_acc_hi: Array[5, uint64]
+
+
+def _ssh_fe_mul_add128(idx: uint64, x: uint64, y: uint64):
+    ssh_mul128_a = x
+    ssh_mul128_b = y
+    _ssh_mul128()
+    p_lo: uint64 = ssh_mul128_lo
+    p_hi: uint64 = ssh_mul128_hi
+    cur_lo: uint64 = _ssh_fe_mul_acc_lo[idx]
+    new_lo: uint64 = cur_lo + p_lo
+    sign_flip: uint64 = 0x8000000000000000
+    carry: uint64 = 0
+    if (new_lo ^ sign_flip) < (cur_lo ^ sign_flip):
+        carry = 1
+    _ssh_fe_mul_acc_lo[idx] = new_lo
+    _ssh_fe_mul_acc_hi[idx] = _ssh_fe_mul_acc_hi[idx] + p_hi + carry
+
+
+def _ssh_fe_mul(r: Ptr[uint64], a: Ptr[uint64], b: Ptr[uint64]):
+    i: uint64 = 0
+    while i < 5:
+        _ssh_fe_mul_acc_lo[i] = 0
+        _ssh_fe_mul_acc_hi[i] = 0
+        i = i + 1
+
+    _ssh_fe_mul_add128(0, a[0], b[0])
+    _ssh_fe_mul_add128(1, a[0], b[1])
+    _ssh_fe_mul_add128(1, a[1], b[0])
+    _ssh_fe_mul_add128(2, a[0], b[2])
+    _ssh_fe_mul_add128(2, a[1], b[1])
+    _ssh_fe_mul_add128(2, a[2], b[0])
+    _ssh_fe_mul_add128(3, a[0], b[3])
+    _ssh_fe_mul_add128(3, a[1], b[2])
+    _ssh_fe_mul_add128(3, a[2], b[1])
+    _ssh_fe_mul_add128(3, a[3], b[0])
+    _ssh_fe_mul_add128(4, a[0], b[4])
+    _ssh_fe_mul_add128(4, a[1], b[3])
+    _ssh_fe_mul_add128(4, a[2], b[2])
+    _ssh_fe_mul_add128(4, a[3], b[1])
+    _ssh_fe_mul_add128(4, a[4], b[0])
+
+    b1_19: uint64 = b[1] * 19
+    b2_19: uint64 = b[2] * 19
+    b3_19: uint64 = b[3] * 19
+    b4_19: uint64 = b[4] * 19
+
+    _ssh_fe_mul_add128(0, a[1], b4_19)
+    _ssh_fe_mul_add128(0, a[2], b3_19)
+    _ssh_fe_mul_add128(1, a[2], b4_19)
+    _ssh_fe_mul_add128(0, a[3], b2_19)
+    _ssh_fe_mul_add128(1, a[3], b3_19)
+    _ssh_fe_mul_add128(2, a[3], b4_19)
+    _ssh_fe_mul_add128(0, a[4], b1_19)
+    _ssh_fe_mul_add128(1, a[4], b2_19)
+    _ssh_fe_mul_add128(2, a[4], b3_19)
+    _ssh_fe_mul_add128(3, a[4], b4_19)
+
+    mask51: uint64 = 0x7FFFFFFFFFFFF
+    sign_flip2: uint64 = 0x8000000000000000
+    i = 0
+    carry_lo: uint64 = 0
+    carry_hi: uint64 = 0
+    while i < 5:
+        cur_lo: uint64 = _ssh_fe_mul_acc_lo[i] + carry_lo
+        cur_hi: uint64 = _ssh_fe_mul_acc_hi[i] + carry_hi
+        if (cur_lo ^ sign_flip2) < (carry_lo ^ sign_flip2):
+            cur_hi = cur_hi + 1
+        if i < 4:
+            r[i] = cur_lo & mask51
+            carry_lo = (cur_lo >> 51) | (cur_hi << 13)
+            carry_hi = cur_hi >> 51
+        else:
+            r[4] = cur_lo & mask51
+            overflow_lo: uint64 = (cur_lo >> 51) | (cur_hi << 13)
+            r[0] = r[0] + overflow_lo * 19
+        i = i + 1
+    _ssh_fe_carry(r)
+
+
+def _ssh_fe_sq(r: Ptr[uint64], a: Ptr[uint64]):
+    _ssh_fe_mul(r, a, a)
+
+
+def _ssh_fe_mul121665(r: Ptr[uint64], a: Ptr[uint64]):
+    sign_flip: uint64 = 0x8000000000000000
+    mask51: uint64 = 0x7FFFFFFFFFFFF
+    los: Array[5, uint64]
+    his: Array[5, uint64]
+    i: uint64 = 0
+    while i < 5:
+        ssh_mul128_a = a[i]
+        ssh_mul128_b = 121665
+        _ssh_mul128()
+        los[i] = ssh_mul128_lo
+        his[i] = ssh_mul128_hi
+        i = i + 1
+    carry_lo: uint64 = 0
+    carry_hi: uint64 = 0
+    i = 0
+    while i < 5:
+        cur_lo: uint64 = los[i] + carry_lo
+        cur_hi: uint64 = his[i] + carry_hi
+        if (cur_lo ^ sign_flip) < (carry_lo ^ sign_flip):
+            cur_hi = cur_hi + 1
+        if i < 4:
+            r[i] = cur_lo & mask51
+            carry_lo = (cur_lo >> 51) | (cur_hi << 13)
+            carry_hi = cur_hi >> 51
+        else:
+            r[4] = cur_lo & mask51
+            overflow_lo: uint64 = (cur_lo >> 51) | (cur_hi << 13)
+            r[0] = r[0] + overflow_lo * 19
+        i = i + 1
+    _ssh_fe_carry(r)
+
+
+def _ssh_fe_extract51(buf: Ptr[uint8], bit_off: uint64) -> uint64:
+    byte_off: uint64 = bit_off >> 3
+    bit_shift: uint64 = bit_off & 7
+    acc: uint64 = 0
+    i: uint64 = 0
+    while i < 8:
+        idx: uint64 = byte_off + i
+        if idx < 32:
+            acc = acc | (cast[uint64](buf[idx]) << (i * 8))
+        i = i + 1
+    acc = acc >> bit_shift
+    return acc & 0x7FFFFFFFFFFFF
+
+
+def _ssh_fe_from_bytes(fe: Ptr[uint64], buf: Ptr[uint8]):
+    fe[0] = _ssh_fe_extract51(buf, 0)
+    fe[1] = _ssh_fe_extract51(buf, 51)
+    fe[2] = _ssh_fe_extract51(buf, 102)
+    fe[3] = _ssh_fe_extract51(buf, 153)
+    fe[4] = _ssh_fe_extract51(buf, 204) & 0x7FFFFFFFFFFFF
+
+
+def _ssh_fe_to_bytes(out: Ptr[uint8], fe: Ptr[uint64]):
+    h: Array[5, uint64]
+    h[0] = fe[0]
+    h[1] = fe[1]
+    h[2] = fe[2]
+    h[3] = fe[3]
+    h[4] = fe[4]
+    _ssh_fe_carry(cast[Ptr[uint64]](&h[0]))
+    _ssh_fe_carry(cast[Ptr[uint64]](&h[0]))
+    mask51: uint64 = 0x7FFFFFFFFFFFF
+    t: Array[5, uint64]
+    t[0] = h[0] + 19
+    carry: uint64 = t[0] >> 51
+    t[0] = t[0] & mask51
+    t[1] = h[1] + carry
+    carry = t[1] >> 51
+    t[1] = t[1] & mask51
+    t[2] = h[2] + carry
+    carry = t[2] >> 51
+    t[2] = t[2] & mask51
+    t[3] = h[3] + carry
+    carry = t[3] >> 51
+    t[3] = t[3] & mask51
+    t[4] = h[4] + carry
+    use_t: int32 = 0
+    if (t[4] >> 51) != 0:
+        use_t = 1
+    if use_t == 1:
+        h[0] = t[0]
+        h[1] = t[1]
+        h[2] = t[2]
+        h[3] = t[3]
+        h[4] = t[4] & mask51
+    i: uint64 = 0
+    while i < 32:
+        out[i] = 0
+        i = i + 1
+    bit: uint64 = 0
+    j: uint64 = 0
+    while j < 5:
+        v: uint64 = h[j]
+        k: uint64 = 0
+        while k < 51:
+            if ((v >> k) & 1) == 1:
+                byte_idx: uint64 = (bit + k) >> 3
+                bit_idx: uint64 = (bit + k) & 7
+                if byte_idx < 32:
+                    out[byte_idx] = out[byte_idx] | cast[uint8](1 << bit_idx)
+            k = k + 1
+        bit = bit + 51
+        j = j + 1
+
+
+def _ssh_fe_invert(out: Ptr[uint64], z: Ptr[uint64]):
+    z2: Array[5, uint64]
+    z9: Array[5, uint64]
+    z11: Array[5, uint64]
+    z2_5_0: Array[5, uint64]
+    z2_10_0: Array[5, uint64]
+    z2_20_0: Array[5, uint64]
+    z2_50_0: Array[5, uint64]
+    z2_100_0: Array[5, uint64]
+    t0: Array[5, uint64]
+    t1: Array[5, uint64]
+    _ssh_fe_sq(cast[Ptr[uint64]](&z2[0]), z)
+    _ssh_fe_sq(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&z2[0]))
+    _ssh_fe_sq(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]))
+    _ssh_fe_mul(cast[Ptr[uint64]](&z9[0]), cast[Ptr[uint64]](&t1[0]), z)
+    _ssh_fe_mul(cast[Ptr[uint64]](&z11[0]), cast[Ptr[uint64]](&z9[0]),
+                cast[Ptr[uint64]](&z2[0]))
+    _ssh_fe_sq(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&z11[0]))
+    _ssh_fe_mul(cast[Ptr[uint64]](&z2_5_0[0]), cast[Ptr[uint64]](&t0[0]),
+                cast[Ptr[uint64]](&z9[0]))
+    _ssh_fe_sq(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&z2_5_0[0]))
+    i: uint64 = 1
+    while i < 5:
+        _ssh_fe_sq(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]))
+        _ssh_fe_copy(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+        i = i + 1
+    _ssh_fe_mul(cast[Ptr[uint64]](&z2_10_0[0]), cast[Ptr[uint64]](&t0[0]),
+                cast[Ptr[uint64]](&z2_5_0[0]))
+    _ssh_fe_sq(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&z2_10_0[0]))
+    i = 1
+    while i < 10:
+        _ssh_fe_sq(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]))
+        _ssh_fe_copy(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+        i = i + 1
+    _ssh_fe_mul(cast[Ptr[uint64]](&z2_20_0[0]), cast[Ptr[uint64]](&t0[0]),
+                cast[Ptr[uint64]](&z2_10_0[0]))
+    _ssh_fe_sq(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&z2_20_0[0]))
+    i = 1
+    while i < 20:
+        _ssh_fe_sq(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]))
+        _ssh_fe_copy(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+        i = i + 1
+    _ssh_fe_mul(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]),
+                cast[Ptr[uint64]](&z2_20_0[0]))
+    _ssh_fe_sq(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+    i = 1
+    while i < 10:
+        _ssh_fe_sq(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]))
+        _ssh_fe_copy(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+        i = i + 1
+    _ssh_fe_mul(cast[Ptr[uint64]](&z2_50_0[0]), cast[Ptr[uint64]](&t0[0]),
+                cast[Ptr[uint64]](&z2_10_0[0]))
+    _ssh_fe_sq(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&z2_50_0[0]))
+    i = 1
+    while i < 50:
+        _ssh_fe_sq(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]))
+        _ssh_fe_copy(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+        i = i + 1
+    _ssh_fe_mul(cast[Ptr[uint64]](&z2_100_0[0]), cast[Ptr[uint64]](&t0[0]),
+                cast[Ptr[uint64]](&z2_50_0[0]))
+    _ssh_fe_sq(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&z2_100_0[0]))
+    i = 1
+    while i < 100:
+        _ssh_fe_sq(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]))
+        _ssh_fe_copy(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+        i = i + 1
+    _ssh_fe_mul(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]),
+                cast[Ptr[uint64]](&z2_100_0[0]))
+    _ssh_fe_sq(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+    i = 1
+    while i < 50:
+        _ssh_fe_sq(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]))
+        _ssh_fe_copy(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+        i = i + 1
+    _ssh_fe_mul(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]),
+                cast[Ptr[uint64]](&z2_50_0[0]))
+    _ssh_fe_sq(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+    i = 1
+    while i < 5:
+        _ssh_fe_sq(cast[Ptr[uint64]](&t1[0]), cast[Ptr[uint64]](&t0[0]))
+        _ssh_fe_copy(cast[Ptr[uint64]](&t0[0]), cast[Ptr[uint64]](&t1[0]))
+        i = i + 1
+    _ssh_fe_mul(out, cast[Ptr[uint64]](&t0[0]),
+                cast[Ptr[uint64]](&z11[0]))
+
+
+def ssh_x25519(out: Ptr[uint8], scalar: Ptr[uint8],
+               u_in: Ptr[uint8]) -> int32:
+    # X25519: out = scalarmult(clamp(scalar), u_in). All three buffers
+    # are 32 bytes. Returns 0 (never fails for well-formed input).
+    k: Array[32, uint8]
+    u: Array[32, uint8]
+    i: uint64 = 0
+    while i < 32:
+        k[i] = scalar[i]
+        u[i] = u_in[i]
+        i = i + 1
+    k[0]  = k[0]  & 248
+    k[31] = k[31] & 127
+    k[31] = k[31] | 64
+    u[31] = u[31] & 127
+    x1: Array[5, uint64]
+    x2: Array[5, uint64]
+    z2: Array[5, uint64]
+    x3: Array[5, uint64]
+    z3: Array[5, uint64]
+    _ssh_fe_from_bytes(cast[Ptr[uint64]](&x1[0]),
+                       cast[Ptr[uint8]](&u[0]))
+    _ssh_fe_one(cast[Ptr[uint64]](&x2[0]))
+    _ssh_fe_zero(cast[Ptr[uint64]](&z2[0]))
+    _ssh_fe_copy(cast[Ptr[uint64]](&x3[0]), cast[Ptr[uint64]](&x1[0]))
+    _ssh_fe_one(cast[Ptr[uint64]](&z3[0]))
+    swap: uint64 = 0
+
+    a_buf: Array[5, uint64]
+    b_buf: Array[5, uint64]
+    c_buf: Array[5, uint64]
+    d_buf: Array[5, uint64]
+    aa: Array[5, uint64]
+    bb: Array[5, uint64]
+    e_buf: Array[5, uint64]
+    da: Array[5, uint64]
+    cb: Array[5, uint64]
+    tmp1: Array[5, uint64]
+    tmp2: Array[5, uint64]
+
+    t: int64 = 254
+    while t >= 0:
+        byte_idx: uint64 = cast[uint64](t) >> 3
+        bit_idx: uint64 = cast[uint64](t) & 7
+        kt: uint64 = (cast[uint64](k[byte_idx]) >> bit_idx) & 1
+        cs: uint64 = swap ^ kt
+        _ssh_fe_cswap(cs, cast[Ptr[uint64]](&x2[0]),
+                      cast[Ptr[uint64]](&x3[0]))
+        _ssh_fe_cswap(cs, cast[Ptr[uint64]](&z2[0]),
+                      cast[Ptr[uint64]](&z3[0]))
+        swap = kt
+        _ssh_fe_add(cast[Ptr[uint64]](&a_buf[0]),
+                    cast[Ptr[uint64]](&x2[0]),
+                    cast[Ptr[uint64]](&z2[0]))
+        _ssh_fe_sq(cast[Ptr[uint64]](&aa[0]),
+                   cast[Ptr[uint64]](&a_buf[0]))
+        _ssh_fe_sub(cast[Ptr[uint64]](&b_buf[0]),
+                    cast[Ptr[uint64]](&x2[0]),
+                    cast[Ptr[uint64]](&z2[0]))
+        _ssh_fe_sq(cast[Ptr[uint64]](&bb[0]),
+                   cast[Ptr[uint64]](&b_buf[0]))
+        _ssh_fe_sub(cast[Ptr[uint64]](&e_buf[0]),
+                    cast[Ptr[uint64]](&aa[0]),
+                    cast[Ptr[uint64]](&bb[0]))
+        _ssh_fe_add(cast[Ptr[uint64]](&c_buf[0]),
+                    cast[Ptr[uint64]](&x3[0]),
+                    cast[Ptr[uint64]](&z3[0]))
+        _ssh_fe_sub(cast[Ptr[uint64]](&d_buf[0]),
+                    cast[Ptr[uint64]](&x3[0]),
+                    cast[Ptr[uint64]](&z3[0]))
+        _ssh_fe_mul(cast[Ptr[uint64]](&da[0]),
+                    cast[Ptr[uint64]](&d_buf[0]),
+                    cast[Ptr[uint64]](&a_buf[0]))
+        _ssh_fe_mul(cast[Ptr[uint64]](&cb[0]),
+                    cast[Ptr[uint64]](&c_buf[0]),
+                    cast[Ptr[uint64]](&b_buf[0]))
+        _ssh_fe_add(cast[Ptr[uint64]](&tmp1[0]),
+                    cast[Ptr[uint64]](&da[0]),
+                    cast[Ptr[uint64]](&cb[0]))
+        _ssh_fe_sq(cast[Ptr[uint64]](&x3[0]),
+                   cast[Ptr[uint64]](&tmp1[0]))
+        _ssh_fe_sub(cast[Ptr[uint64]](&tmp2[0]),
+                    cast[Ptr[uint64]](&da[0]),
+                    cast[Ptr[uint64]](&cb[0]))
+        _ssh_fe_sq(cast[Ptr[uint64]](&tmp1[0]),
+                   cast[Ptr[uint64]](&tmp2[0]))
+        _ssh_fe_mul(cast[Ptr[uint64]](&z3[0]),
+                    cast[Ptr[uint64]](&x1[0]),
+                    cast[Ptr[uint64]](&tmp1[0]))
+        _ssh_fe_mul(cast[Ptr[uint64]](&x2[0]),
+                    cast[Ptr[uint64]](&aa[0]),
+                    cast[Ptr[uint64]](&bb[0]))
+        _ssh_fe_mul121665(cast[Ptr[uint64]](&tmp1[0]),
+                          cast[Ptr[uint64]](&e_buf[0]))
+        _ssh_fe_add(cast[Ptr[uint64]](&tmp2[0]),
+                    cast[Ptr[uint64]](&aa[0]),
+                    cast[Ptr[uint64]](&tmp1[0]))
+        _ssh_fe_mul(cast[Ptr[uint64]](&z2[0]),
+                    cast[Ptr[uint64]](&e_buf[0]),
+                    cast[Ptr[uint64]](&tmp2[0]))
+        t = t - 1
+    _ssh_fe_cswap(swap, cast[Ptr[uint64]](&x2[0]),
+                  cast[Ptr[uint64]](&x3[0]))
+    _ssh_fe_cswap(swap, cast[Ptr[uint64]](&z2[0]),
+                  cast[Ptr[uint64]](&z3[0]))
+    inv: Array[5, uint64]
+    _ssh_fe_invert(cast[Ptr[uint64]](&inv[0]),
+                   cast[Ptr[uint64]](&z2[0]))
+    res: Array[5, uint64]
+    _ssh_fe_mul(cast[Ptr[uint64]](&res[0]),
+                cast[Ptr[uint64]](&x2[0]),
+                cast[Ptr[uint64]](&inv[0]))
+    _ssh_fe_to_bytes(out, cast[Ptr[uint64]](&res[0]))
+    return 0
+
+
+def ssh_x25519_base(out_pub: Ptr[uint8], priv: Ptr[uint8]) -> int32:
+    # Public key = X25519(priv, basepoint u=9).
+    base: Array[32, uint8]
+    base[0] = 9
+    i: uint64 = 1
+    while i < 32:
+        base[i] = 0
+        i = i + 1
+    return ssh_x25519(out_pub, priv, cast[Ptr[uint8]](&base[0]))

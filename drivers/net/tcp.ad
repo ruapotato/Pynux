@@ -1291,6 +1291,72 @@ def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
             return 0                      # treat timeout-with-no-data as 0
 
 
+def tcp_slot_at_eof(slot_signed: int32) -> int32:
+    # Returns 1 iff the slot has truly reached end-of-stream: the peer
+    # sent a FIN and the rx ring is fully drained, OR the slot is
+    # CLOSED. Returns 0 for a live ESTABLISHED slot that simply has no
+    # data buffered this instant. Used by vfs_read's FD_SOCKET arm to
+    # tell a real EOF apart from a poll that found the ring momentarily
+    # empty — without this a non-blocking read of 0 bytes would be
+    # mis-latched as a permanent socket close.
+    if slot_signed < 0:
+        return 1
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= TCP_NUM_SLOTS:
+        return 1
+    if tcp_slot_state[slot] == TCP_CLOSED:
+        return 1
+    if tcp_slot_saw_fin[slot] != 0:
+        if tcp_slot_rx_count[slot] == 0:
+            return 1
+    return 0
+
+
+def tcp_recv_nb(slot_signed: int32, buf: Ptr[uint8],
+                max_len: uint64) -> int64:
+    # Non-blocking receive. Pumps virtio_net_poll() once so freshly
+    # arrived segments land in the ring, then copies whatever is
+    # buffered. Returns >0 bytes copied, 0 if the slot is still live
+    # but has nothing buffered ("would block"), or -1 on a true EOF
+    # (peer FIN + drained ring) or a CLOSED slot. This is the building
+    # block behind SYS_READ_NB for socket fds — an event-loop daemon
+    # can poll the socket without the 5 s blocking budget tcp_recv
+    # imposes.
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= TCP_NUM_SLOTS:
+        return -1
+    virtio_net_poll()
+    avail: uint64 = tcp_slot_rx_count[slot]
+    if avail > 0:
+        n: uint64 = avail
+        if n > max_len:
+            n = max_len
+        rx_base: uint64 = slot * TCP_RX_BUF
+        head: uint64 = tcp_slot_rx_head[slot]
+        i: uint64 = 0
+        while i < n:
+            buf[i] = tcp_slot_rx_data[rx_base + head]
+            head = head + 1
+            if head >= TCP_RX_BUF:
+                head = 0
+            i = i + 1
+        tcp_slot_rx_head[slot] = head
+        was_full: int32 = 0
+        if avail >= TCP_RX_BUF:
+            was_full = 1
+        tcp_slot_rx_count[slot] = avail - n
+        if was_full != 0 and tcp_slot_state[slot] == TCP_ESTABLISHED:
+            _tcp_build_and_send(slot, TCP_ACK, cast[Ptr[uint8]](0), 0)
+        return cast[int64](n)
+    if tcp_slot_saw_fin[slot] != 0:
+        return -1
+    if tcp_slot_state[slot] == TCP_CLOSED:
+        return -1
+    return 0
+
+
 def tcp_close(slot_signed: int32) -> int32:
     # Active close: send FIN, wait for peer's ACK + FIN, send the
     # final ACK, return to CLOSED. Slot becomes reusable.

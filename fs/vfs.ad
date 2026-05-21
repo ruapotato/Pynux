@@ -150,7 +150,10 @@ from fs.socketpair import (
 # cycle. u_socket_state.ad is the per-socket-fd backing-record store —
 # also a leaf — shared with linux_abi/u_syscalls.ad's socket(2)/
 # connect(2) bodies.
-from drivers.net.tcp import tcp_send, tcp_recv, tcp_close, tcp_listen_close
+from drivers.net.tcp import (
+    tcp_send, tcp_recv, tcp_recv_nb, tcp_slot_at_eof,
+    tcp_close, tcp_listen_close,
+)
 from linux_abi.u_socket_state import (
     usock_record_for_fdbuf, usock_get_state, usock_get_tcp_slot,
     usock_set_state, usock_set_tcp_slot, usock_free,
@@ -1635,6 +1638,56 @@ def _check_fd(fd: int32) -> int32:
     return 0
 
 
+def vfs_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    # Non-blocking read backing SYS_READ_NB. Returns >0 bytes ready,
+    # 0 if the fd is open but momentarily empty ("would block"), or -1
+    # on a true EOF / error. Only the two fd kinds an event-loop daemon
+    # actually polls are special-cased — a connected socket and a pipe
+    # read-end. Every other fd kind has no would-block notion here, so
+    # we just delegate to the blocking vfs_read (a regular file always
+    # has data or is at EOF immediately anyway).
+    rc: int32 = _check_fd(fd)
+    if rc != 0:
+        return cast[int64](rc)
+    task: Ptr[TaskStruct] = current_task()
+    fdu: uint64 = cast[uint64](fd)
+    file_idx: uint32 = task[0].fd_idx[fdu]
+
+    if file_idx == FD_CLOSED_MARK:
+        return -1
+    if file_idx == FD_SOCKET_MARK:
+        sk_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
+        if sk_rec < 0:
+            return -1
+        if usock_get_state(sk_rec) != USOCK_CONNECTED:
+            return -1
+        sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
+        if sk_tcp < 0:
+            return -1
+        # TLS-active sockets have no non-blocking record-layer path;
+        # an event-loop daemon over TLS is out of scope here.
+        if usock_is_tls(sk_rec) != 0:
+            return -1
+        n_sk: int64 = tcp_recv_nb(sk_tcp, buf, count)
+        if n_sk < 0:
+            usock_set_state(sk_rec, USOCK_CLOSED)
+        return n_sk
+    if file_idx == FD_PIPE_MARK_R:
+        # pipe_read is already non-blocking at the fs/pipe.ad layer; a
+        # 0 return there means "empty right now". Distinguish a closed
+        # pipe (no writers left) as a true EOF (-1).
+        slot: int32 = cast[int32](task[0].fd_buf[fdu])
+        n_p: int64 = pipe_read(slot, buf, count)
+        if n_p > 0:
+            return n_p
+        if pipe_writers(slot) == 0:
+            return -1
+        return 0
+    # Anything else: no would-block semantics — fall back to the
+    # ordinary blocking read.
+    return vfs_read(fd, buf, count)
+
+
 def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     rc: int32 = _check_fd(fd)
     if rc != 0:
@@ -1691,12 +1744,19 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # 500 jiffies (~5 s @ HZ=100) blocking budget — generous for a
         # local server, bounded so a dead peer can't wedge the syscall.
         # tcp_recv polls virtio_net internally; on a connected socket
-        # it returns >0 bytes, 0 on peer-FIN-with-no-data (EOF), or -1
-        # on a hard transport error. We latch CLOSED on the EOF/error
-        # answers so a subsequent read short-circuits.
+        # it returns >0 bytes, or 0 on EITHER a peer-FIN-with-no-data
+        # (true EOF) OR a plain timeout-with-no-data. The two answers
+        # are indistinguishable from tcp_recv's return value alone, so
+        # we ask the slot directly: latch CLOSED only when the slot has
+        # genuinely reached end-of-stream. A bare timeout leaves the
+        # socket open so the caller can read again — important for
+        # long-lived interactive servers (user/sshd.ad).
         n_sk: int64 = tcp_recv(sk_tcp, buf, count, 500)
-        if n_sk <= 0:
+        if n_sk < 0:
             usock_set_state(sk_rec, USOCK_CLOSED)
+        elif n_sk == 0:
+            if tcp_slot_at_eof(sk_tcp) != 0:
+                usock_set_state(sk_rec, USOCK_CLOSED)
         return n_sk
     if file_idx == FD_DEVZERO_MARK:
         # /dev/zero hands back `count` zero bytes per request.

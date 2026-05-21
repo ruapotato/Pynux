@@ -121,6 +121,21 @@ sys_read:
     .size sys_read, .-sys_read
 
 
+    /* --- sys_read_nb(fd, buf, count) -> int64 -----------------------
+     * Non-blocking read. Returns >0 bytes ready now, 0 if the fd is
+     * open but momentarily empty ("would block"), or -1 on a true EOF
+     * / error. Lets a single-threaded event-loop daemon (user/sshd.ad)
+     * poll a socket fd and a pipe fd in one task without either read
+     * wedging it. */
+    .globl sys_read_nb
+    .type sys_read_nb, @function
+sys_read_nb:
+    movq    $23, %rax               /* SYS_READ_NB */
+    syscall
+    ret
+    .size sys_read_nb, .-sys_read_nb
+
+
     /* --- sys_open(path) -> int32 ------------------------------------- */
     .globl sys_open
     .type sys_open, @function

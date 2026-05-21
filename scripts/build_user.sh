@@ -132,3 +132,4 @@ build_adder_user apt                  # apt-path V0: fetch + decompress + parse 
 build_adder_user u_server             # U-socket V1: native TCP server (bind/listen/accept smoke test)
 build_adder_user u_tlstest            # U-TLS: native HTTPS client (socket/connect/tls_connect smoke test)
 build_adder_user httpd                # U-socket: static-file HTTP/1.0 server daemon (/bin/httpd)
+build_adder_user sshd                 # SSH-2.0 server daemon: curve25519-sha256 KEX + chacha20-poly1305 + hamsh shell

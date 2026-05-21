@@ -54,7 +54,7 @@ from kernel.sched.core import (
     task_struct_at,
 )
 from fs.vfs import (
-    vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_write,
+    vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_read_nb, vfs_write,
     vfs_close, vfs_lseek, vfs_dup, vfs_dup2, vfs_listdir,
     vfs_unlink, vfs_mkdir, vfs_fd_is_dir, vfs_fd_is_open,
     resolve_path,
@@ -200,6 +200,7 @@ SYS_CHDIR:       uint64 = 19                   # a0=path; returns 0 / -E2BIG
 SYS_GETCWD:      uint64 = 20                   # a0=buf, a1=count; returns bytes (incl NUL)
 SYS_UNLINK:      uint64 = 21                   # a0=path; returns 0 / -errno
 SYS_MKDIR:       uint64 = 22                   # a0=path; real for tmpfs (V1 tree)
+SYS_READ_NB:     uint64 = 23                   # a0=fd, a1=buf, a2=count; non-blocking read: >0 bytes, 0 would-block, -1 EOF/error
 
 # Phase B / M16.93: Plan 9-shape native syscall number block. Reserved
 # 256..274 in docs/native-api.md (Phase B). All but SYS_ERRSTR are
@@ -1263,6 +1264,16 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         if n < 0:
             set_current_errstr("read: bad fd")
         return cast[uint64](n)
+    if nr == SYS_READ_NB:
+        # Non-blocking read. Used by single-threaded event-loop daemons
+        # (user/sshd.ad) that must poll a socket fd and a pipe fd in one
+        # task. Returns >0 bytes ready now, 0 if the fd is open but has
+        # no data this instant ("would block"), or -1 on a true EOF /
+        # error. Unlike SYS_READ this never yields-and-spins; the caller
+        # owns the poll cadence.
+        n: int64 = vfs_read_nb(cast[int32](a0),
+                               cast[Ptr[uint8]](a1), a2)
+        return cast[uint64](n)
     if nr == SYS_CLOSE:
         rc: int32 = vfs_close(cast[int32](a0))
         if rc < 0:
@@ -1384,10 +1395,25 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         parent: Ptr[TaskStruct] = current_task()
         sin:  int32 = cast[int32](a2)
         sout: int32 = cast[int32](a3)
+        # a2 / a3 select the child's stdin / stdout. A value in [0,16)
+        # names a specific parent fd to dup in. -1 means "inherit" —
+        # which has to mean "inherit the PARENT's fd 0 / fd 1", not
+        # "use the global serial default". A shell (hamsh) whose own
+        # stdio is a pipe — e.g. when hamsh itself runs under an SSH
+        # session bridged by user/sshd.ad — must hand that pipe down
+        # to every command it spawns, or the command's output escapes
+        # to the kernel console instead of the SSH channel. Dup-ing
+        # the parent's fd 0/1 is also exactly POSIX fork+exec
+        # behaviour, and on a normal console boot the parent's fd 0/1
+        # ARE the serial console, so this is a no-op there.
         if sin >= 0 and sin < 16:
             dup_fd_to_child(slot, 0, parent, cast[uint64](sin))
+        else:
+            dup_fd_to_child(slot, 0, parent, cast[uint64](0))
         if sout >= 0 and sout < 16:
             dup_fd_to_child(slot, 1, parent, cast[uint64](sout))
+        else:
+            dup_fd_to_child(slot, 1, parent, cast[uint64](1))
         return task_pid_at(slot)
     if nr == SYS_PIPE:
         # Hand a pair of (rfd, wfd) back to the calling task. The
