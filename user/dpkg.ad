@@ -17,10 +17,10 @@
 #
 #   dpkg -i <file.deb>
 #       1. Slurp the .deb into RAM, walk the `ar` table-of-contents,
-#          locate control.tar.gz and data.tar.gz (reusing the proven
-#          dpkg_deb ar-walk + gzip-inflate + ustar-parse code paths).
-#       2. Inflate control.tar.gz, find the `./control` member, and
-#          parse its RFC822-style fields: Package, Version,
+#          locate control.tar.{gz,xz} and data.tar.{gz,xz} (reusing the
+#          proven dpkg_deb ar-walk + decompress + ustar-parse paths).
+#       2. Decompress control.tar.{gz,xz}, find the `./control` member,
+#          and parse its RFC822-style fields: Package, Version,
 #          Architecture, Maintainer, Description. Multi-line
 #          Description continuation lines (lines that begin with a
 #          space) are folded into the Description value.
@@ -28,7 +28,7 @@
 #          dpkg status database: if a stanza for the same Package is
 #          already present it is REPLACED in place; otherwise the new
 #          stanza is appended (see DB path note below).
-#       4. Inflate data.tar.gz, walk its ustar headers, and write (not
+#       4. Decompress data.tar.{gz,xz}, walk its ustar headers, write (not
 #          append — overwrite) the installed-file manifest (one path
 #          per line) to the per-package `<package>.list` file — what
 #          `dpkg -L` reads.
@@ -71,23 +71,30 @@
 # canonical /var/lib/dpkg/{status,info/<pkg>.list} and drop the
 # flatten/truncate logic. The stanza format + parsing stay identical.
 #
-# -- V2 SCOPE (NOT done — V3 backlog) --------------------------------
+# -- SCOPE (NOT done — backlog) --------------------------------------
 #   * `dpkg -r` deregisters a package from the DATABASE only — it does
 #     NOT delete the package's installed files from the filesystem.
-#     V3's real "remove" walks the .list manifest and unlinks each
+#     A real "remove" walks the .list manifest and unlinks each
 #     recorded path before deleting the .list itself.
 #   * No data.tar extraction to the live filesystem — that is
 #     `dpkg-deb -x` (user/dpkg_deb.ad), already shipped. `dpkg -i` here
-#     records metadata only.
+#     records metadata only (control + the installed-file manifest).
 #   * No dependency resolution (Depends/Pre-Depends/Conflicts).
 #   * No maintainer scripts (preinst/postinst/prerm/postrm).
 #   * No conffiles handling, no triggers, no `dpkg --purge`.
-#   * Compression: gzip only (same as dpkg_deb V0); .xz/.zst error out.
+#   * Compression: gzip AND xz (LZMA2) — xz is the modern Debian
+#     default for both control.tar and data.tar, so a real Debian
+#     package now installs. .zst / .bz2 still error out. The xz path
+#     is single-shot (lib/xz/xz.ad): the whole compressed member is in
+#     RAM and the whole decompressed tar fits the 512 KiB tar_buf,
+#     which a real *small* package's data.tar does (debian's `hello`
+#     decompresses to ~256 KiB). A package whose data.tar exceeds the
+#     cap needs streaming xz — deferred until a real install needs it.
 #   * The -l/-s/-L query sub-commands are shipped (see the QUERY
-#     section). What is still V3 there: -l column alignment is naive
+#     section). Still backlog: -l column alignment is naive
 #     single-space padding (no fixed-width columns), and -s/-L key the
 #     status DB / .list paths off the flattened tmpfs names — they
-#     follow the same V3 path migration as -i.
+#     follow the same path migration as -i.
 #
 # -- V2 DONE (was V1 backlog) ----------------------------------------
 #   * Dedup/replace on `dpkg -i`: a re-install of the same Package now
@@ -105,6 +112,18 @@ from lib.zlib.inflate import (
     InflateState,
     inflate_init,
     inflate_feed,
+)
+
+# xz/LZMA2 decompressor. Modern Debian compresses a `.deb`'s
+# `control.tar` and `data.tar` members with xz (LZMA2) — `data.tar.xz`
+# is the near-universal default. V3 routes a `.tar.xz` member through
+# xz_decompress() the same single-shot way the gzip `.gz` path uses
+# inflate_feed; see `_decompress_tar`. A real small package
+# (debian's `hello`: data.tar.xz decompresses to ~256 KiB) sits inside
+# the 512 KiB tar_buf, so the single-shot xz path suffices — no
+# streaming-xz rewrite is needed for this milestone.
+from lib.xz.xz import (
+    xz_decompress,
 )
 
 extern def sys_open(path: Ptr[char]) -> int32
@@ -142,18 +161,29 @@ fld_arch:     Array[256, uint8]
 fld_maint:    Array[512, uint8]
 fld_desc:     Array[2048, uint8]
 
+# In-RAM caps for the status DB and per-package file manifest. tmpfs
+# files cap at TMPFS_FILE_CAP (512 KiB), so these are the apt-path
+# limits, not the filesystem's. A real small Debian package (`hello`)
+# carries ~143 data.tar entries — its `.list` manifest is ~4.5 KiB, so
+# the 4 KiB the V2 code used would have silently truncated it; 64 KiB
+# holds a real small-package manifest with comfortable headroom. The
+# status DB grows by one stanza per installed package, so it is sized
+# for a modest set of installed packages.
+STATUS_CAP: uint64 = 65536     # in-RAM status-DB cap
+LIST_CAP:   uint64 = 65536     # in-RAM per-package .list manifest cap
+
 # The Debian stanza we assemble before writing it to the status DB.
 stanza_buf: Array[4096, uint8]
 
 # Read-modify-write scratch for the append-to-status path: tmpfs has
 # no O_APPEND, so we read the current status file, then rewrite it
-# with the new stanza concatenated. Capped at TMPFS_FILE_CAP (4096).
-status_buf: Array[4096, uint8]
+# with the new stanza concatenated. Capped at STATUS_CAP.
+status_buf: Array[65536, uint8]
 
 # Composed file-list path ( /tmp/dpkg.<pkg>.list ) and the manifest
-# body ( one path per line ).
+# body ( one path per line ). Capped at LIST_CAP.
 list_path:  Array[64, uint8]
-list_buf:   Array[4096, uint8]
+list_buf:   Array[65536, uint8]
 
 # Scratch for the query sub-commands (-l/-s/-L): a single extracted
 # field value (Package/Version/Architecture/Description) lifted out of
@@ -227,13 +257,21 @@ def _ar_member_name_starts_with(hdr: Ptr[uint8], want: Ptr[uint8],
     return 1
 
 
-# _ar_find_tar_gz(stem, stem_len, deb_len, out_size) — returns the
-# byte offset of "<stem>.tar.gz"'s body inside deb_buf (+ its size via
-# out_size), -1 if no "<stem>.tar.<comp>" member exists, -2 if found
-# but with unsupported compression.
+# Compression type codes for the located `.tar.<comp>` member.
+COMP_GZ: int32 = 0       # .tar.gz   — DEFLATE  (lib/zlib/inflate.ad)
+COMP_XZ: int32 = 1       # .tar.xz   — LZMA2    (lib/xz/xz.ad)
 
-def _ar_find_tar_gz(stem: Ptr[uint8], stem_len: uint64,
-                    deb_len: uint64, out_size: Ptr[uint64]) -> int64:
+# _ar_find_tar(stem, stem_len, deb_len, out_size, out_comp) — returns
+# the byte offset of "<stem>.tar.<comp>"'s body inside deb_buf (+ its
+# size via out_size, + the compression code via out_comp). V3 supports
+# both `.gz` (gzip/DEFLATE) and `.xz` (LZMA2) — `.xz` is the modern
+# Debian default for both control.tar and data.tar. Returns -1 if no
+# "<stem>.tar.<comp>" member exists, -2 if found but with a
+# compression V3 still does not support (.zst / .bz2 / uncompressed).
+
+def _ar_find_tar(stem: Ptr[uint8], stem_len: uint64,
+                 deb_len: uint64, out_size: Ptr[uint64],
+                 out_comp: Ptr[int32]) -> int64:
     if deb_len < 8:
         write_str(2, "dpkg: file too short for ar magic\n")
         return -1
@@ -273,27 +311,42 @@ def _ar_find_tar_gz(stem: Ptr[uint8], stem_len: uint64,
             return -1
 
         if _ar_member_name_starts_with(hdr, &path_buf[0], prefix_len) != 0:
+            # The byte after "<stem>.tar" is the extension dot, or a
+            # name TERMINATOR. The terminator is convention-dependent:
+            # the SysV `ar` variant ends a name with '/', the GNU/BSD
+            # variant (which modern `ar`, hence real Debian `.deb`s,
+            # uses) just space-pads. So an uncompressed ".tar" member
+            # has its name end in '/' OR ' ' here, and a compressed
+            # ".tar.<ext>" member has its extension chars likewise
+            # followed by '/' OR ' '. Earlier dpkg only accepted '/',
+            # which silently rejected every real (GNU-ar) Debian .deb.
             cN: uint8 = hdr[prefix_len]
-            if cN == 47:                                # '/'
-                write_str(2, "dpkg: uncompressed .tar not supported (V1 expects .tar.gz)\n")
+            if cN == 47 or cN == 32:                    # '/' or ' '
+                write_str(2, "dpkg: uncompressed .tar not supported (V3 expects .tar.gz/.xz)\n")
                 return -1
             if cN == 46:
                 ext0: uint8 = hdr[prefix_len + 1]
                 ext1: uint8 = hdr[prefix_len + 2]
                 ext2: uint8 = hdr[prefix_len + 3]
-                if ext0 == 103 and ext1 == 122 and ext2 == 47:   # gz/
+                # 2-char extensions (gz, xz): ext2 is the terminator.
+                term2_ok: int32 = 0
+                if ext2 == 47 or ext2 == 32 or prefix_len + 3 >= 16:
+                    term2_ok = 1
+                if ext0 == 103 and ext1 == 122 and term2_ok != 0:    # "gz"
                     out_size[0] = body_sz
+                    out_comp[0] = COMP_GZ
                     return cast[int64](body)
-                if ext0 == 120 and ext1 == 122 and ext2 == 47:   # xz/
-                    write_str(2, "dpkg: unsupported compression: .xz; V1 supports .gz only\n")
+                if ext0 == 120 and ext1 == 122 and term2_ok != 0:    # "xz"
+                    out_size[0] = body_sz
+                    out_comp[0] = COMP_XZ
+                    return cast[int64](body)
+                if ext0 == 122 and ext1 == 115 and ext2 == 116:  # "zst"
+                    write_str(2, "dpkg: unsupported compression: .zst; V3 supports .gz and .xz\n")
                     return -2
-                if ext0 == 122 and ext1 == 115 and ext2 == 116:  # zst
-                    write_str(2, "dpkg: unsupported compression: .zst; V1 supports .gz only\n")
+                if ext0 == 98 and ext1 == 122 and ext2 == 50:    # "bz2"
+                    write_str(2, "dpkg: unsupported compression: .bz2; V3 supports .gz and .xz\n")
                     return -2
-                if ext0 == 98 and ext1 == 122 and ext2 == 50:    # bz2
-                    write_str(2, "dpkg: unsupported compression: .bz2; V1 supports .gz only\n")
-                    return -2
-                write_str(2, "dpkg: unknown .tar compression extension; V1 supports .gz only\n")
+                write_str(2, "dpkg: unknown .tar compression extension; V3 supports .gz and .xz\n")
                 return -2
 
         off = body + body_sz
@@ -358,9 +411,29 @@ def _name_copy_nul(dst: Ptr[uint8], src: Ptr[uint8], maxlen: uint64) -> uint64:
     return i
 
 
-# -- gzip inflate the named tar.gz body into tar_buf -------------------
+# -- decompress the located tar member into tar_buf --------------------
+#
+# Dispatches on the compression code _ar_find_tar reported: COMP_GZ
+# routes through the gzip inflater (lib/zlib/inflate.ad), COMP_XZ
+# through the single-shot xz/LZMA2 decompressor (lib/xz/xz.ad). Both
+# write the decompressed ustar bytes into tar_buf and return the
+# decompressed byte count, or -1 on a decompression error.
 
-def _inflate_tar(in_ptr: Ptr[uint8], in_len: uint64) -> int64:
+def _decompress_tar(in_ptr: Ptr[uint8], in_len: uint64,
+                    comp: int32) -> int64:
+    if comp == COMP_XZ:
+        # Single-shot xz: the whole compressed member is in RAM and the
+        # whole decompressed tar fits tar_buf (a small real package's
+        # data.tar decompresses well inside 512 KiB).
+        drc: int64 = xz_decompress(in_ptr, in_len, &tar_buf[0], TAR_CAP)
+        if drc < 0:
+            if drc == -4:
+                write_str(2, "dpkg: data/control.tar.xz exceeds 512 KiB cap (V3 limit)\n")
+            else:
+                write_str(2, "dpkg: xz decompress failed (corrupt or truncated)\n")
+            return -1
+        return drc
+    # COMP_GZ: gzip / DEFLATE.
     inflate_init(&inf_state)
     out_consumed: uint64 = 0
     in_consumed: uint64 = 0
@@ -704,8 +777,8 @@ def _load_status_db() -> uint64:
     old_len: uint64 = 0
     rfd: int32 = sys_open(db_path)
     if rfd >= 0:
-        while old_len < 4096:
-            room: uint64 = 4096 - old_len
+        while old_len < STATUS_CAP:
+            room: uint64 = STATUS_CAP - old_len
             ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&status_buf[0]) + old_len)
             n: int64 = sys_read(rfd, ptr, room)
             if n <= 0:
@@ -787,8 +860,8 @@ def _write_status(stanza_len: uint64) -> int32:
     if have_old != 0:
         old_span_len = old_end - old_start
     new_total: uint64 = old_len - old_span_len + stanza_len
-    if new_total > 4096:
-        write_str(2, "dpkg: status DB would exceed tmpfs 4 KiB cap (V2 limit)\n")
+    if new_total > STATUS_CAP:
+        write_str(2, "dpkg: status DB would exceed the in-RAM status cap (V3 limit)\n")
         return -1
 
     wfd: int32 = sys_open_write(db_path)
@@ -913,11 +986,11 @@ def _write_file_list(data_tar_len: uint64) -> int64:
 
         if record != 0:
             i: uint64 = 0
-            while warn_buf[i] != 0 and mlen + 1 < 4096:
+            while warn_buf[i] != 0 and mlen + 1 < LIST_CAP:
                 list_buf[mlen] = warn_buf[i]
                 mlen = mlen + 1
                 i = i + 1
-            if mlen + 1 < 4096:
+            if mlen + 1 < LIST_CAP:
                 list_buf[mlen] = 10                     # '\n'
                 mlen = mlen + 1
             count = count + 1
@@ -968,8 +1041,8 @@ def _read_status_db() -> int64:
     if rfd < 0:
         return -1
     total: uint64 = 0
-    while total < 4096:
-        room: uint64 = 4096 - total
+    while total < STATUS_CAP:
+        room: uint64 = STATUS_CAP - total
         ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&status_buf[0]) + total)
         n: int64 = sys_read(rfd, ptr, room)
         if n <= 0:
@@ -1150,8 +1223,8 @@ def _do_files(pkg: Ptr[uint8]) -> int32:
         write_str(2, "' is not installed\n")
         return 1
     total: uint64 = 0
-    while total < 4096:
-        room: uint64 = 4096 - total
+    while total < LIST_CAP:
+        room: uint64 = LIST_CAP - total
         ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](&list_buf[0]) + total)
         n: int64 = sys_read(fd, ptr, room)
         if n <= 0:
@@ -1260,14 +1333,17 @@ def _do_install(deb_path: Ptr[char]) -> int32:
         return 1
     deb_len: uint64 = cast[uint64](deb_len_i)
 
-    # 2. Locate + inflate control.tar.gz, parse the control file.
+    # 2. Locate + decompress control.tar.{gz,xz}, parse the control
+    #    file. _ar_find_tar reports the compression code so
+    #    _decompress_tar can route gzip vs. xz.
     ctl_member_size: uint64 = 0
-    ctl_off_i: int64 = _ar_find_tar_gz(cast[Ptr[uint8]]("control"), 7,
-                                       deb_len, &ctl_member_size)
+    ctl_comp: int32 = COMP_GZ
+    ctl_off_i: int64 = _ar_find_tar(cast[Ptr[uint8]]("control"), 7,
+                                    deb_len, &ctl_member_size, &ctl_comp)
     if ctl_off_i < 0:
         return 1
-    ctl_tar_i: int64 = _inflate_tar(&deb_buf[cast[uint64](ctl_off_i)],
-                                    ctl_member_size)
+    ctl_tar_i: int64 = _decompress_tar(&deb_buf[cast[uint64](ctl_off_i)],
+                                       ctl_member_size, ctl_comp)
     if ctl_tar_i < 0:
         return 1
     ctl_body_len: uint64 = 0
@@ -1286,17 +1362,19 @@ def _do_install(deb_path: Ptr[char]) -> int32:
     if _write_status(stanza_len) != 0:
         return 1
 
-    # 4. Locate + inflate data.tar.gz, write the per-package file list.
-    #    NOTE: this re-inflates into the SAME tar_buf, clobbering the
-    #    control tar — fine, because _parse_control already copied the
-    #    five fields we need into the fld_* buffers.
+    # 4. Locate + decompress data.tar.{gz,xz}, write the per-package
+    #    file list. NOTE: this re-decompresses into the SAME tar_buf,
+    #    clobbering the control tar — fine, because _parse_control
+    #    already copied the five fields we need into the fld_* buffers.
     data_member_size: uint64 = 0
-    data_off_i: int64 = _ar_find_tar_gz(cast[Ptr[uint8]]("data"), 4,
-                                        deb_len, &data_member_size)
+    data_comp: int32 = COMP_GZ
+    data_off_i: int64 = _ar_find_tar(cast[Ptr[uint8]]("data"), 4,
+                                     deb_len, &data_member_size,
+                                     &data_comp)
     if data_off_i < 0:
         return 1
-    data_tar_i: int64 = _inflate_tar(&deb_buf[cast[uint64](data_off_i)],
-                                     data_member_size)
+    data_tar_i: int64 = _decompress_tar(&deb_buf[cast[uint64](data_off_i)],
+                                        data_member_size, data_comp)
     if data_tar_i < 0:
         return 1
     nfiles_i: int64 = _write_file_list(cast[uint64](data_tar_i))

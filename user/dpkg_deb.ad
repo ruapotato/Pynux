@@ -20,9 +20,14 @@
 #       path: ..." rather than dumped to stdout — `-c` mirrors what
 #       `-x` would do, which is informational by design).
 #
-# V0.1 SCOPE (documented up front so the next agent knows where to pick up):
-#   - Compression: gzip only. `.xz` and `.zst` produce a loud error
-#     to stderr + non-zero rc (V1 hooks in xz/zstd decoders).
+# SCOPE (documented up front so the next agent knows where to pick up):
+#   - Compression: gzip AND xz (LZMA2). A `.tar.xz` member — the modern
+#     Debian default for both control.tar and data.tar — is routed
+#     through lib/xz/xz.ad's single-shot xz_decompress(). `.zst` and
+#     `.bz2` still produce a loud error to stderr + non-zero rc. The xz
+#     path is single-shot: the whole compressed member is in RAM and
+#     the whole decompressed tar must fit the 512 KiB tar_buf, which a
+#     real *small* package's data.tar does.
 #   - Tar types: regular ('0'/'\0') + directory ('5') extracted.
 #     Symlinks ('2') and other typeflags (hardlink/device/etc.) are
 #     skipped with a one-line warning on stderr. The extraction does
@@ -61,6 +66,16 @@ from lib.zlib.inflate import (
     InflateState,
     inflate_init,
     inflate_feed,
+)
+
+# xz/LZMA2 decompressor. Modern Debian compresses a `.deb`'s
+# control.tar / data.tar members with xz — `data.tar.xz` is the
+# near-universal default — so without this dpkg-deb could only ever
+# operate on host-fabricated `.gz` test fixtures, never a genuine
+# Debian package. A `.tar.xz` member is routed through xz_decompress()
+# the same single-shot way the `.gz` path uses inflate_feed.
+from lib.xz.xz import (
+    xz_decompress,
 )
 
 extern def sys_open(path: Ptr[char]) -> int32
@@ -366,15 +381,22 @@ def _write_full(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
 
 # -- ar walk -----------------------------------------------------------------
 #
-# _ar_find_tar_gz(stem, stem_len, ...) returns the byte-offset of the
-# "<stem>.tar.gz" member's body within deb_buf (+ writes its size to
-# *out_size), or -1 if no "<stem>.tar.<comp>" member was found, or -2
-# if found but with unsupported compression (.xz / .zst / .bz2). The
-# caller passes a name stem like "data" or "control" (no trailing dot
-# or slash).
+# Compression-type codes for the located `.tar.<comp>` member.
+COMP_GZ: int32 = 0       # .tar.gz   — DEFLATE  (lib/zlib/inflate.ad)
+COMP_XZ: int32 = 1       # .tar.xz   — LZMA2    (lib/xz/xz.ad)
+
+# _ar_find_tar_gz(stem, stem_len, ..., out_comp) returns the
+# byte-offset of the "<stem>.tar.<comp>" member's body within deb_buf
+# (+ writes its size to *out_size and its compression code to
+# *out_comp), or -1 if no "<stem>.tar.<comp>" member was found, or -2
+# if found but with a compression still unsupported (.zst / .bz2 /
+# uncompressed). Both `.gz` (gzip) and `.xz` (LZMA2) are supported.
+# The caller passes a name stem like "data" or "control" (no trailing
+# dot or slash).
 
 def _ar_find_tar_gz(stem: Ptr[uint8], stem_len: uint64,
-                    deb_len: uint64, out_size: Ptr[uint64]) -> int64:
+                    deb_len: uint64, out_size: Ptr[uint64],
+                    out_comp: Ptr[int32]) -> int64:
     # Verify global magic.
     if deb_len < 8:
         write_str(2, "dpkg-deb: file too short for ar magic\n")
@@ -422,34 +444,46 @@ def _ar_find_tar_gz(stem: Ptr[uint8], stem_len: uint64,
         if _ar_member_name_starts_with(hdr,
                                        &path_buf[0],
                                        prefix_len) != 0:
-            # The char after the stem.tar prefix is either '/' (= bare
-            # "<stem>.tar/" — uncompressed, rare) or '.' (= ".<ext>/").
+            # The byte after the "<stem>.tar" prefix is the extension
+            # dot, or a name TERMINATOR. The terminator is convention-
+            # dependent: SysV `ar` ends a name with '/', the GNU/BSD
+            # variant (which modern `ar`, hence real Debian `.deb`s,
+            # uses) just space-pads. So an uncompressed ".tar" member
+            # ends in '/' OR ' ', and a compressed ".tar.<ext>" member
+            # has its extension chars followed by '/' OR ' '. Earlier
+            # dpkg-deb only accepted '/' — which silently rejected
+            # every real (GNU-ar) Debian .deb.
             cN: uint8 = hdr[prefix_len]
-            if cN == 47:                                # '/'
-                write_str(2, "dpkg-deb: uncompressed .tar not supported (V0 expects .tar.gz)\n")
+            if cN == 47 or cN == 32:                    # '/' or ' '
+                write_str(2, "dpkg-deb: uncompressed .tar not supported (expects .tar.gz/.xz)\n")
                 return -1
             if cN == 46:
-                # Read up to the trailing '/' (SysV terminator).
                 ext0: uint8 = hdr[prefix_len + 1]
                 ext1: uint8 = hdr[prefix_len + 2]
                 ext2: uint8 = hdr[prefix_len + 3]
-                # .tar.gz/  -> ext0='g', ext1='z', ext2='/'
-                if ext0 == 103 and ext1 == 122 and ext2 == 47:
+                # 2-char extensions (gz, xz): ext2 is the terminator.
+                term2_ok: int32 = 0
+                if ext2 == 47 or ext2 == 32 or prefix_len + 3 >= 16:
+                    term2_ok = 1
+                # .tar.gz  -> ext0='g', ext1='z'
+                if ext0 == 103 and ext1 == 122 and term2_ok != 0:
                     out_size[0] = body_sz
+                    out_comp[0] = COMP_GZ
                     return cast[int64](body)
-                # .tar.xz/
-                if ext0 == 120 and ext1 == 122 and ext2 == 47:
-                    write_str(2, "dpkg-deb: unsupported compression: .xz; V0 supports .gz only\n")
-                    return -2
-                # .tar.zst/  (4 chars: 'z' 's' 't' '/')
+                # .tar.xz
+                if ext0 == 120 and ext1 == 122 and term2_ok != 0:
+                    out_size[0] = body_sz
+                    out_comp[0] = COMP_XZ
+                    return cast[int64](body)
+                # .tar.zst  (3-char extension: 'z' 's' 't')
                 if ext0 == 122 and ext1 == 115 and ext2 == 116:
-                    write_str(2, "dpkg-deb: unsupported compression: .zst; V0 supports .gz only\n")
+                    write_str(2, "dpkg-deb: unsupported compression: .zst; supports .gz and .xz\n")
                     return -2
-                # .tar.bz2/
+                # .tar.bz2
                 if ext0 == 98 and ext1 == 122 and ext2 == 50:
-                    write_str(2, "dpkg-deb: unsupported compression: .bz2; V0 supports .gz only\n")
+                    write_str(2, "dpkg-deb: unsupported compression: .bz2; supports .gz and .xz\n")
                     return -2
-                write_str(2, "dpkg-deb: unknown .tar compression extension; V0 supports .gz only\n")
+                write_str(2, "dpkg-deb: unknown .tar compression extension; supports .gz and .xz\n")
                 return -2
 
         # Advance to next member: skip body + 1-byte pad if body_sz is odd.
@@ -461,13 +495,26 @@ def _ar_find_tar_gz(stem: Ptr[uint8], stem_len: uint64,
     return -1
 
 
-# -- gzip-inflate the data.tar.gz body into tar_buf --------------------------
+# -- decompress the located tar member into tar_buf --------------------------
 
-def _inflate_data_tar(in_ptr: Ptr[uint8], in_len: uint64) -> int64:
-    # One-shot inflate. We have the entire compressed buffer in RAM
-    # and the entire output buffer (tar_buf) sized to fit a small
-    # package's worth of plaintext. Returns the inflated byte count
-    # on success, -1 on inflate error.
+def _inflate_data_tar(in_ptr: Ptr[uint8], in_len: uint64,
+                      comp: int32) -> int64:
+    # One-shot decompress. We have the entire compressed buffer in RAM
+    # and the output buffer (tar_buf) sized to fit a small package's
+    # worth of plaintext. Dispatches on the compression code
+    # _ar_find_tar_gz reported: gzip via inflate_feed, xz via
+    # xz_decompress. Returns the decompressed byte count on success,
+    # -1 on a decompression error.
+    if comp == COMP_XZ:
+        drc: int64 = xz_decompress(in_ptr, in_len, &tar_buf[0], TAR_CAP)
+        if drc < 0:
+            if drc == -4:
+                write_str(2, "dpkg-deb: .tar.xz exceeds the 512 KiB tar cap\n")
+            else:
+                write_str(2, "dpkg-deb: xz decompress failed (corrupt or truncated)\n")
+            return -1
+        return drc
+    # COMP_GZ: gzip / DEFLATE.
     inflate_init(&inf_state)
     out_consumed: uint64 = 0
     in_consumed: uint64 = 0
@@ -837,14 +884,17 @@ def _load_and_inflate(deb_path: Ptr[char],
     deb_len: uint64 = cast[uint64](deb_len_i)
 
     member_size: uint64 = 0
-    member_off_i: int64 = _ar_find_tar_gz(stem, stem_len, deb_len, &member_size)
+    member_comp: int32 = COMP_GZ
+    member_off_i: int64 = _ar_find_tar_gz(stem, stem_len, deb_len,
+                                          &member_size, &member_comp)
     if member_off_i == -2:
         return 1                                        # unsupported comp
     if member_off_i < 0:
         return 1
     member_off: uint64 = cast[uint64](member_off_i)
 
-    tar_len_i: int64 = _inflate_data_tar(&deb_buf[member_off], member_size)
+    tar_len_i: int64 = _inflate_data_tar(&deb_buf[member_off], member_size,
+                                         member_comp)
     if tar_len_i < 0:
         return 1
     out_tar_len[0] = cast[uint64](tar_len_i)
