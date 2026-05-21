@@ -155,8 +155,11 @@ Concretely this means closing four named gates:
    into `http_get` so real `Packages.gz` decompresses transparently.
    The apt-glue (Release → Packages.gz → .deb → dpkg) is now built
    too: a native `apt` runs the whole chain over HTTP and HTTPS in
-   QEMU. Outstanding before a real-world `apt update` against a live
-   Debian mirror: `Release`/`InRelease` GPG signature verification.
+   QEMU. It now also streams a real `main`-sized index, decompresses
+   gzip **and xz**, and verifies the `Release`/`InRelease` OpenPGP
+   signature (RSA PKCS#1 v1.5, SHA-512, multi-key keyrings) against a
+   baked Debian-archive key — the end-to-end run against a live
+   `deb.debian.org` mirror is the remaining exercise.
 3. **USB HID continuous polling** so a real `sendkey x` keystroke
    reaches hamsh stdin. **Closed structurally** in M16.139 V0/V1/V2
    (xHCI controller + transfer engine + interrupt-IN timer-tick poll
@@ -166,11 +169,11 @@ Concretely this means closing four named gates:
    keystroke reaches the kbd FIFO through EHCI under QEMU `usb-ehci` +
    `usb-kbd`. Not yet exercised on the real Asus, where the built-in
    keyboard remains the open hardware blocker.
-4. **Inbound SSH.** Not yet started. The crypto primitives are in
-   place (ChaCha20-Poly1305, AES-128-GCM, X25519, SHA-256, ECDSA-P256,
-   RSA-PSS, the inflater, the validated TLS stack), but the SSH
-   protocol layer itself doesn't exist yet. Once present, "useful
-   server OS" is functionally demonstrated.
+4. **Inbound SSH.** Shipped — `user/sshd.ad`, a native-Adder SSH-2.0
+   server: curve25519-sha256 KEX, ECDSA-P256 host key,
+   chacha20-poly1305 cipher, password auth, and an interactive session
+   channel — `ssh` in, run a command, see its output. "Useful server
+   OS" is functionally demonstrated.
 
 Stack-canary compiler hardening (`-fstack-protector-strong` equivalent)
 has landed (`f9d8d2f`) — it catches the class of stack-local overflow
@@ -190,9 +193,8 @@ beyond MVP.
 | **TLS cert validation** | **Closed** — apt-over-HTTPS against LE-signed mirrors is MITM-resistant | Full chain validation V0..V7: ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify, ECDSA-P256 verify, PKCS#1 v1.5 verify, chain builder + CA store + validity window, CertificateVerify transcript binding per RFC 8446 §4.4.3, multi-record handshake stitching, TCP per-slot RX ring. V6 added the AES-256-GCM-SHA384 cipher suite (codepoint 0x1302) + SHA-384; V6.1/V7 fixed ISRG Root X1 / RSA-4096 chain validation (x509 SPKI buffer cap + bigint limb count). Remaining real-world fragilities: (a) no CRL/OCSP (intentional per RFC 5280 §6 — out of scope); (b) timing-channel hardening still pending in primitives; (c) `_tls_now_unix` falls back to a build epoch when RTC is unavailable, opening a clock-rolled-back attack on expired certs. |
 | **Real-hardware keyboard** | Open blocker | Hamnix boots to `hamsh` on the real Asus laptop, but the built-in keyboard produces nothing. The atkbd path got an i8042 controller bring-up handshake + IRQ 1 wiring + an ISA-edge IOAPIC redirect fix (`dbd40e6`), all confirmed under QEMU; on the real laptop the keyboard still does not respond. Leading hypothesis: the keyboard is on the EHCI USB 2.0 controller, not the i8042. A native-Adder EHCI driver has since landed (V0 probe/port-enum, V1 control transfers + HID boot keyboard, V2 interrupt-driven delivery) — all verified under QEMU `usb-ehci` + `usb-kbd`, but **not yet tested on the real Asus**. |
 | **UEFI real-hardware boot** | Not re-confirmed | UEFI direct boot reaches `hamsh` under QEMU+OVMF. Legacy/BIOS boot is confirmed on the real Asus; the UEFI path on that laptop has not been re-verified after the M16.151–156 wave. |
-| **`apt` against a live Debian mirror** | Works in QEMU vs. a fixture repo; not run vs. a live mirror | A native `apt` (`update`/`show`/`pkgnames`/`install` with transitive `Depends:` + SHA-256 verify, over HTTP **and HTTPS** via `tls_connect(2)`) is verified under QEMU against a local fake Debian repo. A real `apt update` against `deb.debian.org` is not yet exercised — and the `Release`/`InRelease` GPG signature is not verified, so the index is currently trusted on transport security alone. |
+| **`apt` against a live Debian mirror** | Streaming + xz + GPG-verify all in; live `deb.debian.org` run in progress | A native `apt` (`update`/`show`/`pkgnames`/`install` with transitive `Depends:` + SHA-256 verify, over HTTP **and HTTPS**) streams a real `main`-sized index with no fixed-buffer cap, decompresses gzip **and xz**, and verifies the `Release`/`InRelease` OpenPGP signature (RSA PKCS#1 v1.5, SHA-512, multi-key keyrings) against a baked Debian-archive key — a tampered or unsigned index is rejected. The end-to-end exercise against the genuine `deb.debian.org` `main` suite is the remaining step. |
 | **apt/dpkg/httpd under a namespace** | Open — global-path debt | The native `apt`/`dpkg`/`httpd` tools still write *global* paths (a global `/var` tmpfs, `/tmp/...`). Per the Namespace law they must run *under* `nsrun` so `/var/lib/dpkg`, `/var/cache/apt`, `/var/www` resolve through a private `distrofs` namespace. `distrofs` + `nsrun` exist; migrating the tools onto them is open work. |
-| **Inbound SSH** | Not yet started | Needed for "useful server OS" but no SSH protocol code exists. Crypto primitives are in place (ChaCha20-Poly1305, AES-128/256-GCM, X25519, SHA-256/384, ECDSA-P256, RSA-PSS); the SSH layer itself isn't. |
 | **busybox `ls` enumeration** | Open XFAIL | CPython 3.11.10 and busybox 1.36 run as musl static-PIE binaries in QEMU; `python3 -c` and a multi-applet `busybox sh` pipeline pass. But `busybox ls` directory enumeration prints nothing — musl's `opendir`/`readdir` round-trip the directory fd incorrectly (a direct `getdents64` syscall enumerates fine). busybox `sh`'s *internal* pipeline (`sh -c "a \| b"`) also trips a `#GP`. Both are marked XFAIL in the U-track tests. |
 Compiler bugs that surfaced during development have landed proper
 fixes — do not work around them: the U9 nested-frame `Array` spill,

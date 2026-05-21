@@ -395,12 +395,11 @@ follow-ups:
 - HTTP header continuation lines (folded headers, RFC 9112 §5.2) and
   a header block spanning multiple `tcp_recv` chunks (the parser
   punts past a 4 KiB scratch today).
-- sshd prerequisites now read: (1) passive-open ready; (2) crypto
-  primitives — done (SHA-256/384, X25519, ChaCha20-Poly1305,
-  AES-128/256-GCM, ECDSA-P256, RSA-PSS); (3) a real PRNG — done
-  (ChaCha20 CSPRNG keyed off RDSEED/RDRAND); (4) RSA / Ed25519
-  host-key parser + verifier; (5) a `/etc/passwd`-shaped auth table
-  or PAM-equivalent stub. The SSH protocol layer itself is unwritten.
+- sshd has SHIPPED (`user/sshd.ad`) — native-Adder SSH-2.0:
+  curve25519-sha256 KEX, ECDSA-P256 host key, chacha20-poly1305,
+  password auth, an interactive session channel. Open follow-ups:
+  publickey auth, a generated (not build-constant) host key, an
+  RFC 6979 deterministic nonce for the host-key signature.
 The Intel e1000e and Realtek r8169 NIC drivers have shipped with TX +
 MSI single-vector paths (V1/V2). Open follow-ups:
 
@@ -568,14 +567,9 @@ mode (M16.156). Open follow-ups:
 - **Drop the FAT12 32 MiB ESP cap** by conditionally using the
   GPT-ESP direct-mount path modern OVMF supports — eliminates the
   ceiling on initramfs growth.
-- **`apt` against a live Debian mirror** — the native `apt`
-  (`update`/`show`/`pkgnames`/`install` with transitive `Depends:`
-  + SHA-256 verify, over HTTP and HTTPS) is verified under QEMU
-  against a local fixture repo. Run it against a real mirror
-  (`deb.debian.org`). Blocked behind the next item.
-- **`apt` `Release`/`InRelease` GPG signature verification.** apt
-  currently trusts the repo index on transport security (HTTPS +
-  cert validation) alone — it does not verify the detached GPG
-  signature on `Release` / the inline-signed `InRelease`. A real
-  `apt update` against an untrusted mirror needs an OpenPGP
-  signature verifier + a baked Debian-archive keyring.
+- **`apt` against a live Debian mirror** — the native `apt` streams a
+  real `main`-sized index, decompresses gzip + xz, and verifies the
+  `Release`/`InRelease` OpenPGP signature (RSA PKCS#1 v1.5, SHA-512,
+  multi-key keyrings) against a baked Debian-archive key. The
+  end-to-end run against the genuine `deb.debian.org` `main` suite is
+  the remaining exercise.
