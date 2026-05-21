@@ -1,0 +1,171 @@
+# tests/test_inflate_realgz.ad
+#
+# OFFLINE repro for the streaming gzip inflater against a *real*
+# Debian `main/Packages.gz`. The genuine deb.debian.org index is a
+# single-member standard gzip (flg=0x00, xfl=2, ~50 MB decompressed)
+# and the small synthetic fixtures in tests/test_inflate.ad did NOT
+# catch the cross-chunk dynamic-header resume bug — only a real file,
+# fed in chunks, exercises a chunk boundary landing inside a
+# dynamic-Huffman header's run-length-encoded code-length list.
+#
+# DESIGN — deterministic, no network:
+#   scripts/test_inflate_realgz.sh fetches the real Packages.gz on the
+#   host once, bakes it onto a virtio-blk ext4 disk image (a disk
+#   image holds tens of MB without bloating the kernel/initramfs),
+#   boots Hamnix with that disk attached (kernel auto-mounts ext4 at
+#   /ext), and runs this binary. We read /ext/Packages.gz in 64 KiB
+#   chunks — exactly how user/apt.ad drains a chunked HTTP body — and
+#   feed each chunk to inflate_feed. The inflater verifies the gzip
+#   trailer's CRC32 + ISIZE internally, so a final rc==1 is proof the
+#   entire ~50 MB stream inflated byte-correct.
+#
+# PASS criterion: "[realgz] PASS" in the serial log.
+# On failure we print the exact phase / byte offset so a regression
+# is debuggable from the log alone.
+
+from lib.zlib.inflate import (
+    InflateState,
+    inflate_init,
+    inflate_feed,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+
+
+# -- tiny printer ------------------------------------------------------------
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _wstr(s: Ptr[uint8]):
+    sys_write(1, s, _strlen(s))
+
+
+def _wdec(value: uint64):
+    if value == 0:
+        sys_write(1, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(1, &out[0], i)
+
+
+# -- buffers (top-level — InflateState alone is ~40 KiB; an in_buf
+#    and out_buf on the stack would spill the userland stack) ----------------
+
+INBUF_BYTES:  uint64 = 65536    # one socket-drain-shaped input chunk
+OUTBUF_BYTES: uint64 = 65536    # one inflate-output staging chunk
+
+state:   InflateState
+in_buf:  Array[65536, uint8]
+out_buf: Array[65536, uint8]
+
+
+def main() -> int32:
+    _wstr("[realgz] start\n")
+
+    fd: int32 = sys_open("/ext/Packages.gz")
+    if fd < 0:
+        _wstr("[realgz] FAIL: cannot open /ext/Packages.gz\n")
+        return 1
+
+    inflate_init(&state)
+
+    total_in:  uint64 = 0      # compressed bytes fed
+    total_out: uint64 = 0      # decompressed bytes produced
+    done:      int32  = 0
+    err:       int32  = 0
+
+    # Outer loop: pull one input chunk off the file, then feed it to
+    # the inflater (possibly looping inflate_feed because out_buf may
+    # fill before the whole input chunk is consumed).
+    while done == 0 and err == 0:
+        n: int64 = sys_read(fd, &in_buf[0], INBUF_BYTES)
+        if n < 0:
+            _wstr("[realgz] FAIL: read error\n")
+            err = 1
+        elif n == 0:
+            # EOF before the inflater reported stream-end. With the
+            # bug this never happens (it errors first); a clean fix
+            # always hits done==1 before EOF.
+            _wstr("[realgz] FAIL: EOF before stream-end, total_in=")
+            _wdec(total_in)
+            _wstr(" total_out=")
+            _wdec(total_out)
+            _wstr("\n")
+            err = 1
+        else:
+            chunk_len: uint64 = cast[uint64](n)
+            in_done:   uint64 = 0
+            while in_done < chunk_len and done == 0 and err == 0:
+                in_consumed:  uint64 = 0
+                out_consumed: uint64 = 0
+                rc: int32 = inflate_feed(&state,
+                                         &in_buf[in_done],
+                                         chunk_len - in_done,
+                                         &out_buf[0], OUTBUF_BYTES,
+                                         &out_consumed, &in_consumed,
+                                         &done)
+                total_out = total_out + out_consumed
+                in_done = in_done + in_consumed
+                if rc < 0:
+                    _wstr("[realgz] FAIL: inflate_feed rc<0 (corrupt or CRC/ISIZE mismatch)\n")
+                    _wstr("[realgz]   phase=")
+                    _wdec(cast[uint64](cast[int64](state.phase)))
+                    _wstr(" body_state=")
+                    _wdec(cast[uint64](cast[int64](state.body_state)))
+                    _wstr(" dyn_phase=")
+                    _wdec(cast[uint64](cast[int64](state.dyn_phase)))
+                    _wstr(" total_in=")
+                    _wdec(total_in + in_done)
+                    _wstr(" total_out=")
+                    _wdec(total_out)
+                    _wstr("\n")
+                    err = 1
+                if rc == 1:
+                    done = 1
+                # rc == 0: needs more input OR out_buf filled. If
+                # out_buf is NOT full the input chunk is starved —
+                # break out to pull the next file chunk.
+                if rc == 0 and state.out_full == 0:
+                    # input chunk exhausted for now (in_done may be
+                    # < chunk_len only if a partial symbol remains —
+                    # but inflate_feed consumes all it can, so when
+                    # out_full==0 the rest of the chunk IS consumed).
+                    in_done = chunk_len
+            total_in = total_in + chunk_len
+
+    sys_close(fd)
+
+    if err != 0:
+        _wstr("[realgz] FAIL\n")
+        return 1
+
+    # done == 1: the inflater verified the gzip CRC32 + ISIZE trailer.
+    _wstr("[realgz] inflated OK: compressed_in=")
+    _wdec(total_in)
+    _wstr(" decompressed_out=")
+    _wdec(total_out)
+    _wstr("\n")
+    _wstr("[realgz] gzip CRC32 + ISIZE trailer verified\n")
+    _wstr("[realgz] PASS\n")
+    return 0
