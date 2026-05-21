@@ -1,0 +1,211 @@
+# mm/cow.ad
+#
+# Copy-on-write (COW) support for fork().
+#
+# Hamnix runs ET_DYN binaries identity-mapped and clones a per-task
+# PML4 on fork. The eager-copy fork path (fs/elf.ad::vm_fork_install_all
+# + mm/vma.ad::vma_fork_copy) gave every child a verbatim physical copy
+# of every writable region — roughly 33 MiB copied per fork. COW
+# replaces that bulk copy with a lazy scheme:
+#
+#   * On fork, every writable user page is marked READ-ONLY + COW in
+#     BOTH the parent's and the child's PML4. Both PML4 entries point at
+#     the SAME physical page. The page's refcount is bumped.
+#   * On a write fault to a present, read-only, COW-marked page the #PF
+#     handler (arch/x86/kernel/trap_diag.ad::do_cow_page_fault) either
+#       - clears COW + makes the page writable in place when the page is
+#         no longer shared (refcount 1), or
+#       - allocates a fresh page, copies the bytes, repoints the faulting
+#         task's PTE at the copy (writable, COW cleared), decrements the
+#         old page's refcount.
+#
+# Per-physical-page refcounts
+#
+#   The buddy allocator (mm/page_alloc.ad) has no struct-page array, so
+#   COW carries its own refcount table — one uint16 per 4 KiB physical
+#   page frame, indexed by PFN (phys >> 12). The table is sized to the
+#   top of the memblock RAM region and allocated from memblock at
+#   mem_init() time (cow_init), before the buddy allocator starts
+#   handing pages out.
+#
+#   Refcount semantics:
+#     refcount[pfn] == 0  -> page is NOT COW-tracked. It is owned
+#                            normally by whoever allocated it; a write
+#                            fault on it is a genuine fault.
+#     refcount[pfn] == N  -> N page-table entries share this page COW.
+#
+#   cow_share_page(phys): first share bumps 0 -> 2 (parent + child);
+#     a subsequent share (grandchild fork of an already-COW page)
+#     bumps N -> N+1.
+#   cow_page_is_shared(phys): refcount > 1.
+#   cow_drop_page(phys): decrements; returns 1 when the caller should
+#     now free the page (refcount fell to 0), 0 otherwise. A page at
+#     refcount 0 (untracked) returns 1 immediately — the caller frees
+#     it normally.
+#
+# COW PTE marker
+#
+#   x86_64 PTE bits 9..11 are available for OS use. We use bit 9
+#   (0x200) as the COW marker. A PTE that is Present, has RW clear, and
+#   has bit 9 set is a COW page. The page-fault handler distinguishes a
+#   COW fault (recoverable) from a genuine protection fault (keep the
+#   diagnostic halt).
+
+from mm.memblock import memblock_alloc, memblock_region_top
+from kernel.printk.printk import printk0, printk1, printk2
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+# get_bsp_cr3() is misnamed — it reads the LIVE %cr3, not a saved
+# "BSP CR3". cow_init() runs in mem_init(), before ANY task is
+# created, so at that moment the live CR3 genuinely IS the pristine
+# boot page-table root. We snapshot it then; fs/elf.ad's COW
+# table-cracker reads it back via cow_boot_cr3() so its "is this
+# entry still the shared boot mapping?" test compares against tables
+# that are never mutated — not against whatever task happens to be
+# running (which broke per-task page-table isolation on fork).
+extern def get_bsp_cr3() -> uint64
+
+# COW marker — PTE bit 9 (software-available). A PTE with P=1, RW=0 and
+# this bit set is a copy-on-write page.
+COW_PTE_BIT: uint64 = 0x200
+
+PAGE_SHIFT_4K: uint64 = 12
+PAGE_SIZE_4K_C: uint64 = 0x1000
+
+# Refcount table: one uint16 per physical page frame. Base address +
+# number of entries (PFN ceiling). Both 0 until cow_init() runs.
+cow_refcount_base: uint64 = 0
+cow_nr_frames:     uint64 = 0
+
+# Pristine boot page-table root (CR3), snapshotted in cow_init() before
+# any task exists. The COW page-table cracker compares against THIS to
+# decide whether a PML4 entry still aliases the shared boot identity
+# map and therefore needs a private clone. Using the live CR3 instead
+# (the original bug) made a fork child inherit the parent's private
+# page tables and trample them.
+cow_boot_cr3_saved: uint64 = 0
+
+# Saturation ceiling for a uint16 refcount. With NTASKS=16 a page can
+# be shared by at most ~16 tasks, far under 0xFFFF; the clamp only
+# guards against a runaway and makes the saturated page leak (never
+# freed) rather than wrap to 0 and double-free.
+COW_REFCOUNT_MAX: uint64 = 0xFFFF
+
+
+def cow_init():
+    # Allocate the per-PFN refcount table from memblock. Called from
+    # mem_init() AFTER e820_init() has widened the memblock region to
+    # the firmware-reported RAM extent, but BEFORE page_alloc_init() —
+    # so the table itself comes out of the bump allocator and is never
+    # handed to the buddy allocator.
+    #
+    # The table covers PFN 0 .. (RAM top >> 12). memblock_region_top()
+    # is the high-water address of usable RAM; any physical page the
+    # buddy allocator can ever return has a PFN below that ceiling.
+    top: uint64 = memblock_region_top()
+    nframes: uint64 = (top + PAGE_SIZE_4K_C - 1) >> PAGE_SHIFT_4K
+    # 2 bytes per frame.
+    table_bytes: uint64 = nframes * 2
+    base: uint64 = memblock_alloc(table_bytes, 8)
+    if base == 0:
+        printk0("[cow] FATAL: refcount table alloc failed\n")
+        # Leave cow_nr_frames at 0 — cow_share_page / cow_drop_page
+        # treat an out-of-range PFN as "untracked", so fork silently
+        # falls back to never marking COW. Boot still proceeds.
+        return
+    memset(cast[Ptr[uint8]](base), 0, table_bytes)
+    cow_refcount_base = base
+    cow_nr_frames     = nframes
+    # Snapshot the pristine boot CR3 NOW — mem_init() runs before the
+    # scheduler creates any task, so the live CR3 is still the boot
+    # page-table root that every per-task PML4 will be cloned from.
+    cow_boot_cr3_saved = get_bsp_cr3()
+    printk2("[cow] refcount table: %d frames, %d bytes\n",
+            nframes, table_bytes)
+    printk1("[cow] pristine boot CR3 = %p\n", cow_boot_cr3_saved)
+
+
+def cow_boot_cr3() -> uint64:
+    # The pristine boot page-table root captured by cow_init(). The COW
+    # table-cracker (fs/elf.ad) compares PML4 entries against the boot
+    # PML4's entries to decide "still shared boot mapping -> clone".
+    return cow_boot_cr3_saved
+
+
+def _cow_pfn(phys: uint64) -> uint64:
+    return phys >> PAGE_SHIFT_4K
+
+
+def _cow_slot(pfn: uint64) -> Ptr[uint16]:
+    # Address of the uint16 refcount for `pfn`, or 0 if out of range /
+    # table not initialised.
+    if cow_refcount_base == 0:
+        return cast[Ptr[uint16]](0)
+    if pfn >= cow_nr_frames:
+        return cast[Ptr[uint16]](0)
+    return cast[Ptr[uint16]](cow_refcount_base + pfn * 2)
+
+
+def cow_refcount(phys: uint64) -> uint64:
+    # Read the refcount of the page frame containing `phys`. 0 means
+    # "untracked" (also returned for an out-of-range / pre-init PFN).
+    slot: Ptr[uint16] = _cow_slot(_cow_pfn(phys))
+    if cast[uint64](slot) == 0:
+        return 0
+    return cast[uint64](slot[0])
+
+
+def cow_share_page(phys: uint64):
+    # Mark a physical page as shared by one MORE COW mapper. On the
+    # FIRST share the refcount goes 0 -> 2 (the parent that already
+    # mapped it + the new child). On a subsequent share it goes N ->
+    # N+1. An untracked / out-of-range page is silently ignored — the
+    # caller's fork falls back to a non-COW behaviour for that page
+    # (it stays writable in both, which is wrong only for RAM the
+    # refcount table can't index; in practice the table covers all of
+    # usable RAM).
+    slot: Ptr[uint16] = _cow_slot(_cow_pfn(phys))
+    if cast[uint64](slot) == 0:
+        return
+    cur: uint64 = cast[uint64](slot[0])
+    if cur == 0:
+        slot[0] = 2
+        return
+    if cur >= COW_REFCOUNT_MAX:
+        return
+    slot[0] = cast[uint16](cur + 1)
+
+
+def cow_page_is_shared(phys: uint64) -> int32:
+    # 1 if more than one COW mapper holds this page, else 0.
+    if cow_refcount(phys) > 1:
+        return 1
+    return 0
+
+
+def cow_drop_page(phys: uint64) -> int32:
+    # Drop one COW reference to `phys`. Returns 1 if the CALLER should
+    # now physically free the page (the refcount fell to 0), 0 if other
+    # mappers still hold it.
+    #
+    #   refcount 0  (untracked)        -> return 1 (free normally)
+    #   refcount 1  -> becomes 0       -> return 1 (last holder)
+    #   refcount N>1 -> becomes N-1    -> return 0 (still shared)
+    slot: Ptr[uint16] = _cow_slot(_cow_pfn(phys))
+    if cast[uint64](slot) == 0:
+        return 1
+    cur: uint64 = cast[uint64](slot[0])
+    if cur == 0:
+        return 1
+    if cur >= COW_REFCOUNT_MAX:
+        # Saturated — never decrement, never free. Leaks, but safe.
+        return 0
+    slot[0] = cast[uint16](cur - 1)
+    if cur == 1:
+        return 1
+    return 0
+
+
+def cow_pte_bit() -> uint64:
+    # Accessor so callers in other modules don't re-declare the bit.
+    return COW_PTE_BIT

@@ -24,6 +24,7 @@
 from mm.memblock import memblock_alloc
 from mm.page_alloc import alloc_page, alloc_pages
 from mm.slab import kfree
+from mm.cow import cow_boot_cr3
 from kernel.printk.printk import printk0, printk1, printk2
 from fs.pipe import (
     pipe_close_reader, pipe_close_writer,
@@ -661,15 +662,29 @@ def create_user_thread(entry: uint64, name0: uint64,
     task_table[s].name0       = name0
     task_table[s].parent_pid  = task_table[current_idx].pid
     task_table[s].exit_code   = 0
-    # Per-task PML4: clone the BSP's so the kernel half is mapped
-    # identically (lower-level PDPT/PD tables are shared). When we
-    # add user-only private mappings, they live inside this PML4
-    # without affecting the kernel or other tasks.
+    # Per-task PML4: clone the PRISTINE BOOT PML4 so the kernel half is
+    # mapped identically and the user half starts as the untouched boot
+    # identity map. We deliberately clone the BOOT page-table root
+    # (cow_boot_cr3(), snapshotted in cow_init() before any task
+    # existed) rather than the LIVE %cr3: copy-of-the-live-CR3 would
+    # bake in whatever user-half page-table cracking the currently
+    # running task (e.g. a forking parent) had already done, so the new
+    # task would silently SHARE that task's private PDPT/PD/PT and a
+    # COW fault in one would trample the other. Cloning the pristine
+    # boot PML4 guarantees every task's user half starts unshared, and
+    # fs/elf.ad's COW table-cracker (which compares against the same
+    # boot tables) then hands each task fully private lower-level
+    # tables on first touch. Fall back to the live CR3 only if
+    # cow_init() has not run yet (defensive — task creation always
+    # follows mem_init()).
     new_pml4: uint64 = alloc_page()
     if new_pml4 == 0:
         return -1
+    pml4_src: uint64 = cow_boot_cr3()
+    if pml4_src == 0:
+        pml4_src = get_bsp_cr3()
     memcpy(cast[Ptr[uint8]](new_pml4),
-           cast[Ptr[uint8]](get_bsp_cr3()), 4096)
+           cast[Ptr[uint8]](pml4_src), 4096)
     task_table[s].cr3 = new_pml4
     # U1: default new user tasks to native Hamnix ABI. The Linux ELF
     # loader path (future U-series milestone) will call

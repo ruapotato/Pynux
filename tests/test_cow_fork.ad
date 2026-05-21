@@ -1,0 +1,205 @@
+# tests/test_cow_fork.ad
+#
+# Copy-on-write fork stress test.
+#
+# Proves that the COW fork path (kernel/sched -> do_rfork ->
+# vm_cow_share_all in fs/elf.ad) gives each forked child a PRIVATE
+# address space even though no eager copy happens: parent and child
+# share read-only physical pages until the first write, which faults
+# into do_page_fault and copies just that page.
+#
+# What it exercises:
+#   1. A global .bss array (cow_scratch) — this lives in the loaded
+#      ELF image, so writing to it after fork exercises image-region
+#      COW. Both parent and child write a DISTINCT value into the same
+#      array index and then read it back; if COW is correct each sees
+#      only its own write.
+#   2. A deep stack buffer — writing into it after fork exercises
+#      user-stack COW.
+#   3. ITERATION: the fork+verify cycle runs COW_ITERS times so a
+#      refcount leak / page leak shows up as a cumulative failure or
+#      an OOM (the kernel would log "COW share OOM" or fail the fork).
+#
+# Contract / PASS criteria (host harness greps the serial log):
+#   - "[cow] start"
+#   - "[cow] iter N child ok"   for every iteration (child saw its
+#                                own private write, not the parent's)
+#   - "[cow] iter N parent ok"  for every iteration (parent's value
+#                                survived the child's divergent write)
+#   - "[cow] PASS"
+# A FAIL line is printed (and the test returns non-zero) if either
+# side ever observes the other side's value.
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       tests/test_cow_fork.ad -o build/user/test_cow_fork.elf
+#
+# Run via scripts/test_cow_fork.sh.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_rfork(flags: int32) -> int32
+extern def sys_waitpid(pid: uint64) -> int64
+extern def sys_exit(code: uint64)
+
+# Plan 9 POSIX-fork combo: new process + copy fd table + copy namespace
+# + copy environment. No RFMEM -> the child gets a private (COW) copy
+# of the address space.
+RFPROC:   int32 = 0x001
+RFFDG:    int32 = 0x004
+RFNAMEG:  int32 = 0x008
+RFENVG:   int32 = 0x010
+
+# Number of fork+verify cycles. Each cycle COW-shares the whole image
+# + stack, then both sides write — so a per-page or per-refcount leak
+# accumulates across iterations and surfaces as an OOM or a wrong read.
+COW_ITERS: uint64 = 8
+
+# A global array in .bss — part of the loaded ELF image. Writing to it
+# after fork forces an image-region COW fault. 4096 entries so it spans
+# more than one page (4096 * 8 bytes = 32 KiB = 8 pages), exercising
+# multi-page image COW.
+cow_scratch: Array[4096, uint64]
+
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen(s))
+
+
+def write_dec(fd: int32, value: uint64):
+    if value == 0:
+        sys_write(fd, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(fd, &out[0], i)
+
+
+def _fill_scratch(value: uint64):
+    # Write `value` into every entry of the global .bss array. After a
+    # COW fork this triggers a write fault on each image page the array
+    # spans, copying them privately for the writing task.
+    i: uint64 = 0
+    while i < 4096:
+        cow_scratch[i] = value
+        i = i + 1
+
+
+def _check_scratch(expect: uint64) -> int32:
+    # Return 1 if every entry of cow_scratch holds `expect`, else 0.
+    i: uint64 = 0
+    while i < 4096:
+        if cow_scratch[i] != expect:
+            return 0
+        i = i + 1
+    return 1
+
+
+def main() -> int32:
+    write_str(1, "[cow] start\n")
+
+    iter: uint64 = 0
+    while iter < COW_ITERS:
+        # Seed the global array + a stack buffer with a parent-side
+        # sentinel BEFORE forking, so both regions are dirtied and the
+        # COW share has real content to protect.
+        parent_val: uint64 = 0x1000 + iter
+        _fill_scratch(parent_val)
+
+        stack_buf: Array[256, uint64]
+        si: uint64 = 0
+        while si < 256:
+            stack_buf[si] = parent_val
+            si = si + 1
+
+        rc: int32 = sys_rfork(RFPROC | RFFDG | RFNAMEG | RFENVG)
+        if rc < 0:
+            write_str(1, "[cow] FAIL: sys_rfork returned negative at iter ")
+            write_dec(1, iter)
+            write_str(1, "\n")
+            return 1
+
+        if rc == 0:
+            # --- child -------------------------------------------------
+            # Overwrite both regions with a CHILD sentinel. Under COW
+            # these writes fault and copy the affected pages privately;
+            # the parent must NOT see them.
+            child_val: uint64 = 0x9000 + iter
+            _fill_scratch(child_val)
+            ci: uint64 = 0
+            while ci < 256:
+                stack_buf[ci] = child_val
+                ci = ci + 1
+            # Read both regions back — the child must observe ITS OWN
+            # value everywhere.
+            ok: int32 = _check_scratch(child_val)
+            cj: uint64 = 0
+            while cj < 256:
+                if stack_buf[cj] != child_val:
+                    ok = 0
+                cj = cj + 1
+            if ok != 0:
+                write_str(1, "[cow] iter ")
+                write_dec(1, iter)
+                write_str(1, " child ok\n")
+                sys_exit(0)
+            else:
+                write_str(1, "[cow] FAIL: child saw parent value at iter ")
+                write_dec(1, iter)
+                write_str(1, "\n")
+                sys_exit(1)
+            # Not reached.
+            return 0
+
+        # --- parent ----------------------------------------------------
+        # Wait for the child to finish its divergent writes + exit.
+        status: int64 = sys_waitpid(cast[uint64](rc))
+        if status < 0:
+            write_str(1, "[cow] FAIL: waitpid -errno at iter ")
+            write_dec(1, iter)
+            write_str(1, "\n")
+            return 2
+        if status != 0:
+            write_str(1, "[cow] FAIL: child reported failure at iter ")
+            write_dec(1, iter)
+            write_str(1, "\n")
+            return 3
+        # The child overwrote its private copies of cow_scratch +
+        # stack_buf with child_val. The parent's copies must STILL hold
+        # parent_val — proof the child's writes never reached us.
+        pok: int32 = _check_scratch(parent_val)
+        pj: uint64 = 0
+        while pj < 256:
+            if stack_buf[pj] != parent_val:
+                pok = 0
+            pj = pj + 1
+        if pok == 0:
+            write_str(1, "[cow] FAIL: parent value corrupted by child at iter ")
+            write_dec(1, iter)
+            write_str(1, "\n")
+            return 4
+        write_str(1, "[cow] iter ")
+        write_dec(1, iter)
+        write_str(1, " parent ok\n")
+
+        iter = iter + 1
+
+    write_str(1, "[cow] PASS\n")
+    return 0

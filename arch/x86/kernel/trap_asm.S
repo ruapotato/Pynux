@@ -102,10 +102,131 @@ trap_diag_stub_0d:
     pushq   $13
     jmp     common_trap_diag
 
+/* ---------- trap_diag_stub_0e — productive #PF (copy-on-write) ---- *
+ *
+ * The #PF vector is no longer a pure diagnostic halt. A write fault to
+ * a present, read-only, COW-marked page is a recoverable copy-on-write
+ * fault: do_page_fault() copies the page (or just unshares it) and we
+ * return to USER with iretq so the faulting instruction re-runs.
+ *
+ * Any other #PF — a not-present page, a write to a genuinely
+ * read-only page, a kernel-mode fault — is a real fault: we fall
+ * through to common_trap_diag, preserving the existing print-and-halt
+ * behaviour so genuine segfaults are NOT masked.
+ *
+ * Stack on entry (CPU pushed, low -> high):
+ *    0: error_code   (P/W/U/RSVD/I)
+ *    8: RIP
+ *   16: CS
+ *   24: RFLAGS
+ *   32: RSP_user
+ *   40: SS
+ *
+ * The COW resolution path must return to the faulting instruction
+ * with EVERY register intact, so we save the full GPR set (not just
+ * the SysV caller-saved subset) and restore it on the resolved path.
+ */
     .align 16
     .globl trap_diag_stub_0e
 trap_diag_stub_0e:
-    /* #PF: CPU pushes error code (P/W/U/RSVD/I bits). */
+    /* Disable interrupts for the whole handler. A COW resolution must
+     * be atomic w.r.t. scheduling: if a timer IRQ preempted us
+     * mid-resolution, another task could run, take its OWN COW fault,
+     * and (before this fix used a global RSP scratch slot) clobber our
+     * saved state. cli also means the faulting task cannot be migrated
+     * off-CPU between the PTE rewrite and the iretq. The interrupted
+     * RFLAGS in the iret frame still has IF=1, so iretq re-enables
+     * interrupts on return to the faulting instruction.                */
+    cli
+
+    /* #PF: CPU has already pushed the error code at 0(%rsp). Save the
+     * full GPR set BELOW it so the resolved path can restore exactly
+     * what the faulting instruction expects. 15 GPRs (rsp excluded —
+     * it is in the iret frame).                                       */
+    pushq   %rax
+    pushq   %rbx
+    pushq   %rcx
+    pushq   %rdx
+    pushq   %rsi
+    pushq   %rdi
+    pushq   %rbp
+    pushq   %r8
+    pushq   %r9
+    pushq   %r10
+    pushq   %r11
+    pushq   %r12
+    pushq   %r13
+    pushq   %r14
+    pushq   %r15
+
+    /* Stack now (low -> high):
+     *    0..112: r15..rax  (15 quads)
+     *  120: error_code
+     *  128: RIP ...                                                    */
+
+    /* do_page_fault(error_code, fault_va, faulting_cr3).
+     *   %rdi = error_code   (at 120(%rsp))
+     *   %rsi = CR2          (faulting linear address)
+     *   %rdx = CR3          (the faulting task's PML4)                 */
+    movq    120(%rsp), %rdi
+    movq    %cr2, %rsi
+    movq    %cr3, %rdx
+
+    /* Park the pre-call RSP in %rbx — a SysV callee-saved register, so
+     * do_page_fault is contractually required to preserve it. (%rbx is
+     * already saved on the stack above and gets restored on the way
+     * out.) This replaces an earlier global scratch slot that was not
+     * re-entrancy / preemption safe. Then 16-align RSP for the call. */
+    movq    %rsp, %rbx
+    andq    $-16, %rsp
+    call    do_page_fault
+    /* Restore RSP to the post-push value from the callee-saved %rbx. */
+    movq    %rbx, %rsp
+
+    /* do_page_fault returned in %rax:
+     *   1  -> COW fault resolved; restore GPRs and iretq.
+     *   else -> not a COW fault (or OOM); fall through to the
+     *           diagnostic halt path.                                  */
+    cmpq    $1, %rax
+    jne     1f
+
+    /* Resolved: pop the 15 saved GPRs, drop the error code, iretq. */
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %r11
+    popq    %r10
+    popq    %r9
+    popq    %r8
+    popq    %rbp
+    popq    %rdi
+    popq    %rsi
+    popq    %rdx
+    popq    %rcx
+    popq    %rbx
+    popq    %rax
+    addq    $8, %rsp                    /* discard CPU error code      */
+    iretq
+
+1:  /* Not a COW fault. Pop our saved GPRs so the stack is back to the
+     * post-CPU-push shape common_trap_diag expects (error_code at
+     * 0(%rsp)), then push the vector and take the diagnostic path. */
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %r11
+    popq    %r10
+    popq    %r9
+    popq    %r8
+    popq    %rbp
+    popq    %rdi
+    popq    %rsi
+    popq    %rdx
+    popq    %rcx
+    popq    %rbx
+    popq    %rax
     pushq   $14
     jmp     common_trap_diag
 

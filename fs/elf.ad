@@ -43,6 +43,10 @@
 
 from mm.memblock import memblock_alloc
 from mm.page_alloc import alloc_page, alloc_pages
+from mm.cow import (
+    cow_share_page, cow_page_is_shared, cow_drop_page,
+    cow_boot_cr3,
+)
 from kernel.printk.printk import printk0, printk1, printk2
 from kernel.panic import panic
 # U42: PT_INTERP loading needs to look up the interpreter binary
@@ -63,6 +67,8 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 extern def load_cr3(value: uint64)
 extern def get_bsp_cr3() -> uint64
+# COW: flush one page's TLB entry after rewriting its PTE.
+extern def invlpg_one(va: uint64)
 # kernel_image_end() — the first PHYSICAL byte past the kernel image
 # in low RAM. The kernel is now a HIGHER-HALF kernel: it is LINKED and
 # runs at 0xffffffff80000000+offset, but its image is LOADED into low
@@ -664,6 +670,18 @@ def elf_load_blob(blob: Ptr[uint8], blob_size: uint64) -> uint64:
     elf_last_interp_base    = 0
     elf_last_app_entry_user = entry_real
 
+    # Per-process address space (fork): record the page-aligned virtual
+    # span of the loaded ELF32 image so do_execve stashes it on the
+    # task and fork (do_clone / do_rfork) can COW-share the image's
+    # writable .data / .bss between parent and child. A native ELF32
+    # binary runs identity-mapped at `region` (same as an ET_DYN
+    # ELF64), so the image occupies [region, region + span). `span` is
+    # already 4 KiB-rounded. Before this, ELF32 left these globals at 0
+    # and fork skipped the image entirely — a native binary that wrote
+    # a global after fork() corrupted its parent. COW now covers it.
+    elf_last_img_lo = region
+    elf_last_img_hi = region + span
+
     # U3: Linux-ABI detection. We record whether this image is a Linux-
     # ABI binary in elf_last_was_linux; the caller (SYS_SPAWN or
     # SYS_EXECVE) is responsible for flipping is_linux_userspace on the
@@ -1158,3 +1176,288 @@ def vm_fork_copy_install(child_pml4: uint64, vlo: uint64,
                     & ~cast[uint64](PAGE_SIZE_4K - 1)
     return elf_install_user_mapping(child_pml4, vlo_a, vhi_a,
                                     phys_base)
+
+
+# ---------------------------------------------------------------------
+# Copy-on-write fork — vm_cow_share_range + the #PF resolver helpers.
+# ---------------------------------------------------------------------
+#
+# Instead of eager-copying every writable user page on fork, COW shares
+# the parent's physical pages with the child and defers the copy to the
+# first write fault. vm_cow_share_range() walks a virtual range and, for
+# every present user page:
+#
+#   1. ensures BOTH the parent's and the child's PML4 have a private,
+#      4 KiB-granular PTE for that page (cracking the BSP-shared 1 GiB /
+#      2 MiB identity entries — exactly what elf_install_user_mapping
+#      already does, factored here into _cow_resolve_pte_slot),
+#   2. points the child's PTE at the SAME physical page the parent maps,
+#   3. clears RW and sets the COW bit (PTE bit 9) in BOTH PTEs,
+#   4. bumps the page's COW refcount (mm/cow.ad),
+#   5. invalidates the parent's stale (writable) TLB entry.
+#
+# After this the parent and child share read-only physical pages; the
+# first write by either side faults into do_cow_page_fault (see
+# arch/x86/kernel/trap_diag.ad) which performs the actual copy.
+#
+# A page that is ALREADY COW-marked in the parent (a grandchild fork of
+# a page the parent itself COW-shares with a sibling) is handled
+# correctly: the parent PTE is left as-is (already RO+COW), the child
+# gets the same RO+COW PTE, and the refcount is bumped — three+ way
+# sharing.
+
+# Software COW marker bit in a PTE — mirror mm/cow.ad's COW_PTE_BIT.
+PT_FLAG_COW: uint64 = 0x200
+
+
+def _cow_resolve_pte_slot(pml4_phys: uint64, vaddr: uint64) -> uint64:
+    # Return the ADDRESS of the 4 KiB PTE slot mapping `vaddr` inside
+    # `pml4_phys`, cracking any BSP-shared 1 GiB / 2 MiB identity
+    # entries along the way so the write lands ONLY in this task's
+    # address space. Returns 0 on OOM.
+    #
+    # This is the per-page distillation of elf_install_user_mapping's
+    # Step 1..3 table-cracking walk. We deliberately do NOT touch the
+    # PTE's contents — the caller decides what to write.
+    #
+    # CRITICAL: the "is this entry still the shared boot mapping?" test
+    # compares against the PRISTINE BOOT page tables (cow_boot_cr3(),
+    # snapshotted before any task existed) — NOT get_bsp_cr3(), which
+    # is misnamed and actually returns the LIVE %cr3. With the live
+    # CR3, comparing a child PML4 against "the current task's" (the
+    # parent's, already-cracked) PML4 gave wrong answers: the child
+    # skipped the clone and inherited the PARENT's private PDPT/PD/PT,
+    # so resolving a COW fault in the child trampled the parent's PTEs.
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys)
+    bsp_pml4: Ptr[uint64] = cast[Ptr[uint64]](
+        cow_boot_cr3() & PT_ADDR_MASK)
+
+    pml4_idx: uint64 = (vaddr >> 39) & 0x1FF
+    pdpt_idx: uint64 = (vaddr >> 30) & 0x1FF
+    pd_idx:   uint64 = (vaddr >> 21) & 0x1FF
+    pt_idx:   uint64 = (vaddr >> 12) & 0x1FF
+
+    # --- Step 1: private PDPT ---------------------------------------
+    pml4_entry: uint64 = pml4[pml4_idx]
+    if pml4_entry == bsp_pml4[pml4_idx]:
+        new_pdpt: uint64 = alloc_page()
+        if new_pdpt == 0:
+            return 0
+        old_pdpt_phys: uint64 = pml4_entry & PT_ADDR_MASK
+        memcpy(cast[Ptr[uint8]](new_pdpt),
+               cast[Ptr[uint8]](old_pdpt_phys), 4096)
+        pml4[pml4_idx] = new_pdpt | (pml4_entry & ~PT_ADDR_MASK)
+        pml4_entry = pml4[pml4_idx]
+
+    pdpt: Ptr[uint64] = cast[Ptr[uint64]](pml4_entry & PT_ADDR_MASK)
+
+    # --- Step 2: PDPT[idx] -> a PD (crack a 1 GiB PS=1 entry) -------
+    pdpt_entry: uint64 = pdpt[pdpt_idx]
+    if (pdpt_entry & PT_FLAG_PS) != 0 or (pdpt_entry & PT_FLAG_P) == 0:
+        new_pd: uint64 = alloc_page()
+        if new_pd == 0:
+            return 0
+        gib_base: uint64 = pdpt_idx * PAGE_SIZE_1G
+        _build_identity_pd(new_pd, gib_base)
+        pdpt[pdpt_idx] = new_pd | PT_FLAG_US | PT_FLAG_RW | PT_FLAG_P
+        pdpt_entry = pdpt[pdpt_idx]
+
+    pd: Ptr[uint64] = cast[Ptr[uint64]](pdpt_entry & PT_ADDR_MASK)
+
+    # --- Step 3: PD[idx] -> a PT (crack a 2 MiB PS=1 entry) ---------
+    pd_entry: uint64 = pd[pd_idx]
+    if (pd_entry & PT_FLAG_PS) != 0 or (pd_entry & PT_FLAG_P) == 0:
+        new_pt: uint64 = alloc_page()
+        if new_pt == 0:
+            return 0
+        mib2_base: uint64 = (vaddr >> 21) << 21
+        _build_identity_pt(new_pt, mib2_base)
+        pd[pd_idx] = new_pt | PT_FLAG_US | PT_FLAG_RW | PT_FLAG_P
+        pd_entry = pd[pd_idx]
+
+    pt: Ptr[uint64] = cast[Ptr[uint64]](pd_entry & PT_ADDR_MASK)
+    return cast[uint64](pt) + pt_idx * 8
+
+
+def _cow_share_one_page(parent_pml4: uint64, child_pml4: uint64,
+                        vaddr: uint64) -> int32:
+    # COW-share the single page at `vaddr`. Returns 0 on success,
+    # -1 on OOM (the caller aborts the fork).
+    pslot: uint64 = _cow_resolve_pte_slot(parent_pml4, vaddr)
+    if pslot == 0:
+        return -1
+    parent_pte: uint64 = cast[Ptr[uint64]](pslot)[0]
+    # Not present -> nothing mapped here; skip silently.
+    if (parent_pte & PT_FLAG_P) == 0:
+        return 0
+    phys: uint64 = parent_pte & PT_ADDR_MASK
+    cslot: uint64 = _cow_resolve_pte_slot(child_pml4, vaddr)
+    if cslot == 0:
+        return -1
+
+    # The flag word the COW-shared PTE carries: present + user, COW
+    # bit set, RW CLEARED. Preserve any other low flag bits the parent
+    # PTE had (PCD/PWT/etc.) but force-clear RW and force-set COW.
+    parent_flags: uint64 = parent_pte & ~PT_ADDR_MASK
+    cow_flags: uint64 = (parent_flags & ~PT_FLAG_RW) \
+                        | PT_FLAG_COW | PT_FLAG_P | PT_FLAG_US
+
+    # Child PTE -> same physical page, read-only, COW-marked.
+    cast[Ptr[uint64]](cslot)[0] = phys | cow_flags
+    # Parent PTE -> drop RW, set COW (idempotent if already COW).
+    cast[Ptr[uint64]](pslot)[0] = phys | cow_flags
+
+    # Account the new sharer. If the parent page was already COW
+    # (refcount >= 2) this bumps it by one; otherwise it goes 0 -> 2
+    # (parent + child).
+    cow_share_page(phys)
+
+    # The parent's old TLB entry was writable; flush it so the parent's
+    # next write to this page faults into the COW handler. The child
+    # has never run, so its TLB holds nothing for this CR3.
+    invlpg_one(vaddr)
+    return 0
+
+
+def vm_cow_share_range(parent_pml4: uint64, child_pml4: uint64,
+                       vlo_in: uint64, vhi_in: uint64) -> int32:
+    # COW-share every present user page in [vlo_in, vhi_in) between
+    # parent and child. Returns 0 on success, -1 on OOM.
+    if vhi_in <= vlo_in:
+        return 0
+    vlo: uint64 = vlo_in & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vhi: uint64 = (vhi_in + PAGE_SIZE_4K - 1) \
+                  & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vaddr: uint64 = vlo
+    while vaddr < vhi:
+        if _cow_share_one_page(parent_pml4, child_pml4, vaddr) < 0:
+            return -1
+        vaddr = vaddr + PAGE_SIZE_4K
+    return 0
+
+
+def vm_cow_share_all(parent_pml4: uint64, child_pml4: uint64,
+                     img_lo: uint64, img_hi: uint64,
+                     brk_lo: uint64, brk_max: uint64,
+                     ust_lo: uint64, ust_sz: uint64,
+                     sp_fallback: uint64) -> int32:
+    # COW counterpart of vm_fork_install_all: share the three fixed
+    # regions (ELF image, brk heap, user stack) read-only + COW between
+    # parent and child instead of eager-copying them. mmap VMAs are
+    # handled separately by mm/vma.ad::vma_fork_copy.
+    #
+    # Any region whose range is unset is skipped (same rules as
+    # vm_fork_install_all). Returns 0 on success, -1 on OOM.
+    if img_lo != 0 and img_hi > img_lo:
+        if vm_cow_share_range(parent_pml4, child_pml4,
+                              img_lo, img_hi) < 0:
+            return -1
+    if brk_lo != 0 and brk_max > brk_lo:
+        if vm_cow_share_range(parent_pml4, child_pml4,
+                              brk_lo, brk_max) < 0:
+            return -1
+    if ust_lo != 0 and ust_sz != 0:
+        if vm_cow_share_range(parent_pml4, child_pml4,
+                              ust_lo, ust_lo + ust_sz) < 0:
+            return -1
+    elif sp_fallback != 0:
+        sp_pg: uint64 = sp_fallback & ~cast[uint64](PAGE_SIZE_4K - 1)
+        if vm_cow_share_range(parent_pml4, child_pml4,
+                              sp_pg, sp_pg + PAGE_SIZE_4K) < 0:
+            return -1
+    # The COW share dropped RW on every page it touched in the PARENT's
+    # (== caller's, == current) PML4. Each _cow_share_one_page already
+    # invlpg'd its page, but a per-page invlpg can leave a stale
+    # WRITABLE entry behind if the page was previously reached through
+    # a huge-page (2 MiB / 1 GiB) TLB entry that a later table-crack
+    # only partially superseded. A stale writable entry would let the
+    # parent write a still-shared page WITHOUT faulting — and race the
+    # child onto the same physical page. Reload CR3 with its own value
+    # to drop EVERY non-global TLB entry: bulletproof, and fork is not
+    # a hot enough path to care about the cost. The child runs on a
+    # different CR3 that schedule() load_cr3's fresh on first dispatch,
+    # so the child needs no flush here.
+    load_cr3(parent_pml4)
+    return 0
+
+
+# ---------------------------------------------------------------------
+# COW page-fault resolver — called by the #PF handler.
+# ---------------------------------------------------------------------
+#
+# cow_handle_write_fault() is the productive core of the #PF handler.
+# Given the faulting task's PML4 and the faulting linear address it
+# decides whether the fault is a recoverable COW fault and, if so,
+# resolves it. Return codes:
+#
+#   1  - fault was a COW fault and is now RESOLVED; the handler should
+#        iretq and let the faulting instruction re-run.
+#   0  - NOT a COW fault (page absent, not COW-marked, or already
+#        writable). The handler keeps its diagnostic / halt behaviour
+#        so genuine segfaults are not masked.
+#  -1  - it WAS a COW fault but resolution failed (OOM). The handler
+#        should treat this as fatal (halt) — we can't safely resume.
+
+def cow_handle_write_fault(faulting_pml4: uint64,
+                           fault_va: uint64) -> int32:
+    # Resolve the 4 KiB PTE slot WITHOUT cracking — the page must
+    # already be mapped (COW pages were installed at 4 KiB granularity
+    # by vm_cow_share_range). We still go through _cow_resolve_pte_slot
+    # which is harmless if the tables are already private; on a COW
+    # page they always are.
+    pte_slot: uint64 = _cow_resolve_pte_slot(faulting_pml4, fault_va)
+    if pte_slot == 0:
+        return -1
+    pte: uint64 = cast[Ptr[uint64]](pte_slot)[0]
+    # Must be present, COW-marked, and currently read-only. Anything
+    # else is a genuine fault — let the diagnostic handler take it.
+    if (pte & PT_FLAG_P) == 0:
+        return 0
+    if (pte & PT_FLAG_COW) == 0:
+        return 0
+    if (pte & PT_FLAG_RW) != 0:
+        # COW bit set but already writable — shouldn't fault on a
+        # write. Treat as not-a-COW-fault so the diagnostic surfaces it.
+        return 0
+    return cow_resolve_pte(pte_slot, fault_va)
+
+
+def cow_resolve_pte(pte_slot: uint64, fault_va: uint64) -> int32:
+    # Perform the actual COW resolution on a confirmed COW PTE.
+    # Returns 1 on success, -1 on OOM.
+    pte: uint64 = cast[Ptr[uint64]](pte_slot)[0]
+    old_phys: uint64 = pte & PT_ADDR_MASK
+    flags: uint64 = pte & ~PT_ADDR_MASK
+    page_va: uint64 = fault_va & ~cast[uint64](PAGE_SIZE_4K - 1)
+
+    if cow_page_is_shared(old_phys) == 0:
+        # Refcount 1 (or untracked): this task is the sole remaining
+        # owner. No copy — just clear COW, set RW, and drop the page's
+        # refcount back to "untracked" (0) so a later teardown frees it
+        # normally.
+        new_flags: uint64 = (flags & ~PT_FLAG_COW) | PT_FLAG_RW \
+                            | PT_FLAG_P
+        cast[Ptr[uint64]](pte_slot)[0] = old_phys | new_flags
+        cow_drop_page(old_phys)
+        invlpg_one(page_va)
+        return 1
+
+    # Still shared: allocate a fresh page, copy the old contents into
+    # it, repoint this task's PTE at the copy (writable, COW cleared),
+    # and decrement the old page's refcount.
+    new_phys: uint64 = alloc_page()
+    if new_phys == 0:
+        printk1("cow: OOM resolving write fault @ 0x%x\n", fault_va)
+        return -1
+    # The old page is identity-mapped, so memcpy from its physical
+    # address reads its bytes directly.
+    memcpy(cast[Ptr[uint8]](new_phys),
+           cast[Ptr[uint8]](old_phys), PAGE_SIZE_4K)
+    new_flags2: uint64 = (flags & ~PT_FLAG_COW) | PT_FLAG_RW \
+                         | PT_FLAG_P
+    cast[Ptr[uint64]](pte_slot)[0] = new_phys | new_flags2
+    # Drop our reference to the shared page. The fresh page is born
+    # untracked (refcount 0) — it has exactly one mapper now.
+    cow_drop_page(old_phys)
+    invlpg_one(page_va)
+    return 1

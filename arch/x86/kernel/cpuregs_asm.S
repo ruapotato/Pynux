@@ -92,3 +92,35 @@ fninit_helper:
 write_cr4:
     movq    %rdi, %cr4
     ret
+
+/* ---------- read_cr2() -> uint64 --------------------------------- *
+ *
+ * Copy-on-write #PF support. On a page fault the CPU latches the
+ * faulting linear address into CR2; the COW page-fault handler reads
+ * it to learn which page to resolve. Pure read, no side effects.
+ *
+ * SysV ABI: no arguments, result in %rax.
+ */
+    .align 16
+    .globl read_cr2
+read_cr2:
+    movq    %cr2, %rax
+    ret
+
+/* ---------- invlpg_one(va: uint64) ------------------------------- *
+ *
+ * Invalidate the TLB entry for a single page. After the COW handler
+ * rewrites a PTE (in the parent at fork time, or in the faulting task
+ * at copy time) the stale TLB entry for that page must be flushed or
+ * the CPU keeps using the old (writable, or read-only) translation.
+ * `invlpg` flushes exactly the one page containing the operand and is
+ * far cheaper than a full CR3 reload.
+ *
+ * SysV ABI: %rdi = virtual address inside the page to flush. No
+ * return value.
+ */
+    .align 16
+    .globl invlpg_one
+invlpg_one:
+    invlpg  (%rdi)
+    ret

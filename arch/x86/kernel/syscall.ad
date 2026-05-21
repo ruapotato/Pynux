@@ -83,7 +83,7 @@ from fs.elf import (
     # the private-copy machinery do_clone uses to give a forked child
     # its own physical pages remapped at the same virtual addresses.
     elf_last_img_lo_get, elf_last_img_hi_get,
-    vm_fork_install_all,
+    vm_cow_share_all,
 )
 from mm.page_alloc import alloc_page, alloc_pages
 # U42 follow-up: per-task VMA list. do_execve clears the outgoing
@@ -930,35 +930,35 @@ def do_clone(flags: uint64, child_stack: uint64,
         set_current_errstr("fork: out of tasks")
         return cast[int64](-11)               # -EAGAIN
     child_pml4: uint64 = task_pml4(slot)
+    parent_pml4: uint64 = task_pml4(cast[int32](parent_idx))
     cslot: uint64 = cast[uint64](slot)
 
-    # Eager-copy the three fixed writable regions into the child's
-    # private physical pages, each remapped at the SAME virtual
-    # address in the child's PML4:
+    # Copy-on-write the three fixed writable regions. Instead of
+    # eager-copying ~33 MiB of pages, vm_cow_share_all marks every
+    # writable user page READ-ONLY + COW in BOTH the parent's and the
+    # child's PML4, pointing both at the SAME physical pages. The first
+    # write by either side faults into do_page_fault, which copies (or
+    # just unshares) exactly that one 4 KiB page. Regions covered:
     #
-    #   * the loaded ELF image (code + rodata + data + bss) — without
-    #     a private copy the child shares glibc's writable globals
-    #     (_IO_2_1_stdout_, the malloc arena header, errno);
-    #   * the brk heap — copied across its ENTIRE reserved window
-    #     [brk_base, brk_max), NOT just the used [brk_base, brk_end)
-    #     prefix: glibc-malloc's sysmalloc grows the arena by calling
-    #     brk(new) PAST the current break, so the child must own
-    #     private pages all the way to brk_max (the static-PIE glibc
-    #     TLS/TCB block is sbrk-allocated, so this also gives the
-    #     child a private TCB that its inherited fs_base resolves to);
-    #   * the user stack — the whole recorded region, so the child's
-    #     deepest call (the fork epilogue unwinding through atexit +
-    #     _IO_cleanup) stays inside private memory.
+    #   * the loaded ELF image (code + rodata + data + bss) — the
+    #     read-only .text pages stay shared forever; only writable
+    #     .data / .bss ever get copied, lazily, on first write;
+    #   * the brk heap across its ENTIRE reserved window
+    #     [brk_base, brk_max) — glibc-malloc's sysmalloc grows the
+    #     arena PAST the current break, so the whole reservation must
+    #     be COW-shared (the static-PIE glibc TLS/TCB block is
+    #     sbrk-allocated, so this also covers the child's private TCB);
+    #   * the user stack — the whole recorded region.
     img_lo: uint64 = task_image_lo(parent_idx)
     img_hi: uint64 = task_image_hi(parent_idx)
     brk_lo: uint64 = task_brk_base(parent_idx)
     brk_mx: uint64 = task_brk_max(parent_idx)
     ust_lo: uint64 = task_ustack_lo(parent_idx)
     ust_sz: uint64 = task_ustack_sz(parent_idx)
-    if vm_fork_install_all(child_pml4, img_lo, img_hi,
-                           brk_lo, brk_mx, ust_lo, ust_sz,
-                           parent_user_rsp) < 0:
-        set_current_errstr("fork: address-space copy OOM")
+    if vm_cow_share_all(parent_pml4, child_pml4, img_lo, img_hi,
+                        brk_lo, brk_mx, ust_lo, ust_sz,
+                        parent_user_rsp) < 0:
+        set_current_errstr("fork: address-space COW share OOM")
         return cast[int64](-12)               # -ENOMEM
 
     # Copy 4: anonymous + file-backed mmap VMAs (glibc-malloc arenas,

@@ -62,11 +62,62 @@
 
 from kernel.printk.printk import printk0, printk1, printk2
 from arch.x86.kernel.idt import idt_set_gate_with_ist
+# COW page-fault resolution. cow_handle_write_fault inspects the
+# faulting task's PTE and either resolves a copy-on-write fault or
+# reports "not a COW fault" so the diagnostic halt still fires.
+from fs.elf import cow_handle_write_fault
 
 # trap_asm.S — per-vector stubs + IST1 stack + tss_set_ist1 helper.
 extern def get_trap_diag_stub(vector: uint64) -> uint64
 extern def get_trap_diag_ist_stack_top() -> uint64
 extern def tss_set_ist1(top: uint64)
+
+
+# #PF error-code bits (Intel SDM Vol 3A 4.7).
+PF_ERR_P:  uint64 = 0x1        # 1 = protection violation (page present)
+PF_ERR_W:  uint64 = 0x2        # 1 = the access was a write
+PF_ERR_U:  uint64 = 0x4        # 1 = fault occurred in user mode
+
+# CR3 -> PML4 physical address: low 12 bits are flags.
+PF_CR3_ADDR_MASK: uint64 = 0x000FFFFFFFFFF000
+
+
+def do_page_fault(error_code: uint64, fault_va: uint64,
+                  cr3: uint64) -> int64:
+    # Productive #PF handler — the copy-on-write fast path.
+    #
+    # Called from trap_diag_stub_0e (arch/x86/kernel/trap_asm.S) with
+    # the CPU-pushed error code, the faulting linear address (CR2), and
+    # the faulting task's CR3. Return value drives the asm stub:
+    #
+    #   1  -> the fault was a recoverable COW write fault and has been
+    #         resolved; the stub restores all GPRs and iretq's so the
+    #         faulting instruction re-runs.
+    #   0  -> NOT a COW fault (not-present page, write to a genuinely
+    #         read-only page, kernel-mode fault, ...). The stub falls
+    #         through to common_trap_diag's print-and-halt — genuine
+    #         segfaults are deliberately NOT masked.
+    #
+    # A COW fault is precisely a WRITE to a PRESENT page (error code
+    # P=1, W=1). Any other shape is handed straight to the diagnostic.
+    if (error_code & PF_ERR_W) == 0:
+        # Read fault — never a COW fault (COW pages are still readable).
+        return cast[int64](0)
+    if (error_code & PF_ERR_P) == 0:
+        # Not-present page — demand paging / genuine NULL deref, not COW.
+        return cast[int64](0)
+    pml4_phys: uint64 = cr3 & PF_CR3_ADDR_MASK
+    rc: int32 = cow_handle_write_fault(pml4_phys, fault_va)
+    if rc == 1:
+        # Resolved — resume the faulting instruction.
+        return cast[int64](1)
+    if rc < 0:
+        # COW fault but resolution OOM'd. We can't safely resume; let
+        # the diagnostic halt surface it.
+        printk1("[pf] COW resolution failed (OOM) va=%p\n", fault_va)
+        return cast[int64](0)
+    # rc == 0: the PTE wasn't a COW PTE — genuine fault.
+    return cast[int64](0)
 
 
 def do_trap_diag_5(vec: uint64, err: uint64, rip: uint64,

@@ -43,7 +43,7 @@ from kernel.sched.core import (
     task_ustack_lo, task_ustack_sz, set_task_ustack_range,
     task_brk_base, task_brk_end, task_brk_max, set_task_brk_range,
 )
-from fs.elf import vm_fork_install_all
+from fs.elf import vm_cow_share_all
 from mm.vma import vma_fork_copy
 # task_table is module-private to core.ad; we need a per-slot read of
 # the saved kernel-stack pointer so we can patch the callee-saved
@@ -347,21 +347,28 @@ def do_rfork(flags: int32, user_rbp: uint64) -> int32:
         return -11                              # -EAGAIN
     pidx: uint64 = current_idx_get()
     child_pml4: uint64 = task_pml4(slot)
+    parent_pml4: uint64 = task_pml4(cast[int32](pidx))
     cslot: uint64 = cast[uint64](slot)
 
-    # Private-copy the parent's three fixed writable regions (ELF
-    # image, brk heap, user stack) into the child's PML4 at the same
-    # virtual addresses. For a native Hamnix ELF32 binary (the
-    # test_rfork fixture) image_lo / brk_base are 0 and those copies
+    # Copy-on-write the parent's three fixed writable regions (ELF
+    # image, brk heap, user stack): each writable user page is marked
+    # read-only + COW in BOTH parent and child PML4, both pointing at
+    # the same physical page; the first write faults into do_page_fault
+    # and copies just that page. For a native Hamnix ELF32 binary (the
+    # test_rfork fixture) image_lo / brk_base are 0 and those regions
     # are skipped — only the stack-page fallback runs, which is the
     # behaviour the native fixture relied on before. For a Linux-ABI
-    # rfork caller this is the full per-process address space.
-    if vm_fork_install_all(child_pml4,
-                           task_image_lo(pidx), task_image_hi(pidx),
-                           task_brk_base(pidx), task_brk_max(pidx),
-                           task_ustack_lo(pidx), task_ustack_sz(pidx),
-                           parent_user_rsp) < 0:
-        set_current_errstr("rfork: address-space copy OOM")
+    # rfork caller this COW-shares the full per-process address space.
+    #
+    # RFMEM (share memory, no COW) is the thread case — it is handled
+    # by the early -ENOSYS return above, so reaching here always means
+    # "give the child a private (COW) copy".
+    if vm_cow_share_all(parent_pml4, child_pml4,
+                        task_image_lo(pidx), task_image_hi(pidx),
+                        task_brk_base(pidx), task_brk_max(pidx),
+                        task_ustack_lo(pidx), task_ustack_sz(pidx),
+                        parent_user_rsp) < 0:
+        set_current_errstr("rfork: address-space COW share OOM")
         return -12                              # -ENOMEM
     # Anonymous + file-backed mmap VMAs.
     if vma_fork_copy(cslot, pidx, child_pml4) < 0:
