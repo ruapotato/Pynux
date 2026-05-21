@@ -1,68 +1,147 @@
 # drivers/net/icmp.ad
 #
-# ICMPv4 (RFC 792) — echo request / echo reply only. The wire format
-# is dirt simple: 4-byte header (type, code, checksum) + 4 type-
-# specific bytes + payload. For echo the type-specific 4 bytes hold
-# identifier (2) + sequence number (2). The checksum covers the
-# entire ICMP message (header + payload), computed with the same
-# 1's complement algorithm used by IPv4 headers (RFC 1071).
+# ICMPv4 (RFC 792) — echo request / echo reply, plus §10 error
+# messages. The wire format is dirt simple: 4-byte header (type, code,
+# checksum) + 4 type-specific bytes + payload. For echo the type-
+# specific 4 bytes hold identifier (2) + sequence number (2). For an
+# error message (type 3 dest-unreachable / type 11 time-exceeded) the
+# 4 type-specific bytes are unused (zero) and the payload is the IP
+# header + first 8 bytes of the datagram that triggered the error.
+# The checksum covers the entire ICMP message, computed with the 1's
+# complement algorithm used by IPv4 headers (RFC 1071).
 #
-# Two entry points:
+# Entry points:
 #
 #   icmp_rx() — called from ip_rx with the L4 payload + source IP
 #               (the IPv4 layer has already stripped the IP header).
-#               If the message is an echo request (type 8), we
-#               build an echo reply, recompute the checksum, and
-#               hand it back through ip_send.
+#               Echo request (type 8) -> build an echo reply.
+#               Dest-unreachable (type 3) / time-exceeded (type 11)
+#               -> §10: decode the embedded datagram and, if it was a
+#               UDP datagram WE sent, surface the failure via
+#               udp_deliver_icmp_error so a connected UDP socket's
+#               SO_ERROR reports it.
 #
-#   icmp_send_echo_request() — emit an unsolicited echo request to
-#               a chosen destination. Used by the SLIRP-gateway
-#               smoke test: we ping 10.0.2.2 from the kernel and
-#               assert that SLIRP responds with an echo reply.
+#   icmp_send_echo_request() — emit an unsolicited echo request to a
+#               chosen destination (SLIRP-gateway smoke test).
 #
-# Out of scope: destination-unreachable, time-exceeded, redirect,
-# timestamp, info request, address-mask request. Echo is the only
-# ICMP type apt / curl / ping over IPv4 actually demands; the rest
-# is debugging surface area.
+#   icmp_send_port_unreach() — §10: emit an ICMP destination-
+#               unreachable / port-unreachable for an inbound UDP
+#               datagram that hit no listener. Called from udp_rx.
 
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.ip import ip_send, ip_csum16, IPPROTO_ICMP
 
 
 # ICMP types we handle.
-ICMP_TYPE_ECHO_REPLY:   uint8 = 0
-ICMP_TYPE_ECHO_REQUEST: uint8 = 8
+ICMP_TYPE_ECHO_REPLY:     uint8 = 0
+ICMP_TYPE_DEST_UNREACH:   uint8 = 3
+ICMP_TYPE_ECHO_REQUEST:   uint8 = 8
+ICMP_TYPE_TIME_EXCEEDED:  uint8 = 11
+
+# ICMP codes for type 3 (destination unreachable).
+ICMP_CODE_PORT_UNREACH:   uint8 = 3
+
+# IP protocol number for UDP — kept local to avoid an ip.ad import
+# beyond what we already pull in.
+ICMP_IPPROTO_UDP:         uint8 = 17
+
+# errno-style codes we latch on a UDP socket for a received ICMP
+# error (see drivers/net/udp.ad::udp_deliver_icmp_error). Negative,
+# Linux-style: -111 ECONNREFUSED (port unreachable), -113 EHOSTUNREACH.
+ICMP_ERR_CONNREFUSED:     int32 = -111
+ICMP_ERR_HOSTUNREACH:     int32 = -113
 
 ICMP_HDR_LEN: uint64 = 8
 
-# Scratch buffer for outbound echo replies + requests. Sized to
-# match the largest payload we expect from a normal ping (32-64
-# bytes of payload + 8-byte ICMP header). 256 bytes is overkill
-# for the smoke test but keeps headroom for future use.
+# Scratch buffer for outbound echo replies + requests + error
+# messages. An error message carries the IP header (20) + first 8
+# bytes of the offending datagram = 28 bytes + 8-byte ICMP header.
+# 256 bytes keeps headroom.
 ICMP_BUF_BYTES: uint64 = 256
 icmp_tx_buf:    Array[256, uint8]
 
-# Counters. Bumped by both rx and tx so the smoke test can assert
-# "we sent one and got one back" via a printk2 dump.
+# Counters. Bumped by rx and tx so the smoke tests can assert flow.
 icmp_in_echo_req:    uint64 = 0
 icmp_in_echo_reply:  uint64 = 0
 icmp_out_echo_req:   uint64 = 0
 icmp_out_echo_reply: uint64 = 0
+icmp_in_errors:      uint64 = 0          # type 3 / 11 received
+icmp_out_unreach:    uint64 = 0          # port-unreachable sent
 
-# Identifier + sequence used for the kernel-driven echo request
-# (smoke test). Real Linux uses a per-socket ID; we have one
-# in-kernel sender so a single ID is sufficient.
+# Identifier + sequence used for the kernel-driven echo request.
 ICMP_PING_ID:   uint16 = 0xCAFE
 icmp_ping_seq:  uint16 = 0
+
+
+def _icmp_handle_error(payload: Ptr[uint8], length: uint64):
+    # §10: handle a received ICMP error (type 3 dest-unreachable or
+    # type 11 time-exceeded). `payload` points at the ICMP message;
+    # bytes 8.. carry the IP header + first 8 bytes of the datagram
+    # that triggered the error. We decode that embedded IP header — if
+    # it names a UDP datagram WE sent, hand the failure to the UDP
+    # socket layer so the matching connected socket's SO_ERROR reports
+    # it.
+    #
+    # Embedded layout, offset from `payload`:
+    #   8        : start of the offending IP header
+    #   8 + 9    : IP protocol byte
+    #   8 + 12.. : IP src (4) — our address
+    #   8 + 16.. : IP dst (4) — the peer
+    #   8 + ihl*4: the offending L4 header (UDP: src port, dst port)
+    icmp_in_errors = icmp_in_errors + 1
+    if length < ICMP_HDR_LEN + 28:
+        # Not enough embedded data to attribute the error (need a full
+        # 20-byte IP header + 8 L4 bytes). Ignore quietly.
+        printk0("[icmp] error message too short to attribute\n")
+        return
+    itype: uint8 = payload[0]
+    icode: uint8 = payload[1]
+    ip_off: uint64 = ICMP_HDR_LEN
+    version_ihl: uint8 = payload[ip_off]
+    ihl: uint8 = version_ihl & 0x0F
+    if ihl < 5:
+        return
+    inner_proto: uint8 = payload[ip_off + 9]
+    if inner_proto != ICMP_IPPROTO_UDP:
+        # Only UDP errors are actionable here — a TCP RST already
+        # carries the connection failure; ICMP errors for TCP are
+        # advisory and tcp.ad doesn't consume them.
+        printk1("[icmp] error for non-UDP proto=%d — ignored\n",
+                cast[uint64](inner_proto))
+        return
+    l4_off: uint64 = ip_off + cast[uint64](ihl) * 4
+    if length < l4_off + 4:
+        return
+    # Embedded IP dst (the peer we sent to) — bytes 16..19.
+    peer_ip: uint32 = (cast[uint32](payload[ip_off + 16]) << 24) \
+                    | (cast[uint32](payload[ip_off + 17]) << 16) \
+                    | (cast[uint32](payload[ip_off + 18]) << 8) \
+                    | cast[uint32](payload[ip_off + 19])
+    # Embedded UDP header — src port (ours) + dst port (peer's).
+    our_port: uint16 = cast[uint16](
+        (cast[uint32](payload[l4_off]) << 8)
+        | cast[uint32](payload[l4_off + 1]))
+    peer_port: uint16 = cast[uint16](
+        (cast[uint32](payload[l4_off + 2]) << 8)
+        | cast[uint32](payload[l4_off + 3]))
+    errno: int32 = ICMP_ERR_HOSTUNREACH
+    if itype == ICMP_TYPE_DEST_UNREACH:
+        if icode == ICMP_CODE_PORT_UNREACH:
+            errno = ICMP_ERR_CONNREFUSED
+    printk2("[icmp] error type=%d code=%d", cast[uint64](itype),
+            cast[uint64](icode))
+    printk1(" -> UDP local port %d\n", cast[uint64](our_port))
+    # Hand to the UDP socket layer (drivers/net/udp.ad). Called by name
+    # — the Adder build merges all .ad files; importing udp.ad here
+    # would create an icmp <-> udp cycle.
+    udp_deliver_icmp_error(peer_ip, peer_port, our_port, errno)
 
 
 def icmp_rx(payload: Ptr[uint8], length: uint64,
             src_b0: uint8, src_b1: uint8,
             src_b2: uint8, src_b3: uint8):
     # Parse the ICMP header. We don't validate the checksum on
-    # ingress — SLIRP and any real peer will already have done
-    # that on egress, and we'd just drop a corrupted packet
-    # anyway. (A future hardening pass can recompute it.)
+    # ingress — any real peer already did on egress.
     if length < ICMP_HDR_LEN:
         printk0("[icmp] runt\n")
         return
@@ -107,23 +186,24 @@ def icmp_rx(payload: Ptr[uint8], length: uint64,
                 IPPROTO_ICMP,
                 rep_ptr, length)
         return
-    # Any other type: ignore. Common surprises: type=3 (dest
-    # unreachable, sent by a gateway we tried to reach without
-    # an ARP entry), type=11 (TTL exceeded).
+    if itype == ICMP_TYPE_DEST_UNREACH:
+        # §10: a gateway / peer rejected one of our datagrams.
+        _icmp_handle_error(payload, length)
+        return
+    if itype == ICMP_TYPE_TIME_EXCEEDED:
+        # §10: TTL expired in transit (or fragment-reassembly timeout).
+        _icmp_handle_error(payload, length)
+        return
+    # Any other type: ignore.
     printk1("[icmp] ignored type=%d\n", cast[uint64](itype))
 
 
 def icmp_send_echo_request(dst_b0: uint8, dst_b1: uint8,
                            dst_b2: uint8, dst_b3: uint8) -> int32:
     # Emit an unsolicited echo request with a 32-byte payload of
-    # ascending bytes. The smoke test uses this to ping the SLIRP
-    # gateway (10.0.2.2) — SLIRP responds with an echo reply that
-    # lands in icmp_rx → bumps icmp_in_echo_reply. Returns 0 on
-    # ip_send success, -1 otherwise.
+    # ascending bytes. Returns 0 on ip_send success, -1 otherwise.
     PAYLOAD_LEN: uint64 = 32
     TOTAL_LEN:   uint64 = 40           # ICMP_HDR_LEN + PAYLOAD_LEN
-    # Zero the whole scratch buffer so any earlier reply contents
-    # don't bleed into the request.
     i: uint64 = 0
     while i < TOTAL_LEN:
         icmp_tx_buf[i] = 0
@@ -137,8 +217,6 @@ def icmp_send_echo_request(dst_b0: uint8, dst_b1: uint8,
     icmp_ping_seq = icmp_ping_seq + 1
     icmp_tx_buf[6] = cast[uint8]((cast[uint32](icmp_ping_seq) >> 8) & 0xFF)
     icmp_tx_buf[7] = cast[uint8](cast[uint32](icmp_ping_seq) & 0xFF)
-    # Fill payload with ascending bytes (0,1,2,...,31) — same shape
-    # `ping -c 1` uses by default.
     j: uint64 = 0
     while j < PAYLOAD_LEN:
         icmp_tx_buf[8 + j] = cast[uint8](j & 0xFF)
@@ -152,11 +230,84 @@ def icmp_send_echo_request(dst_b0: uint8, dst_b1: uint8,
             cast[uint64](dst_b1))
     printk2(".%d.%d\n", cast[uint64](dst_b2),
             cast[uint64](dst_b3))
-    # Pre-compute the buffer pointer (codegen quirk workaround).
     req_ptr: Ptr[uint8] = cast[Ptr[uint8]](&icmp_tx_buf[0])
     return ip_send(dst_b0, dst_b1, dst_b2, dst_b3,
                    IPPROTO_ICMP,
                    req_ptr, TOTAL_LEN)
+
+
+def icmp_send_port_unreach(dst_b0: uint8, dst_b1: uint8,
+                           dst_b2: uint8, dst_b3: uint8,
+                           orig_ip_pkt: Ptr[uint8],
+                           orig_len: uint64) -> int32:
+    # §10: emit an ICMP destination-unreachable / port-unreachable
+    # (type 3, code 3) for a UDP datagram that hit no listener.
+    # RFC 792: the ICMP payload is the offending datagram's IP header
+    # plus its first 8 bytes (the UDP header). udp_rx calls here with
+    # `orig_ip_pkt` pointing at the UDP header it received — but the
+    # ICMP error must echo back the IP header too. We don't have the
+    # original IP header here (ip_rx stripped it), so we SYNTHESISE a
+    # minimal 20-byte IPv4 header describing the offending datagram:
+    # that is enough for the sender to match the error to its socket
+    # (it reads proto + src/dst port from the echoed bytes). `dst_*`
+    # is where the error is sent (the original datagram's source).
+    #
+    # The echoed inner header carries:
+    #   proto = 17 (UDP), src = dst_* (the original sender), and the
+    #   first 8 bytes of `orig_ip_pkt` (the offending UDP header).
+    # Returns 0 on ip_send success, -1 otherwise.
+    if orig_len < 8:
+        return -1
+    # Layout: [ICMP 8][synthetic IP hdr 20][first 8 bytes of UDP] = 36.
+    TOTAL: uint64 = ICMP_HDR_LEN + 20 + 8
+    i: uint64 = 0
+    while i < TOTAL:
+        icmp_tx_buf[i] = 0
+        i = i + 1
+    # ICMP header.
+    icmp_tx_buf[0] = ICMP_TYPE_DEST_UNREACH
+    icmp_tx_buf[1] = ICMP_CODE_PORT_UNREACH
+    icmp_tx_buf[2] = 0                 # checksum placeholder
+    icmp_tx_buf[3] = 0
+    # bytes 4..7 unused for dest-unreachable (zero).
+    # Synthetic offending IPv4 header @ offset 8.
+    ip_off: uint64 = ICMP_HDR_LEN
+    icmp_tx_buf[ip_off + 0] = 0x45     # version 4, IHL 5
+    icmp_tx_buf[ip_off + 1] = 0
+    # total_length of the offending datagram = 20 + (UDP len). We use
+    # 20 + orig_len; orig_len is the full UDP datagram length.
+    orig_total: uint16 = cast[uint16](20 + orig_len)
+    icmp_tx_buf[ip_off + 2] = cast[uint8]((cast[uint32](orig_total) >> 8) & 0xFF)
+    icmp_tx_buf[ip_off + 3] = cast[uint8](cast[uint32](orig_total) & 0xFF)
+    # id / flags / frag = 0.
+    icmp_tx_buf[ip_off + 8] = 64       # TTL
+    icmp_tx_buf[ip_off + 9] = ICMP_IPPROTO_UDP
+    # src = the original sender (dst_* here, since the error goes back
+    # to them). dst = us — left zero; the sender keys on src + ports.
+    icmp_tx_buf[ip_off + 12] = dst_b0
+    icmp_tx_buf[ip_off + 13] = dst_b1
+    icmp_tx_buf[ip_off + 14] = dst_b2
+    icmp_tx_buf[ip_off + 15] = dst_b3
+    # First 8 bytes of the offending datagram (the UDP header).
+    udp_off: uint64 = ip_off + 20
+    j: uint64 = 0
+    while j < 8:
+        icmp_tx_buf[udp_off + j] = orig_ip_pkt[j]
+        j = j + 1
+    # Checksum over the whole ICMP message.
+    csum: uint16 = ip_csum16(
+        cast[Ptr[uint8]](&icmp_tx_buf[0]), TOTAL)
+    icmp_tx_buf[2] = cast[uint8]((cast[uint32](csum) >> 8) & 0xFF)
+    icmp_tx_buf[3] = cast[uint8](cast[uint32](csum) & 0xFF)
+    icmp_out_unreach = icmp_out_unreach + 1
+    printk2("[icmp] port-unreachable -> %d.%d", cast[uint64](dst_b0),
+            cast[uint64](dst_b1))
+    printk2(".%d.%d\n", cast[uint64](dst_b2),
+            cast[uint64](dst_b3))
+    unr_ptr: Ptr[uint8] = cast[Ptr[uint8]](&icmp_tx_buf[0])
+    return ip_send(dst_b0, dst_b1, dst_b2, dst_b3,
+                   IPPROTO_ICMP,
+                   unr_ptr, TOTAL)
 
 
 def icmp_init():
@@ -164,5 +315,7 @@ def icmp_init():
     icmp_in_echo_reply = 0
     icmp_out_echo_req = 0
     icmp_out_echo_reply = 0
+    icmp_in_errors = 0
+    icmp_out_unreach = 0
     icmp_ping_seq = 0
-    printk0("icmp: initialized (echo request/reply)\n")
+    printk0("icmp: initialized (echo + error messages)\n")

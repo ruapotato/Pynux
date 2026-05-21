@@ -93,8 +93,21 @@ from linux_abi.u_socket_state import (
     usock_fdbuf_for_record, usock_record_for_fdbuf,
     usock_set_bound, usock_get_bound_port, usock_port_in_use,
     usock_set_tls, usock_is_tls, usock_any_tls_active,
+    usock_get_type, usock_set_peer, usock_get_peer_addr,
+    usock_get_peer_port, usock_set_opt, usock_get_opt,
     USOCK_CREATED, USOCK_CONNECTED, USOCK_LISTENING,
-    USOCK_AF_INET, USOCK_SOCK_STREAM,
+    USOCK_AF_INET, USOCK_SOCK_STREAM, USOCK_SOCK_DGRAM,
+    USOCK_SOL_SOCKET, USOCK_SO_ERROR,
+)
+# §10 UDP sockets: a SOCK_DGRAM socket fd bridges to the in-kernel UDP
+# socket layer (drivers/net/udp.ad). The usock record's "tcp_slot"
+# field doubles as the generic stack-slot handle — for a datagram
+# socket it carries the udp.ad socket slot.
+from drivers.net.udp import (
+    udp_socket_open, udp_socket_close, udp_socket_bind,
+    udp_socket_connect, udp_socket_sendto, udp_socket_recvfrom,
+    udp_socket_local_port, udp_socket_set_broadcast,
+    udp_socket_get_so_error,
 )
 # U-TLS: bridge userland tls_connect(2) to the in-kernel TLS 1.3 stack
 # (drivers/net/tls.ad). tls_handshake drives the full handshake —
@@ -435,6 +448,9 @@ ELINUX_ADDRINUSE:    int64 = -98    # EADDRINUSE — bind port already in use
 ELINUX_BUSY:         int64 = -16    # EBUSY — a TLS session is already live
 ELINUX_PROTO:        int64 = -71    # EPROTO — TLS handshake / cert validation failed
 ELINUX_PIPE:         int64 = -32    # EPIPE — write to a pipe / socket with no reader
+# §10 UDP-socket / sockopt errnos.
+ELINUX_MSGSIZE:      int64 = -90    # EMSGSIZE — datagram larger than the UDP MTU
+ELINUX_NOPROTOOPT:   int64 = -92    # ENOPROTOOPT — unrecognised setsockopt option
 
 
 # =====================================================================
@@ -1402,28 +1418,28 @@ def _u_socket(a0: uint64, a1: uint64, a2: uint64,
               a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int socket(int domain, int type, int protocol)
     #
-    # U-socket V0: allocate a socket fd PLUS a per-socket-fd backing
-    # record (linux_abi/u_socket_state.ad) that connect(2) / read /
-    # write / close use to reach the real in-kernel TCP stack. V0
-    # supports exactly one combination — AF_INET + SOCK_STREAM — and
-    # rejects everything else with a faithful errno so the caller sees
-    # the same refusal Linux would give. `protocol` is ignored (0 ==
-    # "default for this type", which for SOCK_STREAM is TCP).
+    # Allocate a socket fd PLUS a per-socket-fd backing record
+    # (linux_abi/u_socket_state.ad) that connect(2) / read / write /
+    # close / sendto / recvfrom use to reach the in-kernel stack.
+    # Supported combinations are AF_INET + SOCK_STREAM (TCP) and, as of
+    # §10, AF_INET + SOCK_DGRAM (UDP). Everything else is rejected with
+    # a faithful errno. `protocol` is ignored (0 == "default for this
+    # type": TCP for STREAM, UDP for DGRAM).
     domain:    uint32 = cast[uint32](a0)
     sock_type: uint32 = cast[uint32](a1)
     # SOCK_CLOEXEC (0x80000) / SOCK_NONBLOCK (0x800) ride in the high
     # bits of `type` on Linux. Hamnix has no CLOEXEC table and no
     # non-blocking sockets yet (see V1 backlog), so mask them off
-    # before the SOCK_STREAM compare rather than failing the call.
+    # before the type compare rather than failing the call.
     sock_type = sock_type & 0xFF
     if domain != USOCK_AF_INET:
-        # Only AF_INET in V0 — AF_UNIX / AF_INET6 not supported.
+        # Only AF_INET — AF_UNIX / AF_INET6 not supported.
         set_current_errstr("socket: address family not supported")
         return ELINUX_AFNOSUPPORT
     if sock_type != USOCK_SOCK_STREAM:
-        # Only SOCK_STREAM (TCP) in V0 — SOCK_DGRAM (UDP) not supported.
-        set_current_errstr("socket: socket type not supported")
-        return ELINUX_PROTONOSUP
+        if sock_type != USOCK_SOCK_DGRAM:
+            set_current_errstr("socket: socket type not supported")
+            return ELINUX_PROTONOSUP
     fd: int32 = vfs_alloc_socket_fd()
     if fd < 0:
         set_current_errstr("socket: out of fd slots")
@@ -1435,10 +1451,28 @@ def _u_socket(a0: uint64, a1: uint64, a2: uint64,
         vfs_close(fd)
         set_current_errstr("socket: out of socket records")
         return ELINUX_MFILE
+    # §10: a SOCK_DGRAM socket gets a UDP socket slot immediately (UDP
+    # is connectionless — there's no connect() to defer the slot to).
+    # The udp.ad slot is stashed in the record's stack-slot field.
+    if sock_type == USOCK_SOCK_DGRAM:
+        uslot: int32 = udp_socket_open()
+        if uslot < 0:
+            usock_free(rec)
+            vfs_close(fd)
+            set_current_errstr("socket: out of UDP socket slots")
+            return ELINUX_MFILE
+        usock_set_tcp_slot(rec, uslot)
+        # A UDP socket is usable for I/O right after socket() — Linux
+        # lets you sendto/recvfrom without an explicit connect — so the
+        # record goes straight to CONNECTED (here "ready", not "has a
+        # fixed peer"; the peer tuple stays zero until connect(2)).
+        usock_set_state(rec, USOCK_CONNECTED)
     # Wire the record id into the fd's fd_buf so vfs read/write/close
     # can find it. If the fd_buf write fails the fd vanished from
     # under us — release the record and surface the error.
     if vfs_socket_fd_set_record(fd, usock_fdbuf_for_record(rec)) != 0:
+        if sock_type == USOCK_SOCK_DGRAM:
+            udp_socket_close(usock_get_tcp_slot(rec))
         usock_free(rec)
         vfs_close(fd)
         set_current_errstr("socket: fd record bind failed")
@@ -1470,6 +1504,37 @@ def _u_connect(a0: uint64, a1: uint64, a2: uint64,
         # Socket fd with no backing record — a legacy U35-era fd, or a
         # record-alloc failure slipped through. Treat as a bad fd.
         return ELINUX_BADF
+    # §10 UDP: connect on a datagram socket just records a fixed peer
+    # (no handshake). A bare send(2) / sendto(NULL) then targets it,
+    # and a received ICMP port-unreachable surfaces via SO_ERROR.
+    if usock_get_type(rec) == USOCK_SOCK_DGRAM:
+        if a1 == 0:
+            set_current_errstr("connect: null sockaddr")
+            return ELINUX_INVAL
+        if a2 < 16:
+            set_current_errstr("connect: addrlen too short for sockaddr_in")
+            return ELINUX_INVAL
+        uaddr: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        ufam: uint32 = cast[uint32](uaddr[0]) \
+                     | (cast[uint32](uaddr[1]) << 8)
+        if ufam != USOCK_AF_INET:
+            set_current_errstr("connect: sockaddr family not AF_INET")
+            return ELINUX_AFNOSUPPORT
+        uport: uint32 = (cast[uint32](uaddr[2]) << 8) \
+                      | cast[uint32](uaddr[3])
+        uip: uint32 = (cast[uint32](uaddr[4]) << 24) \
+                    | (cast[uint32](uaddr[5]) << 16) \
+                    | (cast[uint32](uaddr[6]) << 8) \
+                    | cast[uint32](uaddr[7])
+        uslot: int32 = usock_get_tcp_slot(rec)
+        if udp_socket_connect(uslot, uip, cast[uint16](uport & 0xFFFF)) != 0:
+            set_current_errstr("connect: UDP socket slot invalid")
+            return ELINUX_BADF
+        usock_set_peer(rec, uip, uport)
+        printk2("[u_socket] UDP connect -> %d.%d", cast[uint64](uaddr[4]),
+                cast[uint64](uaddr[5]))
+        printk1(":%d\n", cast[uint64](uport))
+        return 0
     st: uint32 = usock_get_state(rec)
     if st == USOCK_CONNECTED:
         set_current_errstr("connect: socket already connected")
@@ -1751,6 +1816,35 @@ def _u_bind(a0: uint64, a1: uint64, a2: uint64,
     rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
     if usock_valid(rec) == 0:
         return ELINUX_BADF
+    # §10 UDP: bind a datagram socket to a local port via the UDP
+    # socket layer. A UDP socket can be bound exactly once; a second
+    # bind (local port already set) is -EINVAL.
+    if usock_get_type(rec) == USOCK_SOCK_DGRAM:
+        if a1 == 0:
+            set_current_errstr("bind: null sockaddr")
+            return ELINUX_INVAL
+        if a2 < 16:
+            set_current_errstr("bind: addrlen too short for sockaddr_in")
+            return ELINUX_INVAL
+        ua: Ptr[uint8] = cast[Ptr[uint8]](a1)
+        ufam: uint32 = cast[uint32](ua[0]) | (cast[uint32](ua[1]) << 8)
+        if ufam != USOCK_AF_INET:
+            set_current_errstr("bind: sockaddr family not AF_INET")
+            return ELINUX_AFNOSUPPORT
+        uport: uint32 = (cast[uint32](ua[2]) << 8) | cast[uint32](ua[3])
+        uslot: int32 = usock_get_tcp_slot(rec)
+        if udp_socket_local_port(uslot) != 0:
+            set_current_errstr("bind: socket already bound")
+            return ELINUX_INVAL
+        ubrc: int32 = udp_socket_bind(uslot, cast[uint16](uport & 0xFFFF))
+        if ubrc == -2:
+            set_current_errstr("bind: address already in use")
+            return ELINUX_ADDRINUSE
+        if ubrc != 0:
+            set_current_errstr("bind: UDP socket slot invalid")
+            return ELINUX_BADF
+        printk1("[u_socket] UDP bind: port=%d\n", cast[uint64](uport))
+        return 0
     if usock_get_state(rec) != USOCK_CREATED:
         # Already bound + listening, or connected, or closed — Linux
         # returns -EINVAL ("socket is already bound to an address").
@@ -1862,9 +1956,43 @@ def _u_setsockopt(a0: uint64, a1: uint64, a2: uint64,
                   a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int setsockopt(int sockfd, int level, int optname,
     #                const void *optval, socklen_t optlen)
-    # Accept and discard — no per-socket state to mutate.
-    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+    #
+    # §10: store the option on the socket's backing record. The common
+    # daemon options (SO_REUSEADDR, SO_REUSEPORT, SO_RCVBUF/SO_SNDBUF,
+    # SO_KEEPALIVE, TCP_NODELAY, SO_BROADCAST) are recorded; SO_RCVBUF/
+    # SO_SNDBUF and the flags round-trip through getsockopt. Options
+    # with a real effect are honoured (SO_BROADCAST is pushed to the
+    # UDP socket layer); the rest are accept-and-record. An unmodelled
+    # (level, optname) returns -ENOPROTOOPT rather than silently
+    # succeeding, so a daemon that depends on a real option learns it
+    # is unsupported instead of being misled.
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) == 0:
+        return ELINUX_BADF
+    level:   uint32 = cast[uint32](a1)
+    optname: uint32 = cast[uint32](a2)
+    # optval is a pointer to an int (the common case). A NULL optval or
+    # an optlen < 4 can't carry an integer option — Linux returns
+    # -EINVAL / -EFAULT; -EINVAL is the closest fit we have.
+    if a3 == 0:
+        return ELINUX_INVAL
+    if a4 < 4:
+        return ELINUX_INVAL
+    value: uint32 = cast[Ptr[uint32]](a3)[0]
+    if usock_set_opt(rec, level, optname, value) != 0:
+        set_current_errstr("setsockopt: unsupported option")
+        return ELINUX_NOPROTOOPT
+    # SO_BROADCAST has a real effect on a UDP socket — mirror it into
+    # the UDP socket layer so getsockopt there agrees and so the flag
+    # is recorded against the live datagram slot.
+    if level == USOCK_SOL_SOCKET:
+        if optname == USOCK_SO_BROADCAST:
+            if usock_get_type(rec) == USOCK_SOCK_DGRAM:
+                udp_socket_set_broadcast(usock_get_tcp_slot(rec),
+                                         cast[uint8](value & 1))
     return 0
 
 
@@ -1872,12 +2000,52 @@ def _u_getsockopt(a0: uint64, a1: uint64, a2: uint64,
                   a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int getsockopt(int sockfd, int level, int optname,
     #                void *optval, socklen_t *optlen)
-    # Report zero-length result so glibc's getsockopt(SO_ERROR) probes
-    # see "no pending error" rather than -ENOSYS.
-    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+    #
+    # §10: return the option value the socket's record carries. The
+    # special case is SO_ERROR — Linux returns the socket's pending
+    # error and CLEARS it. For a UDP socket the pending error lives in
+    # the udp.ad slot (an ICMP port-unreachable latches it there); we
+    # read-and-clear it. For a TCP socket we have no async error
+    # channel, so SO_ERROR reads 0.
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
-    if a4 != 0:
-        cast[Ptr[uint32]](a4)[0] = 0
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) == 0:
+        return ELINUX_BADF
+    if a3 == 0:
+        return ELINUX_INVAL
+    if a4 == 0:
+        return ELINUX_INVAL
+    # The caller's *optlen must be able to hold an int.
+    if cast[Ptr[uint32]](a4)[0] < 4:
+        return ELINUX_INVAL
+    level:   uint32 = cast[uint32](a1)
+    optname: uint32 = cast[uint32](a2)
+    result: int32 = 0
+    if level == USOCK_SOL_SOCKET:
+        if optname == USOCK_SO_ERROR:
+            # Read-and-clear the pending error. A connected UDP socket
+            # that got an ICMP port-unreachable surfaces -ECONNREFUSED
+            # here; getsockopt reports it as a POSITIVE errno value.
+            if usock_get_type(rec) == USOCK_SOCK_DGRAM:
+                uerr: int32 = udp_socket_get_so_error(
+                    usock_get_tcp_slot(rec))
+                if uerr < 0:
+                    result = -uerr
+                else:
+                    result = uerr
+            else:
+                result = 0
+            cast[Ptr[uint32]](a3)[0] = cast[uint32](result)
+            cast[Ptr[uint32]](a4)[0] = 4
+            return 0
+    got: int32 = usock_get_opt(rec, level, optname)
+    if got < 0:
+        set_current_errstr("getsockopt: unsupported option")
+        return ELINUX_NOPROTOOPT
+    cast[Ptr[uint32]](a3)[0] = cast[uint32](got)
+    cast[Ptr[uint32]](a4)[0] = 4
     return 0
 
 
@@ -1899,17 +2067,61 @@ def _u_sendto(a0: uint64, a1: uint64, a2: uint64,
     #                int flags, const struct sockaddr *dest_addr,
     #                socklen_t addrlen)
     #
-    # U-socket V0: a connected SOCK_STREAM socket ignores the
-    # dest_addr / addrlen pair (Linux does too — the connection's peer
-    # is fixed), so sendto degrades to write(2). `flags` is ignored;
-    # we don't implement MSG_OOB / MSG_DONTWAIT yet. vfs_write's
-    # FD_SOCKET_MARK arm routes the bytes through tcp_send.
-    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+    # SOCK_STREAM: a connected stream socket ignores dest_addr (Linux
+    # does too), so sendto degrades to write(2).
+    #
+    # §10 SOCK_DGRAM: send ONE datagram. dest_addr names the target; a
+    # NULL dest_addr requires the socket to have been connect(2)'d (the
+    # fixed peer is used). `flags` (MSG_DONTWAIT etc.) are ignored.
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) != 0:
+        if usock_get_type(rec) == USOCK_SOCK_DGRAM:
+            uslot: int32 = usock_get_tcp_slot(rec)
+            dst_ip:   uint32 = 0
+            dst_port: uint32 = 0
+            if a4 != 0:
+                # dest_addr supplied — parse the sockaddr_in.
+                if a5 < 16:
+                    set_current_errstr("sendto: addrlen too short")
+                    return ELINUX_INVAL
+                da: Ptr[uint8] = cast[Ptr[uint8]](a4)
+                dfam: uint32 = cast[uint32](da[0]) \
+                             | (cast[uint32](da[1]) << 8)
+                if dfam != USOCK_AF_INET:
+                    set_current_errstr("sendto: dest family not AF_INET")
+                    return ELINUX_AFNOSUPPORT
+                dst_port = (cast[uint32](da[2]) << 8) \
+                         | cast[uint32](da[3])
+                dst_ip = (cast[uint32](da[4]) << 24) \
+                       | (cast[uint32](da[5]) << 16) \
+                       | (cast[uint32](da[6]) << 8) \
+                       | cast[uint32](da[7])
+            else:
+                # No dest_addr — use the connect(2)'d peer.
+                dst_ip   = usock_get_peer_addr(rec)
+                dst_port = usock_get_peer_port(rec)
+                if dst_ip == 0:
+                    set_current_errstr("sendto: no peer (connect first)")
+                    return ELINUX_NOTCONN
+            usn: int64 = udp_socket_sendto(uslot, dst_ip,
+                                           cast[uint16](dst_port & 0xFFFF),
+                                           cast[Ptr[uint8]](a1), a2)
+            if usn == -90:
+                set_current_errstr("sendto: datagram too large")
+                return ELINUX_MSGSIZE
+            if usn == -9:
+                return ELINUX_BADF
+            if usn < 0:
+                set_current_errstr("sendto: transmit failed")
+                return ELINUX_NETUNREACH
+            return usn
     # §3: SIGPIPE on a send to a peer that has gone away — same
     # contract as write(2). vfs_write's FD_SOCKET_MARK arm returns
     # -EPIPE when the TCP slot is CLOSED / unconnected.
-    sn: int64 = vfs_write(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
+    sn: int64 = vfs_write(fd, cast[Ptr[uint8]](a1), a2)
     if sn == ELINUX_PIPE:
         signal_post(current_idx_get(), SIGPIPE)
     return sn
@@ -1920,17 +2132,55 @@ def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
     # ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
     #                  struct sockaddr *src_addr, socklen_t *addrlen)
     #
-    # U-socket V0: a connected SOCK_STREAM socket degrades recvfrom to
-    # read(2). If the caller passed a src_addr buffer we zero its
-    # addrlen out-param (we have no peer address table to populate),
-    # matching the getpeername / getsockname stubs. vfs_read's
-    # FD_SOCKET_MARK arm routes the read through tcp_recv.
-    if vfs_fd_is_socket(cast[int32](a0)) == 0:
+    # SOCK_STREAM: degrades to read(2) (no per-connection peer table).
+    #
+    # §10 SOCK_DGRAM: receive ONE datagram. If src_addr is supplied,
+    # fill it with the datagram's source (sockaddr_in) and set *addrlen
+    # to 16. `flags` are ignored.
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_is_socket(fd) == 0:
         return ELINUX_BADF
+    rec: int32 = usock_record_for_fdbuf(vfs_socket_fd_get_record(fd))
+    if usock_valid(rec) != 0:
+        if usock_get_type(rec) == USOCK_SOCK_DGRAM:
+            uslot: int32 = usock_get_tcp_slot(rec)
+            src_ip:   uint32 = 0
+            src_port: uint16 = 0
+            urn: int64 = udp_socket_recvfrom(
+                uslot, cast[Ptr[uint8]](a1), a2, 500,
+                cast[Ptr[uint32]](&src_ip),
+                cast[Ptr[uint16]](&src_port))
+            if urn == -9:
+                return ELINUX_BADF
+            if urn == -11:
+                # Timed out with no datagram — would-block.
+                return ELINUX_AGAIN
+            if urn < 0:
+                # A latched ICMP error (port-unreachable) surfaced as
+                # the negative errno itself.
+                return urn
+            # Fill the source sockaddr_in out-param if requested.
+            if a4 != 0:
+                sa: Ptr[uint8] = cast[Ptr[uint8]](a4)
+                sa[0] = cast[uint8](USOCK_AF_INET & 0xFF)
+                sa[1] = cast[uint8]((USOCK_AF_INET >> 8) & 0xFF)
+                sa[2] = cast[uint8]((cast[uint32](src_port) >> 8) & 0xFF)
+                sa[3] = cast[uint8](cast[uint32](src_port) & 0xFF)
+                sa[4] = cast[uint8]((src_ip >> 24) & 0xFF)
+                sa[5] = cast[uint8]((src_ip >> 16) & 0xFF)
+                sa[6] = cast[uint8]((src_ip >> 8) & 0xFF)
+                sa[7] = cast[uint8](src_ip & 0xFF)
+                z: uint64 = 8
+                while z < 16:
+                    sa[z] = 0
+                    z = z + 1
+                if a5 != 0:
+                    cast[Ptr[uint32]](a5)[0] = 16
+            return urn
     if a4 != 0:
         if a5 != 0:
             cast[Ptr[uint32]](a5)[0] = 0
-    return vfs_read(cast[int32](a0), cast[Ptr[uint8]](a1), a2)
+    return vfs_read(fd, cast[Ptr[uint8]](a1), a2)
 
 
 def _u_poll(a0: uint64, a1: uint64, a2: uint64,

@@ -40,10 +40,22 @@ USOCK_LISTENING: uint32 = 4    # listen() done — passive socket, tcp_slot
                                #   holds the TCP_LISTEN listener slot
 
 # Address family / socket type values we recognise (subset of Linux's
-# <bits/socket.h> / <bits/socket_type.h>). V0 supports exactly one
-# combination: AF_INET + SOCK_STREAM.
+# <bits/socket.h> / <bits/socket_type.h>). AF_INET with either
+# SOCK_STREAM (TCP) or SOCK_DGRAM (UDP, §10).
 USOCK_AF_INET:     uint32 = 2
 USOCK_SOCK_STREAM: uint32 = 1
+USOCK_SOCK_DGRAM:  uint32 = 2
+
+# §10 socket options. setsockopt/getsockopt store per-record state in
+# the usock_opt_* parallel arrays below. SO_RCVBUF / SO_SNDBUF / the
+# boolean flags are RECORDED faithfully so a getsockopt round-trips the
+# value a daemon set; SO_REUSEADDR / SO_REUSEPORT / TCP_NODELAY have no
+# behavioural effect at this scale (one listener per port, no Nagle),
+# SO_BROADCAST is forwarded to the UDP socket layer where directed
+# broadcast already works, and SO_ERROR is read-and-cleared from the
+# stack slot (TCP / UDP) when queried.
+USOCK_OPT_RCVBUF_DEFAULT: uint32 = 262144   # mirrors tcp.ad TCP_RX_BUF
+USOCK_OPT_SNDBUF_DEFAULT: uint32 = 65536
 
 # Pool size — see header. One spare over TCP_NUM_SLOTS so a socket()
 # that out-runs the TCP table still gets a record (connect() then
@@ -73,6 +85,25 @@ usock_tls:      Array[9, uint8]    # 1 if TLS handshake done on this fd
 usock_bound_port: Array[9, uint32]  # bound port (host order), 0 if unbound
 usock_bound_addr: Array[9, uint32]  # bound IPv4 (host order), 0 == ANY
 
+# §10 UDP: a connected datagram socket records its fixed peer so a
+# bare send(2) (or a sendto with NULL addr) reaches it, and recvfrom
+# can fill the src_addr out-param. Host order; 0 == not connected.
+usock_peer_addr: Array[9, uint32]   # connected peer IPv4 (host order)
+usock_peer_port: Array[9, uint32]   # connected peer port (host order)
+
+# §10 socket options — per-record store written by setsockopt(2) and
+# read back by getsockopt(2). Booleans are 0/1; the buffer sizes are
+# byte counts. These are initialised to faithful defaults in
+# usock_alloc so a getsockopt before any setsockopt returns a sane
+# value (matching Linux, which has non-zero default SO_RCVBUF etc).
+usock_opt_reuseaddr: Array[9, uint8]
+usock_opt_reuseport: Array[9, uint8]
+usock_opt_keepalive: Array[9, uint8]
+usock_opt_nodelay:   Array[9, uint8]
+usock_opt_broadcast: Array[9, uint8]
+usock_opt_rcvbuf:    Array[9, uint32]
+usock_opt_sndbuf:    Array[9, uint32]
+
 
 def usock_init():
     # Reset every record to FREE. Called once during kernel bring-up so
@@ -88,6 +119,15 @@ def usock_init():
         usock_bound_port[i] = 0
         usock_bound_addr[i] = 0
         usock_tls[i]        = 0
+        usock_peer_addr[i]  = 0
+        usock_peer_port[i]  = 0
+        usock_opt_reuseaddr[i] = 0
+        usock_opt_reuseport[i] = 0
+        usock_opt_keepalive[i] = 0
+        usock_opt_nodelay[i]   = 0
+        usock_opt_broadcast[i] = 0
+        usock_opt_rcvbuf[i]    = USOCK_OPT_RCVBUF_DEFAULT
+        usock_opt_sndbuf[i]    = USOCK_OPT_SNDBUF_DEFAULT
         i = i + 1
     printk0("[usock] socket-fd record pool initialised\n")
 
@@ -107,6 +147,15 @@ def usock_alloc(family: uint32, sock_type: uint32) -> int32:
             usock_bound_port[i] = 0
             usock_bound_addr[i] = 0
             usock_tls[i]        = 0
+            usock_peer_addr[i]  = 0
+            usock_peer_port[i]  = 0
+            usock_opt_reuseaddr[i] = 0
+            usock_opt_reuseport[i] = 0
+            usock_opt_keepalive[i] = 0
+            usock_opt_nodelay[i]   = 0
+            usock_opt_broadcast[i] = 0
+            usock_opt_rcvbuf[i]    = USOCK_OPT_RCVBUF_DEFAULT
+            usock_opt_sndbuf[i]    = USOCK_OPT_SNDBUF_DEFAULT
             return cast[int32](i)
         i = i + 1
     return -1
@@ -129,6 +178,15 @@ def usock_free(rec: int32):
     usock_bound_port[ru] = 0
     usock_bound_addr[ru] = 0
     usock_tls[ru]        = 0
+    usock_peer_addr[ru]  = 0
+    usock_peer_port[ru]  = 0
+    usock_opt_reuseaddr[ru] = 0
+    usock_opt_reuseport[ru] = 0
+    usock_opt_keepalive[ru] = 0
+    usock_opt_nodelay[ru]   = 0
+    usock_opt_broadcast[ru] = 0
+    usock_opt_rcvbuf[ru]    = USOCK_OPT_RCVBUF_DEFAULT
+    usock_opt_sndbuf[ru]    = USOCK_OPT_SNDBUF_DEFAULT
 
 
 def usock_valid(rec: int32) -> int32:
@@ -269,3 +327,121 @@ def usock_any_tls_active() -> int32:
                 return 1
         i = i + 1
     return 0
+
+
+# -- §10 UDP: connected-peer accessors --------------------------------
+#
+# A UDP (SOCK_DGRAM) record uses usock_tcp_slot as a GENERIC stack-slot
+# handle — for a datagram socket it holds the drivers/net/udp.ad socket
+# slot, not a TCP connection slot. usock_get_tcp_slot / usock_set_tcp_
+# slot already do the right thing as plain getters/setters; the name
+# is historical. The peer accessors below let connect(2) record the
+# fixed peer and recvfrom(2) / getpeername(2) read it back.
+
+def usock_set_peer(rec: int32, addr: uint32, port: uint32):
+    # Record the connected peer (host order) on a datagram socket.
+    if usock_valid(rec) == 0:
+        return
+    usock_peer_addr[cast[uint64](rec)] = addr
+    usock_peer_port[cast[uint64](rec)] = port
+
+
+def usock_get_peer_addr(rec: int32) -> uint32:
+    # Connected peer IPv4 (host order), or 0 if unconnected / invalid.
+    if usock_valid(rec) == 0:
+        return 0
+    return usock_peer_addr[cast[uint64](rec)]
+
+
+def usock_get_peer_port(rec: int32) -> uint32:
+    # Connected peer port (host order), or 0 if unconnected / invalid.
+    if usock_valid(rec) == 0:
+        return 0
+    return usock_peer_port[cast[uint64](rec)]
+
+
+# -- §10 socket-option accessors --------------------------------------
+#
+# A small fixed set of option codes; the optname values match Linux's
+# <asm-generic/socket.h> / <netinet/tcp.h>. setsockopt(2) dispatches on
+# (level, optname) into usock_set_opt, getsockopt(2) reads usock_get_opt.
+
+USOCK_SOL_SOCKET:  uint32 = 1        # level — generic socket options
+USOCK_SOL_TCP:     uint32 = 6        # level — IPPROTO_TCP options
+
+USOCK_SO_REUSEADDR: uint32 = 2
+USOCK_SO_ERROR:     uint32 = 4
+USOCK_SO_BROADCAST: uint32 = 6
+USOCK_SO_SNDBUF:    uint32 = 7
+USOCK_SO_RCVBUF:    uint32 = 8
+USOCK_SO_KEEPALIVE: uint32 = 9
+USOCK_SO_REUSEPORT: uint32 = 15
+USOCK_TCP_NODELAY:  uint32 = 1        # at level SOL_TCP
+
+
+def usock_set_opt(rec: int32, level: uint32, optname: uint32,
+                  value: uint32) -> int32:
+    # Apply an integer socket option to a record. Returns 0 if the
+    # option was recognised and stored, -1 if (level, optname) is one
+    # we don't model (the caller maps that to -ENOPROTOOPT). SO_ERROR
+    # is read-only — a setsockopt against it is rejected.
+    if usock_valid(rec) == 0:
+        return -1
+    r: uint64 = cast[uint64](rec)
+    if level == USOCK_SOL_SOCKET:
+        if optname == USOCK_SO_REUSEADDR:
+            usock_opt_reuseaddr[r] = cast[uint8](value & 1)
+            return 0
+        if optname == USOCK_SO_REUSEPORT:
+            usock_opt_reuseport[r] = cast[uint8](value & 1)
+            return 0
+        if optname == USOCK_SO_KEEPALIVE:
+            usock_opt_keepalive[r] = cast[uint8](value & 1)
+            return 0
+        if optname == USOCK_SO_BROADCAST:
+            usock_opt_broadcast[r] = cast[uint8](value & 1)
+            return 0
+        if optname == USOCK_SO_RCVBUF:
+            # Linux doubles the requested SO_RCVBUF for bookkeeping
+            # overhead; we store the value verbatim — a daemon's
+            # getsockopt-after-setsockopt round-trip then matches.
+            usock_opt_rcvbuf[r] = value
+            return 0
+        if optname == USOCK_SO_SNDBUF:
+            usock_opt_sndbuf[r] = value
+            return 0
+        if optname == USOCK_SO_ERROR:
+            # SO_ERROR is read-only.
+            return -1
+    if level == USOCK_SOL_TCP:
+        if optname == USOCK_TCP_NODELAY:
+            usock_opt_nodelay[r] = cast[uint8](value & 1)
+            return 0
+    return -1
+
+
+def usock_get_opt(rec: int32, level: uint32, optname: uint32) -> int32:
+    # Read an integer socket option. Returns the value as a (non-
+    # negative) int32 for a recognised option, or -1 if (level,
+    # optname) is unmodelled. SO_ERROR is handled by the caller (it
+    # must read-and-clear the stack slot's pending error), not here.
+    if usock_valid(rec) == 0:
+        return -1
+    r: uint64 = cast[uint64](rec)
+    if level == USOCK_SOL_SOCKET:
+        if optname == USOCK_SO_REUSEADDR:
+            return cast[int32](usock_opt_reuseaddr[r])
+        if optname == USOCK_SO_REUSEPORT:
+            return cast[int32](usock_opt_reuseport[r])
+        if optname == USOCK_SO_KEEPALIVE:
+            return cast[int32](usock_opt_keepalive[r])
+        if optname == USOCK_SO_BROADCAST:
+            return cast[int32](usock_opt_broadcast[r])
+        if optname == USOCK_SO_RCVBUF:
+            return cast[int32](usock_opt_rcvbuf[r])
+        if optname == USOCK_SO_SNDBUF:
+            return cast[int32](usock_opt_sndbuf[r])
+    if level == USOCK_SOL_TCP:
+        if optname == USOCK_TCP_NODELAY:
+            return cast[int32](usock_opt_nodelay[r])
+    return -1

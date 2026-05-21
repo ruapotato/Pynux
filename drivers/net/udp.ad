@@ -1,11 +1,14 @@
 # drivers/net/udp.ad
 #
 # UDP (RFC 768) — 8-byte header, no state, no retransmit. We
-# implement the wire-format header and a minimal rx/tx pair that:
+# implement the wire-format header and:
 #
 #   udp_rx(...)  dispatches by destination port. Port 68 (the
-#                DHCP client port) routes to dhcp_rx; any other
-#                port is dropped with a diagnostic.
+#                DHCP client port) routes to dhcp_rx; the DNS
+#                client pool (53000..53003) routes to dns_rx; any
+#                other port is matched against the UDP socket
+#                table (a bound SOCK_DGRAM socket). A datagram with
+#                no listener triggers an ICMP port-unreachable.
 #
 #   udp_send(...) builds the 8-byte UDP header in front of the
 #                payload and calls ip_send with protocol=17. The
@@ -13,16 +16,27 @@
 #                "if not used, set to zero"). We zero it — saves
 #                a pseudo-header construction and matches what
 #                most embedded stacks do for DHCP.
+#
+# §10 (kernel roadmap) — UDP sockets. The udp_socket_* family below
+# is the Layer-2 datagram-socket facility a Linux server daemon
+# reaches through socket(AF_INET, SOCK_DGRAM, 0): a small table of
+# bound sockets, each with a fixed ring of received datagrams. The
+# linux_abi shim (linux_abi/u_syscalls.ad) and fs/vfs.ad's
+# FD_SOCKET_MARK arms delegate sendto/recvfrom/close to this layer.
+# This is a Layer-2 facility — it CONSUMES ip_send/udp_send, it is
+# not a substrate beneath the native stack.
 
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.ip import ip_send, IPPROTO_UDP
+from drivers.net.virtio_net import virtio_net_poll
+from arch.x86.kernel.time import pit_monotonic_us
 
 
 # Reserved port numbers we care about. DHCP server speaks on 67,
 # DHCP client on 68. DNS responses come back to our ephemeral
 # client-side pool 53000..53003 (see drivers/net/dns.ad — one slot
-# per in-flight query, four slots total). Everything else we drop
-# until socket(2) lands and a real bind table comes online.
+# per in-flight query, four slots total). Everything else is matched
+# against the UDP socket table.
 UDP_PORT_DHCP_SERVER:    uint16 = 67
 UDP_PORT_DHCP_CLIENT:    uint16 = 68
 UDP_PORT_DNS_CLIENT_LO:  uint16 = 53000
@@ -49,7 +63,407 @@ class UdpHdr:
 
 udp_in_datagrams:  uint64 = 0
 udp_out_datagrams: uint64 = 0
+udp_no_ports:      uint64 = 0          # datagrams with no listener
 
+
+# =====================================================================
+# §10 UDP socket table
+# =====================================================================
+#
+# A bare-metal datagram-socket layer for the Linux-ABI socket(2) path.
+# 8 sockets, matching TCP_NUM_SLOTS. Each socket holds a small ring of
+# received datagrams; each datagram is (src ip, src port, length,
+# payload). Parallel arrays — same nested-frame-Array discipline the
+# rest of the net stack follows.
+#
+# Datagram payloads are capped at UDS_DGRAM_MAX bytes; an inbound
+# datagram larger than that is truncated (UDP has no reassembly here).
+# A socket holds at most UDS_QUEUE_DEPTH queued datagrams; an arrival
+# that overflows the ring is dropped (the most recent loss, RFC-legal
+# for UDP — datagrams are unreliable by definition).
+
+UDS_MAX:          uint64 = 8       # number of UDP socket slots
+UDS_QUEUE_DEPTH:  uint64 = 8       # datagrams buffered per socket
+UDS_DGRAM_MAX:    uint64 = 1472    # max payload (1500 MTU - 20 IP - 8 UDP)
+
+# Socket-slot scalar state (parallel arrays, one entry per slot).
+uds_inuse:       Array[8, uint8]    # 1 if slot allocated
+uds_local_port:  Array[8, uint16]   # bound local port (host order), 0 unbound
+uds_peer_ip:     Array[8, uint32]   # connected peer IPv4 (host order), 0 none
+uds_peer_port:   Array[8, uint16]   # connected peer port (host order), 0 none
+uds_so_error:    Array[8, int32]    # pending SO_ERROR (0 = none)
+uds_broadcast:   Array[8, uint8]    # SO_BROADCAST allowed (1) — informational
+
+# Per-socket receive ring. uds_q_head is the consumer index, uds_q_tail
+# the producer index, uds_q_count the number of queued datagrams.
+uds_q_head:      Array[8, uint64]
+uds_q_tail:      Array[8, uint64]
+uds_q_count:     Array[8, uint64]
+
+# Datagram metadata, indexed [slot * UDS_QUEUE_DEPTH + ring_index].
+uds_dg_src_ip:   Array[64, uint32]   # 8 slots * 8 depth
+uds_dg_src_port: Array[64, uint16]
+uds_dg_len:      Array[64, uint64]
+
+# Datagram payload bytes, indexed
+# [(slot*UDS_QUEUE_DEPTH + ring_index) * UDS_DGRAM_MAX + offset].
+# 8 slots * 8 depth * 1472 bytes = 94208 bytes of BSS.
+uds_dg_data:     Array[94208, uint8]
+
+# Ephemeral source-port allocator for an unbound socket that sends.
+# Linux auto-binds an ephemeral port on first sendto from an unbound
+# socket; we hand out a rotating port from the 49152..65535 range.
+uds_ephemeral_cur:  uint16 = 0
+uds_ephemeral_init: uint8  = 0
+
+
+def udp_socket_init():
+    # Reset every UDP socket slot. Called from udp_init (kernel
+    # bring-up); idempotent.
+    i: uint64 = 0
+    while i < UDS_MAX:
+        uds_inuse[i]      = 0
+        uds_local_port[i] = 0
+        uds_peer_ip[i]    = 0
+        uds_peer_port[i]  = 0
+        uds_so_error[i]   = 0
+        uds_broadcast[i]  = 0
+        uds_q_head[i]     = 0
+        uds_q_tail[i]     = 0
+        uds_q_count[i]    = 0
+        i = i + 1
+    uds_ephemeral_cur  = 0
+    uds_ephemeral_init = 0
+
+
+def _uds_ephemeral_next() -> uint16:
+    # Rotate a source port through the 49152..65535 ephemeral range.
+    if uds_ephemeral_init == 0:
+        # Seed off the PIT counter so two boots don't reuse the same
+        # first port — purely cosmetic, UDP has no TIME_WAIT.
+        seed: uint64 = pit_monotonic_us()
+        uds_ephemeral_cur = cast[uint16](49152 + (seed % 16384))
+        uds_ephemeral_init = 1
+    else:
+        nxt: uint32 = cast[uint32](uds_ephemeral_cur) + 1
+        if nxt > 65535:
+            nxt = 49152
+        if nxt < 49152:
+            nxt = 49152
+        uds_ephemeral_cur = cast[uint16](nxt)
+    return uds_ephemeral_cur
+
+
+def udp_socket_open() -> int32:
+    # Claim a free UDP socket slot. Returns slot index 0..UDS_MAX-1, or
+    # -1 if the table is full. The slot starts unbound + unconnected.
+    i: uint64 = 0
+    while i < UDS_MAX:
+        if uds_inuse[i] == 0:
+            uds_inuse[i]      = 1
+            uds_local_port[i] = 0
+            uds_peer_ip[i]    = 0
+            uds_peer_port[i]  = 0
+            uds_so_error[i]   = 0
+            uds_broadcast[i]  = 0
+            uds_q_head[i]     = 0
+            uds_q_tail[i]     = 0
+            uds_q_count[i]    = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def udp_socket_close(slot_signed: int32):
+    # Free a UDP socket slot. Idempotent for an out-of-range / already
+    # free slot so a double close can't corrupt a neighbour.
+    if slot_signed < 0:
+        return
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= UDS_MAX:
+        return
+    uds_inuse[slot]      = 0
+    uds_local_port[slot] = 0
+    uds_peer_ip[slot]    = 0
+    uds_peer_port[slot]  = 0
+    uds_so_error[slot]   = 0
+    uds_broadcast[slot]  = 0
+    uds_q_head[slot]     = 0
+    uds_q_tail[slot]     = 0
+    uds_q_count[slot]    = 0
+
+
+def _uds_port_in_use(port: uint16) -> int32:
+    # 1 if any live UDP socket is already bound to `port`.
+    if port == 0:
+        return 0
+    i: uint64 = 0
+    while i < UDS_MAX:
+        if uds_inuse[i] != 0:
+            if uds_local_port[i] == port:
+                return 1
+        i = i + 1
+    return 0
+
+
+def udp_socket_bind(slot_signed: int32, port: uint16) -> int32:
+    # Bind a UDP socket to a local port (host order). Returns 0 on
+    # success, -1 on a bad slot, -2 if the port is already in use.
+    # A port of 0 means "ephemeral" — we leave the socket unbound and
+    # let the first sendto pick a port (Linux semantics).
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= UDS_MAX:
+        return -1
+    if uds_inuse[slot] == 0:
+        return -1
+    if port == 0:
+        return 0
+    if _uds_port_in_use(port) != 0:
+        return -2
+    uds_local_port[slot] = port
+    return 0
+
+
+def udp_socket_connect(slot_signed: int32,
+                       peer_ip: uint32, peer_port: uint16) -> int32:
+    # "connect" a UDP socket: record a fixed peer so send(2)/recv(2)
+    # (and a sendto with a NULL addr) target it, and so a received
+    # ICMP port-unreachable for this peer can surface via SO_ERROR.
+    # peer_ip is host order. Returns 0 on success, -1 on a bad slot.
+    if slot_signed < 0:
+        return -1
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= UDS_MAX:
+        return -1
+    if uds_inuse[slot] == 0:
+        return -1
+    uds_peer_ip[slot]   = peer_ip
+    uds_peer_port[slot] = peer_port
+    uds_so_error[slot]  = 0
+    return 0
+
+
+def udp_socket_local_port(slot_signed: int32) -> uint16:
+    # The socket's bound local port (host order), or 0 if unbound.
+    if slot_signed < 0:
+        return 0
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= UDS_MAX:
+        return 0
+    if uds_inuse[slot] == 0:
+        return 0
+    return uds_local_port[slot]
+
+
+def udp_socket_set_broadcast(slot_signed: int32, on: uint8):
+    # Record the SO_BROADCAST flag. ip_send already lets a directed
+    # broadcast (255.255.255.255) go out, so this is bookkeeping for
+    # getsockopt round-trips; we don't gate sends on it.
+    if slot_signed < 0:
+        return
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= UDS_MAX:
+        return
+    if uds_inuse[slot] == 0:
+        return
+    uds_broadcast[slot] = on
+
+
+def udp_socket_get_so_error(slot_signed: int32) -> int32:
+    # Read-and-clear the pending SO_ERROR for a UDP socket (getsockopt
+    # SO_ERROR semantics: the error is consumed on read). Returns 0 if
+    # no error is pending or the slot is bad.
+    if slot_signed < 0:
+        return 0
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= UDS_MAX:
+        return 0
+    if uds_inuse[slot] == 0:
+        return 0
+    err: int32 = uds_so_error[slot]
+    uds_so_error[slot] = 0
+    return err
+
+
+def _uds_find_bound(port: uint16) -> int32:
+    # Find the UDP socket bound to local `port`. Returns slot index or
+    # -1. Used by the inbound demux (udp_rx).
+    if port == 0:
+        return -1
+    i: uint64 = 0
+    while i < UDS_MAX:
+        if uds_inuse[i] != 0:
+            if uds_local_port[i] == port:
+                return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _uds_enqueue(slot: uint64, src_ip: uint32, src_port: uint16,
+                 payload: Ptr[uint8], length: uint64):
+    # Append a received datagram to a socket's ring. A full ring drops
+    # the arrival (UDP is unreliable — losing the newest datagram is
+    # RFC-legal). `length` is truncated at UDS_DGRAM_MAX.
+    if uds_q_count[slot] >= UDS_QUEUE_DEPTH:
+        printk1("[udp] socket rx ring full — dropping datagram (slot %d)\n",
+                slot)
+        return
+    keep: uint64 = length
+    if keep > UDS_DGRAM_MAX:
+        keep = UDS_DGRAM_MAX
+    tail: uint64 = uds_q_tail[slot]
+    meta: uint64 = slot * UDS_QUEUE_DEPTH + tail
+    uds_dg_src_ip[meta]   = src_ip
+    uds_dg_src_port[meta] = src_port
+    uds_dg_len[meta]      = keep
+    data_base: uint64 = meta * UDS_DGRAM_MAX
+    i: uint64 = 0
+    while i < keep:
+        uds_dg_data[data_base + i] = payload[i]
+        i = i + 1
+    tail = tail + 1
+    if tail >= UDS_QUEUE_DEPTH:
+        tail = 0
+    uds_q_tail[slot]  = tail
+    uds_q_count[slot] = uds_q_count[slot] + 1
+
+
+def udp_socket_sendto(slot_signed: int32,
+                      dst_ip: uint32, dst_port: uint16,
+                      payload: Ptr[uint8], payload_len: uint64) -> int64:
+    # Send a datagram from a UDP socket. dst_ip is host order. If the
+    # socket is unbound, auto-bind an ephemeral source port (Linux
+    # semantics). Returns the byte count sent, or a negative errno-style
+    # code (-9 EBADF bad slot, -90 EMSGSIZE too big, -1 transmit error).
+    if slot_signed < 0:
+        return -9
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= UDS_MAX:
+        return -9
+    if uds_inuse[slot] == 0:
+        return -9
+    if payload_len > UDS_DGRAM_MAX:
+        return -90
+    src_port: uint16 = uds_local_port[slot]
+    if src_port == 0:
+        # Auto-bind an ephemeral port for an unbound sender.
+        src_port = _uds_ephemeral_next()
+        uds_local_port[slot] = src_port
+    db0: uint8 = cast[uint8]((dst_ip >> 24) & 0xFF)
+    db1: uint8 = cast[uint8]((dst_ip >> 16) & 0xFF)
+    db2: uint8 = cast[uint8]((dst_ip >> 8) & 0xFF)
+    db3: uint8 = cast[uint8](dst_ip & 0xFF)
+    rc: int32 = udp_send(db0, db1, db2, db3,
+                         src_port, dst_port, payload, payload_len)
+    if rc != 0:
+        return -1
+    return cast[int64](payload_len)
+
+
+def udp_socket_recvfrom(slot_signed: int32, buf: Ptr[uint8],
+                        max_len: uint64, timeout_jiffies: uint64,
+                        out_src_ip: Ptr[uint32],
+                        out_src_port: Ptr[uint16]) -> int64:
+    # Poll until the socket has a queued datagram, then copy ONE
+    # datagram into `buf` (UDP delivers a datagram at a time — a recv
+    # never spans two datagrams). Returns the byte count copied (a
+    # datagram longer than max_len is truncated, the rest discarded),
+    # or a negative code: -9 EBADF bad slot, -11 EAGAIN timed out with
+    # no datagram. A pending SO_ERROR (e.g. an ICMP port-unreachable)
+    # fails the call with that error.
+    #
+    # Like tcp_recv, this runs from syscall context with CPU interrupts
+    # IF-masked, so it polls the free-running PIT counter for a real
+    # wall-clock deadline and drives virtio_net_poll itself.
+    if slot_signed < 0:
+        return -9
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= UDS_MAX:
+        return -9
+    if uds_inuse[slot] == 0:
+        return -9
+    budget_us: uint64 = timeout_jiffies * 10000
+    if budget_us == 0:
+        budget_us = 5000000                          # 5 s default
+    start_us: uint64 = pit_monotonic_us()
+    while True:
+        virtio_net_poll()
+        if uds_so_error[slot] != 0:
+            err: int32 = uds_so_error[slot]
+            uds_so_error[slot] = 0
+            return cast[int64](err)
+        if uds_q_count[slot] > 0:
+            head: uint64 = uds_q_head[slot]
+            meta: uint64 = slot * UDS_QUEUE_DEPTH + head
+            dlen: uint64 = uds_dg_len[meta]
+            n: uint64 = dlen
+            if n > max_len:
+                n = max_len
+            data_base: uint64 = meta * UDS_DGRAM_MAX
+            i: uint64 = 0
+            while i < n:
+                buf[i] = uds_dg_data[data_base + i]
+                i = i + 1
+            if out_src_ip != cast[Ptr[uint32]](0):
+                out_src_ip[0] = uds_dg_src_ip[meta]
+            if out_src_port != cast[Ptr[uint16]](0):
+                out_src_port[0] = uds_dg_src_port[meta]
+            head = head + 1
+            if head >= UDS_QUEUE_DEPTH:
+                head = 0
+            uds_q_head[slot]  = head
+            uds_q_count[slot] = uds_q_count[slot] - 1
+            return cast[int64](n)
+        if pit_monotonic_us() - start_us >= budget_us:
+            return -11                               # EAGAIN — no datagram
+
+
+def udp_socket_recv_pending(slot_signed: int32) -> int32:
+    # 1 if the socket has at least one queued datagram OR a pending
+    # SO_ERROR — used by poll(2) / a non-blocking recvfrom probe.
+    if slot_signed < 0:
+        return 0
+    slot: uint64 = cast[uint64](slot_signed)
+    if slot >= UDS_MAX:
+        return 0
+    if uds_inuse[slot] == 0:
+        return 0
+    if uds_q_count[slot] > 0:
+        return 1
+    if uds_so_error[slot] != 0:
+        return 1
+    return 0
+
+
+def udp_deliver_icmp_error(orig_dst_ip: uint32, orig_dst_port: uint16,
+                           orig_src_port: uint16, errno: int32):
+    # An ICMP error (port-unreachable / time-exceeded) came back for a
+    # UDP datagram WE sent. icmp_rx decoded the offending datagram's
+    # UDP header and calls here so a connected socket can surface the
+    # failure via SO_ERROR. `orig_*` describe the datagram that failed:
+    # orig_src_port is OUR local port, orig_dst_ip/port the peer. We
+    # match it against a connected UDP socket and latch `errno`.
+    i: uint64 = 0
+    while i < UDS_MAX:
+        if uds_inuse[i] != 0:
+            if uds_local_port[i] == orig_src_port:
+                # Only a CONNECTED socket gets the error — an unbound
+                # or unconnected socket can't attribute it (Linux only
+                # delivers ICMP errors to connected datagram sockets).
+                if uds_peer_ip[i] == orig_dst_ip:
+                    if uds_peer_port[i] == orig_dst_port:
+                        uds_so_error[i] = errno
+                        printk1("[udp] ICMP error latched on socket %d\n",
+                                i)
+                        return
+        i = i + 1
+
+
+# =====================================================================
+# UDP receive / transmit
+# =====================================================================
 
 def udp_rx(payload: Ptr[uint8], length: uint64,
            src_b0: uint8, src_b1: uint8,
@@ -74,22 +488,38 @@ def udp_rx(payload: Ptr[uint8], length: uint64,
         # Inbound datagram on the DHCP client port — hand to the
         # DHCP state machine. We pass the inner UDP payload, not
         # the whole UDP header, because the DHCP layer doesn't
-        # care about UDP port numbers (it has its own DHCP magic
-        # cookie + transaction ID for matching).
+        # care about UDP port numbers.
         dhcp_rx(inner, inner_len,
                 src_b0, src_b1, src_b2, src_b3)
         return
     if dst_port >= UDP_PORT_DNS_CLIENT_LO:
         if dst_port <= UDP_PORT_DNS_CLIENT_HI:
-            # DNS response for one of our in-flight queries. The
-            # DNS layer matches the qid against its slot table; we
-            # pass the inner UDP payload (DNS header + sections),
-            # NOT the UDP header — dns_rx doesn't care about ports.
+            # DNS response for one of our in-flight queries.
             dns_rx(inner, inner_len,
                    src_b0, src_b1, src_b2, src_b3)
             return
-    printk2("udp_rx: drop src=%d dst=%d\n",
+    # §10: match the destination port against a bound UDP socket. On a
+    # hit, queue the datagram for udp_socket_recvfrom to drain.
+    sk: int32 = _uds_find_bound(dst_port)
+    if sk >= 0:
+        src_ip: uint32 = (cast[uint32](src_b0) << 24) \
+                       | (cast[uint32](src_b1) << 16) \
+                       | (cast[uint32](src_b2) << 8) \
+                       | cast[uint32](src_b3)
+        _uds_enqueue(cast[uint64](sk), src_ip, src_port,
+                     inner, inner_len)
+        return
+    # No listener. Bump the no-port counter and emit an ICMP
+    # destination-unreachable / port-unreachable so the sender learns
+    # the port is dead (RFC 1122 §3.2.2.1). icmp_send_port_unreach
+    # lives in drivers/net/icmp.ad — called directly (the Adder build
+    # merges all .ad files and resolves by name; importing it would
+    # create an icmp <-> udp cycle).
+    udp_no_ports = udp_no_ports + 1
+    printk2("udp_rx: no listener src=%d dst=%d\n",
             cast[uint64](src_port), cast[uint64](dst_port))
+    icmp_send_port_unreach(src_b0, src_b1, src_b2, src_b3,
+                           payload, length)
 
 
 def udp_send(dst_b0: uint8, dst_b1: uint8, dst_b2: uint8, dst_b3: uint8,
@@ -132,13 +562,15 @@ def udp_send(dst_b0: uint8, dst_b1: uint8, dst_b2: uint8, dst_b3: uint8,
 def udp_init():
     udp_in_datagrams  = 0
     udp_out_datagrams = 0
-    printk0("udp: initialized\n")
+    udp_no_ports      = 0
+    udp_socket_init()
+    printk0("udp: initialized (incl. socket table)\n")
 
 
-# Note: dhcp_rx (drivers/net/dhcp.ad) and dns_rx (drivers/net/dns.ad)
-# are both called from udp_rx above. Since the Adder build merges
-# all .ad files into a single program and the linker resolves call
-# sites by name, no forward declaration is needed; we just call the
-# symbols directly and trust they exist at link time. (A forward
-# `extern def` here would collide with the real definition — see
-# merge_programs in compiler/adder.py.)
+# Note: dhcp_rx (drivers/net/dhcp.ad), dns_rx (drivers/net/dns.ad), and
+# icmp_send_port_unreach (drivers/net/icmp.ad) are all called from
+# udp_rx above. Since the Adder build merges all .ad files into a
+# single program and the linker resolves call sites by name, no forward
+# declaration is needed; we just call the symbols directly and trust
+# they exist at link time. (A forward `extern def` here would collide
+# with the real definition — see merge_programs in compiler/adder.py.)

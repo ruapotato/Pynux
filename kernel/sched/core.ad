@@ -1547,7 +1547,40 @@ def close_fd_in_task(task: Ptr[TaskStruct], fdu: uint64):
         fat_close(cast[int32](task[0].fd_buf[fdu]))
     elif fi == FD_EXT4_MARK:
         ext4_close(cast[int32](task[0].fd_buf[fdu]))
-    # FD_SOCKET_MARK has no backing slot to release — falls through to
+    elif fi == FD_SOCKET_MARK:
+        # §10: a socket fd carries a backing record (linux_abi/
+        # u_socket_state.ad) and, behind it, an in-kernel stack slot —
+        # a TCP connection slot (drivers/net/tcp.ad) or a UDP socket
+        # slot (drivers/net/udp.ad). vfs_close releases these explicitly
+        # before reaching here, but a task that EXITS without close()-
+        # ing a socket fd reaches close_fd_in_task via task_close_all_
+        # fds with the slot still live — without this arm the TCP/UDP
+        # control block would leak for the rest of the boot. We tear it
+        # down here so explicit-close and implicit-on-exit both release
+        # the slot. The usock_* / tcp_* / udp_socket_* symbols are
+        # resolved by name at link time (the Adder build merges all .ad
+        # files into one program) — importing drivers/net into core.ad
+        # would form a core -> tcp -> time -> core import cycle, so we
+        # call them directly the same way drivers/net/udp.ad calls
+        # dns_rx without an import.
+        sock_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
+        if sock_rec >= 0:
+            sock_slot: int32 = usock_get_tcp_slot(sock_rec)
+            if sock_slot >= 0:
+                if usock_get_type(sock_rec) == 2:
+                    # USOCK_SOCK_DGRAM — release the UDP socket slot.
+                    udp_socket_close(sock_slot)
+                else:
+                    # SOCK_STREAM. A LISTENING socket's slot is a
+                    # passive TCB (no FIN); a connected/closed one
+                    # gets the FIN handshake.
+                    if usock_get_state(sock_rec) == 4:
+                        # USOCK_LISTENING
+                        tcp_listen_close(sock_slot)
+                    else:
+                        tcp_close(sock_slot)
+            usock_free(sock_rec)
+    # All other marks have no backing slot to release — fall through to
     # the slot-rewrite below.
     task[0].fd_idx[fdu]    = FD_CLOSED_MARK
     task[0].fd_buf[fdu]    = 0

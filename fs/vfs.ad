@@ -178,8 +178,18 @@ from drivers.net.tcp import (
 from linux_abi.u_socket_state import (
     usock_record_for_fdbuf, usock_get_state, usock_get_tcp_slot,
     usock_set_state, usock_set_tcp_slot, usock_free,
-    usock_is_tls, usock_set_tls,
+    usock_is_tls, usock_set_tls, usock_get_type,
+    usock_get_peer_addr, usock_get_peer_port,
     USOCK_CONNECTED, USOCK_CLOSED, USOCK_LISTENING,
+    USOCK_SOCK_DGRAM,
+)
+# §10 UDP sockets: a SOCK_DGRAM socket fd's read/write/close route
+# through the in-kernel UDP socket layer (drivers/net/udp.ad — an
+# import leaf, same as tcp.ad). A plain read(2)/write(2) on a UDP
+# socket fd maps to recvfrom/sendto on the connected peer.
+from drivers.net.udp import (
+    udp_socket_sendto, udp_socket_recvfrom, udp_socket_close,
+    udp_socket_recv_pending,
 )
 # U-TLS: a socket fd marked TLS-active (by tls_connect(2)) routes its
 # read/write/close through the in-kernel TLS 1.3 record layer instead
@@ -1802,6 +1812,21 @@ def vfs_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         sk_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
         if sk_rec < 0:
             return -1
+        # §10 UDP: a non-blocking read on a datagram socket returns a
+        # queued datagram if one is ready, else 0 ("would block" — a
+        # UDP socket is never at a true EOF).
+        if usock_get_type(sk_rec) == USOCK_SOCK_DGRAM:
+            udp_slot_nb: int32 = usock_get_tcp_slot(sk_rec)
+            if udp_slot_nb < 0:
+                return -1
+            if udp_socket_recv_pending(udp_slot_nb) == 0:
+                return 0
+            ud_nb: int64 = udp_socket_recvfrom(
+                udp_slot_nb, buf, count, 1,
+                cast[Ptr[uint32]](0), cast[Ptr[uint16]](0))
+            if ud_nb < 0:
+                return 0
+            return ud_nb
         if usock_get_state(sk_rec) != USOCK_CONNECTED:
             return -1
         sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
@@ -1882,6 +1907,20 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         sk_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
         if sk_rec < 0:
             return 0
+        # §10 UDP: a datagram socket's read(2) pulls ONE datagram via
+        # the UDP socket layer. The udp.ad slot is the record's stack-
+        # slot field. A timeout with no data returns 0 (a UDP socket is
+        # never at a stream EOF; plain read(2) has no EAGAIN channel).
+        if usock_get_type(sk_rec) == USOCK_SOCK_DGRAM:
+            udp_slot_r: int32 = usock_get_tcp_slot(sk_rec)
+            if udp_slot_r < 0:
+                return 0
+            ud_rn: int64 = udp_socket_recvfrom(
+                udp_slot_r, buf, count, 500,
+                cast[Ptr[uint32]](0), cast[Ptr[uint16]](0))
+            if ud_rn < 0:
+                return 0
+            return ud_rn
         if usock_get_state(sk_rec) != USOCK_CONNECTED:
             return 0
         sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
@@ -2259,6 +2298,26 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         sk_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
         if sk_rec < 0:
             return cast[int64](EPIPE)
+        # §10 UDP: a datagram socket's write(2) sends one datagram to
+        # the connect(2)'d peer. write(2) on an unconnected UDP socket
+        # is -EDESTADDRREQ in Linux; we don't have that errno, so
+        # -EPIPE is the closest fit. udp_socket_sendto returns the
+        # byte count on success.
+        if usock_get_type(sk_rec) == USOCK_SOCK_DGRAM:
+            udp_slot_w: int32 = usock_get_tcp_slot(sk_rec)
+            if udp_slot_w < 0:
+                return cast[int64](EPIPE)
+            udp_peer: uint32 = usock_get_peer_addr(sk_rec)
+            udp_pport: uint32 = usock_get_peer_port(sk_rec)
+            if udp_peer == 0:
+                # No peer — write(2) on an unconnected datagram socket.
+                return cast[int64](EPIPE)
+            ud_wn: int64 = udp_socket_sendto(
+                udp_slot_w, udp_peer,
+                cast[uint16](udp_pport & 0xFFFF), buf, count)
+            if ud_wn < 0:
+                return cast[int64](EPIPE)
+            return ud_wn
         if usock_get_state(sk_rec) != USOCK_CONNECTED:
             return cast[int64](EPIPE)
         sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
@@ -2523,25 +2582,34 @@ def vfs_close(fd: int32) -> int32:
         sk_rec: int32 = usock_record_for_fdbuf(task[0].fd_buf[fdu])
         if sk_rec >= 0:
             sk_tcp: int32 = usock_get_tcp_slot(sk_rec)
-            if sk_tcp >= 0:
-                # U-TLS: a TLS-active fd gets a graceful TLS shutdown
-                # first — send a close_notify alert (best-effort) and
-                # reset the in-kernel TLS session so a later
-                # tls_connect(2) can claim it again. Then the TCP slot
-                # is torn down the same way a plain socket fd is.
-                if usock_is_tls(sk_rec) != 0:
-                    tls_close_notify(sk_tcp)
-                    tls_close()
-                    usock_set_tls(sk_rec, 0)
-                # A LISTENING socket's tcp slot is a passive TCB with no
-                # peer — tcp_listen_close resets it without a FIN. A
-                # CONNECTED / CLOSED socket gets the full FIN handshake
-                # via tcp_close.
-                if usock_get_state(sk_rec) == USOCK_LISTENING:
-                    tcp_listen_close(sk_tcp)
-                else:
-                    tcp_close(sk_tcp)
-            usock_free(sk_rec)
+            # §10 UDP: a datagram socket's stack slot is a udp.ad socket
+            # slot — release it via udp_socket_close (no FIN handshake;
+            # UDP is connectionless). Then free the backing record.
+            if usock_get_type(sk_rec) == USOCK_SOCK_DGRAM:
+                if sk_tcp >= 0:
+                    udp_socket_close(sk_tcp)
+                usock_free(sk_rec)
+            else:
+                if sk_tcp >= 0:
+                    # U-TLS: a TLS-active fd gets a graceful TLS shutdown
+                    # first — send a close_notify alert (best-effort) and
+                    # reset the in-kernel TLS session so a later
+                    # tls_connect(2) can claim it again. Then the TCP
+                    # slot is torn down the same way a plain socket fd
+                    # is.
+                    if usock_is_tls(sk_rec) != 0:
+                        tls_close_notify(sk_tcp)
+                        tls_close()
+                        usock_set_tls(sk_rec, 0)
+                    # A LISTENING socket's tcp slot is a passive TCB
+                    # with no peer — tcp_listen_close resets it without
+                    # a FIN. A CONNECTED / CLOSED socket gets the full
+                    # FIN handshake via tcp_close.
+                    if usock_get_state(sk_rec) == USOCK_LISTENING:
+                        tcp_listen_close(sk_tcp)
+                    else:
+                        tcp_close(sk_tcp)
+                usock_free(sk_rec)
     # /proc/<pid>/<file> fds carry no per-fd backing — devproc_close
     # is a no-op success today (kept as a hook so future per-fd
     # snapshot support can land without re-plumbing the close path).
