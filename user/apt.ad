@@ -196,6 +196,7 @@ from lib.pgp.pgp import (
     pgp_inrelease_split,
     pgp_dearmor,
     pgp_sig_parse,
+    pgp_next_packet,
     pgp_build_signed_data,
     pgp_signed_data,
     pgp_sig_packet,
@@ -432,8 +433,10 @@ apt_pgp_sig:      PgpSig               # parsed InRelease signature packet
 # The keyring's keys re-shaped into lib/rsa's RsaPubkey form, one per
 # PgpKeyring slot. Verification walks these until one accepts the
 # signature. A flat top-level Array of RsaPubkey — `&apt_rsa_keys[i]`
-# is a usable Ptr[RsaPubkey].
-apt_rsa_keys:     Array[16, RsaPubkey]
+# is a usable Ptr[RsaPubkey]. Sized to match PgpKeyring's 32-key
+# capacity (PGP_KEYRING_MAX_KEYS): the real Debian keyring carries both
+# primary keys and signing subkeys, so this must not be smaller.
+apt_rsa_keys:     Array[32, RsaPubkey]
 apt_rsa_nkeys:    uint64 = 0
 
 # The InRelease body is fetched into http_buf; before the (later)
@@ -1739,71 +1742,104 @@ def _verify_inrelease(port: int64, suite: Ptr[uint8]) -> int32:
         write_str(2, "apt-get: InRelease signature armor is malformed\n")
         return 0
 
-    # 5. Parse the signature packet.
-    if pgp_sig_parse(&pgp_sig_packet[0], cast[uint64](sig_n),
-                     &apt_pgp_sig) != 0:
-        write_str(2, "apt-get: InRelease signature packet is malformed ")
-        write_str(2, "or uses an unsupported algorithm\n")
-        return 0
-
-    # Map the OpenPGP hash-algorithm id to lib/rsa's digest selector.
-    # 8 == SHA-256, 9 == SHA-384, 10 == SHA-512 (pgp_sig_parse already
-    # rejected anything else). The real deb.debian.org archive signs
-    # `InRelease` with a SHA-512 digest; all three are now supported.
-    digest_alg: int32 = RSA_DIGEST_SHA256
-    if apt_pgp_sig.hash_alg == 9:
-        digest_alg = RSA_DIGEST_SHA384
-    elif apt_pgp_sig.hash_alg == 10:
-        digest_alg = RSA_DIGEST_SHA512
-
-    # 6. Assemble the v4 signed-data byte string.
-    signed_len: uint64 = 0
-    if pgp_build_signed_data(&inrelease_buf[0], clear_off, clear_end,
-                             &pgp_sig_packet[0], &apt_pgp_sig,
-                             &signed_len) != 0:
-        write_str(2, "apt-get: InRelease cleartext too large to verify\n")
-        return 0
-
-    # 7. RSA PKCS#1 v1.5 verification. The keyring may carry several
-    #    archive keys; the signature is valid if ANY of them accepts
-    #    it. We try each in turn — the signature's Issuer subpacket is
-    #    advisory only, so trying every key is the sound approach (and
-    #    avoids needing a SHA-1 fingerprint to index the keyring).
-    #
-    #    For each key: right-align the (minimal-length) OpenPGP
-    #    signature MPI into a k-byte buffer (lib/rsa's verifier requires
-    #    a signature octet string of length exactly the modulus byte
-    #    width), then rsa_pkcs1_v1_5_verify hashes the signed-data,
-    #    recovers the EM via s^e mod n, and byte-exact-compares against
-    #    the expected EMSA-PKCS1-v1_5 encoding.
+    # 5. Walk EVERY signature packet in the dearmored block and try to
+    #    verify it. A real Debian `InRelease` is signed by more than one
+    #    key — the dearmored block carries several concatenated Tag 2
+    #    packets (today: two RSA-4096 signatures from two archive signing
+    #    SUBKEYS, plus one Ed25519 signature). The InRelease is authentic
+    #    if ANY one of those signatures verifies against ANY key in the
+    #    baked keyring. We must not parse only the first packet: its
+    #    signer might have rotated out of the keyring while a later
+    #    packet is from a key apt still trusts. Non-RSA packets (Ed25519,
+    #    pub-alg 22) make pgp_sig_parse return -1 — those are simply
+    #    skipped, not fatal.
     if apt_rsa_nkeys == 0:
         write_str(2, "apt-get: no usable keys in the trust anchor\n")
         return 0
-    ki: uint64 = 0
-    while ki < apt_rsa_nkeys:
-        k: uint64 = apt_rsa_keys[ki].mod_bytes
-        # A key whose modulus is too small for this signature simply
-        # cannot be the signer — skip it rather than fail outright.
-        if apt_pgp_sig.sig_mpi_len <= k and k <= 520:
-            pad: uint64 = k - apt_pgp_sig.sig_mpi_len
-            pi: uint64 = 0
-            while pi < pad:
-                apt_sig_padded[pi] = 0
-                pi = pi + 1
-            pi = 0
-            while pi < apt_pgp_sig.sig_mpi_len:
-                apt_sig_padded[pad + pi] = \
-                    pgp_sig_packet[apt_pgp_sig.sig_mpi_off + pi]
-                pi = pi + 1
-            vrc: int32 = rsa_pkcs1_v1_5_verify(
-                &apt_rsa_keys[ki],
-                cast[Ptr[uint8]](0), cast[uint64](0),
-                digest_alg,
-                &pgp_signed_data[0], signed_len,
-                &apt_sig_padded[0], k)
-            if vrc == 1:
-                return 1
-        ki = ki + 1
+    sig_total: uint64 = cast[uint64](sig_n)
+    pkt_pos: uint64 = 0
+    saw_rsa_sig: int32 = 0
+    while pkt_pos < sig_total:
+        pkt_off: uint64 = 0
+        pkt_len: uint64 = 0
+        if pgp_next_packet(&pgp_sig_packet[0], sig_total, pkt_pos,
+                           &pkt_off, &pkt_len) != 0:
+            break
+        # Advance past this packet for the next iteration regardless of
+        # whether it parses as a usable RSA signature.
+        pkt_pos = pkt_off + pkt_len
+
+        # Parse this packet as a v4 RSA signature. A non-RSA / non-v4 /
+        # unsupported-hash packet returns -1 — skip it and try the next.
+        if pgp_sig_parse(&pgp_sig_packet[pkt_off], pkt_len,
+                         &apt_pgp_sig) != 0:
+            continue
+        saw_rsa_sig = 1
+
+        # Map the OpenPGP hash-algorithm id to lib/rsa's digest selector.
+        # 8 == SHA-256, 9 == SHA-384, 10 == SHA-512 (pgp_sig_parse
+        # already rejected anything else). The real deb.debian.org
+        # archive signs `InRelease` with a SHA-256 digest; all three are
+        # supported.
+        digest_alg: int32 = RSA_DIGEST_SHA256
+        if apt_pgp_sig.hash_alg == 9:
+            digest_alg = RSA_DIGEST_SHA384
+        elif apt_pgp_sig.hash_alg == 10:
+            digest_alg = RSA_DIGEST_SHA512
+
+        # 6. Assemble the v4 signed-data byte string for THIS signature
+        #    packet (its hashed section + trailer differ per packet).
+        signed_len: uint64 = 0
+        if pgp_build_signed_data(&inrelease_buf[0], clear_off, clear_end,
+                                 &pgp_sig_packet[pkt_off], &apt_pgp_sig,
+                                 &signed_len) != 0:
+            write_str(2, "apt-get: InRelease cleartext too large to verify\n")
+            return 0
+
+        # 7. RSA PKCS#1 v1.5 verification. The keyring may carry several
+        #    archive keys (primaries AND signing subkeys); the signature
+        #    is valid if ANY of them accepts it. We try each in turn —
+        #    the signature's Issuer subpacket is advisory only, so trying
+        #    every key is the sound approach (and avoids needing a SHA-1
+        #    fingerprint to index the keyring).
+        #
+        #    For each key: right-align the (minimal-length) OpenPGP
+        #    signature MPI into a k-byte buffer (lib/rsa's verifier
+        #    requires a signature octet string of length exactly the
+        #    modulus byte width), then rsa_pkcs1_v1_5_verify hashes the
+        #    signed-data, recovers the EM via s^e mod n, and
+        #    byte-exact-compares against the expected EMSA-PKCS1-v1_5
+        #    encoding.
+        ki: uint64 = 0
+        while ki < apt_rsa_nkeys:
+            k: uint64 = apt_rsa_keys[ki].mod_bytes
+            # A key whose modulus is too small for this signature simply
+            # cannot be the signer — skip it rather than fail outright.
+            if apt_pgp_sig.sig_mpi_len <= k and k <= 520:
+                pad: uint64 = k - apt_pgp_sig.sig_mpi_len
+                pi: uint64 = 0
+                while pi < pad:
+                    apt_sig_padded[pi] = 0
+                    pi = pi + 1
+                pi = 0
+                while pi < apt_pgp_sig.sig_mpi_len:
+                    apt_sig_padded[pad + pi] = \
+                        pgp_sig_packet[pkt_off + apt_pgp_sig.sig_mpi_off + pi]
+                    pi = pi + 1
+                vrc: int32 = rsa_pkcs1_v1_5_verify(
+                    &apt_rsa_keys[ki],
+                    cast[Ptr[uint8]](0), cast[uint64](0),
+                    digest_alg,
+                    &pgp_signed_data[0], signed_len,
+                    &apt_sig_padded[0], k)
+                if vrc == 1:
+                    return 1
+            ki = ki + 1
+
+    # No (signature, trusted-key) pair verified.
+    if saw_rsa_sig == 0:
+        write_str(2, "apt-get: InRelease carries no RSA signature this ")
+        write_str(2, "build can verify\n")
     return 0
 
 

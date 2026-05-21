@@ -1,0 +1,337 @@
+# tests/test_apt_inrelease_real.ad
+#
+# OFFLINE repro for apt's OpenPGP `InRelease` verification against the
+# REAL `deb.debian.org` archive.
+#
+# WHY THIS EXISTS
+#
+#   scripts/test_apt_inrelease.sh / test_apt_inrelease_sha512.sh prove
+#   verification against *synthetic* gpg-clearsigned fixtures — and
+#   those pass. But verification against the GENUINE Debian `InRelease`
+#   failed, because a real Debian `InRelease` is NOT signed by the
+#   primary archive keys: it is signed by the dedicated `[S]` signing
+#   SUBKEYS those primary keys carry (Tag 14 Public-Subkey packets in
+#   the keyring). pgp_keyring_load used to skip Tag 14 packets, so apt
+#   held none of the keys that actually signed the index — and every
+#   real-Debian `InRelease` verification failed even though the crypto
+#   was correct.
+#
+#   This is the same shape of defect as the gzip cross-chunk bug:
+#   synthetic fixtures pass, real-world data fails. The fix:
+#   pgp_keyring_load now also collects Tag 14 Public-Subkey packets as
+#   trust anchors (the whole baked keyring blob is the trust root, so
+#   every key and subkey in it is trusted by construction), and apt now
+#   walks EVERY signature packet in the dearmored block (a real
+#   InRelease carries several).
+#
+# DESIGN — deterministic, no network:
+#   scripts/build_realinrelease_img.py fetches the genuine Debian
+#   `InRelease` and the genuine `debian-archive-keyring.gpg` on the
+#   host ONCE (cached under build/cache/), bakes both onto a virtio-blk
+#   ext4 disk image, and boots Hamnix with that disk attached (the
+#   kernel auto-mounts ext4 at /ext). This binary reads
+#   /ext/InRelease + /ext/keyring.gpg and runs the SAME lib/pgp +
+#   lib/rsa verification path apt's _verify_inrelease drives.
+#
+# ASSERTIONS (both directions — a verifier that only ever says "ok" is
+# worthless):
+#   GOOD   — the genuine InRelease verifies against the real keyring.
+#   TAMPER — flipping one byte of the signed cleartext makes every
+#            signature fail. Proves the verifier does the real math.
+#
+# PASS criterion: "[inrel-real] PASS" in the serial log.
+
+from lib.pgp.pgp import (
+    PgpKeyring,
+    PgpSig,
+    pgp_keyring_load,
+    pgp_inrelease_split,
+    pgp_dearmor,
+    pgp_sig_parse,
+    pgp_next_packet,
+    pgp_build_signed_data,
+    pgp_signed_data,
+    pgp_sig_packet,
+)
+from lib.rsa.rsa import (
+    RsaPubkey,
+    rsa_init,
+    rsa_pkcs1_v1_5_verify,
+    RSA_DIGEST_SHA256,
+    RSA_DIGEST_SHA384,
+    RSA_DIGEST_SHA512,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+
+
+# -- tiny printer ------------------------------------------------------
+
+def _strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def _wstr(s: Ptr[uint8]):
+    sys_write(1, s, _strlen(s))
+
+
+def _wdec(value: uint64):
+    if value == 0:
+        sys_write(1, "0", 1)
+        return
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    out: Array[24, uint8]
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    sys_write(1, &out[0], i)
+
+
+# -- buffers (top-level — per the U9 nested-frame-Array quirk) ---------
+#
+# A real Debian InRelease is ~150 KiB; 256 KiB covers it. The keyring
+# blob is ~56 KiB; 128 KiB is ample headroom.
+
+INRELEASE_CAP: uint64 = 262144
+KEYRING_CAP:   uint64 = 131072
+
+inrelease_buf: Array[262144, uint8]
+keyring_buf:   Array[131072, uint8]
+
+kr_ring:       PgpKeyring
+the_sig:       PgpSig
+rsa_keys:      Array[32, RsaPubkey]
+rsa_nkeys:     uint64 = 0
+
+# The RSA signature value, left-zero-padded to the modulus byte width.
+sig_padded:    Array[520, uint8]
+
+
+# Read an entire file into `buf` (capacity `cap`). Returns the byte
+# count, or 0 on open/empty failure.
+def _read_file(path: Ptr[char], buf: Ptr[uint8], cap: uint64) -> uint64:
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return 0
+    total: uint64 = 0
+    while total < cap:
+        room: uint64 = cap - total
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + total)
+        n: int64 = sys_read(fd, ptr, room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    return total
+
+
+# Re-shape one parsed OpenPGP key into lib/rsa's RsaPubkey form. This is
+# a verbatim copy of apt.ad's _reshape_rsa_key — the test exercises the
+# SAME shaping logic the production path uses.
+def _reshape(src_mod: Ptr[uint8], src_mod_len: uint64,
+             src_exp: Ptr[uint8], src_exp_len: uint64,
+             dst: Ptr[RsaPubkey]):
+    i: uint64 = 0
+    while i < src_mod_len:
+        dst[0].mod_bytes_be[i] = src_mod[i]
+        i = i + 1
+    dst[0].mod_len = src_mod_len
+    i = 0
+    while i < src_exp_len:
+        dst[0].exp_bytes_be[i] = src_exp[i]
+        i = i + 1
+    dst[0].exp_len = src_exp_len
+    skip: uint64 = 0
+    if src_mod_len > 1 and src_mod[0] == 0:
+        skip = 1
+    top: uint8 = src_mod[skip]
+    bit: uint64 = 7
+    while bit > 0:
+        if ((top >> bit) & 1) != 0:
+            break
+        bit = bit - 1
+    full_bytes: uint64 = src_mod_len - skip - 1
+    dst[0].mod_bits = full_bytes * 8 + bit + 1
+    dst[0].mod_bytes = (dst[0].mod_bits + 7) / 8
+
+
+# Run the full apt _verify_inrelease verification path over
+# inrelease_buf[0, ir_len). Returns 1 if any signature verifies against
+# any keyring key, 0 otherwise.
+def _verify(ir_len: uint64) -> int32:
+    clear_off: uint64 = 0
+    clear_end: uint64 = 0
+    armor_off: uint64 = 0
+    if pgp_inrelease_split(&inrelease_buf[0], ir_len,
+                           &clear_off, &clear_end, &armor_off) != 0:
+        _wstr("[inrel-real]   split FAILED\n")
+        return 0
+    sig_n: int64 = pgp_dearmor(&inrelease_buf[0], armor_off, ir_len,
+                               &pgp_sig_packet[0], cast[uint64](4096))
+    if sig_n <= 0:
+        _wstr("[inrel-real]   dearmor FAILED\n")
+        return 0
+
+    sig_total: uint64 = cast[uint64](sig_n)
+    pkt_pos: uint64 = 0
+    n_rsa_sigs: uint64 = 0
+    while pkt_pos < sig_total:
+        pkt_off: uint64 = 0
+        pkt_len: uint64 = 0
+        if pgp_next_packet(&pgp_sig_packet[0], sig_total, pkt_pos,
+                           &pkt_off, &pkt_len) != 0:
+            break
+        pkt_pos = pkt_off + pkt_len
+
+        if pgp_sig_parse(&pgp_sig_packet[pkt_off], pkt_len,
+                         &the_sig) != 0:
+            continue
+        n_rsa_sigs = n_rsa_sigs + 1
+
+        digest_alg: int32 = RSA_DIGEST_SHA256
+        if the_sig.hash_alg == 9:
+            digest_alg = RSA_DIGEST_SHA384
+        elif the_sig.hash_alg == 10:
+            digest_alg = RSA_DIGEST_SHA512
+
+        signed_len: uint64 = 0
+        if pgp_build_signed_data(&inrelease_buf[0], clear_off, clear_end,
+                                 &pgp_sig_packet[pkt_off], &the_sig,
+                                 &signed_len) != 0:
+            _wstr("[inrel-real]   build_signed_data FAILED\n")
+            return 0
+
+        ki: uint64 = 0
+        while ki < rsa_nkeys:
+            k: uint64 = rsa_keys[ki].mod_bytes
+            if the_sig.sig_mpi_len <= k and k <= 520:
+                pad: uint64 = k - the_sig.sig_mpi_len
+                pi: uint64 = 0
+                while pi < pad:
+                    sig_padded[pi] = 0
+                    pi = pi + 1
+                pi = 0
+                while pi < the_sig.sig_mpi_len:
+                    sig_padded[pad + pi] = \
+                        pgp_sig_packet[pkt_off + the_sig.sig_mpi_off + pi]
+                    pi = pi + 1
+                vrc: int32 = rsa_pkcs1_v1_5_verify(
+                    &rsa_keys[ki],
+                    cast[Ptr[uint8]](0), cast[uint64](0),
+                    digest_alg,
+                    &pgp_signed_data[0], signed_len,
+                    &sig_padded[0], k)
+                if vrc == 1:
+                    _wstr("[inrel-real]   verified: signature packet ")
+                    _wdec(n_rsa_sigs - 1)
+                    _wstr(" against keyring key ")
+                    _wdec(ki)
+                    _wstr("\n")
+                    return 1
+            ki = ki + 1
+
+    _wstr("[inrel-real]   no signature verified (RSA sig packets: ")
+    _wdec(n_rsa_sigs)
+    _wstr(")\n")
+    return 0
+
+
+def main() -> int32:
+    _wstr("[inrel-real] start\n")
+    rsa_init()
+
+    # --- load the genuine InRelease + keyring off the disk image ---
+    ir_len: uint64 = _read_file(cast[Ptr[char]]("/ext/InRelease"),
+                                &inrelease_buf[0], INRELEASE_CAP)
+    if ir_len == 0:
+        _wstr("[inrel-real] FAIL: cannot read /ext/InRelease\n")
+        return 1
+    kr_len: uint64 = _read_file(cast[Ptr[char]]("/ext/keyring.gpg"),
+                                &keyring_buf[0], KEYRING_CAP)
+    if kr_len == 0:
+        _wstr("[inrel-real] FAIL: cannot read /ext/keyring.gpg\n")
+        return 1
+    _wstr("[inrel-real] InRelease=")
+    _wdec(ir_len)
+    _wstr(" bytes, keyring=")
+    _wdec(kr_len)
+    _wstr(" bytes\n")
+
+    # --- load every trust anchor (primaries AND signing subkeys) ---
+    if pgp_keyring_load(&keyring_buf[0], kr_len, &kr_ring) != 0:
+        _wstr("[inrel-real] FAIL: pgp_keyring_load rejected the real ")
+        _wstr("debian-archive-keyring\n")
+        return 1
+    rsa_nkeys = kr_ring.n_keys
+    _wstr("[inrel-real] keyring: ")
+    _wdec(rsa_nkeys)
+    _wstr(" RSA trust anchors (primaries + signing subkeys)\n")
+    if rsa_nkeys == 0:
+        _wstr("[inrel-real] FAIL: no RSA keys in the keyring\n")
+        return 1
+    ki: uint64 = 0
+    while ki < rsa_nkeys:
+        _reshape(&kr_ring.keys[ki].mod_be[0], kr_ring.keys[ki].mod_len,
+                 &kr_ring.keys[ki].exp_be[0], kr_ring.keys[ki].exp_len,
+                 &rsa_keys[ki])
+        ki = ki + 1
+
+    fail: int32 = 0
+
+    # --- GOOD: the genuine InRelease must verify ---
+    _wstr("[inrel-real] GOOD run — genuine InRelease must verify\n")
+    if _verify(ir_len) == 1:
+        _wstr("[inrel-real] OK: genuine real-Debian InRelease verified\n")
+    else:
+        _wstr("[inrel-real] MISS: genuine InRelease did NOT verify\n")
+        fail = 1
+
+    # --- TAMPER: flip one byte of the signed cleartext ---
+    # Find the cleartext span and corrupt a byte deep inside it (well
+    # past the SIGNED MESSAGE header and the armor headers). The clear-
+    # sign framing stays intact; only the signed text changes, so every
+    # signature must now fail.
+    _wstr("[inrel-real] TAMPER run — corrupted cleartext must be rejected\n")
+    c_off: uint64 = 0
+    c_end: uint64 = 0
+    a_off: uint64 = 0
+    if pgp_inrelease_split(&inrelease_buf[0], ir_len,
+                           &c_off, &c_end, &a_off) != 0:
+        _wstr("[inrel-real] FAIL: cannot re-split for tamper\n")
+        return 1
+    # Pick a byte ~64 bytes into the cleartext body and flip a bit. The
+    # cleartext is always far longer than that for a real Release.
+    tamper_at: uint64 = c_off + 64
+    if tamper_at >= c_end:
+        tamper_at = c_off
+    orig: uint8 = inrelease_buf[tamper_at]
+    inrelease_buf[tamper_at] = orig ^ 0x01
+    if _verify(ir_len) == 1:
+        _wstr("[inrel-real] MISS: tampered InRelease still verified — ")
+        _wstr("the verifier is a rubber stamp!\n")
+        fail = 1
+    else:
+        _wstr("[inrel-real] OK: tampered InRelease correctly rejected\n")
+    # Restore (not strictly needed — the run ends here).
+    inrelease_buf[tamper_at] = orig
+
+    if fail != 0:
+        _wstr("[inrel-real] FAIL\n")
+        return 1
+    _wstr("[inrel-real] PASS\n")
+    return 0

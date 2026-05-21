@@ -44,15 +44,37 @@
 #
 # MULTI-KEY KEYRING
 #
-#   The real `debian-archive-keyring.gpg` carries SEVERAL signing keys
-#   (the current archive key plus older still-valid ones). pgp_keyring_load
-#   walks the whole packet stream and collects EVERY Tag 6 Public-Key
-#   packet into a PgpKeyring (capacity PGP_KEYRING_MAX_KEYS). The caller
-#   (apt) tries each key in turn — a signature verifies if ANY trusted
-#   key accepts it. The signature's Issuer subpacket (the 8-byte key ID)
-#   is exposed for diagnostics / a fast-path match, but correctness does
-#   not depend on it: trying every key is sound and avoids needing a
-#   SHA-1 fingerprint computation just to index the keyring.
+#   The real `debian-archive-keyring.gpg` carries SEVERAL keys (the
+#   current archive key plus older still-valid ones). pgp_keyring_load
+#   walks the whole packet stream and collects every RSA Tag 6
+#   Public-Key packet AND every RSA Tag 14 Public-Subkey packet into a
+#   PgpKeyring (capacity PGP_KEYRING_MAX_KEYS). The caller (apt) tries
+#   each key in turn — a signature verifies if ANY trusted key accepts
+#   it. The signature's Issuer subpacket (the 8-byte key ID) is exposed
+#   for diagnostics / a fast-path match, but correctness does not depend
+#   on it: trying every key is sound and avoids needing a SHA-1
+#   fingerprint computation just to index the keyring.
+#
+#   WHY SUBKEYS ARE TRUST ANCHORS TOO
+#
+#   The real `deb.debian.org` archive does NOT sign `Release` /
+#   `InRelease` with the primary archive keys — it signs with the
+#   dedicated `[S]` SIGNING SUBKEYS those primary keys carry (each
+#   archive key is a primary `[SC]` key plus an rsa4096 `[S]` subkey,
+#   and the subkey is what the ftp-master signing pipeline uses). A
+#   verifier that collects only Tag 6 primaries therefore has NONE of
+#   the keys that actually signed the index, and every real-Debian
+#   `InRelease` verification fails even though the crypto is correct.
+#
+#   The whole `debian-archive-keyring.gpg` blob is the trust root: it
+#   is baked into the image at build time exactly like the kernel's
+#   TLS CA roots. Every key and subkey it contains is trusted by
+#   construction, so collecting a Tag 14 subkey as an anchor does not
+#   widen trust beyond what baking the keyring already established —
+#   the same reasoning that already justifies "collect every Tag 6".
+#   We do NOT (and need not) validate each subkey's binding signature:
+#   a subkey present in the baked keyring is, by the act of baking,
+#   a trusted anchor, just as a primary key in it is.
 #
 # HOW apt USES IT
 #
@@ -119,10 +141,13 @@ class PgpPubkey:
 
 # -- multi-key trust anchor --------------------------------------------
 #
-# A keyring blob may carry several Public-Key packets. PgpKeyring holds
-# every RSA signing key recovered from one. PGP_KEYRING_MAX_KEYS caps
-# the count — a real `debian-archive-keyring.gpg` carries well under a
-# dozen keys; 16 is generous headroom. A keyring with more keys than
+# A keyring blob may carry several Public-Key AND Public-Subkey packets.
+# PgpKeyring holds every RSA signing key recovered from one — primaries
+# (Tag 6) and signing subkeys (Tag 14) alike, since Debian signs the
+# archive with the subkeys. PGP_KEYRING_MAX_KEYS caps the count: a real
+# `debian-archive-keyring.gpg` today carries 7 RSA primaries + 6 RSA
+# subkeys = 13 RSA anchors; the cap of 32 is generous headroom for the
+# keyring growing over future releases. A keyring with more keys than
 # the cap loads the first PGP_KEYRING_MAX_KEYS and reports success
 # (the remainder are simply not trust anchors).
 #
@@ -130,11 +155,11 @@ class PgpPubkey:
 # pointer table — the Adder backend handles a top-level Array of class
 # instances, and `&keys[i]` yields a usable Ptr[PgpPubkey].
 
-PGP_KEYRING_MAX_KEYS: uint64 = 16
+PGP_KEYRING_MAX_KEYS: uint64 = 32
 
 
 class PgpKeyring:
-    keys:    Array[16, PgpPubkey]
+    keys:    Array[32, PgpPubkey]
     n_keys:  uint64               # number of valid keys in `keys`
     valid:   int32                # 1 once pgp_keyring_load succeeded
 
@@ -416,12 +441,15 @@ def pgp_read_mpi(buf: Ptr[uint8], off: uint64, buf_len: uint64,
 
 # -- _pgp_parse_pubkey_body --------------------------------------------
 #
-# Recover the RSA (n, e) MPIs from one v4 Public-Key packet BODY span
-# (buf[body_off .. body_off+body_len)) into `out`. Returns 0 on success,
-# -1 on a malformed / non-RSA / non-v4 packet body.
+# Recover the RSA (n, e) MPIs from one v4 Public-Key / Public-Subkey
+# packet BODY span (buf[body_off .. body_off+body_len)) into `out`.
+# Returns 0 on success, -1 on a malformed / non-RSA / non-v4 packet body.
 #
 # Shared by pgp_keyring_load — factored out so the keyring walk can
-# apply it to every Tag 6 packet it encounters.
+# apply it to every Tag 6 Public-Key AND every Tag 14 Public-Subkey
+# packet it encounters. A Public-Subkey packet body has the exact same
+# layout as a Public-Key packet body (RFC 4880 §5.5.1.2 / §5.5.2), so
+# the same parser handles both unchanged.
 
 def _pgp_parse_pubkey_body(buf: Ptr[uint8], body_off: uint64,
                            body_len: uint64,
@@ -479,20 +507,25 @@ def _pgp_parse_pubkey_body(buf: Ptr[uint8], body_off: uint64,
 # `gpg --export`. A real `debian-archive-keyring.gpg` carries SEVERAL
 # keys (each a Tag 6 Public-Key packet followed by User-ID / Signature
 # / Public-Subkey packets). This walks the WHOLE packet stream and
-# collects every RSA Tag 6 Public-Key packet into `out`, up to
-# PGP_KEYRING_MAX_KEYS.
+# collects every RSA Tag 6 Public-Key packet AND every RSA Tag 14
+# Public-Subkey packet into `out`, up to PGP_KEYRING_MAX_KEYS.
+#
+# Tag 14 Public-Subkey packets ARE collected as trust anchors: the real
+# Debian archive signs `Release` / `InRelease` with the dedicated `[S]`
+# signing SUBKEYS, not the primary keys (see the MULTI-KEY KEYRING note
+# at the top of this file). A verifier that ignored Tag 14 would hold
+# none of the keys that actually sign the index. The whole keyring blob
+# is the trust root (baked at build time); every key and subkey in it
+# is trusted by construction, so no per-subkey binding-signature check
+# is needed.
 #
 # Non-key packets (User-ID tag 13, Signature tag 2, User-Attribute
-# tag 17, Public-Subkey tag 14, Trust tag 12, ...) are skipped. Tag 14
-# Public-Subkey packets are deliberately NOT collected as trust anchors
-# — the primary keys are what sign the archive Release; treating a
-# subkey as an anchor without validating its binding signature would
-# widen trust incorrectly.
+# tag 17, Trust tag 12, ...) are skipped.
 #
-# A Tag 6 packet that fails to parse as RSA is skipped (not fatal) —
-# the keyring may legitimately also carry an EdDSA/ECDSA key we don't
-# use. The load fails (-1) only if NO usable RSA key is found, or the
-# packet framing itself is corrupt.
+# A Tag 6 / Tag 14 packet that fails to parse as RSA is skipped (not
+# fatal) — the keyring may legitimately also carry an EdDSA/ECDSA key
+# we don't use. The load fails (-1) only if NO usable RSA key is found,
+# or the packet framing itself is corrupt.
 #
 # Returns 0 on success (>= 1 key collected), -1 on malformed input.
 
@@ -515,19 +548,25 @@ def pgp_keyring_load(keyring: Ptr[uint8], keyring_len: uint64,
             # stop; otherwise the whole blob is unusable.
             break
         saw_packet = 1
-        # Tag 5 (Secret-Key) is never a valid trust-anchor input.
-        if tag == 5:
+        # Tag 5 (Secret-Key) / Tag 7 (Secret-Subkey) are never valid
+        # trust-anchor input — a keyring blob must be public-only.
+        if tag == 5 or tag == 7:
             return -1
-        # Tag 6 == Public-Key packet — a candidate trust anchor.
-        if tag == 6:
+        # Tag 6 (Public-Key) and Tag 14 (Public-Subkey) are both
+        # candidate trust anchors. The real Debian archive signs the
+        # repository index with the `[S]` signing SUBKEY, so Tag 14
+        # packets must be collected too (see the header note). Their
+        # body layout is identical to a Tag 6 body, so the same parser
+        # applies.
+        if tag == 6 or tag == 14:
             if out[0].n_keys < PGP_KEYRING_MAX_KEYS:
                 rc: int32 = _pgp_parse_pubkey_body(
                     keyring, body_off, body_len,
                     &out[0].keys[out[0].n_keys])
                 if rc == 0:
                     out[0].n_keys = out[0].n_keys + 1
-        # All other tags (13 User-ID, 2 Signature, 14 Public-Subkey,
-        # 17 User-Attribute, 12 Trust, ...) are skipped.
+        # All other tags (13 User-ID, 2 Signature, 17 User-Attribute,
+        # 12 Trust, ...) are skipped.
         pos = pkt_end
 
     if saw_packet == 0:
@@ -714,6 +753,48 @@ def pgp_sig_parse(pkt: Ptr[uint8], pkt_len: uint64,
     out[0].sig_mpi_off = val_off
     out[0].sig_mpi_len = val_len
     out[0].valid = 1
+    return 0
+
+
+# -- pgp_next_packet ---------------------------------------------------
+#
+# Locate the next OpenPGP packet in `buf[0..buf_len)` starting at byte
+# offset `start`. Writes the packet's start offset (the CTB byte) and
+# its total on-the-wire length (header + body) through the out
+# pointers. Returns 0 on success, -1 if `start` is at/past the end or
+# the packet header is malformed.
+#
+# WHY THIS EXISTS
+#
+#   A real Debian `InRelease` is signed by MORE THAN ONE key: the
+#   dearmored signature block carries several concatenated Tag 2
+#   signature packets (today: two RSA-4096 signatures from two archive
+#   subkeys, plus one Ed25519 signature). apt must be able to walk
+#   every signature packet and try each against the keyring, rather
+#   than parsing only the first — the first packet's signer might be a
+#   key that has since rotated out of the baked keyring, while a later
+#   packet is from a key apt still trusts. Walking the whole list and
+#   accepting if ANY (signature, trusted-key) pair verifies is the
+#   sound, forward-compatible behaviour.
+#
+# This walker does not interpret the packet — it only delimits it, so
+# the caller can hand each delimited span to pgp_sig_parse. Non-Tag-2
+# packets are delimited the same way; the caller decides what to skip.
+
+def pgp_next_packet(buf: Ptr[uint8], buf_len: uint64, start: uint64,
+                    out_pkt_off: Ptr[uint64],
+                    out_pkt_len: Ptr[uint64]) -> int32:
+    if start >= buf_len:
+        return -1
+    tag: uint8 = 0
+    body_off: uint64 = 0
+    body_len: uint64 = 0
+    pkt_end: uint64 = pgp_packet_header(buf, start, buf_len,
+                                        &tag, &body_off, &body_len)
+    if pkt_end == 0:
+        return -1
+    out_pkt_off[0] = start
+    out_pkt_len[0] = pkt_end - start
     return 0
 
 
