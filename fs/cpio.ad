@@ -37,8 +37,15 @@ class FileEntry:
     size:  uint64
 
 
-NR_FILES: uint64 = 192
-file_table: Array[192, FileEntry]
+# NR_FILES is the in-kernel cpio index capacity. The table lives in
+# top-level BSS (NOBITS, zero-filled by head_64.S) so a large static
+# array costs zero image bytes and never touches the stack. At
+# sizeof(FileEntry)==24 bytes, 8192 slots is ~192 KiB of BSS — trivial
+# next to the kernel's other BSS buffers. Sized to accept a real
+# debootstrap Debian rootfs (~5000 files) with headroom; see
+# scripts/build_initramfs.py's HAMNIX_EMBED_DEBIAN=full path.
+NR_FILES: uint64 = 8192
+file_table: Array[8192, FileEntry]
 nr_files:   uint64 = 0
 
 

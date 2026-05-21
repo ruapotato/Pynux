@@ -127,7 +127,10 @@ from drivers.net.tcp import (
 from drivers.net.http import http_init, http_get, https_get
 from drivers.net.tls import tls_init
 from linux_abi.u_socket_state import usock_init
-from fs.cpio import cpio_init, initramfs_entry_count, initramfs_entry_name
+from fs.cpio import (
+    cpio_init, initramfs_entry_count, initramfs_entry_name,
+    initramfs_entry_data, initramfs_entry_size,
+)
 from kernel.block.blk import (
     blk_read_sectors, blk_write_sectors, find_blockdev, blk_scan_partitions,
 )
@@ -327,6 +330,74 @@ def blkwrite_smoke_test(fat_slot: int32, ext4_slot: int32):
     # mutated for downstream code.
     blk_write_sectors(target, test_lba, 1, &orig[0])
     printk0("blk: write smoke test PASS\n")
+
+
+def cpio_capacity_smoke_test():
+    # Gated cpio-capacity regression. Runs only when the initramfs was
+    # built with HAMNIX_CPIO_STRESS_FILES=<N> (scripts/build_initramfs.py
+    # plants /cpio-stress/file0../file<N-1>; the LAST one carries the
+    # payload "CPIO_STRESS_LAST_FILE_OK\n"). The test confirms fs/cpio.ad's
+    # NR_FILES table indexed entries PAST the historical 192-slot cap:
+    #   1. total registered file count is > 192, AND
+    #   2. an entry at index >= 192 named /cpio-stress/* exists, AND
+    #   3. the file carrying the marker payload is found and its bytes
+    #      read back correctly via initramfs_entry_data/_size.
+    # Default boots ship no /cpio-stress/* files: the marker walk finds
+    # nothing and the test prints a skip banner. See
+    # scripts/test_cpio_capacity.sh.
+    count: uint64 = initramfs_entry_count()
+    prefix: Ptr[uint8] = "/cpio-stress/"      # 13 chars
+    stress_seen: int32 = 0
+    past192_seen: int32 = 0
+    marker_ok: int32 = 0
+
+    i: uint64 = 0
+    while i < count:
+        name: Ptr[char] = initramfs_entry_name(i)
+        # Prefix-compare against "/cpio-stress/".
+        is_stress: int32 = 1
+        j: uint64 = 0
+        while j < 13:
+            if cast[uint8](name[j]) != prefix[j]:
+                is_stress = 0
+                j = 13                          # break
+            else:
+                j = j + 1
+        if is_stress == 1:
+            stress_seen = 1
+            if i >= 192:
+                past192_seen = 1
+            # Check this entry's payload for the last-file marker.
+            sz: uint64 = initramfs_entry_size(i)
+            if sz == 25:                        # len("CPIO_STRESS_LAST_FILE_OK\n")
+                data: Ptr[uint8] = initramfs_entry_data(i)
+                expect: Ptr[uint8] = "CPIO_STRESS_LAST_FILE_OK\n"
+                same: int32 = 1
+                k: uint64 = 0
+                while k < 25:
+                    if data[k] != expect[k]:
+                        same = 0
+                        k = 25                  # break
+                    else:
+                        k = k + 1
+                if same == 1:
+                    marker_ok = 1
+        i = i + 1
+
+    if stress_seen == 0:
+        printk0("[cpio_cap] skipped (no /cpio-stress/* files; set HAMNIX_CPIO_STRESS_FILES)\n")
+        return
+    printk1("[cpio_cap] %d files registered from initramfs\n", count)
+    if count <= 192:
+        printk0("[cpio_cap] FAIL: file count not above old 192 cap\n")
+        return
+    if past192_seen == 0:
+        printk0("[cpio_cap] FAIL: no /cpio-stress/* entry at index >= 192\n")
+        return
+    if marker_ok == 0:
+        printk0("[cpio_cap] FAIL: last-file marker payload not found\n")
+        return
+    printk0("[cpio_cap] PASS: cpio table indexed files past index 192\n")
 
 
 def net_smoke_test():
@@ -1738,6 +1809,10 @@ def start_kernel():
     # Default real-hw boot lands in neither branch and prints a skip
     # banner — the diagnostic the cron test wrappers can pattern-match.
     cpio_init()                                # idempotent w/ vfs_init's
+    # cpio capacity regression — gated on /cpio-stress/* markers; a
+    # no-op skip on default boots. Proves the NR_FILES table indexes
+    # files past the historical 192-slot cap.
+    cpio_capacity_smoke_test()
     xhci_marker_found: int32 = 0
     xs_idx: uint64 = 0
     xs_count: uint64 = initramfs_entry_count()

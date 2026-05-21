@@ -233,6 +233,35 @@ else:
                 pass
             break
 
+# cpio capacity stress fixture: scripts/test_cpio_capacity.sh sets
+# HAMNIX_CPIO_STRESS_FILES=<N> to plant N tiny synthetic files at
+# /cpio-stress/file<i> inside the initramfs. This exercises fs/cpio.ad's
+# NR_FILES table past the historical 192-slot cap (the table is now
+# 8192 entries). The last planted file carries a recognisable payload
+# so the kernel-side check can assert a file PAST index 192 was
+# registered and is readable. Off-default: an unset env var leaves the
+# initramfs alone, exactly like every other gated marker above.
+_CPIO_STRESS_RAW = os.environ.get("HAMNIX_CPIO_STRESS_FILES", "")
+if _CPIO_STRESS_RAW:
+    try:
+        _cpio_stress_n = int(_CPIO_STRESS_RAW)
+    except ValueError:
+        raise SystemExit(
+            f"HAMNIX_CPIO_STRESS_FILES={_CPIO_STRESS_RAW!r}: expected an "
+            f"integer file count")
+    if _cpio_stress_n < 1:
+        raise SystemExit(
+            f"HAMNIX_CPIO_STRESS_FILES={_cpio_stress_n}: must be >= 1")
+    for _i in range(_cpio_stress_n):
+        # All but the last file carry a trivial payload. The last one
+        # carries a distinctive marker the kernel-side test greps for,
+        # proving an entry beyond the old 192 cap was indexed.
+        if _i == _cpio_stress_n - 1:
+            _payload = b"CPIO_STRESS_LAST_FILE_OK\n"
+        else:
+            _payload = b"x\n"
+        FILES.append((f"/cpio-stress/file{_i}", _payload))
+
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
