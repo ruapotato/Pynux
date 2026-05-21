@@ -206,13 +206,16 @@ knows which it holds.
   files; growing a full ext4 directory block; multi-cluster FAT
   directories.
 
-## §13 cdev / proc field completions  (after the Phase D Chan conversion)
-- [ ] `/dev/uptime` idle column; `/dev/loadavg` EWMA; `/dev/stat` real
-  columns; `/dev/diskstats` counters; persist `/dev/hostname`.
-- [ ] Layer-2 `/proc` extensions via bind: `stat`/`mounts`/`diskstats`,
-  per-pid `/proc/<pid>/*`, `/proc/self`, `/proc/net/*`, `/proc/cmdline`.
-- [ ] Real `KmallocLive` (per-cache slab walker); per-backend errstr
-  (ext4/fat/blk); user-mode `perror` helper.
+## §13 cdev / proc field completions
+- [x] `/dev/uptime` idle column, `/dev/loadavg` real EWMA, `/dev/stat`
+  real columns, `/dev/diskstats` counters (`ad3e5ad`); `/dev/hostname`
+  already persisted.
+- [x] Layer-2 `/proc` extensions: `/proc/{stat,mounts,diskstats}`,
+  `/proc/self`, per-pid `/proc/<pid>/{stat,cmdline,comm,maps}`,
+  `/proc/cmdline` (`ad3e5ad`).
+- [x] Real `KmallocLive` per-cache slab walker (`ad3e5ad`).
+- [ ] Still open: `/proc/net/*`; per-backend errstr (ext4/fat/blk) +
+  user-mode `perror` helper (deferred).
 
 ## §14 Resource control & security  (stretch)
 - [ ] Per-namespace CPU/memory caps (ride the namespace model, not Linux
@@ -238,10 +241,10 @@ The dependency-ordered critical path is **COMPLETE**: Phase D
 (`4964a6b`) → §1 (`e32ec28`) → §2 (futex/TLS) → §4 (dynamic loader,
 `6d9898e`) are all landed — a stock dynamically-linked binary now runs
 inside a namespace. Also landed: §3 (signals, `abc5e73`), §9, §11,
-§12 (fs write, `63198b2`), §15, §16. Remaining, all off the critical
-path and parallelizable: §5 (Layer-2 async), §6 (vDSO only), §7
-(entropy), §10 (networking), §13 (cdev/proc), §14, §17. Everything in
-§5 is Layer-2-only per the boundary law.
+§12 (fs write, `63198b2`), §13 (cdev/proc, `ad3e5ad`), §15, §16.
+Remaining, all off the critical path and parallelizable: §5 (Layer-2
+async), §6 (vDSO only), §7 (entropy), §10 (networking), §14, §17.
+Everything in §5 is Layer-2-only per the boundary law.
 
 ---
 
