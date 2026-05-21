@@ -1002,6 +1002,90 @@ def tcp_reconnect_smoke_test():
                 ok_count)
 
 
+# Scratch RX buffer for tcp_throughput_smoke_test — top-level (BSS) so
+# the 16 KiB array stays out of the call frame.
+tcp_tput_rx_buf: Array[16384, uint8]
+
+
+def tcp_throughput_smoke_test():
+    # Sustained bulk-download throughput regression.
+    #
+    # Connects to a SLIRP-forwarded helper at 10.0.2.203:9200 (the
+    # scripts/test_net_tcp_throughput.sh wrapper sets up a
+    # `guestfwd=tcp:10.0.2.203:9200-tcp:127.0.0.1:9200` netdev option
+    # with a Python server that, on "PULL\n", streams the target
+    # bytes back as fast as the socket accepts them). The kernel then
+    # drains the whole blob via tcp_recv in a loop, timing the drain
+    # off the free-running PIT counter, and computes bytes/second.
+    #
+    # A small per-chunk processing spin is interposed so the 256 KiB
+    # per-slot RX ring genuinely fills and the zero-window /
+    # window-update reopen cycle (_tcp_adv_window) is exercised — the
+    # exact receive-path machinery that gates a real multi-MB apt
+    # index download. This is the regression guard for a TCP receive
+    # path collapse (tiny window, ACK-per-RTO stall, RX-ring drop
+    # storm): any of those drops the measured rate far below the
+    # floor.
+    #
+    # PASS marker: "[tcp_tput] PASS <N> bytes <R> B/s" with R above
+    # the sanity floor; "[tcp_tput] FAIL ..." otherwise.
+    printk0("[tcp_tput] throughput smoke test starting\n")
+    target: uint64 = 1048576                  # 1 MiB blob
+    floor_bps: uint64 = 50000                 # 50 KB/s sanity floor
+    slot: int32 = tcp_connect(10, 0, 2, 203, 9200, 200)
+    if slot < 0:
+        printk0("[tcp_tput] SKIP — connect failed (no guestfwd?)\n")
+        return
+    printk1("[tcp_tput] connected slot=%d\n", cast[uint64](slot))
+    pull_msg: Array[5, uint8]
+    pull_msg[0] = 0x50    # 'P'
+    pull_msg[1] = 0x55    # 'U'
+    pull_msg[2] = 0x4C    # 'L'
+    pull_msg[3] = 0x4C    # 'L'
+    pull_msg[4] = 0x0A    # '\n'
+    pull_ptr: Ptr[uint8] = cast[Ptr[uint8]](&pull_msg[0])
+    nsent: int64 = tcp_send(slot, pull_ptr, 5)
+    if nsent < 0:
+        printk0("[tcp_tput] send PULL failed\n")
+        tcp_close(slot)
+        return
+    rxbuf_ptr: Ptr[uint8] = cast[Ptr[uint8]](&tcp_tput_rx_buf[0])
+    total: uint64 = 0
+    # Start the clock only after the first byte lands so connection
+    # setup latency doesn't skew the rate.
+    started: int32 = 0
+    t0: uint64 = 0
+    while total < target:
+        n: int64 = tcp_recv(slot, rxbuf_ptr, 16384, 500)
+        if n <= 0:
+            break
+        if started == 0:
+            t0 = pit_monotonic_us()
+            started = 1
+        total = total + cast[uint64](n)
+        # Interpose a per-chunk processing cost (stand-in for a real
+        # consumer's gzip-inflate / parse work). This lets the 256 KiB
+        # RX ring fill so the zero-window / window-update reopen path
+        # is on the measured path — not just the never-fills fast
+        # case.
+        spin: uint64 = 0
+        while spin < 200000:
+            spin = spin + 1
+    elapsed_us: uint64 = pit_monotonic_us() - t0
+    if elapsed_us == 0:
+        elapsed_us = 1
+    # bytes/second = total * 1_000_000 / elapsed_us. Do the multiply
+    # first; total <= 1 MiB so total*1e6 (~1e12) stays well inside u64.
+    rate_bps: uint64 = (total * 1000000) / elapsed_us
+    printk2("[tcp_tput] drained %d bytes in %d us\n", total, elapsed_us)
+    printk1("[tcp_tput] rate = %d B/s\n", rate_bps)
+    if total >= target and rate_bps >= floor_bps:
+        printk2("[tcp_tput] PASS %d bytes %d B/s\n", total, rate_bps)
+    else:
+        printk2("[tcp_tput] FAIL %d bytes %d B/s\n", total, rate_bps)
+    tcp_close(slot)
+
+
 def http_smoke_test():
     # In-kernel HTTP/1.1 GET smoke test. Fetches the root of
     # http://example.com/ (RFC 2606's reserved-for-examples domain,
@@ -2219,6 +2303,38 @@ def start_kernel():
         tcp_reconnect_smoke_test()
     else:
         printk0("[tcp_reconnect] skipped (no /etc/tcp-reconnect-test marker)\n")
+
+    # --- TCP bulk-download throughput smoke gated on cpio marker ---
+    # Runs only when scripts/test_net_tcp_throughput.sh planted
+    # /etc/tcp-throughput-test in the initramfs
+    # (ENABLE_TCP_THROUGHPUT_SMOKE=1) AND a guestfwd to
+    # 10.0.2.203:9200 is configured. Same gating pattern as
+    # /etc/tcp-ring-test above — a sustained-throughput regression
+    # guard for the TCP receive path (window advertisement, per-segment
+    # ACK, RX-ring drain, zero-window/window-update reopen cycle).
+    tput_marker_found: int32 = 0
+    tp_idx: uint64 = 0
+    tp_count: uint64 = initramfs_entry_count()
+    while tp_idx < tp_count:
+        tp_name: Ptr[char] = initramfs_entry_name(tp_idx)
+        ok_tp: int32 = 1
+        tp_target: Ptr[uint8] = "/etc/tcp-throughput-test"
+        tp_j: uint64 = 0
+        while tp_j < 25:                            # 24 chars + NUL
+            if cast[uint8](tp_name[tp_j]) != tp_target[tp_j]:
+                ok_tp = 0
+                tp_j = 25                            # break
+            else:
+                tp_j = tp_j + 1
+        if ok_tp == 1:
+            tput_marker_found = 1
+            tp_idx = tp_count                        # break
+        else:
+            tp_idx = tp_idx + 1
+    if tput_marker_found == 1:
+        tcp_throughput_smoke_test()
+    else:
+        printk0("[tcp_tput] skipped (no /etc/tcp-throughput-test marker)\n")
 
     # --- HTTP 3xx redirect-follow smoke gated on cpio marker --------
     # Runs only when scripts/test_net_http_redirect.sh planted

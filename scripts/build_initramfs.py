@@ -98,6 +98,16 @@ if os.environ.get("ENABLE_TCP_FIN_WAIT2_SMOKE") == "1":
 if os.environ.get("ENABLE_TCP_RECONNECT_SMOKE") == "1":
     FILES.append(("/etc/tcp-reconnect-test", b"1\n"))
 
+# TCP bulk-download throughput smoke. Gated the same way as the TCP
+# ring / reconnect markers above. The fixture (scripts/test_net_tcp_
+# throughput.sh) boots with a guestfwd to a Python blob server at
+# 10.0.2.203:9200; the kernel's tcp_throughput_smoke_test drains a
+# 1 MiB blob and asserts the sustained rate clears a sane floor — a
+# regression guard for the TCP receive path. Only that one harness
+# sets this; default boot and other tests run without it.
+if os.environ.get("ENABLE_TCP_THROUGHPUT_SMOKE") == "1":
+    FILES.append(("/etc/tcp-throughput-test", b"1\n"))
+
 # DHCP renew/rebind/expiry smoke. Gated the same way as the TLS / TCP
 # ring markers above. The renew smoke leaves DHCP state at IDLE on
 # exit, which breaks any downstream test that requires state == BOUND
