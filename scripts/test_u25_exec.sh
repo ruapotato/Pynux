@@ -25,6 +25,7 @@
 #     make -C tests/u-binary/src/glibc_exec  install
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,18 +34,11 @@ cd "$PROJ_ROOT"
 UBIN_PARENT=tests/u-binary/u_glibc_exec
 UBIN_CHILD=tests/u-binary/u_glibc_hello
 
-if [ ! -f "$UBIN_PARENT" ]; then
-    echo "[test_u25_exec] SKIP: $UBIN_PARENT not staged"
-    echo "    REQUIRES host cc + libc6-dev (static glibc)."
-    echo "    apt-get install -y libc6-dev  # (needs sudo)"
-    echo "    then: make -C tests/u-binary/src/glibc_exec install"
-    exit 0
-fi
-if [ ! -f "$UBIN_CHILD" ]; then
-    echo "[test_u25_exec] SKIP: $UBIN_CHILD not staged (parent execs into it)"
-    echo "    then: make -C tests/u-binary/src/glibc_hello install"
-    exit 0
-fi
+# Build-on-missing: both fixtures are gitignored (host-built). The
+# parent execs into the child, so both must be present. Build each
+# from its src recipe; only SKIP if a build genuinely fails.
+ensure_ubin_or_skip test_u25_exec u_glibc_exec  glibc_exec
+ensure_ubin_or_skip test_u25_exec u_glibc_hello glibc_hello
 
 ELF=build/hamnix-vmlinux.elf
 HAMSH_ELF=build/user/hamsh.elf

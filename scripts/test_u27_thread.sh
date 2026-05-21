@@ -25,20 +25,17 @@
 #     make -C tests/u-binary/src/glibc_thread install
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 UBIN=tests/u-binary/u_glibc_thread
-
-if [ ! -f "$UBIN" ]; then
-    echo "[test_u27_thread] SKIP: $UBIN not staged"
-    echo "    REQUIRES host cc + libc6-dev (static glibc + libpthread)."
-    echo "    apt-get install -y libc6-dev  # (needs sudo)"
-    echo "    then: make -C tests/u-binary/src/glibc_thread install"
-    exit 0
-fi
+# Build-on-missing: the fixture is gitignored (host-built). If absent,
+# build it from tests/u-binary/src/glibc_thread; only SKIP on a real
+# failure (e.g. a genuine missing static glibc + libpthread).
+ensure_ubin_or_skip test_u27_thread u_glibc_thread glibc_thread
 
 ELF=build/hamnix-vmlinux.elf
 HAMSH_ELF=build/user/hamsh.elf

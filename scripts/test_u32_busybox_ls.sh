@@ -31,19 +31,18 @@
 # the Linux ABI, and FAILs only on a hard crash (TRAP / page fault).
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 UBIN=tests/u-binary/u_busybox_musl
-
-if [ ! -f "$UBIN" ]; then
-    echo "[test_u32_busybox_ls] SKIP: $UBIN not staged"
-    echo "    REQUIRES host musl-gcc (apt-get install musl-tools)"
-    echo "    then: make -C tests/u-binary/src/musl_busybox install"
-    exit 0
-fi
+# Build-on-missing: the fixture is gitignored (host-built). If absent,
+# build it from tests/u-binary/src/musl_busybox; only SKIP on a real
+# failure (e.g. a genuine missing musl-gcc, or no network to fetch the
+# busybox upstream tarball).
+ensure_ubin_or_skip test_u32_busybox_ls u_busybox_musl musl_busybox
 
 ELF=build/hamnix-vmlinux.elf
 HAMSH_ELF=build/user/hamsh.elf

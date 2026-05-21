@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 UBIN=tests/u-binary/u_musl_thread1
-[ -f "$UBIN" ] || { echo "[test_u27_musl_thread1] SKIP: $UBIN not built"; exit 0; }
+# Build-on-missing: the fixture is gitignored (host-built). If absent,
+# build it from tests/u-binary/src/musl_thread1; only SKIP on a real
+# build failure.
+ensure_ubin_or_skip test_u27_musl_thread1 u_musl_thread1 musl_thread1
 
 ELF=build/hamnix-vmlinux.elf
 HAMSH_ELF=build/user/hamsh.elf

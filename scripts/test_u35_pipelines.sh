@@ -27,17 +27,21 @@
 #      don't trip a -ENOSYS or hang. Also best-effort.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
-UBIN=tests/u-binary/u_busybox
-
-if [ ! -f "$UBIN" ]; then
-    echo "[test_u35_pipelines] SKIP: $UBIN not staged"
-    exit 0
-fi
+# Build-on-missing: the legacy glibc-static u_busybox is RETIRED (it was
+# an ET_EXEC at 0x400000 the kernel's collision guard now -ENOEXECs, and
+# it never had a build recipe). Every busybox regression test drives the
+# musl static-PIE fixture u_busybox_musl instead — see the retirement
+# note in tests/u-binary/src/musl_busybox/Makefile. The fixture is
+# gitignored; build it from src and only SKIP on a real build failure
+# (e.g. no musl-gcc, or no network for the busybox upstream tarball).
+UBIN=tests/u-binary/u_busybox_musl
+ensure_ubin_or_skip test_u35_pipelines u_busybox_musl musl_busybox
 
 ELF=build/hamnix-vmlinux.elf
 HAMSH_ELF=build/user/hamsh.elf
@@ -47,7 +51,7 @@ bash scripts/build_user.sh
 bash scripts/build_modules.sh
 
 echo "[test_u35_pipelines] (2/4) Swap /init=hamsh + embed busybox"
-cp tests/u-binary/u_busybox tests/u-binary/busybox
+cp tests/u-binary/u_busybox_musl tests/u-binary/busybox
 HAMNIX_EMBED_UBIN=1 INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py
 
 echo "[test_u35_pipelines] (3/4) Rebuild kernel image"

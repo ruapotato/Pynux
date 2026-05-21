@@ -35,17 +35,17 @@
 #       stale procfs renderer leak.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 UBIN=tests/u-binary/u_proc_translation
-if [ ! -f "$UBIN" ]; then
-    echo "[test_proc_translation] SKIP: $UBIN not staged"
-    echo "    Build with: make -C tests/u-binary/src/proc_translation install"
-    exit 0
-fi
+# Build-on-missing: the fixture is gitignored (host-built). If absent,
+# build it from tests/u-binary/src/proc_translation; only SKIP on a
+# real build failure.
+ensure_ubin_or_skip test_proc_translation u_proc_translation proc_translation
 
 ELF=build/hamnix-vmlinux.elf
 HAMSH_ELF=build/user/hamsh.elf

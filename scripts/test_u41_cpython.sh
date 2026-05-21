@@ -59,20 +59,20 @@
 #     / mmap-alignment regressions returning.
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 UBIN=tests/u-binary/u_cpython
-if [ ! -f "$UBIN" ]; then
-    echo "[test_u41_cpython] SKIP: $UBIN not staged"
-    echo "    REQUIRES host gcc + make + libc6-dev (libc.a)"
-    echo "    Build is ~15-30 min from upstream Python-3.11.x tarball."
-    echo "    apt-get install -y gcc make libc6-dev wget  # (needs sudo)"
-    echo "    then: make -C tests/u-binary/src/cpython install"
-    exit 0
-fi
+# Build-on-missing: the fixture is gitignored (host-built). If absent,
+# build it from tests/u-binary/src/cpython; only SKIP on a real failure.
+# NOTE: this fixture fetches the upstream Python-3.11.x tarball and
+# does a full ~15-30 min interpreter build — an offline host (or one
+# without wget/curl) will fail here, which is the correct, informative
+# skip reason.
+ensure_ubin_or_skip test_u41_cpython u_cpython cpython
 
 ELF=build/hamnix-vmlinux.elf
 HAMSH_ELF=build/user/hamsh.elf
