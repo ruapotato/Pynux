@@ -187,9 +187,11 @@ knows which it holds.
   NewReno or CUBIC.
 - [ ] Multi-listener accept queue / wider TCB table; window scaling +
   SACK + timestamps.
-- [ ] ICMP errors (dest-unreachable, time-exceeded, redirect); generic
-  unicast ARP helper; UDP sockets; `getsockopt`/`setsockopt`; close a
-  socket fd's TCP slot at task exit.
+- [x] UDP sockets (`socket`/`bind`/`connect`/`sendto`/`recvfrom`),
+  `getsockopt`/`setsockopt`, ICMP dest-/port-unreachable + received
+  ICMP-error latching, socket-fd slot release at task exit — `5a499f3`.
+- [ ] Still open: generic unicast ARP helper; ICMP time-exceeded/
+  redirect.
 
 ## §11 DNS resolver  (off critical path — parallelizable)
 - [x] Multiple A-records (return all + round-robin), PTR/MX/SRV record
