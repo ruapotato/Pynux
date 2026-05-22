@@ -117,6 +117,15 @@ if os.environ.get("ENABLE_TCP_THROUGHPUT_SMOKE") == "1":
 if os.environ.get("ENABLE_DHCP_RENEW_SMOKE") == "1":
     FILES.append(("/etc/dhcp-renew-test", b"1\n"))
 
+# SYS_NETCFG (`ifconfig`) network info + static-config smoke. Gated the
+# same way as the markers above — see init/main.ad's nc_marker_found
+# gate. The smoke pins a static IPv4 address / gateway / DNS, which
+# stops DHCP from installing a lease, so it would break any downstream
+# test that needs the DHCP-assigned 10.0.2.15. Only
+# scripts/test_net_cfg.sh sets this; default boot keeps DHCP in charge.
+if os.environ.get("ENABLE_NETCFG_SMOKE") == "1":
+    FILES.append(("/etc/netcfg-test", b"1\n"))
+
 # xHCI V1/V2 synthetic transfer-engine selftests. Gated the same way as
 # the markers above — see init/main.ad's xhci_marker_found gate. The
 # selftests forge Event-Ring state that real silicon won't agree with

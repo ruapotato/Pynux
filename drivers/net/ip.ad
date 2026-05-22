@@ -78,8 +78,21 @@ ip_in_addr_err: uint64 = 0
 # without a swap on the hot path.
 ip_our_ip:   Array[4, uint8]
 ip_gateway:  Array[4, uint8]
+ip_netmask:  Array[4, uint8]
 ip_our_set:  uint8 = 0
 ip_gw_set:   uint8 = 0
+ip_mask_set: uint8 = 0
+
+# Configuration source. 0 = unconfigured, 1 = DHCP, 2 = static.
+# A static config (set via SYS_NETCFG from `ifconfig`) latches this
+# to 2; the DHCP client checks ip_cfg_source before installing a
+# lease so an operator's static override is never clobbered by a
+# late DHCP ACK or a renew. Mirrors NetworkManager's "manual" vs
+# "auto" method on a connection.
+IP_CFG_NONE:   uint8 = 0
+IP_CFG_DHCP:   uint8 = 1
+IP_CFG_STATIC: uint8 = 2
+ip_cfg_source: uint8 = 0
 
 # Monotonic IPv4 fragment-ID counter. Stock Linux uses a per-route
 # atomic; we have one route, one TX path, no preemption on this
@@ -131,8 +144,83 @@ def ip_gateway_b(i: uint64) -> uint8:
     return ip_gateway[i]
 
 
+def ip_set_netmask(b0: uint8, b1: uint8, b2: uint8, b3: uint8):
+    # IPv4 subnet mask (network order). Set by DHCP option 1 or by a
+    # static `ifconfig <if> <addr> netmask <m>`. _ip_in_subnet uses
+    # it to decide on-link vs via-gateway when it is set; it falls
+    # back to the /24 heuristic when ip_mask_set is 0.
+    ip_netmask[0] = b0
+    ip_netmask[1] = b1
+    ip_netmask[2] = b2
+    ip_netmask[3] = b3
+    ip_mask_set = 1
+
+
+def ip_netmask_b(i: uint64) -> uint8:
+    return ip_netmask[i]
+
+
+def ip_have_netmask() -> int32:
+    if ip_mask_set == 0:
+        return 0
+    return 1
+
+
+def ip_cfg_source_get() -> uint8:
+    return ip_cfg_source
+
+
+def ip_apply_dhcp(addr0: uint8, addr1: uint8, addr2: uint8, addr3: uint8,
+                  have_mask: uint8,
+                  mask0: uint8, mask1: uint8, mask2: uint8, mask3: uint8,
+                  have_gw: uint8,
+                  gw0: uint8, gw1: uint8, gw2: uint8, gw3: uint8) -> int32:
+    # DHCP-lease install path. Honours a static override: if the
+    # operator has pinned a static config (ip_cfg_source == STATIC),
+    # the lease is dropped and we return -1 so the DHCP client can
+    # log "static config in effect, ignoring lease". Otherwise the
+    # address / mask / gateway are installed and the source latches
+    # to DHCP. This is the single choke point that lets `ifconfig`
+    # win over a racing DHCP ACK.
+    if ip_cfg_source == IP_CFG_STATIC:
+        return -1
+    ip_set_our_ip(addr0, addr1, addr2, addr3)
+    if have_mask == 1:
+        ip_set_netmask(mask0, mask1, mask2, mask3)
+    if have_gw == 1:
+        ip_set_gateway(gw0, gw1, gw2, gw3)
+    ip_cfg_source = IP_CFG_DHCP
+    return 0
+
+
+def ip_apply_static_addr(addr0: uint8, addr1: uint8,
+                         addr2: uint8, addr3: uint8,
+                         mask0: uint8, mask1: uint8,
+                         mask2: uint8, mask3: uint8):
+    # Static-config install path. Sets the address + netmask and
+    # latches ip_cfg_source to STATIC so subsequent DHCP ACKs are
+    # ignored (see ip_apply_dhcp). Called from SYS_NETCFG when the
+    # operator runs `ifconfig <if> <addr> netmask <m>`.
+    ip_set_our_ip(addr0, addr1, addr2, addr3)
+    ip_set_netmask(mask0, mask1, mask2, mask3)
+    ip_cfg_source = IP_CFG_STATIC
+
+
+def ip_apply_static_gw(gw0: uint8, gw1: uint8, gw2: uint8, gw3: uint8):
+    # Static default-gateway install (route add default gw ...).
+    # Also latches the config source to STATIC.
+    ip_set_gateway(gw0, gw1, gw2, gw3)
+    ip_cfg_source = IP_CFG_STATIC
+
+
 def ip_have_our_ip() -> int32:
     if ip_our_set == 0:
+        return 0
+    return 1
+
+
+def ip_have_gateway() -> int32:
+    if ip_gw_set == 0:
         return 0
     return 1
 
@@ -269,14 +357,24 @@ def _ip_is_broadcast(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> int32:
 
 
 def _ip_in_subnet(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> int32:
-    # Heuristic: same /24 as our IP counts as on-link, otherwise we
-    # go through the gateway. Good enough for the SLIRP layout
-    # (we're 10.0.2.15 and the gateway is 10.0.2.2 — both on
-    # 10.0.2.0/24) and for any future bridged config that uses a
-    # /24 subnet. A real implementation would honour the netmask
-    # learned via DHCP (option 1).
+    # On-link test. When a netmask has been learned (DHCP option 1
+    # or a static `ifconfig ... netmask`), apply it byte-wise: the
+    # destination is on-link iff (dst & mask) == (our_ip & mask).
+    # When no mask is set we fall back to the /24 heuristic that
+    # served the early SLIRP bring-up (we're 10.0.2.15, the gateway
+    # is 10.0.2.2 — both on 10.0.2.0/24).
     if ip_our_set == 0:
         return 0
+    if ip_mask_set == 1:
+        if (ip_our_ip[0] & ip_netmask[0]) != (b0 & ip_netmask[0]):
+            return 0
+        if (ip_our_ip[1] & ip_netmask[1]) != (b1 & ip_netmask[1]):
+            return 0
+        if (ip_our_ip[2] & ip_netmask[2]) != (b2 & ip_netmask[2]):
+            return 0
+        if (ip_our_ip[3] & ip_netmask[3]) != (b3 & ip_netmask[3]):
+            return 0
+        return 1
     if ip_our_ip[0] != b0:
         return 0
     if ip_our_ip[1] != b1:
@@ -401,11 +499,14 @@ def ip_init():
     ip_in_addr_err = 0
     ip_our_set = 0
     ip_gw_set  = 0
+    ip_mask_set = 0
+    ip_cfg_source = IP_CFG_NONE
     ip_next_id = 1
     i: uint64 = 0
     while i < 4:
         ip_our_ip[i] = 0
         ip_gateway[i] = 0
+        ip_netmask[i] = 0
         i = i + 1
     printk0("ip: initialized\n")
 

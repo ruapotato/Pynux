@@ -1,12 +1,33 @@
 # user/ifconfig.ad
 #
-# Stub `ifconfig` — Hamnix has no real NIC driver yet (no e1000,
-# no virtio-net, no socket layer), so the only "interface" we can
-# truthfully claim is the loopback address that any TCP/IP stack
-# synthesises in software. Print one line so scripts that probe
-# for `lo` find it; everything else is intentionally absent.
+# Network info + configuration for the Hamnix server. This is the one
+# obvious command for "show me / set up my network": with no arguments
+# it prints the live IPv4 config (address, netmask, gateway, DNS, and
+# whether they came from DHCP or were pinned static); with arguments it
+# sets a static config that overrides DHCP.
+#
+# All of it rides on the single SYS_NETCFG syscall (286 -> do_netcfg in
+# arch/x86/kernel/syscall.ad), which bridges the kernel's IPv4 stack
+# (drivers/net/ip.ad), DNS resolver (drivers/net/dns.ad) and DHCP client
+# (drivers/net/dhcp.ad).
+#
+# Usage:
+#   ifconfig                         show the current network config
+#   ifconfig eth0 <addr> netmask <m> set a static address + netmask
+#   ifconfig gw <addr>               set a static default gateway
+#   ifconfig dns <addr>              set a static DNS server
+#
+# A static `ifconfig` latches the kernel's config source so a racing or
+# later DHCP lease can never clobber the operator's choice. The system
+# does DHCP by default at boot — running `ifconfig` with no arguments on
+# a fresh boot shows the DHCP-assigned address marked "(dhcp)".
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+# Network-config syscall. op 0 = GET (a1 = 24-byte buffer), op 1 =
+# SET_ADDR (a1 = packed addr, a2 = packed mask), op 2 = SET_GW (a1 =
+# packed gateway), op 3 = SET_DNS (a1 = packed DNS server). Returns 0
+# on success, -1 on a bad op / null buffer.
+extern def sys_netcfg(op: uint64, a1: uint64, a2: uint64) -> int64
 
 
 def strlen_u8(s: Ptr[uint8]) -> uint64:
@@ -20,6 +41,313 @@ def write_str(fd: int32, s: Ptr[uint8]):
     sys_write(fd, s, strlen_u8(s))
 
 
-def main() -> int32:
-    write_str(1, "lo  inet 127.0.0.1/8\n")
+# Render a uint64 (0..255 in practice) as decimal into `buf` starting
+# at `off`; returns the new offset. No leading zeros.
+def emit_u8(buf: Ptr[uint8], off: uint64, v: uint64) -> uint64:
+    if v == 0:
+        buf[off] = 48                       # '0'
+        return off + 1
+    # Up to 3 digits for a byte.
+    digs: Array[3, uint8]
+    n: uint64 = 0
+    x: uint64 = v
+    while x > 0:
+        digs[n] = cast[uint8](48 + (x % 10))
+        x = x / 10
+        n = n + 1
+    # digs holds the number least-significant-first; emit reversed.
+    i: uint64 = n
+    while i > 0:
+        i = i - 1
+        buf[off] = digs[i]
+        off = off + 1
+    return off
+
+
+# Render a 4-octet IPv4 (b0.b1.b2.b3) into `buf` at `off`; returns the
+# new offset.
+def emit_ip(buf: Ptr[uint8], off: uint64,
+            b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> uint64:
+    off = emit_u8(buf, off, cast[uint64](b0))
+    buf[off] = 46                           # '.'
+    off = off + 1
+    off = emit_u8(buf, off, cast[uint64](b1))
+    buf[off] = 46
+    off = off + 1
+    off = emit_u8(buf, off, cast[uint64](b2))
+    buf[off] = 46
+    off = off + 1
+    off = emit_u8(buf, off, cast[uint64](b3))
+    return off
+
+
+# Parse a dotted-quad "a.b.c.d" string into 4 octets written to out[0..3].
+# Returns 0 on success, -1 on a malformed address. Accepts only digits
+# and exactly three dots; each octet must be 0..255.
+def parse_ip(s: Ptr[uint8], out: Ptr[uint8]) -> int32:
+    octet: uint64 = 0
+    seen_digit: int32 = 0
+    idx: uint64 = 0                         # which octet (0..3)
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c == 46:                         # '.'
+            if seen_digit == 0:
+                return -1
+            if idx >= 3:
+                return -1
+            if octet > 255:
+                return -1
+            out[idx] = cast[uint8](octet)
+            idx = idx + 1
+            octet = 0
+            seen_digit = 0
+        elif c >= 48 and c <= 57:
+            octet = octet * 10 + cast[uint64](c - 48)
+            seen_digit = 1
+            if octet > 255:
+                return -1
+        else:
+            return -1
+        i = i + 1
+    if seen_digit == 0:
+        return -1
+    if idx != 3:
+        return -1
+    out[3] = cast[uint8](octet)
     return 0
+
+
+def pack_ip(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> uint64:
+    # Pack 4 octets the way SYS_NETCFG SET_* expects (octet 0 high).
+    return (cast[uint64](b0) << 24) | (cast[uint64](b1) << 16) \
+         | (cast[uint64](b2) << 8) | cast[uint64](b3)
+
+
+# Compare two NUL-terminated strings for equality. Returns 1 if equal.
+def str_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if b[i] != 0:
+        return 0
+    return 1
+
+
+# --- display --------------------------------------------------------
+
+def show_config() -> int32:
+    # SYS_NETCFG GET fills a 24-byte buffer; see do_netcfg for the
+    # layout. We render it into an `ifconfig`-style block.
+    cfg: Array[24, uint8]
+    if sys_netcfg(0, cast[uint64](&cfg[0]), 0) != 0:
+        write_str(2, "ifconfig: cannot read network config\n")
+        return 1
+    have_addr: uint8 = cfg[16]
+    have_mask: uint8 = cfg[17]
+    have_gw:   uint8 = cfg[18]
+    have_dns:  uint8 = cfg[19]
+    cfg_src:   uint8 = cfg[20]               # 0 none, 1 dhcp, 2 static
+    dns_src:   uint8 = cfg[21]               # 0 dhcp, 1 static
+
+    out: Array[256, uint8]
+    off: uint64 = 0
+
+    # eth0 line: address + netmask, with the config source.
+    h: Ptr[uint8] = "eth0  inet "
+    k: uint64 = 0
+    while h[k] != 0:
+        out[off] = h[k]
+        off = off + 1
+        k = k + 1
+    if have_addr == 1:
+        off = emit_ip(cast[Ptr[uint8]](&out[0]), off,
+                      cfg[0], cfg[1], cfg[2], cfg[3])
+    else:
+        out[off] = 48                        # '0'
+        off = off + 1
+        out[off] = 46
+        off = off + 1
+        out[off] = 48
+        off = off + 1
+        out[off] = 46
+        off = off + 1
+        out[off] = 48
+        off = off + 1
+        out[off] = 46
+        off = off + 1
+        out[off] = 48
+        off = off + 1
+    nm: Ptr[uint8] = "  netmask "
+    k = 0
+    while nm[k] != 0:
+        out[off] = nm[k]
+        off = off + 1
+        k = k + 1
+    if have_mask == 1:
+        off = emit_ip(cast[Ptr[uint8]](&out[0]), off,
+                      cfg[4], cfg[5], cfg[6], cfg[7])
+    else:
+        un: Ptr[uint8] = "(unset)"
+        k = 0
+        while un[k] != 0:
+            out[off] = un[k]
+            off = off + 1
+            k = k + 1
+    # Config source tag.
+    src: Ptr[uint8] = "  (none)"
+    if cfg_src == 1:
+        src = "  (dhcp)"
+    elif cfg_src == 2:
+        src = "  (static)"
+    k = 0
+    while src[k] != 0:
+        out[off] = src[k]
+        off = off + 1
+        k = k + 1
+    out[off] = 10                            # '\n'
+    off = off + 1
+    sys_write(1, &out[0], off)
+
+    # lo line — the software loopback any TCP/IP stack synthesises.
+    write_str(1, "lo    inet 127.0.0.1  netmask 255.0.0.0\n")
+
+    # gateway line.
+    off = 0
+    gw: Ptr[uint8] = "gateway  "
+    k = 0
+    while gw[k] != 0:
+        out[off] = gw[k]
+        off = off + 1
+        k = k + 1
+    if have_gw == 1:
+        off = emit_ip(cast[Ptr[uint8]](&out[0]), off,
+                      cfg[8], cfg[9], cfg[10], cfg[11])
+    else:
+        un2: Ptr[uint8] = "(none)"
+        k = 0
+        while un2[k] != 0:
+            out[off] = un2[k]
+            off = off + 1
+            k = k + 1
+    out[off] = 10
+    off = off + 1
+    sys_write(1, &out[0], off)
+
+    # DNS line.
+    off = 0
+    dn: Ptr[uint8] = "dns      "
+    k = 0
+    while dn[k] != 0:
+        out[off] = dn[k]
+        off = off + 1
+        k = k + 1
+    if have_dns == 1:
+        off = emit_ip(cast[Ptr[uint8]](&out[0]), off,
+                      cfg[12], cfg[13], cfg[14], cfg[15])
+        dsrc: Ptr[uint8] = "  (dhcp)"
+        if dns_src == 1:
+            dsrc = "  (static)"
+        k = 0
+        while dsrc[k] != 0:
+            out[off] = dsrc[k]
+            off = off + 1
+            k = k + 1
+    else:
+        un3: Ptr[uint8] = "(none)"
+        k = 0
+        while un3[k] != 0:
+            out[off] = un3[k]
+            off = off + 1
+            k = k + 1
+    out[off] = 10
+    off = off + 1
+    sys_write(1, &out[0], off)
+    return 0
+
+
+# --- static configuration -------------------------------------------
+
+def set_addr(addr_s: Ptr[uint8], mask_s: Ptr[uint8]) -> int32:
+    addr: Array[4, uint8]
+    mask: Array[4, uint8]
+    if parse_ip(addr_s, cast[Ptr[uint8]](&addr[0])) != 0:
+        write_str(2, "ifconfig: bad address\n")
+        return 1
+    if parse_ip(mask_s, cast[Ptr[uint8]](&mask[0])) != 0:
+        write_str(2, "ifconfig: bad netmask\n")
+        return 1
+    a: uint64 = pack_ip(addr[0], addr[1], addr[2], addr[3])
+    m: uint64 = pack_ip(mask[0], mask[1], mask[2], mask[3])
+    if sys_netcfg(1, a, m) != 0:
+        write_str(2, "ifconfig: failed to set address\n")
+        return 1
+    write_str(1, "ifconfig: static address set\n")
+    return 0
+
+
+def set_gw(gw_s: Ptr[uint8]) -> int32:
+    gw: Array[4, uint8]
+    if parse_ip(gw_s, cast[Ptr[uint8]](&gw[0])) != 0:
+        write_str(2, "ifconfig: bad gateway\n")
+        return 1
+    g: uint64 = pack_ip(gw[0], gw[1], gw[2], gw[3])
+    if sys_netcfg(2, g, 0) != 0:
+        write_str(2, "ifconfig: failed to set gateway\n")
+        return 1
+    write_str(1, "ifconfig: static gateway set\n")
+    return 0
+
+
+def set_dns(dns_s: Ptr[uint8]) -> int32:
+    dns: Array[4, uint8]
+    if parse_ip(dns_s, cast[Ptr[uint8]](&dns[0])) != 0:
+        write_str(2, "ifconfig: bad DNS server\n")
+        return 1
+    d: uint64 = pack_ip(dns[0], dns[1], dns[2], dns[3])
+    if sys_netcfg(3, d, 0) != 0:
+        write_str(2, "ifconfig: failed to set DNS server\n")
+        return 1
+    write_str(1, "ifconfig: static DNS server set\n")
+    return 0
+
+
+def usage() -> int32:
+    write_str(2, "usage: ifconfig\n")
+    write_str(2, "       ifconfig <iface> <addr> netmask <mask>\n")
+    write_str(2, "       ifconfig gw <addr>\n")
+    write_str(2, "       ifconfig dns <addr>\n")
+    return 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # No arguments: show the live network config.
+    if argc < 2:
+        return show_config()
+
+    arg1: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+
+    # `ifconfig gw <addr>`
+    if str_eq(arg1, "gw") == 1:
+        if argc < 3:
+            return usage()
+        return set_gw(cast[Ptr[uint8]](argv[2]))
+
+    # `ifconfig dns <addr>`
+    if str_eq(arg1, "dns") == 1:
+        if argc < 3:
+            return usage()
+        return set_dns(cast[Ptr[uint8]](argv[2]))
+
+    # `ifconfig <iface> <addr> netmask <mask>` — the iface name is
+    # accepted for familiarity but Hamnix has a single NIC, so it is
+    # not otherwise used.
+    if argc < 5:
+        return usage()
+    arg3: Ptr[uint8] = cast[Ptr[uint8]](argv[3])
+    if str_eq(arg3, "netmask") == 0:
+        return usage()
+    return set_addr(cast[Ptr[uint8]](argv[2]),
+                    cast[Ptr[uint8]](argv[4]))

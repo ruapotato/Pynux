@@ -679,6 +679,28 @@ sys_nslabel:
     .size sys_nslabel, .-sys_nslabel
 
 
+    /* --- sys_netcfg(op, a1, a2) -> int64 ----------------------------
+     * Network info + static configuration. The `ifconfig` command
+     * reads and writes the IPv4 stack's address / netmask / gateway /
+     * DNS through this one multiplexed syscall (SYS_NETCFG = 286 ->
+     * do_netcfg).
+     *   op 0 GET:      a1 = Ptr to a 24-byte buffer; kernel fills it.
+     *   op 1 SET_ADDR: a1 = address packed (octet0<<24..octet3),
+     *                  a2 = netmask packed the same way.
+     *   op 2 SET_GW:   a1 = gateway packed.
+     *   op 3 SET_DNS:  a1 = DNS server packed.
+     * Three args fit the SysV/syscall-ABI overlap directly (rdi/rsi/
+     * rdx) — no shuffle. Returns 0 on success, -1 + errstr on a bad
+     * op / null buffer. */
+    .globl sys_netcfg
+    .type sys_netcfg, @function
+sys_netcfg:
+    movq    $286, %rax              /* SYS_NETCFG */
+    syscall
+    ret
+    .size sys_netcfg, .-sys_netcfg
+
+
     /* --- sys_rfork(flags) -> int32 ----------------------------------
      * Phase C / M16.98: Plan 9-shape process / namespace primitive.
      * SysV passes `flags` in %rdi (also the syscall a0 slot). do_rfork

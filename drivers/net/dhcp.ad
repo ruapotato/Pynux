@@ -65,7 +65,8 @@
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.eth import eth_get_mac
 from drivers.net.udp import udp_send, UDP_PORT_DHCP_SERVER, UDP_PORT_DHCP_CLIENT
-from drivers.net.ip import ip_set_our_ip, ip_set_gateway
+from drivers.net.ip import ip_set_our_ip, ip_apply_dhcp, \
+    ip_cfg_source_get, IP_CFG_STATIC
 from arch.x86.kernel.time import get_jiffies
 
 
@@ -499,7 +500,12 @@ def dhcp_tick():
             # initial transmit (and the renew smoke test can observe
             # the IDLE drop cleanly).
             dhcp_state = DHCP_STATE_IDLE
-            ip_set_our_ip(0, 0, 0, 0)
+            # Only tear down the address if it is still the DHCP-
+            # assigned one. If the operator pinned a static config
+            # mid-lease, the DHCP lease no longer owns the address —
+            # leave it alone.
+            if ip_cfg_source_get() != IP_CFG_STATIC:
+                ip_set_our_ip(0, 0, 0, 0)
             dhcp_offer_have_lease = 0
             printk0("[dhcp lease expired] forgetting lease, back to IDLE\n")
         return
@@ -575,11 +581,24 @@ def dhcp_rx(payload: Ptr[uint8], length: uint64,
         #   REBINDING — any server confirmed; re-arm timers.
         # In all three we re-install the lease and re-arm T1/T2/T3.
         if dhcp_state == DHCP_STATE_SELECTING:
-            ip_set_our_ip(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
-                          dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3])
-            if dhcp_offer_have_router == 1:
-                ip_set_gateway(dhcp_offer_router[0], dhcp_offer_router[1],
-                               dhcp_offer_router[2], dhcp_offer_router[3])
+            # Install the lease through ip_apply_dhcp, which carries
+            # the netmask (option 1) and refuses the lease when a
+            # static config has been pinned via SYS_NETCFG. A static
+            # override returns -1: we keep the operator's config and
+            # log it, but still march to BOUND so renew timers tick
+            # (the lease stays reserved server-side either way).
+            if ip_apply_dhcp(dhcp_offer_yiaddr[0], dhcp_offer_yiaddr[1],
+                             dhcp_offer_yiaddr[2], dhcp_offer_yiaddr[3],
+                             dhcp_offer_have_mask,
+                             dhcp_offer_mask[0], dhcp_offer_mask[1],
+                             dhcp_offer_mask[2], dhcp_offer_mask[3],
+                             dhcp_offer_have_router,
+                             dhcp_offer_router[0], dhcp_offer_router[1],
+                             dhcp_offer_router[2], dhcp_offer_router[3]) != 0:
+                printk0("[dhcp] static config in effect, ignoring lease\n")
+                _dhcp_arm_lease_timers()
+                dhcp_state = DHCP_STATE_BOUND
+                return
             _dhcp_arm_lease_timers()
             dhcp_state = DHCP_STATE_BOUND
             printk0("[dhcp] got ip=")
@@ -657,6 +676,21 @@ def dhcp_get_dns(out: Ptr[uint8]) -> int32:
     out[1] = dhcp_offer_dns[1]
     out[2] = dhcp_offer_dns[2]
     out[3] = dhcp_offer_dns[3]
+    return 0
+
+
+def dhcp_get_mask(out: Ptr[uint8]) -> int32:
+    # Copy the cached subnet mask (DHCP option 1 from the OFFER /
+    # ACK) into the caller's 4-byte buffer. Returns 0 if a mask was
+    # captured, -1 otherwise. Used by the SYS_NETCFG GET path when
+    # ip.ad has no mask of its own yet (e.g. the server omitted
+    # option 1 and we still want to surface what DHCP knows).
+    if dhcp_offer_have_mask == 0:
+        return -1
+    out[0] = dhcp_offer_mask[0]
+    out[1] = dhcp_offer_mask[1]
+    out[2] = dhcp_offer_mask[2]
+    out[3] = dhcp_offer_mask[3]
     return 0
 
 

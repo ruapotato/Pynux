@@ -231,6 +231,12 @@ DNS_JIFFIES_PER_SEC: uint64 = 100                  # HZ=100 (arch/x86/kernel/tim
 # on every dns_lookup call so a late DHCP ACK still wins).
 dns_server_ip:    Array[4, uint8]
 dns_server_set:   uint8 = 0
+# 1 once a static DNS server has been pinned via dns_set_static_server
+# (SYS_NETCFG from `ifconfig dns ...`). When set, dns_refresh_server
+# becomes a no-op so a DHCP option-6 value can never clobber the
+# operator's choice — the static-override discipline mirrors ip.ad's
+# ip_cfg_source.
+dns_server_static: uint8 = 0
 # 1 once we've successfully ARP'd the DNS server. Avoids re-sending
 # the request on every dns_lookup call.
 dns_server_arp_ok: uint8 = 0
@@ -267,6 +273,12 @@ def dns_refresh_server() -> int32:
     # Pull the DNS server IP from the DHCP cache. Returns 0 on
     # success / -1 if DHCP hasn't completed yet (option 6 not
     # captured). Callers (dns_lookup) treat -1 as a hard failure.
+    #
+    # A static server pinned via dns_set_static_server wins: we
+    # return 0 immediately without consulting DHCP so the operator's
+    # resolver is never replaced.
+    if dns_server_static == 1:
+        return 0
     tmp: Array[4, uint8]
     tmp_ptr: Ptr[uint8] = cast[Ptr[uint8]](&tmp[0])
     rc: int32 = dhcp_get_dns(tmp_ptr)
@@ -277,6 +289,38 @@ def dns_refresh_server() -> int32:
     dns_server_ip[2] = tmp[2]
     dns_server_ip[3] = tmp[3]
     dns_server_set = 1
+    return 0
+
+
+def dns_set_static_server(b0: uint8, b1: uint8, b2: uint8, b3: uint8):
+    # Pin a static DNS resolver (SYS_NETCFG SET_DNS, driven by
+    # `ifconfig dns <addr>`). Latches dns_server_static so a DHCP
+    # option-6 value can never override it; re-primes the ARP cache
+    # for the new server on the next dns_lookup.
+    dns_server_ip[0] = b0
+    dns_server_ip[1] = b1
+    dns_server_ip[2] = b2
+    dns_server_ip[3] = b3
+    dns_server_set = 1
+    dns_server_static = 1
+    dns_server_arp_ok = 0
+
+
+def dns_get_server(out: Ptr[uint8]) -> int32:
+    # Copy the active DNS server IP into the caller's 4-byte buffer.
+    # If no server has been cached yet, tries a DHCP refresh first.
+    # Returns 1 if a static server is in effect, 0 if DHCP-sourced,
+    # -1 if no server is known at all.
+    if dns_server_set == 0:
+        dns_refresh_server()
+    if dns_server_set == 0:
+        return -1
+    out[0] = dns_server_ip[0]
+    out[1] = dns_server_ip[1]
+    out[2] = dns_server_ip[2]
+    out[3] = dns_server_ip[3]
+    if dns_server_static == 1:
+        return 1
     return 0
 
 
@@ -315,6 +359,7 @@ def dns_init():
     dns_server_ip[2] = 0
     dns_server_ip[3] = 0
     dns_server_set = 0
+    dns_server_static = 0
     dns_server_arp_ok = 0
     # Zero the per-slot hostname stash so a stale dns_rx delivery
     # can't observe a half-populated name from a previous boot

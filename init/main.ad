@@ -57,7 +57,7 @@ from kernel.sched.core import (
     # parent and a variable set inside the block leaks back out.
     set_task_image_range,
 )
-from arch.x86.kernel.syscall import syscall_init
+from arch.x86.kernel.syscall import syscall_init, netcfg_smoke_test
 from drivers.video.console.vga_text import (
     vga_init, vga_putc, vga_puts, vga_read_cell_char,
 )
@@ -556,6 +556,35 @@ def net_smoke_test():
                 dr_idx = dr_idx + 1
         if dr_marker_found == 1:
             dhcp_renew_smoke_test()
+
+        # --- SYS_NETCFG (`ifconfig`) smoke (M16.x) ----------------
+        # Exercises the network info + static-config syscall path:
+        # GET reflects the DHCP lease, then SET_ADDR / SET_GW /
+        # SET_DNS pin a static config and a follow-up GET confirms it.
+        # GATED on /etc/netcfg-test because pinning a static config
+        # perturbs downstream net tests (DHCP can no longer install a
+        # lease). Only scripts/test_net_cfg.sh plants the marker.
+        nc_marker_found: int32 = 0
+        nc_idx: uint64 = 0
+        nc_count: uint64 = initramfs_entry_count()
+        while nc_idx < nc_count:
+            nc_name: Ptr[char] = initramfs_entry_name(nc_idx)
+            nc_ok: int32 = 1
+            nc_target: Ptr[uint8] = "/etc/netcfg-test"
+            nc_j: uint64 = 0
+            while nc_j < 17:                        # 16 chars + NUL
+                if cast[uint8](nc_name[nc_j]) != nc_target[nc_j]:
+                    nc_ok = 0
+                    nc_j = 17                        # break
+                else:
+                    nc_j = nc_j + 1
+            if nc_ok == 1:
+                nc_marker_found = 1
+                nc_idx = nc_count                    # break
+            else:
+                nc_idx = nc_idx + 1
+        if nc_marker_found == 1:
+            netcfg_smoke_test()
 
         # --- ICMP echo: ping the SLIRP gateway ------------------
         # By now the ARP cache has 10.0.2.2's MAC (learned from
