@@ -101,6 +101,14 @@ extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
 extern def sys_exit(code: uint64)
 extern def sys_srv_post(name: Ptr[char], srvfd: int32) -> int32
+# `distrofs post <name>` daemon shape (§15 of docs/HAMSH_SPEC.md):
+# create a bidirectional socketpair, publish ONE end on /srv/<name>,
+# and serve 9P over the OTHER end. A later `mount /srv/<name> <path>`
+# from hamsh sys_srv_open's the posted end and speaks 9P over it. This
+# is the wiring stage 9 (view-vs-state) rides: the shell spawns the
+# server, then mounts it inside an `ns` template.
+extern def sys_socketpair(domain: int32, type: int32, protocol: int32,
+                          sv: Ptr[int32]) -> int32
 # distrofs persistent backing — snapshot the RAM node/data tables to /
 # from a single durable file on the ext4 volume so an installed
 # package survives a reboot. The kernel owns the backing-file name;
@@ -276,6 +284,21 @@ dfs_instance: uint64 = 0
 # booted without an ext4 disk runs distrofs purely RAM-backed exactly
 # as before, with no per-clunk failure noise on stderr.
 dfs_backing_ok: int32 = 0
+
+# Wire transport fds. The default fixture launch shape is fd 0 (read
+# T-msgs) / fd 1 (write R-msgs) — a launcher dup'd a pipe pair onto
+# them at spawn. In `post` mode distrofs makes its own socketpair and
+# repoints both at the SAME bidirectional endpoint, leaving fd 0/1
+# (the spawning shell's console) untouched.
+srv_rfd: int32 = 0
+srv_wfd: int32 = 1
+
+# sys_socketpair domain / type for the `post`-mode transport.
+AF_UNIX:     int32 = 1
+SOCK_STREAM: int32 = 1
+# Posted socketpair: [0] is published on /srv (the kernel client
+# reaches us through it), [1] is distrofs' own serve endpoint.
+post_sv: Array[2, int32]
 
 
 def _snap_put_u64(off: uint64, v: uint64) -> uint64:
@@ -696,7 +719,7 @@ def _peek_size(buf: Ptr[uint8]) -> uint32:
 def _send_rmsg(n: int32) -> int32:
     if n <= 0:
         return -1
-    sent: int64 = sys_write(1, &srv_buf[0], cast[uint64](n))
+    sent: int64 = sys_write(srv_wfd, &srv_buf[0], cast[uint64](n))
     if sent != cast[int64](n):
         return -1
     return 0
@@ -1316,9 +1339,11 @@ def _serve_unsupported(in_len: uint64) -> int32:
 # -- one T → R round trip ----------------------------------------------
 
 def _serve_one() -> int32:
-    # Returns 1 on a normal serve, 0 on clean EOF on stdin, -1 on a
-    # wire / decode error.
-    h: int64 = _read_exact(0, &srv_buf[0], 7)
+    # Returns 1 on a normal serve, 0 on clean EOF on the transport, -1
+    # on a wire / decode error. The transport is srv_rfd/srv_wfd: fd
+    # 0/1 in the default fixture shape, the socketpair endpoint in
+    # `post` mode.
+    h: int64 = _read_exact(srv_rfd, &srv_buf[0], 7)
     if h == cast[int64](0):
         return 0
     if h != cast[int64](7):
@@ -1328,7 +1353,7 @@ def _serve_one() -> int32:
         return -1
     rest: uint64 = cast[uint64](sz) - 7
     if rest > 0:
-        b: int64 = _read_exact(0, &srv_buf[7], rest)
+        b: int64 = _read_exact(srv_rfd, &srv_buf[7], rest)
         if b != cast[int64](rest):
             return -1
     in_len: uint64 = cast[uint64](sz)
@@ -1382,20 +1407,52 @@ def _serve_one() -> int32:
     return 1
 
 
+def _arg_is_post(a: Ptr[uint8]) -> int32:
+    # 1 iff `a` is exactly the literal "post".
+    if a == cast[Ptr[uint8]](0):
+        return 0
+    if a[0] == 112 and a[1] == 111 and a[2] == 115 \
+            and a[3] == 116 and a[4] == 0:
+        return 1
+    return 0
+
+
+def _digit_arg(a: Ptr[uint8]) -> int64:
+    # If `a` is a single ASCII digit '0'..'9', return its value; else
+    # -1. Used to read the optional persistent-backing instance id.
+    if a == cast[Ptr[uint8]](0):
+        return -1
+    c0: uint8 = a[0]
+    if c0 >= 48 and c0 <= 57 and a[1] == 0:
+        return cast[int64](c0 - 48)
+    return -1
+
+
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
     init_tree()
-    # Persistent-backing instance id. argv[1], when present and a
-    # single ASCII digit '0'..'9', selects which durable backing file
-    # this daemon uses — nsrun passes the subtree index so its /var,
-    # /usr, /etc daemons each get a distinct, reboot-stable file. A
-    # standalone distrofs (no argv[1]) keeps instance 0. argv[1] is a
-    # tiny launch parameter, never a path: the namespace law holds.
-    if argc >= 2:
-        a1: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
-        if a1 != cast[Ptr[uint8]](0):
-            c0: uint8 = a1[0]
-            if c0 >= 48 and c0 <= 57 and a1[1] == 0:
-                dfs_instance = cast[uint64](c0 - 48)
+    # Two launch shapes:
+    #   distrofs [<digit>]              — fixture shape: serve fd 0/1.
+    #   distrofs post <name> [<digit>]  — daemon shape (§15): make a
+    #     socketpair, publish one end on /srv/<name>, serve over the
+    #     other. hamsh `spawn`s this, then `mount /srv/<name> <path>`.
+    # In both shapes the optional trailing single-digit arg is the
+    # persistent-backing instance id (0..9) — nsrun / hamsh pass the
+    # subtree index so co-resident daemons get distinct ext4 files. A
+    # bare standalone distrofs keeps instance 0. The digit is a tiny
+    # launch parameter, never a path: the namespace law holds.
+    post_mode: int32 = 0
+    srvname: Ptr[char] = cast[Ptr[char]](0)
+    if argc >= 3 and _arg_is_post(cast[Ptr[uint8]](argv[1])) != 0:
+        post_mode = 1
+        srvname = cast[Ptr[char]](argv[2])
+        if argc >= 4:
+            d: int64 = _digit_arg(cast[Ptr[uint8]](argv[3]))
+            if d >= 0:
+                dfs_instance = cast[uint64](d)
+    elif argc >= 2:
+        d: int64 = _digit_arg(cast[Ptr[uint8]](argv[1]))
+        if d >= 0:
+            dfs_instance = cast[uint64](d)
     # Persistent backing: if a durable snapshot exists on the ext4
     # volume, load it so distrofs resumes with every previously-
     # installed package's files in place. With no snapshot (or no ext4
@@ -1407,14 +1464,20 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     else:
         write_str(2, "[distrofs] no snapshot — fresh distro skeleton\n")
     write_str(2, "[distrofs] server starting\n")
-    # If launched as `distrofs post`, publish on the kernel srv table so
-    # a 9P client can sys_srv_open("distrofs"). The transport is still
-    # fd 0 / fd 1; srv_post just advertises fd 1 as the reachable end.
-    # (The test fixture drives us over pipes directly and does NOT pass
-    # "post", so this is exercised only by the namespace-mount path.)
-    # NOTE: argv inspection is omitted in V0 — the fixture launch shape
-    # is positional pipes, not flags. A future namespace launcher will
-    # call sys_srv_post itself before spawn.
+    # `post` mode: create a bidirectional socketpair, publish one end
+    # on /srv/<name>, and serve 9P over the other. We never touch fd
+    # 0/1 — the spawning shell's console stays its own — so distrofs
+    # can run backgrounded by `spawn` and be `mount`ed by name later.
+    if post_mode != 0:
+        if sys_socketpair(AF_UNIX, SOCK_STREAM, 0, &post_sv[0]) < 0:
+            write_str(2, "[distrofs] FAIL: socketpair\n")
+            return 1
+        if sys_srv_post(srvname, post_sv[0]) < 0:
+            write_str(2, "[distrofs] FAIL: srv_post\n")
+            return 1
+        srv_rfd = post_sv[1]
+        srv_wfd = post_sv[1]
+        write_str(2, "[distrofs] posted to /srv, serving\n")
     served: int32 = 0
     while True:
         rc: int32 = _serve_one()
