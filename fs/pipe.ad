@@ -79,6 +79,39 @@ def pipe_alloc() -> int32:
     return slot
 
 
+def pipe_alloc_chan() -> int32:
+    # HAMSH §7: allocate a pipe slot with NO owning references
+    # (readers == writers == 0). Unlike pipe_alloc — which hands the
+    # caller one reader + one writer fd — a pipe-as-Chan is owned
+    # ENTIRELY by the /fd/N names it gets bound at: the shell holds no
+    # fd of its own, so the only references are the ones devfd_bind's
+    # pipe_inc_reader / pipe_inc_writer create. Returns the slot, or
+    # -1 on out-of-slots / OOM.
+    #
+    # Caller contract: the slot MUST get at least one reader-bind and
+    # one writer-bind before any other code path runs _maybe_free on
+    # it — a slot sitting at 0/0 looks reclaimable. The shell does both
+    # binds back-to-back per pipe stage, so the window never opens.
+    slot: int32 = _pipe_find_free_slot()
+    if slot < 0:
+        printk0("pipe: out of slots\n")
+        return -1
+    su: uint64 = cast[uint64](slot)
+    if pipe_table[su].buf == 0:
+        b: uint64 = kmalloc(PIPE_CAP)
+        if b == 0:
+            return -1
+        pipe_table[su].buf = b
+    pipe_table[su].cap     = PIPE_CAP
+    pipe_table[su].head    = 0
+    pipe_table[su].tail    = 0
+    pipe_table[su].count   = 0
+    pipe_table[su].readers = 0
+    pipe_table[su].writers = 0
+    pipe_table[su].used    = 1
+    return slot
+
+
 def pipe_inc_reader(slot: int32):
     pipe_table[cast[uint64](slot)].readers = \
         pipe_table[cast[uint64](slot)].readers + 1

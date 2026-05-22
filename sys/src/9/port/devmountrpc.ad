@@ -1,0 +1,74 @@
+# sys/src/9/port/devmountrpc.ad
+#
+# Layer 1 (Plan 9-shape) mountrpc-counter device — the HAMSH §6 / §18
+# stage-4 tripwire, surfaced as a file. Sibling to devuptime.ad /
+# devtime.ad: a read regenerates a fresh text snapshot, here the
+# cumulative count of 9P T-messages this kernel has sent.
+#
+#   /dev/mountrpc -> "<count>\n"   (decimal, ns(1)-plain shape)
+#
+# WHY THIS EXISTS
+# ---------------
+# HAMSH_SPEC §6's load-bearing performance rule: "pipes are Chans" —
+# 9P messages go on the wire ONLY across a mount boundary. A LOCAL
+# pipe MUST be direct devtab Chan reads, never Tread/Rread per block.
+# The §18 stage-4 acceptance test reads /dev/mountrpc before and after
+# a local pipeline (`a | b`) and asserts the delta is ZERO. Same shape
+# as the Phase D FD_*_MARK tripwire tests.
+#
+# The counter itself (mountrpc_count) lives in 9p_client.ad and is
+# bumped in _p9_send — the single chokepoint every T-message flows
+# through. This device just renders mountrpc_count_get() as ASCII.
+#
+# Stateless backend: every read regenerates the blob. Writes return -1
+# — read-only, like devtime / devuptime.
+#
+# Compiler-quirk note (flat global symbol namespace): every shared-
+# shape helper here is prefixed `_mrpc_` to dodge the devcpuinfo /
+# devmeminfo `_emit_str` collision class documented in devuptime.ad.
+
+from sys.src.port9.port.9p_client import mountrpc_count_get
+
+
+def _mrpc_u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    # Reverse-fill stack then copy out top-down. Returns bytes written.
+    if value == 0:
+        out[0] = 48
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while value != 0:
+        digits[n] = cast[uint8](value % 10) + 48
+        value = value / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def devmountrpc_read(buf: Ptr[uint8], count: uint64) -> int64:
+    # Stateless snapshot: "<count>\n". 32 bytes covers a 20-digit
+    # decimal + newline; the caller's `count` caps bytes copied.
+    if count == 0:
+        return 0
+    scratch: Array[32, uint8]
+    n: uint64 = _mrpc_u64_to_dec(mountrpc_count_get(), &scratch[0])
+    scratch[n] = 10                              # '\n'
+    n = n + 1
+    take: uint64 = count
+    if take > n:
+        take = n
+    i: uint64 = 0
+    while i < take:
+        buf[i] = scratch[i]
+        i = i + 1
+    return cast[int64](take)
+
+
+def devmountrpc_write(buf: Ptr[uint8], count: uint64) -> int64:
+    # /dev/mountrpc is read-only. Mirrors devtime / devuptime.
+    return -1

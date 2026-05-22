@@ -57,13 +57,32 @@
 
 from kernel.sched.core import (
     TaskStruct, current_task, set_current_errstr,
+    current_idx_get, task_lookup_by_pid, task_pgrp,
 )
 from sys.src.port9.port.chan import (
     Chan, MountEntry,
     chan_init, chan_attach,
     chan_set_p9_root_fid_by_srvfd,
     mnttab_bind, mnttab_mount, mnttab_unmount,
+    pgrp_current,
 )
+# HAMSH §7: the `#d` fd device. /fd/N is a name in a Pgrp; pipe /
+# redirect / dup all reduce to devfd_bind installing a backing
+# channel at fd-slot N. do_fdbind / do_fddup are the syscall bodies
+# for that one primitive.
+from sys.src.port9.port.devfd import (
+    devfd_bind_cons, devfd_bind_pipe_r, devfd_bind_pipe_w,
+    devfd_bind_file, devfd_dup,
+    DEVFD_CONS, DEVFD_PIPE_R, DEVFD_PIPE_W, DEVFD_FILE, DEVFD_DUP,
+)
+# HAMSH §7: a local pipe is created here as a devtab pipe Chan pair —
+# pipe_alloc_chan hands back a pipe slot id (with no owning refs); the
+# shell installs the ends at /fd/N names. NO 9P: direct Chan reads (§6).
+from fs.pipe import pipe_alloc_chan
+# HAMSH §7: `cmd > file` redirect — a file channel is a tmpfs slot.
+# tmpfs entries are global / task-independent, so the slot is a
+# namespace-shareable Chan that devfd_bind_file can install at /fd/N.
+from fs.tmpfs import tmpfs_open_for_write, tmpfs_lookup
 # V1: the 9P client surface that turns mount(srvfd, ...) from "store
 # the fd" into "speak Tversion + Tattach over the fd". After this
 # import, do_mount below runs the real handshake.
@@ -263,3 +282,122 @@ def do_unmount(new_user: uint64, old_user: uint64) -> int64:
         set_current_errstr("unmount failed: not mounted")
         return cast[int64](-1)
     return 0
+
+
+# --- HAMSH §7: bind a Chan at an /fd/N name --------------------------
+#
+# do_fdbind(pid, fdnum, kind, arg) — install a backing channel at the
+# name /fd/<fdnum> in a target process's namespace. THIS is the one
+# and only operation pipe / redirect / dup all reduce to (§7): there
+# is no separate pipe mechanism, redirect mechanism, OR dup syscall.
+#
+#   * pid == 0          -> bind into the CALLING task's own Pgrp.
+#   * pid != 0          -> bind into the target pid's Pgrp. The shell
+#                          uses this to wire a just-spawned child's
+#                          /fd/0,1,2 BEFORE the child runs (the
+#                          cooperative scheduler guarantees the child
+#                          is still STATE_READY, not yet scheduled).
+#
+# kind selects the source channel for the bind:
+#   DEVFD_CONS    (1)   -> the console device. arg ignored.
+#   DEVFD_PIPE_R  (2)   -> the read end of pipe slot `arg`.
+#   DEVFD_PIPE_W  (3)   -> the write end of pipe slot `arg`.
+#   DEVFD_FILE    (4)   -> an on-disk file named by kernel fd `arg`.
+#   DEVFD_DUP     (5)   -> the Chan ALREADY BOUND at the /fd/<arg>
+#                          name. `cmd 2>&1` is do_fdbind(pid, 2,
+#                          DEVFD_DUP, 1): bind /fd/1's existing Chan
+#                          also at /fd/2. dup is not a separate
+#                          syscall — it is a bind whose source Chan
+#                          is taken from an existing /fd/N slot.
+#
+# Returns 0 on success, -1 on failure with errstr set.
+
+def _pgrp_for_pid(pid: int32) -> uint64:
+    # Resolve a target pid to its Pgrp pointer. pid 0 == "the calling
+    # task" (so the shell can bind its own /fd table). A non-zero pid
+    # is looked up in the task table.
+    if pid == 0:
+        return pgrp_current()
+    slot: int32 = task_lookup_by_pid(cast[uint64](pid))
+    if slot < 0:
+        return 0
+    pg: uint64 = task_pgrp(slot)
+    return pg
+
+
+def do_fdbind(pid: int32, fdnum: int32, kind: int32,
+              arg: int32) -> int64:
+    pg: uint64 = _pgrp_for_pid(pid)
+    if pg == 0:
+        set_current_errstr("fdbind: no such process / namespace")
+        return cast[int64](-1)
+    rc: int32 = -1
+    if kind == DEVFD_CONS:
+        rc = devfd_bind_cons(pg, fdnum)
+    elif kind == DEVFD_PIPE_R:
+        rc = devfd_bind_pipe_r(pg, fdnum, arg)
+    elif kind == DEVFD_PIPE_W:
+        rc = devfd_bind_pipe_w(pg, fdnum, arg)
+    elif kind == DEVFD_FILE:
+        rc = devfd_bind_file(pg, fdnum, arg)
+    elif kind == DEVFD_DUP:
+        # dup-as-bind: the source Chan is whatever sits at the /fd
+        # name numbered `arg`. devfd_dup re-binds it (and refcount-
+        # bumps a pipe end) at /fd/<fdnum>.
+        rc = devfd_dup(pg, arg, fdnum)
+    else:
+        set_current_errstr("fdbind: unknown channel kind")
+        return cast[int64](-1)
+    if rc < 0:
+        set_current_errstr("fdbind: bind failed (bad fd / source / table full)")
+        return cast[int64](-1)
+    return 0
+
+
+# do_pipechan() — create a local pipe and return its SLOT id. The slot
+# is not an fd: it is the handle the shell threads into two do_fdbind
+# calls (write end at the producer's /fd/1, read end at the consumer's
+# /fd/0). A local pipe is a devtab pipe Chan pair — direct Chan reads,
+# zero 9P marshalling (§6). Returns the slot id (>= 0) or -1.
+
+def do_pipechan() -> int64:
+    slot: int32 = pipe_alloc_chan()
+    if slot < 0:
+        set_current_errstr("pipechan: out of pipe slots")
+        return cast[int64](-1)
+    return cast[int64](slot)
+
+
+# do_openchan(path, write) — open an on-disk file as a namespace-
+# shareable channel and return its tmpfs SLOT. `cmd > file` resolves
+# its redirect target this way: the shell gets a slot and threads it
+# into a do_fdbind(child, 1, DEVFD_FILE, slot). The slot is a global
+# tmpfs entry — addressable from the child's task, not just the
+# shell's, which is exactly what makes "bind a Chan at /fd/N" work
+# across the spawn boundary.
+#
+#   write != 0 -> open-or-create + truncate (the `>` case).
+#   write == 0 -> lookup an existing file (the `<` case).
+#
+# Returns the slot (>= 0) or -1 with errstr set. Only tmpfs-backed
+# paths (/tmp/*, /var/*) are channelable here — a redirect to a
+# cpio / ext4 / FAT file is a stage-9+ follow-on (it needs the
+# persistent-backing work §12 describes).
+
+def do_openchan(path_user: uint64, write: int32) -> int64:
+    if path_user == 0:
+        set_current_errstr("openchan: null path")
+        return cast[int64](-1)
+    path_buf: Array[128, uint8]
+    if _copy_user_path(path_user, &path_buf[0], MAXPATH) < 0:
+        set_current_errstr("openchan: path too long")
+        return cast[int64](-1)
+    slot: int32 = -1
+    if write != 0:
+        slot = tmpfs_open_for_write(cast[Ptr[char]](&path_buf[0]))
+    else:
+        slot = tmpfs_lookup(cast[Ptr[char]](&path_buf[0]))
+    if slot < 0:
+        set_current_errstr("openchan: cannot open file as channel (tmpfs only)")
+        return cast[int64](-1)
+    return cast[int64](slot)

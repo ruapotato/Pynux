@@ -89,6 +89,12 @@ from sys.src.port9.port.devmounts import devmounts_read, devmounts_write
 from sys.src.port9.port.devdiskstats import (
     devdiskstats_read, devdiskstats_write,
 )
+# HAMSH §6 / §18 stage-4 tripwire: /dev/mountrpc renders the
+# cumulative count of 9P T-messages sent. A local pipeline must leave
+# it unchanged — that is what proves "pipes are Chans, not 9P".
+from sys.src.port9.port.devmountrpc import (
+    devmountrpc_read, devmountrpc_write,
+)
 
 
 # --- FD_CHAN_MARK ---------------------------------------------------
@@ -124,9 +130,10 @@ DEV_HOSTNAME:  int32 = 11          # /dev/hostname
 DEV_STAT:      int32 = 12          # /dev/stat
 DEV_MOUNTS:    int32 = 13          # /dev/mounts
 DEV_DISKSTATS: int32 = 14          # /dev/diskstats
-DEV_MNT:       int32 = 15          # mounted 9P server (mountrpc)
+DEV_MOUNTRPC:  int32 = 15          # /dev/mountrpc — HAMSH §6/§18 tripwire
+DEV_MNT:       int32 = 16          # mounted 9P server (mountrpc)
 
-DEV_MAX:       int32 = 16
+DEV_MAX:       int32 = 17
 
 
 # --- Chan: the universal handle -------------------------------------
@@ -320,6 +327,8 @@ def _devtab_lookup(path: Ptr[char]) -> int32:
         return DEV_MOUNTS
     if _streq(path, "/dev/diskstats") != 0:
         return DEV_DISKSTATS
+    if _streq(path, "/dev/mountrpc") != 0:
+        return DEV_MOUNTRPC
     return DEV_NONE
 
 
@@ -332,8 +341,19 @@ def _devtab_lookup(path: Ptr[char]) -> int32:
 # Either shape is "index a table by device kind" — the semantics are
 # identical, and the switch is unambiguous to the Adder codegen.
 
-def _devtab_read(dev_type: int32, buf: Ptr[uint8],
+def _devtab_read(dev_type: int32, off: uint64, buf: Ptr[uint8],
                  count: uint64) -> int64:
+    # `off` is the read cursor. Most cdevs are stateless snapshot
+    # devices and ignore it (every read regenerates) — but a device
+    # like /dev/mountrpc that a `cat` walks to EOF must honour it, or
+    # the regenerate-forever behaviour wedges the reader in a loop.
+    if dev_type == DEV_MOUNTRPC:
+        # Snapshot-once: the blob is delivered on the off==0 read and
+        # the next read (off>0) reports EOF, so `cat /dev/mountrpc`
+        # terminates exactly like reading a finite file.
+        if off > 0:
+            return 0
+        return devmountrpc_read(buf, count)
     if dev_type == DEV_CONS:
         return devcons_read(buf, count)
     if dev_type == DEV_TIME:
@@ -395,6 +415,8 @@ def _devtab_write(dev_type: int32, buf: Ptr[uint8],
         return devmounts_write(buf, count)
     if dev_type == DEV_DISKSTATS:
         return devdiskstats_write(buf, count)
+    if dev_type == DEV_MOUNTRPC:
+        return devmountrpc_write(buf, count)
     return -1
 
 
@@ -617,11 +639,11 @@ def namec_read(cid: int32, off: uint64, buf: Ptr[uint8],
     if _chan_id_valid(cid) == 0:
         return -9                                           # -EBADF
     if _chan_id_is_inline(cid) != 0:
-        return _devtab_read(_chan_id_inline_dev(cid), buf, count)
+        return _devtab_read(_chan_id_inline_dev(cid), off, buf, count)
     su: uint64 = cast[uint64](cid)
     if chan_pool[su].dev_type == DEV_MNT:
         return _mnt_read(su, off, buf, count)
-    return _devtab_read(chan_pool[su].dev_type, buf, count)
+    return _devtab_read(chan_pool[su].dev_type, off, buf, count)
 
 
 def namec_write(cid: int32, off: uint64, buf: Ptr[uint8],

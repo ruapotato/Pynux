@@ -591,6 +591,62 @@ sys_unmount:
     .size sys_unmount, .-sys_unmount
 
 
+    /* --- sys_fdbind(pid, fdnum, kind, arg) -> int32 -----------------
+     * HAMSH §7: bind a Chan at an /fd/N name. THE one primitive —
+     * pipe, redirect, AND dup all reduce to it. `pid` (0 = the
+     * caller's own Pgrp) selects whose namespace; `fdnum` is the
+     * destination /fd slot; `kind` is a DEVFD_* channel kind; `arg`
+     * is kind-dependent:
+     *   DEVFD_CONS   — arg ignored.
+     *   DEVFD_PIPE_R/W — arg is the pipe slot.
+     *   DEVFD_FILE   — arg is the kernel fd of the opened file.
+     *   DEVFD_DUP    — arg is a SOURCE /fd slot: `cmd 2>&1` is
+     *                  sys_fdbind(pid, 2, DEVFD_DUP, 1), i.e. bind
+     *                  /fd/1's existing Chan also at the name /fd/2.
+     * There is no separate dup syscall — dup is just a bind whose
+     * source Chan is taken from an existing /fd/N slot.
+     * SysV's first four arg regs (%rdi/%rsi/%rdx/%rcx) — %rcx must
+     * move to %r10 for the syscall ABI. Returns 0 / -1 + errstr. */
+    .globl sys_fdbind
+    .type sys_fdbind, @function
+sys_fdbind:
+    movq    %rcx, %r10              /* arg 4: arg -> r10 for syscall ABI */
+    movq    $278, %rax              /* SYS_FDBIND */
+    syscall
+    ret
+    .size sys_fdbind, .-sys_fdbind
+
+
+    /* --- sys_pipechan() -> int32 ------------------------------------
+     * HAMSH §7: create a local pipe Chan pair; returns the pipe SLOT
+     * id (NOT fds). The shell threads the slot into two sys_fdbind
+     * calls — write end at the producer's /fd/1, read end at the
+     * consumer's /fd/0. A local pipe never speaks 9P. Returns the
+     * slot id (>= 0) or -1 with errstr set. */
+    .globl sys_pipechan
+    .type sys_pipechan, @function
+sys_pipechan:
+    movq    $280, %rax              /* SYS_PIPECHAN */
+    syscall
+    ret
+    .size sys_pipechan, .-sys_pipechan
+
+
+    /* --- sys_openchan(path, write) -> int32 -------------------------
+     * HAMSH §7: open an on-disk file as a namespace-shareable channel
+     * for a `cmd > file` / `cmd < file` redirect. `write` = 0 looks
+     * up an existing file, 1 creates+truncates. Returns the tmpfs
+     * slot id (>= 0) — which the shell binds at a child's /fd/N via
+     * sys_fdbind(child, N, DEVFD_FILE, slot) — or -1 + errstr. */
+    .globl sys_openchan
+    .type sys_openchan, @function
+sys_openchan:
+    movq    $281, %rax              /* SYS_OPENCHAN */
+    syscall
+    ret
+    .size sys_openchan, .-sys_openchan
+
+
     /* --- sys_rfork(flags) -> int32 ----------------------------------
      * Phase C / M16.98: Plan 9-shape process / namespace primitive.
      * SysV passes `flags` in %rdi (also the syscall a0 slot). do_rfork

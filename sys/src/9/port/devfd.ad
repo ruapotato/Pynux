@@ -1,0 +1,462 @@
+# sys/src/9/port/devfd.ad
+#
+# Phase D / HAMSH §7 — the `#d` fd device. THE substrate for stdio.
+#
+# WHAT THIS IS
+# ------------
+# A process's standard streams are NAMES in its namespace: /fd/0,
+# /fd/1, /fd/2, /fd/N — paths served by this device, the `#d` devtab
+# device. /fd/N is the PRIMARY thing. The Linux integer fd 0/1/2/N is
+# a Layer-2 MAPPING onto the name /fd/N — not the name itself.
+#
+# Pipe, redirect, and dup are ALL one operation — `bind a Chan at an
+# /fd/N name`. There is no separate pipe mechanism, redirect mechanism,
+# and dup mechanism: they all reduce to devfd_bind() installing a
+# backing-channel descriptor at fd-slot N of a namespace's fd table.
+#
+#   pipe   a | b   : the pipe write-end Chan is devfd_bind'd at /fd/1
+#                    of a's namespace; the read-end Chan at /fd/0 of
+#                    b's namespace.
+#   redir  cmd > f : f's open Chan is devfd_bind'd at /fd/1 of cmd's
+#                    namespace.
+#   dup    cmd 2>&1: a devfd_bind with kind == DEVFD_DUP — its SOURCE
+#                    Chan is the one already bound at the /fd/1 name.
+#                    dup is NOT a separate mechanism; it is a bind
+#                    whose source is an existing /fd/N slot.
+#
+# THE PER-NAMESPACE FD TABLE
+# --------------------------
+# /fd is per-process: every Pgrp gets its own fd-channel table, so the
+# name /fd/1 resolves to a different Chan in different namespaces. The
+# table is a side structure keyed by the Pgrp pointer (NOT a new field
+# on the Pgrp struct — adding a struct field can miscompile a function
+# that references it; a parallel side table is the safe shape and is
+# how chan.ad's own Pgrp-keyed bookkeeping already works).
+#
+# A devfd row is COW-copied when rfork(RFNAMEG) clones a Pgrp — see
+# devfd_clone_row, called from chan.ad's pgrp_clone. So a child that
+# rforks its namespace gets its own private /fd table, and binds at
+# /fd/N in the child are invisible to the parent. That is the §7 +
+# §10 model: stdio is just names in a Pgrp, and a Pgrp is COW.
+#
+# LOCAL = devtab-DIRECT, NEVER 9P (§6 performance rule)
+# -----------------------------------------------------
+# A backing channel here is a LOCAL kernel object — a pipe slot, the
+# console device, or an open on-disk file. devfd_read / devfd_write
+# route straight to pipe_read / pipe_write / devcons_* / the file
+# backend. They NEVER marshal a 9P T-message. A local pipe does zero
+# mountrpc — the §18 stage-4 tripwire (9p_client.ad's mountrpc_count)
+# proves it.
+#
+# BOUNDARY LAW
+# ------------
+# Layer 1 (native): pure namespace + local channels. No io_uring /
+# epoll / futex. `#d` is a file server, Layer-1-clean.
+#
+# ADDER QUIRKS HONOURED
+# ---------------------
+#   * Top-level Array storage only — the row pool lives at module
+#     scope, not in a nested frame.
+#   * No sizeof — slot counts are hand-numbered constants.
+#   * Leading-underscore top-level names are module-private.
+
+from fs.pipe import (
+    pipe_read, pipe_write, pipe_writers, pipe_readers,
+    pipe_inc_reader, pipe_inc_writer,
+    pipe_close_reader, pipe_close_writer,
+)
+from sys.src.port9.port.devcons import devcons_read, devcons_write
+# HAMSH §7: a redirect (`cmd > file`) binds an on-disk file's channel
+# at /fd/N. The backing is a tmpfs slot — tmpfs entries are GLOBAL and
+# task-independent (fs/tmpfs.ad), so the channel is addressable from
+# the child's task exactly as it is from the shell's. Redirect to a
+# non-tmpfs (cpio / ext4 / FAT) file is a stage-9+ follow-on (it needs
+# the persistent-backing work the spec's §12 / stage 9 describes).
+from fs.tmpfs import tmpfs_write, tmpfs_size, tmpfs_data
+
+
+# --- FD_DEVFD_MARK --------------------------------------------------
+#
+# The fd-table marker for "this integer fd is the Layer-2 mapping onto
+# an /fd/N name". fd_buf carries the fd-NUMBER N (0,1,2,...). vfs_read
+# / vfs_write on such an fd resolve the name /fd/N through the calling
+# task's Pgrp devfd table and route to the bound backing channel.
+#
+# Colocated here (next to its dispatch code) following the same
+# pattern namec.ad's FD_CHAN_MARK and 9p_client.ad's FD_P9_MARK use —
+# no kernel/sched/core.ad churn. Value sits below namec.ad's
+# FD_CHAN_MARK (0xFFFFFFE0) and clear of every FD_<NAME>_MARK.
+FD_DEVFD_MARK: uint32 = 0xFFFFFFDF
+
+
+# --- backing-channel descriptor kinds -------------------------------
+#
+# A devfd slot binds the name /fd/N to ONE of these backing channels.
+# DEVFD_NONE marks an unbound slot (the name /fd/N is not yet a Chan).
+DEVFD_NONE:   int32 = 0     # nothing bound at this /fd/N
+DEVFD_CONS:   int32 = 1     # the console device (#c) — keyboard / serial
+DEVFD_PIPE_R: int32 = 2     # the read end of a pipe slot (arg = pipe slot)
+DEVFD_PIPE_W: int32 = 3     # the write end of a pipe slot (arg = pipe slot)
+DEVFD_FILE:   int32 = 4     # an on-disk file fd (arg = the kernel fd)
+# DEVFD_DUP is NOT a stored slot kind — it is a `kind` selector for
+# the devfd_bind primitive meaning "the source Chan is the one
+# already bound at another /fd slot". `cmd 2>&1` is a bind with
+# kind == DEVFD_DUP and arg == the source /fd number. There is no
+# separate dup mechanism: dup is a bind whose source is an /fd name.
+DEVFD_DUP:    int32 = 5
+
+
+# --- the per-Pgrp fd-channel table ----------------------------------
+#
+# DEVFD_SLOTS names per Pgrp — /fd/0 .. /fd/15. Comfortable: a shell
+# command uses 0/1/2, a pipeline a few more.
+DEVFD_SLOTS: uint64 = 16
+
+# Row pool. Each row is (pgrp_ptr owner + DEVFD_SLOTS descriptors).
+# A descriptor is (kind, arg) — two parallel arrays so a future field
+# add to a "descriptor struct" can't miscompile a referencing fn.
+# DEVFD_ROWS Pgrps can have a live /fd table; the boot recipe plus a
+# handful of nested shell sessions / pipeline children fit easily.
+DEVFD_ROWS: uint64 = 64
+
+devfd_owner: Array[64, uint64]                 # owning Pgrp pointer; 0 = free
+devfd_kind:  Array[1024, int32]                # 64 rows * 16 slots
+devfd_arg:   Array[1024, int32]                # parallel arg per slot
+devfd_pos:   Array[1024, uint64]               # file cursor for DEVFD_FILE
+devfd_inited: int32 = 0
+
+
+def devfd_init():
+    # Idempotent. BSS-zeroes the pool already; stamp explicitly so a
+    # warm path sees a clean table, flip the lazy-init guard.
+    i: uint64 = 0
+    while i < DEVFD_ROWS:
+        devfd_owner[i] = 0
+        i = i + 1
+    j: uint64 = 0
+    while j < DEVFD_ROWS * DEVFD_SLOTS:
+        devfd_kind[j] = DEVFD_NONE
+        devfd_arg[j] = 0
+        devfd_pos[j] = 0
+        j = j + 1
+    devfd_inited = 1
+
+
+def _devfd_find_row(pgrp: uint64) -> int32:
+    # Locate the row owned by `pgrp`, or -1 if it has none yet.
+    if devfd_inited == 0:
+        devfd_init()
+    i: uint64 = 0
+    while i < DEVFD_ROWS:
+        if devfd_owner[i] == pgrp:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _devfd_alloc_row(pgrp: uint64) -> int32:
+    # Hand `pgrp` a fresh empty row; returns the row index, -1 if the
+    # pool is exhausted. pgrp must be non-zero.
+    if devfd_inited == 0:
+        devfd_init()
+    if pgrp == 0:
+        return -1
+    existing: int32 = _devfd_find_row(pgrp)
+    if existing >= 0:
+        return existing
+    i: uint64 = 0
+    while i < DEVFD_ROWS:
+        if devfd_owner[i] == 0:
+            devfd_owner[i] = pgrp
+            base: uint64 = i * DEVFD_SLOTS
+            s: uint64 = 0
+            while s < DEVFD_SLOTS:
+                devfd_kind[base + s] = DEVFD_NONE
+                devfd_arg[base + s] = 0
+                devfd_pos[base + s] = 0
+                s = s + 1
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _devfd_row_or_alloc(pgrp: uint64) -> int32:
+    r: int32 = _devfd_find_row(pgrp)
+    if r >= 0:
+        return r
+    return _devfd_alloc_row(pgrp)
+
+
+# --- the bind primitive ---------------------------------------------
+#
+# devfd_bind(pgrp, fdnum, kind, arg) — install a backing channel at the
+# name /fd/<fdnum> in `pgrp`'s namespace. THIS IS the one operation
+# pipe / redirect / dup all reduce to. Returns 0 on success, -1 on
+# failure (bad fdnum, pool exhausted).
+#
+# When the slot already held a pipe backing, the old end's refcount is
+# released so a re-bind (the dup case overwriting /fd/2) does not leak
+# a pipe end.
+
+def _devfd_release_slot(row: int32, slot: uint64):
+    base: uint64 = cast[uint64](row) * DEVFD_SLOTS
+    k: int32 = devfd_kind[base + slot]
+    a: int32 = devfd_arg[base + slot]
+    if k == DEVFD_PIPE_R:
+        pipe_close_reader(a)
+    elif k == DEVFD_PIPE_W:
+        pipe_close_writer(a)
+    devfd_kind[base + slot] = DEVFD_NONE
+    devfd_arg[base + slot] = 0
+    devfd_pos[base + slot] = 0
+
+
+def devfd_bind(pgrp: uint64, fdnum: int32, kind: int32,
+               arg: int32) -> int32:
+    if fdnum < 0 or cast[uint64](fdnum) >= DEVFD_SLOTS:
+        return -1
+    row: int32 = _devfd_row_or_alloc(pgrp)
+    if row < 0:
+        return -1
+    slot: uint64 = cast[uint64](fdnum)
+    base: uint64 = cast[uint64](row) * DEVFD_SLOTS
+    # Release whatever Chan currently sits at this name first.
+    _devfd_release_slot(row, slot)
+    devfd_kind[base + slot] = kind
+    devfd_arg[base + slot] = arg
+    return 0
+
+
+def devfd_bind_pipe_r(pgrp: uint64, fdnum: int32,
+                      pipe_slot: int32) -> int32:
+    # Bind a pipe READ end at /fd/<fdnum>. Bumps the pipe's reader
+    # refcount so the namespace owns its own reference — closing the
+    # creator's end can't yank the channel out from under it.
+    if devfd_bind(pgrp, fdnum, DEVFD_PIPE_R, pipe_slot) < 0:
+        return -1
+    pipe_inc_reader(pipe_slot)
+    return 0
+
+
+def devfd_bind_pipe_w(pgrp: uint64, fdnum: int32,
+                      pipe_slot: int32) -> int32:
+    # Bind a pipe WRITE end at /fd/<fdnum>; bumps the writer refcount.
+    if devfd_bind(pgrp, fdnum, DEVFD_PIPE_W, pipe_slot) < 0:
+        return -1
+    pipe_inc_writer(pipe_slot)
+    return 0
+
+
+def devfd_bind_cons(pgrp: uint64, fdnum: int32) -> int32:
+    # Bind the console device at /fd/<fdnum>. The console is global +
+    # stateless — no refcount to bump.
+    return devfd_bind(pgrp, fdnum, DEVFD_CONS, 0)
+
+
+def devfd_bind_file(pgrp: uint64, fdnum: int32, kfd: int32) -> int32:
+    # Bind an on-disk file (named by an already-open kernel fd) at
+    # /fd/<fdnum>. The fd reference is owned by the namespace; the
+    # caller must not close it.
+    return devfd_bind(pgrp, fdnum, DEVFD_FILE, kfd)
+
+
+# --- the dup primitive ----------------------------------------------
+#
+# devfd_dup(pgrp, src, dst) — make the name /fd/<dst> refer to the
+# SAME backing channel currently at /fd/<src>. This is `cmd 2>&1`:
+# bind /fd/1's Chan also at the name /fd/2. One bind over channels.
+
+def devfd_dup(pgrp: uint64, src_fd: int32, dst_fd: int32) -> int32:
+    row: int32 = _devfd_find_row(pgrp)
+    if row < 0:
+        return -1
+    if src_fd < 0 or cast[uint64](src_fd) >= DEVFD_SLOTS:
+        return -1
+    if dst_fd < 0 or cast[uint64](dst_fd) >= DEVFD_SLOTS:
+        return -1
+    base: uint64 = cast[uint64](row) * DEVFD_SLOTS
+    sk: int32 = devfd_kind[base + cast[uint64](src_fd)]
+    sa: int32 = devfd_arg[base + cast[uint64](src_fd)]
+    if sk == DEVFD_PIPE_R:
+        return devfd_bind_pipe_r(pgrp, dst_fd, sa)
+    if sk == DEVFD_PIPE_W:
+        return devfd_bind_pipe_w(pgrp, dst_fd, sa)
+    if sk == DEVFD_FILE:
+        return devfd_bind_file(pgrp, dst_fd, sa)
+    if sk == DEVFD_CONS:
+        return devfd_bind_cons(pgrp, dst_fd)
+    return -1
+
+
+# --- inspecting a slot ----------------------------------------------
+
+def devfd_slot_kind(pgrp: uint64, fdnum: int32) -> int32:
+    # The DEVFD_* kind bound at /fd/<fdnum> in `pgrp`, DEVFD_NONE if
+    # nothing is bound (or the Pgrp has no /fd table yet).
+    row: int32 = _devfd_find_row(pgrp)
+    if row < 0:
+        return DEVFD_NONE
+    if fdnum < 0 or cast[uint64](fdnum) >= DEVFD_SLOTS:
+        return DEVFD_NONE
+    base: uint64 = cast[uint64](row) * DEVFD_SLOTS
+    return devfd_kind[base + cast[uint64](fdnum)]
+
+
+def devfd_slot_arg(pgrp: uint64, fdnum: int32) -> int32:
+    row: int32 = _devfd_find_row(pgrp)
+    if row < 0:
+        return 0
+    if fdnum < 0 or cast[uint64](fdnum) >= DEVFD_SLOTS:
+        return 0
+    base: uint64 = cast[uint64](row) * DEVFD_SLOTS
+    return devfd_arg[base + cast[uint64](fdnum)]
+
+
+# --- the universal operation interface ------------------------------
+#
+# devfd_read / devfd_write resolve the name /fd/<fdnum> in `pgrp` to
+# its backing Chan and route there. NO 9P marshalling — every backing
+# is a local kernel object, so these are devtab-DIRECT (§6).
+#
+# Return value mirrors the underlying backend: >0 bytes, 0 = EOF /
+# would-block-empty, <0 = error. The pipe read-end blocking-yield loop
+# lives in the vfs.ad dispatch arm (it needs yield_to_others); these
+# functions are the non-blocking primitive layer.
+
+def devfd_read(pgrp: uint64, fdnum: int32, buf: Ptr[uint8],
+               count: uint64) -> int64:
+    row: int32 = _devfd_find_row(pgrp)
+    if row < 0:
+        return cast[int64](-9)                  # -EBADF
+    if fdnum < 0 or cast[uint64](fdnum) >= DEVFD_SLOTS:
+        return cast[int64](-9)
+    base: uint64 = cast[uint64](row) * DEVFD_SLOTS
+    sk: uint64 = base + cast[uint64](fdnum)
+    k: int32 = devfd_kind[sk]
+    a: int32 = devfd_arg[sk]
+    if k == DEVFD_CONS:
+        return devcons_read(buf, count)
+    if k == DEVFD_PIPE_R:
+        return pipe_read(a, buf, count)
+    if k == DEVFD_PIPE_W:
+        return cast[int64](-9)                  # write end — can't read
+    if k == DEVFD_FILE:
+        # tmpfs-backed file channel. The cursor lives in the devfd
+        # slot (devfd_pos) — task-independent, so a child reading
+        # /fd/0 from a `< file` redirect advances the same cursor.
+        sz:  uint64 = tmpfs_size(a)
+        pos: uint64 = devfd_pos[sk]
+        if pos >= sz:
+            return 0                            # EOF
+        take: uint64 = count
+        if take > sz - pos:
+            take = sz - pos
+        src: Ptr[uint8] = tmpfs_data(a)
+        i: uint64 = 0
+        while i < take:
+            buf[i] = src[pos + i]
+            i = i + 1
+        devfd_pos[sk] = pos + take
+        return cast[int64](take)
+    return cast[int64](-9)
+
+
+def devfd_read_pipe_writers(pgrp: uint64, fdnum: int32) -> int64:
+    # For the vfs.ad blocking-read arm: how many writers remain on the
+    # pipe behind /fd/<fdnum>. Returns 0 if /fd/<fdnum> is not a pipe
+    # read end (which the caller treats as "no more data possible").
+    row: int32 = _devfd_find_row(pgrp)
+    if row < 0:
+        return 0
+    if fdnum < 0 or cast[uint64](fdnum) >= DEVFD_SLOTS:
+        return 0
+    base: uint64 = cast[uint64](row) * DEVFD_SLOTS
+    if devfd_kind[base + cast[uint64](fdnum)] != DEVFD_PIPE_R:
+        return 0
+    return cast[int64](pipe_writers(devfd_arg[base + cast[uint64](fdnum)]))
+
+
+def devfd_write(pgrp: uint64, fdnum: int32, buf: Ptr[uint8],
+                count: uint64) -> int64:
+    row: int32 = _devfd_find_row(pgrp)
+    if row < 0:
+        return cast[int64](-9)                  # -EBADF
+    if fdnum < 0 or cast[uint64](fdnum) >= DEVFD_SLOTS:
+        return cast[int64](-9)
+    base: uint64 = cast[uint64](row) * DEVFD_SLOTS
+    sk: uint64 = base + cast[uint64](fdnum)
+    k: int32 = devfd_kind[sk]
+    a: int32 = devfd_arg[sk]
+    if k == DEVFD_CONS:
+        return devcons_write(buf, count)
+    if k == DEVFD_PIPE_W:
+        return pipe_write(a, buf, count)
+    if k == DEVFD_PIPE_R:
+        return cast[int64](-9)                  # read end — can't write
+    if k == DEVFD_FILE:
+        # tmpfs-backed file channel — append at the devfd cursor.
+        pos: uint64 = devfd_pos[sk]
+        n: uint64 = tmpfs_write(a, buf, pos, count)
+        devfd_pos[sk] = pos + n
+        return cast[int64](n)
+    return cast[int64](-9)
+
+
+def devfd_write_pipe_readers(pgrp: uint64, fdnum: int32) -> int64:
+    # For the vfs.ad blocking-write arm: how many readers remain on the
+    # pipe behind /fd/<fdnum>. Returns -1 if /fd/<fdnum> is not a pipe
+    # write end.
+    row: int32 = _devfd_find_row(pgrp)
+    if row < 0:
+        return cast[int64](-1)
+    if fdnum < 0 or cast[uint64](fdnum) >= DEVFD_SLOTS:
+        return cast[int64](-1)
+    base: uint64 = cast[uint64](row) * DEVFD_SLOTS
+    if devfd_kind[base + cast[uint64](fdnum)] != DEVFD_PIPE_W:
+        return cast[int64](-1)
+    return cast[int64](pipe_readers(devfd_arg[base + cast[uint64](fdnum)]))
+
+
+# --- Pgrp lifecycle hooks -------------------------------------------
+#
+# devfd_clone_row — called from chan.ad's pgrp_clone() when a Pgrp is
+# COW-copied for rfork(RFNAMEG). The child gets a private /fd table
+# byte-for-byte equal to the parent's; every pipe end the parent's
+# table referenced gets its refcount bumped so the child owns its own
+# reference. This is what makes "stdio is a name in a COW Pgrp" work.
+
+def devfd_clone_row(src_pgrp: uint64, dst_pgrp: uint64):
+    src: int32 = _devfd_find_row(src_pgrp)
+    if src < 0:
+        return                                  # parent has no /fd table
+    dst: int32 = _devfd_alloc_row(dst_pgrp)
+    if dst < 0:
+        return                                  # pool exhausted; child runs bare
+    sbase: uint64 = cast[uint64](src) * DEVFD_SLOTS
+    dbase: uint64 = cast[uint64](dst) * DEVFD_SLOTS
+    s: uint64 = 0
+    while s < DEVFD_SLOTS:
+        k: int32 = devfd_kind[sbase + s]
+        a: int32 = devfd_arg[sbase + s]
+        devfd_kind[dbase + s] = k
+        devfd_arg[dbase + s] = a
+        if k == DEVFD_PIPE_R:
+            pipe_inc_reader(a)
+        elif k == DEVFD_PIPE_W:
+            pipe_inc_writer(a)
+        s = s + 1
+
+
+# devfd_free_row — called from chan.ad's pgrp_ref_dec() when a Pgrp's
+# last referer is gone. Releases every pipe end the /fd table still
+# holds, then frees the row.
+
+def devfd_free_row(pgrp: uint64):
+    row: int32 = _devfd_find_row(pgrp)
+    if row < 0:
+        return
+    s: uint64 = 0
+    while s < DEVFD_SLOTS:
+        _devfd_release_slot(row, s)
+        s = s + 1
+    devfd_owner[cast[uint64](row)] = 0

@@ -91,6 +91,16 @@ from sys.src.port9.port.devproc import (
 # /sysroot/motd open the same bytes /etc/motd would have.
 from sys.src.port9.port.chan import (
     chan_resolve_prefix, chan_find_srv_prefix,
+    pgrp_current,
+)
+# HAMSH §7: the `#d` fd device. /fd/N is a name in the calling
+# process's Pgrp namespace; an `#d/N` open installs an FD_DEVFD_MARK
+# fd and read/write resolve the name through the per-Pgrp devfd table.
+from sys.src.port9.port.devfd import (
+    devfd_read, devfd_write,
+    devfd_read_pipe_writers, devfd_write_pipe_readers,
+    devfd_slot_kind,
+    FD_DEVFD_MARK, DEVFD_PIPE_R, DEVFD_PIPE_W,
 )
 # V3/V3.5: `#s/<name>` name-server dispatch. devsrv_open returns the
 # posted srvfd (or -1 on miss). `#s` itself (directory listing) renders
@@ -796,7 +806,44 @@ def _open_hash_alias(name: Ptr[char]) -> int32:
         if name[2] == 0:
             return _open_dir_n()
         return ENOENT
+    # '#d' — HAMSH §7 fd device. `#d/<N>` resolves to the channel
+    # bound at the name /fd/<N> in the calling process's Pgrp. The
+    # open installs an FD_DEVFD_MARK fd whose fd_buf carries the
+    # fd-number N; vfs_read / vfs_write resolve the name through the
+    # per-Pgrp devfd table at I/O time. This is the substrate stdio
+    # rides on — the Linux integer fd 0/1/2/N is a Layer-2 mapping
+    # ONTO the name /fd/N, not the name itself.
+    if letter == 100:                                  # 'd'
+        if name[2] != 47 or name[3] == 0:              # need '#d/<N>'
+            return ENOENT
+        # Parse the decimal fd-number after '#d/'.
+        fdnum: int32 = 0
+        i: uint64 = 3
+        while name[i] != 0:
+            c: int32 = name[i]
+            if c < 48 or c > 57:
+                return ENOENT                          # non-digit
+            fdnum = fdnum * 10 + (c - 48)
+            i = i + 1
+        return _open_devfd_marked(fdnum)
     return ENOENT
+
+
+def _open_devfd_marked(fdnum: int32) -> int32:
+    # Install an FD_DEVFD_MARK fd carrying the fd-number N. Stateless
+    # at open time — the backing channel is resolved per-read/write
+    # against the calling task's Pgrp devfd table, so a child that
+    # inherits this fd resolves /fd/N in ITS namespace, not the
+    # opener's. fd_pos is the cursor for file-backed channels.
+    task: Ptr[TaskStruct] = current_task()
+    fd: int32 = _alloc_fd(task)
+    if fd < 0:
+        return EMFILE
+    fdu: uint64 = cast[uint64](fd)
+    task[0].fd_idx[fdu] = FD_DEVFD_MARK
+    task[0].fd_pos[fdu] = 0
+    task[0].fd_buf[fdu] = cast[uint64](cast[uint32](fdnum))
+    return fd
 
 
 def _open_hash_proc(name: Ptr[char]) -> int32:
@@ -1892,6 +1939,25 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         if nc > 0:
             task[0].fd_pos[fdu] = coff + cast[uint64](nc)
         return nc
+    if file_idx == FD_DEVFD_MARK:
+        # HAMSH §7: the integer fd is the Layer-2 mapping onto an
+        # /fd/N name. fd_buf carries the fd-number N; resolve it
+        # through the CALLING task's Pgrp devfd table. A pipe read
+        # end blocks-yields until bytes arrive OR every writer has
+        # closed (EOF) — the same model as the FD_PIPE_MARK_R arm.
+        # devfd_read routes to a LOCAL backing channel (pipe slot /
+        # console / file): zero 9P marshalling (§6).
+        df_num: int32 = cast[int32](cast[uint32](task[0].fd_buf[fdu]))
+        df_pg:  uint64 = pgrp_current()
+        if devfd_slot_kind(df_pg, df_num) == DEVFD_PIPE_R:
+            while True:
+                dn: int64 = devfd_read(df_pg, df_num, buf, count)
+                if dn > 0:
+                    return dn
+                if devfd_read_pipe_writers(df_pg, df_num) == 0:
+                    return 0                       # all writers gone
+                yield_to_others()
+        return devfd_read(df_pg, df_num, buf, count)
     if file_idx == FD_P9_MARK:
         # V1 legacy 9P-mounted file path — retained as a non-regressing
         # fallback for any FD_P9_MARK fd a not-yet-converted call site
@@ -2233,6 +2299,30 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         if n > 0:
             task[0].fd_pos[fdu] = off + cast[uint64](n)
         return n
+    if file_idx == FD_DEVFD_MARK:
+        # HAMSH §7: the integer fd is the Layer-2 mapping onto an
+        # /fd/N name. Resolve N through the CALLING task's Pgrp devfd
+        # table. A pipe write end blocks-yields, EPIPE on all-readers-
+        # gone (same model as the FD_PIPE_MARK_W arm). devfd_write
+        # routes to a LOCAL backing channel — zero 9P (§6).
+        dfw_num: int32 = cast[int32](cast[uint32](task[0].fd_buf[fdu]))
+        dfw_pg:  uint64 = pgrp_current()
+        if devfd_slot_kind(dfw_pg, dfw_num) == DEVFD_PIPE_W:
+            total: uint64 = 0
+            while total < count:
+                if devfd_write_pipe_readers(dfw_pg, dfw_num) == 0:
+                    if total > 0:
+                        return cast[int64](total)
+                    return cast[int64](EPIPE)
+                chunk: int64 = devfd_write(dfw_pg, dfw_num,
+                    cast[Ptr[uint8]](cast[uint64](buf) + total),
+                    count - total)
+                if chunk > 0:
+                    total = total + cast[uint64](chunk)
+                else:
+                    yield_to_others()
+            return cast[int64](total)
+        return devfd_write(dfw_pg, dfw_num, buf, count)
     if file_idx == FD_DEVNULL_MARK or file_idx == FD_DEVZERO_MARK:
         # /dev/null and /dev/zero swallow writes silently — the
         # full `count` is returned as bytes-written.

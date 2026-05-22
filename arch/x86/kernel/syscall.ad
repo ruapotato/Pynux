@@ -53,12 +53,15 @@ from kernel.sched.core import (
     # out-of-range slot indices — the syscall body bails with errstr
     # "srv: kernel-only" in that case.
     task_struct_at,
-    # SYS_SPAWN namespace inheritance: a spawned child must share the
-    # parent's Pgrp (mount table) — POSIX fork+exec semantics, and the
-    # Plan 9 rule that a child inherits the parent's namespace unless
-    # it rforks. Without this a child spawned from inside an
-    # nsrun/distrorun distro-shape namespace would land in the root
-    # namespace and never see the mounted distrofs trees.
+    # SYS_SPAWN namespace inheritance — task_pgrp / set_task_pgrp
+    # read/write the per-task Pgrp pointer. sys_spawn has two cases:
+    #  - SPAWN_STDIO_NS (the shell spawning a command): the child gets
+    #    its OWN Pgrp — a COW copy of the caller's ambient namespace
+    #    (HAMSH §7/§9), so it has a private /fd-name table (pgrp_clone).
+    #  - legacy path (apt/dpkg/nsrun/sshd, real integer fds): the child
+    #    shares the parent's Pgrp so a process spawned inside an
+    #    nsrun/distrorun distro-shape namespace sees the mounted
+    #    distrofs trees (pgrp_ref_inc bumps the share refcount).
     task_pgrp, set_task_pgrp,
 )
 from fs.vfs import (
@@ -158,12 +161,18 @@ from sys.src.port9.port.sysfile import (
 # sys/src/9/port/syschan.ad, channel + mount-table skeleton in
 # sys/src/9/port/chan.ad. Replace the M16.93 -ENOSYS stubs for
 # SYS_BIND (257) / SYS_MOUNT (258) / SYS_UNMOUNT (259).
-from sys.src.port9.port.syschan import do_bind, do_mount, do_unmount
+from sys.src.port9.port.syschan import (
+    do_bind, do_mount, do_unmount,
+    do_fdbind, do_pipechan, do_openchan,
+)
 # SYS_SPAWN namespace inheritance: pgrp_current resolves the caller's
-# Pgrp (collapsing the BSS-default 0 onto the root Pgrp); pgrp_ref_inc
-# bumps the share-path refcount so the child + parent both holding the
-# Pgrp is accounted for.
-from sys.src.port9.port.chan import pgrp_ref_inc, pgrp_current
+# Pgrp (collapsing the BSS-default 0 onto the root Pgrp). The
+# SPAWN_STDIO_NS path uses pgrp_clone (private COW Pgrp, HAMSH §7/§9);
+# the legacy path uses pgrp_ref_inc to share the parent's Pgrp. The
+# child's SPAWN_STDIO_NS stdio fds 0/1/2 are FD_DEVFD_MARK — the
+# Layer-2 mapping onto the names /fd/0,1,2.
+from sys.src.port9.port.chan import pgrp_clone, pgrp_ref_inc, pgrp_current
+from sys.src.port9.port.devfd import FD_DEVFD_MARK, devfd_bind_cons
 # Phase C / M16.109: Plan 9 note (signal) primitives. Bodies live in
 # sys/src/9/port/sysnote.ad — mirrors 9front's notify(2)/noted(2) shape.
 # Imported through the port9 directory alias for the same identifier
@@ -281,6 +290,18 @@ SYS_SRV_OPEN:    uint64 = 276                  # a0=name; returns new fd / -1
 # with the Linux-ABI dispatcher would need a non-stock number, so this
 # is native-only for now (apt is native Adder — the priority consumer).
 SYS_TLS_CONNECT: uint64 = 277                  # a0=fd, a1=hostname ptr, a2=hostlen; returns 0/-errno
+# HAMSH §7: the `#d`-fd-device namespace primitives. /fd/N is a name
+# in a process's Pgrp; pipe / redirect / dup all reduce to "bind a
+# Chan at /fd/N". 278..280 are the next free slots above SYS_TLS_CONNECT.
+SYS_FDBIND:      uint64 = 278  # a0=pid(0=self), a1=fdnum, a2=kind, a3=arg; THE bind primitive (pipe/redirect/dup)
+SYS_PIPECHAN:    uint64 = 280  # returns a pipe SLOT id (not fds); the chan ends for an /fd bind
+SYS_OPENCHAN:    uint64 = 281  # a0=path, a1=write; opens a file as a channel, returns the tmpfs slot
+# HAMSH §7: sys_spawn's stdin_fd / stdout_fd sentinel. When the caller
+# passes SPAWN_STDIO_NS, the child's standard streams are NAMES in its
+# namespace (/fd/0,1,2 via the `#d` device), not dup'd integer fds —
+# the caller wires them via SYS_FDBIND. -2 is outside the [0,16) valid-
+# fd band and distinct from the -1 "inherit" sentinel.
+SPAWN_STDIO_NS:  int32  = -2
 
 # Linux-numbered syscalls (L-track, linux_abi/). We use the stock
 # Linux 6.12 x86_64 numbers so userspace tools built against Linux's
@@ -1501,17 +1522,57 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         parent: Ptr[TaskStruct] = current_task()
         sin:  int32 = cast[int32](a2)
         sout: int32 = cast[int32](a3)
-        # a2 / a3 select the child's stdin / stdout. A value in [0,16)
-        # names a specific parent fd to dup in. -1 means "inherit" —
-        # which has to mean "inherit the PARENT's fd 0 / fd 1", not
-        # "use the global serial default". A shell (hamsh) whose own
-        # stdio is a pipe — e.g. when hamsh itself runs under an SSH
-        # session bridged by user/sshd.ad — must hand that pipe down
-        # to every command it spawns, or the command's output escapes
-        # to the kernel console instead of the SSH channel. Dup-ing
-        # the parent's fd 0/1 is also exactly POSIX fork+exec
-        # behaviour, and on a normal console boot the parent's fd 0/1
-        # ARE the serial console, so this is a no-op there.
+        # HAMSH §7: stdio-as-named-channels mode. When the caller
+        # passes SPAWN_STDIO_NS (-2) for stdin / stdout, the child's
+        # standard streams are NAMES in its namespace — /fd/0,1,2,
+        # served by the `#d` device — not dup'd integer fds. The child
+        # gets a private COW copy of the caller's Pgrp (§9: an
+        # external command gets a COW private namespace), which
+        # carries a COW copy of the caller's /fd-name table. The
+        # child's integer fds 0/1/2 are FD_DEVFD_MARK fds — the
+        # Layer-2 mapping onto /fd/0,1,2 — so a Linux binary's
+        # write(1,...) resolves the name /fd/1 through the child's own
+        # namespace. The shell wires the child's /fd/N (pipe /
+        # redirect / dup) via SYS_FDBIND before yielding to it. This
+        # is the §7 model: one bind over channels.
+        #
+        # Any other sin/sout value keeps the legacy integer-fd dup
+        # path (apt / sshd / distrofs / nsrun still pass real parent
+        # fds): a value in [0,16) names a specific parent fd to dup
+        # in; -1 means "inherit the parent's fd 0 / fd 1".
+        if sin == SPAWN_STDIO_NS or sout == SPAWN_STDIO_NS:
+            # Give the child a private COW Pgrp (clone of the caller's
+            # ambient namespace, including its /fd-name table).
+            cpidx: int32 = cast[int32](current_idx_get())
+            caller_pg: uint64 = task_pgrp(cpidx)
+            if caller_pg == 0:
+                caller_pg = pgrp_current()
+                set_task_pgrp(cpidx, caller_pg)
+            child_pg: uint64 = pgrp_clone(caller_pg)
+            if child_pg != 0:
+                set_task_pgrp(slot, child_pg)
+            else:
+                # OOM on the clone — share the caller's Pgrp rather
+                # than fail the spawn. The child still runs; its /fd
+                # binds would be visible to the caller, an acceptable
+                # degradation under memory pressure.
+                set_task_pgrp(slot, caller_pg)
+            # The child's integer fds 0/1/2 become FD_DEVFD_MARK fds
+            # carrying fd-numbers 0/1/2 — the Layer-2 mapping onto the
+            # names /fd/0,1,2. fd_buf holds the fd-number; vfs_read /
+            # vfs_write resolve it through the child's devfd table.
+            childp: Ptr[TaskStruct] = task_struct_at(slot)
+            if cast[uint64](childp) != 0:
+                childp[0].fd_idx[0] = FD_DEVFD_MARK
+                childp[0].fd_buf[0] = 0
+                childp[0].fd_pos[0] = 0
+                childp[0].fd_idx[1] = FD_DEVFD_MARK
+                childp[0].fd_buf[1] = 1
+                childp[0].fd_pos[1] = 0
+                childp[0].fd_idx[2] = FD_DEVFD_MARK
+                childp[0].fd_buf[2] = 2
+                childp[0].fd_pos[2] = 0
+            return task_pid_at(slot)
         if sin >= 0 and sin < 16:
             dup_fd_to_child(slot, 0, parent, cast[uint64](sin))
         else:
@@ -1773,6 +1834,29 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         # unbind everything at old), a1=old. Returns 0 on success
         # or -1 with errstr "not mounted" if nothing matched.
         return cast[uint64](do_unmount(a0, a1))
+    if nr == SYS_FDBIND:
+        # HAMSH §7: bind a Chan at an /fd/N name — THE one primitive
+        # pipe, redirect, AND dup all reduce to. a0=pid (0=self),
+        # a1=fdnum, a2=channel kind (DEVFD_*), a3=arg (pipe slot /
+        # kernel fd / source /fd number, kind-dependent). dup is
+        # kind==DEVFD_DUP with a3 the source /fd slot — no separate
+        # dup syscall. Body in syschan.ad.
+        return cast[uint64](do_fdbind(cast[int32](a0),
+                                      cast[int32](a1),
+                                      cast[int32](a2),
+                                      cast[int32](a3)))
+    if nr == SYS_PIPECHAN:
+        # HAMSH §7: create a local pipe Chan pair; returns the pipe
+        # SLOT id (not fds). The shell threads the slot into two
+        # SYS_FDBIND calls — write end at the producer's /fd/1, read
+        # end at the consumer's /fd/0. A local pipe never speaks 9P.
+        return cast[uint64](do_pipechan())
+    if nr == SYS_OPENCHAN:
+        # HAMSH §7: open an on-disk file as a namespace-shareable
+        # channel. a0=path, a1=write (0=read/lookup, 1=create+trunc).
+        # Returns the tmpfs slot — the shell binds it at a child's
+        # /fd/N (DEVFD_FILE) for `cmd > file` / `cmd < file`.
+        return cast[uint64](do_openchan(a0, cast[int32](a1)))
     if nr == SYS_CREATE:
         # Phase C / M16.101: create-or-truncate + open. Body lives in
         # sys/src/9/port/sysfile.ad. a0=path, a1=flags, a2=mode.

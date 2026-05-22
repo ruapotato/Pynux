@@ -51,6 +51,33 @@ extern def sys_bind(new: Ptr[char], old: Ptr[char], flag: int32) -> int32
 extern def sys_unmount(new: Ptr[char], old: Ptr[char]) -> int32
 extern def sys_kill(pid: int32, sig: int32) -> int32
 extern def sys_exit(code: uint64)
+# HAMSH §7: the `#d`-fd-device namespace primitives. /fd/N is a NAME
+# in a process's Pgrp; pipe / redirect / dup all reduce to "bind a
+# Chan at /fd/N" — sys_fdbind is THE one operation. sys_pipechan
+# creates a local pipe Chan pair and returns its slot id (not fds).
+extern def sys_fdbind(pid: int32, fdnum: int32, kind: int32,
+                      arg: int32) -> int32
+extern def sys_pipechan() -> int32
+extern def sys_openchan(path: Ptr[char], write: int32) -> int32
+
+
+# DEVFD_* — the channel-kind selector for sys_fdbind, matching
+# sys/src/9/port/devfd.ad. dup is kind DEVFD_DUP with arg = the
+# source /fd slot — there is no separate dup primitive.
+DEVFD_CONS:   int32 = 1     # the console device
+DEVFD_PIPE_R: int32 = 2     # a pipe read end (arg = pipe slot)
+DEVFD_PIPE_W: int32 = 3     # a pipe write end (arg = pipe slot)
+DEVFD_FILE:   int32 = 4     # an on-disk file (arg = kernel fd)
+DEVFD_DUP:    int32 = 5     # the Chan at /fd/<arg> (dup-as-bind)
+
+# sys_spawn stdio sentinel: the child's standard streams are NAMES in
+# its namespace (/fd/0,1,2 via `#d`), wired by the shell with
+# sys_fdbind — NOT dup'd integer fds. Matches SPAWN_STDIO_NS in
+# arch/x86/kernel/syscall.ad.
+SPAWN_STDIO_NS: int32 = -2
+
+# MREPL — bind replaces any existing binding at the name (no union).
+MREPL_FLAG: int32 = 0
 
 
 # --- arena sizes ----------------------------------------------------
@@ -2314,36 +2341,30 @@ def _argv_glob_expand(pattern: Ptr[uint8]):
 
 
 # --- the /fd device + pipe/redirect/dup as bind (§7) ----------------
-# A process's standard streams are names in its namespace: /fd/0,
-# /fd/1, /fd/2 — served by the #d device. Pipe, redirect, and dup are
-# ALL the one operation: bind a Chan at an /fd/N name.
+# A process's standard streams are NAMES in its namespace: /fd/0,
+# /fd/1, /fd/2 — paths served by the `#d` device. /fd/N is the
+# primary, substrate thing. The Linux integer fd 0/1/2/N is a Layer-2
+# mapping ONTO the name /fd/N.
 #
-# At the syscall level the kernel still hands a child its stdin/stdout
-# via sys_spawn's stdin_fd/stdout_fd integer fds — those integers ARE
-# the /fd/N names (the Linux-ABI fd<->/fd/N mapping, §7). hamsh's job
-# is to make pipe / `>` / `2>&1` resolve to "bind a channel at the
-# fd-name", which it does by opening the channel and threading the
-# resulting fd into the child's /fd slot. A LOCAL pipe is a devtab
-# pipe Chan — direct Chan reads, zero mountrpc (§6).
-
-# fd-bind plan for one command: which Chan backs /fd/0,1,2.
-fdb_in:   int32 = 0       # fd to install as child /fd/0
-fdb_out:  int32 = 1       # fd to install as child /fd/1
-fdb_err:  int32 = 2       # fd to install as child /fd/2
-
-
-def _fd_name_path(n: int32, buf: Ptr[uint8]):
-    # Render the /fd/N path for fd-number n into buf.
-    buf[0] = 47        # '/'
-    buf[1] = 102       # 'f'
-    buf[2] = 100       # 'd'
-    buf[3] = 47        # '/'
-    src: Ptr[uint8] = render_int(cast[int64](n))
-    i: uint64 = 0
-    while src[i] != 0:
-        buf[4 + i] = src[i]
-        i = i + 1
-    buf[4 + i] = 0
+# Pipe, redirect, and dup are ALL the ONE operation — sys_fdbind: bind
+# a Chan at an /fd/N name. There is no separate pipe mechanism,
+# redirect mechanism, or dup mechanism:
+#
+#   a | b      sys_pipechan creates a local pipe Chan pair; the write
+#              end is sys_fdbind'd at a's /fd/1, the read end at b's
+#              /fd/0. (sys_pipechan → a devtab pipe, NOT a 9P byte-
+#              buffer: a local pipe is direct Chan reads, zero
+#              mountrpc — §6.)
+#   cmd > file sys_open_write the file → a kernel fd; sys_fdbind it
+#              (DEVFD_FILE) at cmd's /fd/1.
+#   cmd 2>&1   sys_fdbind(cmd, 2, DEVFD_DUP, 1): bind whatever Chan is
+#              already at the name /fd/1 ALSO at /fd/2.
+#
+# The shell spawns each command with SPAWN_STDIO_NS — the child gets a
+# private COW namespace whose /fd table starts as a copy of the
+# shell's (console at 0/1/2). The shell then rebinds the child's
+# /fd/N for any pipe / redirect / dup BEFORE yielding to it (the
+# cooperative scheduler guarantees the child is still STATE_READY).
 
 
 # --- PATH resolution + spawn ----------------------------------------
@@ -2410,10 +2431,15 @@ def _build_envp() -> Ptr[uint64]:
     return cast[Ptr[uint64]](&envp_ptrs[0])
 
 
-def spawn_resolved(cmd: Ptr[uint8], argv: Ptr[uint64],
-                   sin: int32, sout: int32) -> int32:
+def spawn_resolved(cmd: Ptr[uint8], argv: Ptr[uint64]) -> int32:
     # Resolve `cmd` to a path and sys_spawn it. A command containing
     # '/' is taken verbatim; otherwise PATH dirs are tried in order.
+    #
+    # HAMSH §7: stdio is ALWAYS spawned in namespace-bind mode
+    # (SPAWN_STDIO_NS). The child gets a private COW namespace whose
+    # /fd table is a copy of the shell's (console at 0/1/2); the
+    # caller rebinds the child's /fd/N for any pipe / redirect / dup
+    # via sys_fdbind AFTER this returns and BEFORE waiting on it.
     envp: Ptr[uint64] = _build_envp()
     has_slash: int32 = 0
     i: uint64 = 0
@@ -2422,12 +2448,13 @@ def spawn_resolved(cmd: Ptr[uint8], argv: Ptr[uint64],
             has_slash = 1
         i = i + 1
     if has_slash != 0:
-        return sys_spawn(cast[Ptr[char]](cmd), argv, sin, sout, envp)
+        return sys_spawn(cast[Ptr[char]](cmd), argv,
+                         SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
     pi: int32 = 0
     while pi < 3:
         _build_path(_path_prefix(pi), cmd)
         pid: int32 = sys_spawn(cast[Ptr[char]](&spawn_path[0]),
-                               argv, sin, sout, envp)
+                               argv, SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
         if pid >= 0:
             return pid
         pi = pi + 1
@@ -2559,178 +2586,163 @@ def builtin_import(argc: int32) -> int32:
 # ====================================================================
 # Running a single command + pipelines (§6, §7)
 # ====================================================================
-# A pipe is a Chan. §7: pipe / redirect / dup are all "bind a Chan at
-# an /fd/N name". Concretely:
-#   * a | b   -> a's /fd/1 channel is bound as b's /fd/0
-#   * cmd > f -> file f's channel is bound as cmd's /fd/1
-#   * cmd 2>&1 -> /fd/1's channel is bound also at /fd/2
-# The kernel's sys_pipe gives us a devtab pipe Chan pair (NOT a 9P
-# byte-buffer): a local pipe is direct devtab Chan reads, zero
-# mountrpc (§6 performance rule).
-#
-# Per-stage instrumentation: count the pipe channels we bind.
-pipe_chan_binds: uint64 = 0
+# §7: pipe / redirect / dup are ALL the ONE operation — sys_fdbind:
+# bind a Chan at an /fd/N name. The shell spawns each command with
+# SPAWN_STDIO_NS; the child gets a private COW namespace whose /fd
+# table starts as a copy of the shell's (console at 0/1/2). The shell
+# then REBINDS the child's /fd/N for any pipe / redirect / dup —
+# BEFORE yielding to it (the cooperative scheduler keeps the child
+# STATE_READY until sys_waitpid). Concretely:
+#   a | b      sys_pipechan -> a pipe slot; bind write end at a's
+#              /fd/1 (DEVFD_PIPE_W), read end at b's /fd/0
+#              (DEVFD_PIPE_R). The slot is a devtab pipe — direct
+#              Chan reads, zero mountrpc (§6).
+#   cmd > file sys_openchan -> a file channel slot; bind it at cmd's
+#              /fd/1 (DEVFD_FILE).
+#   cmd 2>&1   sys_fdbind(cmd, 2, DEVFD_DUP, 1) — bind /fd/1's Chan
+#              also at the name /fd/2.
 
 
-def run_one_command(cmdnode: int32, sin: int32, sout: int32,
-                    serr: int32, do_wait: int32) -> int32:
-    # Execute a single ND_CMD with the given /fd bindings.
-    #   sin  -> child /fd/0   sout -> child /fd/1   serr -> child /fd/2
-    # Returns the exit status (do_wait=1) or the pid (do_wait=0).
-    argc: int32 = _argv_build(cmdnode)
+def _node_to_path(node: int32, out: Ptr[uint8], cap: uint64):
+    # Evaluate a redirect-target node to its string form and copy it
+    # NUL-terminated into `out`.
+    tv: int32 = eval_expr(node)
+    tp: Ptr[uint8] = v_render_str_only(tv)
+    ci: uint64 = 0
+    while tp[ci] != 0 and ci + 1 < cap:
+        out[ci] = tp[ci]
+        ci = ci + 1
+    out[ci] = 0
+
+
+def _wire_redirects(cmdnode: int32, pid: int32):
+    # Apply a command's redirects (§7) as binds at the SPAWNED child's
+    # /fd/N names. Runs after spawn_resolved, before sys_waitpid.
+    nu: uint64 = cast[uint64](cmdnode)
+    # `> file` / `>> file` — bind a file channel at the child's /fd/1.
+    if nd_a[nu] != 0:
+        fp: Array[256, uint8]
+        _node_to_path(nd_a[nu], &fp[0], 256)
+        fslot: int32 = sys_openchan(cast[Ptr[char]](&fp[0]), 1)
+        if fslot >= 0:
+            sys_fdbind(pid, 1, DEVFD_FILE, fslot)
+    # `< file` — bind a file channel at the child's /fd/0.
+    if nd_b[nu] != 0:
+        fp: Array[256, uint8]
+        _node_to_path(nd_b[nu], &fp[0], 256)
+        fslot: int32 = sys_openchan(cast[Ptr[char]](&fp[0]), 0)
+        if fslot >= 0:
+            sys_fdbind(pid, 0, DEVFD_FILE, fslot)
+    # `2> file` — bind a file channel at the child's /fd/2.
+    if nd_i[nu] != 0:
+        fp: Array[256, uint8]
+        _node_to_path(cast[int32](nd_i[nu]), &fp[0], 256)
+        fslot: int32 = sys_openchan(cast[Ptr[char]](&fp[0]), 1)
+        if fslot >= 0:
+            sys_fdbind(pid, 2, DEVFD_FILE, fslot)
+    # `2>&1` — dup-as-bind: whatever Chan is at /fd/1 also at /fd/2.
+    if (nd_c[nu] & 2) != 0:
+        sys_fdbind(pid, 2, DEVFD_DUP, 1)
+
+
+def run_one_command_x(cmdnode: int32, in_pipe: int32, out_pipe: int32,
+                      do_wait: int32, prebuilt: int32) -> int32:
+    # Execute a single ND_CMD. in_pipe / out_pipe are pipe SLOT ids
+    # (-1 = none) for a pipeline stage; the shell binds them at the
+    # child's /fd/0 / /fd/1. Returns the exit status (do_wait=1) or
+    # the pid (do_wait=0).
+    #
+    # `prebuilt` != 0 means the caller has ALREADY run _argv_build on
+    # this node and argv_ptr is still current — do not rebuild. This
+    # matters because a word containing a `{ … }` command substitution
+    # would re-RUN the substituted command on every _argv_build call;
+    # exec_statement already built argv to dispatch the exit/help
+    # builtins, so a rebuild here would spawn the substitution twice.
+    argc: int32 = 0
+    if prebuilt != 0:
+        argc = cast[int32](argv_n)
+    else:
+        argc = _argv_build(cmdnode)
     if argc == 0:
         return 0
     cmd: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[0])
-    nu: uint64 = cast[uint64](cmdnode)
 
-    # redirect targets — bind a file Chan at the fd-name (§7).
-    ropen_out: int32 = -1
-    ropen_in:  int32 = -1
-    ropen_err: int32 = -1
-    eff_out: int32 = sout
-    eff_in:  int32 = sin
-    eff_err: int32 = serr
-
-    if nd_a[nu] != 0:
-        # `> file` / `>> file` : open file, bind its Chan as /fd/1.
-        tv: int32 = eval_expr(nd_a[nu])
-        tp: Ptr[uint8] = v_render_str_only(tv)
-        fp: Array[256, uint8]
-        ci: uint64 = 0
-        while tp[ci] != 0 and ci + 1 < 256:
-            fp[ci] = tp[ci]
-            ci = ci + 1
-        fp[ci] = 0
-        ropen_out = sys_open_write(cast[Ptr[char]](&fp[0]))
-        if ropen_out >= 0:
-            eff_out = ropen_out
-    if nd_b[nu] != 0:
-        # `< file` : bind file's Chan as /fd/0.
-        tv: int32 = eval_expr(nd_b[nu])
-        tp: Ptr[uint8] = v_render_str_only(tv)
-        fp: Array[256, uint8]
-        ci: uint64 = 0
-        while tp[ci] != 0 and ci + 1 < 256:
-            fp[ci] = tp[ci]
-            ci = ci + 1
-        fp[ci] = 0
-        ropen_in = sys_open(cast[Ptr[char]](&fp[0]))
-        if ropen_in >= 0:
-            eff_in = ropen_in
-    if nd_i[nu] != 0:
-        # `2> file` : bind file's Chan as /fd/2.
-        tn: int32 = cast[int32](nd_i[nu])
-        tv: int32 = eval_expr(tn)
-        tp: Ptr[uint8] = v_render_str_only(tv)
-        fp: Array[256, uint8]
-        ci: uint64 = 0
-        while tp[ci] != 0 and ci + 1 < 256:
-            fp[ci] = tp[ci]
-            ci = ci + 1
-        fp[ci] = 0
-        ropen_err = sys_open_write(cast[Ptr[char]](&fp[0]))
-        if ropen_err >= 0:
-            eff_err = ropen_err
-    # `2>&1` : the /fd/2 channel IS the /fd/1 channel (dup-as-bind).
-    if (nd_c[nu] & 2) != 0:
-        eff_err = eff_out
-
-    # builtin? builtins run in-process and only at the prompt scope.
+    # builtin? builtins run in-process at the prompt scope (§15).
     rc_builtin: int32 = run_builtin(cmd, argc)
     if rc_builtin >= 0:
-        if ropen_out >= 0:
-            sys_close(ropen_out)
-        if ropen_in >= 0:
-            sys_close(ropen_in)
-        if ropen_err >= 0:
-            sys_close(ropen_err)
         return rc_builtin
 
-    # external command — spawn it. The kernel installs eff_in/eff_out
-    # as the child's /fd/0,1. eff_err is bound as /fd/2 via a post-
-    # spawn dup if it differs from the default 2 — but sys_spawn only
-    # threads stdin/stdout; stderr defaults to the parent's. For a
-    # 2>&1 / 2>file we map it onto stdout when they coincide.
-    use_out: int32 = eff_out
-    if (nd_c[nu] & 2) != 0:
-        use_out = eff_out
-    pid: int32 = spawn_resolved(cmd, cast[Ptr[uint64]](&argv_ptr[0]),
-                                eff_in, use_out)
+    # external command — spawn it in namespace-bind stdio mode (§7).
+    pid: int32 = spawn_resolved(cmd, cast[Ptr[uint64]](&argv_ptr[0]))
     if pid < 0:
         errstr_set("command not found")
         write_cstr1("hamsh: command not found: ")
         write_cstr1(cmd)
         write_cstr1("\n")
-        if ropen_out >= 0:
-            sys_close(ropen_out)
-        if ropen_in >= 0:
-            sys_close(ropen_in)
-        if ropen_err >= 0:
-            sys_close(ropen_err)
         return 127
+    # Wire the child's /fd/N — ONE bind per stream (§7). The child is
+    # still STATE_READY (cooperative scheduler), so these binds land
+    # in its namespace before its first instruction runs.
+    if in_pipe >= 0:
+        sys_fdbind(pid, 0, DEVFD_PIPE_R, in_pipe)
+    if out_pipe >= 0:
+        sys_fdbind(pid, 1, DEVFD_PIPE_W, out_pipe)
+    _wire_redirects(cmdnode, pid)
     if do_wait == 0:
         # caller manages the pid (pipeline / background)
         return pid
     code: int64 = sys_waitpid(pid)
-    if ropen_out >= 0:
-        sys_close(ropen_out)
-    if ropen_in >= 0:
-        sys_close(ropen_in)
-    if ropen_err >= 0:
-        sys_close(ropen_err)
     return cast[int32](code)
+
+
+def run_one_command(cmdnode: int32, in_pipe: int32, out_pipe: int32,
+                    do_wait: int32) -> int32:
+    # Convenience entry: builds argv itself (prebuilt = 0).
+    return run_one_command_x(cmdnode, in_pipe, out_pipe, do_wait, 0)
 
 
 # pipeline stage bookkeeping.
 pl_pids:  Array[8, int32]
-pl_rfd:   Array[8, int32]
-pl_wfd:   Array[8, int32]
+pl_pipe:  Array[8, int32]      # inter-stage pipe SLOT ids
 
 
 def run_pipeline(plnode: int32) -> int32:
     # Run an N-stage pipeline. Each inter-stage pipe is a Chan bound at
-    # the producer's /fd/1 and the consumer's /fd/0 — ONE bind op (§7).
-    # sys_pipe yields a devtab pipe Chan: a LOCAL pipe is direct Chan
-    # reads, never per-block 9P (§6) — pipe_chan_binds counts the
-    # channel binds and the §18 stage-4 test asserts zero mountrpc.
-    nu: uint64 = cast[uint64](plnode)
+    # the producer's /fd/1 (DEVFD_PIPE_W) and the consumer's /fd/0
+    # (DEVFD_PIPE_R) — ONE bind op per end (§7). sys_pipechan yields a
+    # devtab pipe Chan: a LOCAL pipe is direct Chan reads, never
+    # per-block 9P (§6) — the §18 stage-4 test asserts zero mountrpc.
     nstages: uint64 = nd_kn[plnode]
     if nstages == 0:
         return 0
     if nstages == 1:
-        return run_one_command(nd_kid_at(plnode, 0), 0, 1, 2, 1)
-    # create N-1 pipes
+        return run_one_command(nd_kid_at(plnode, 0), -1, -1, 1)
+    # Create N-1 pipe Chans up front.
     npipes: uint64 = nstages - 1
     pi: uint64 = 0
     while pi < npipes:
-        pair: Array[2, int32]
-        if sys_pipe(&pair[0]) < 0:
-            errstr_set("pipe: out of fds")
+        slot: int32 = sys_pipechan()
+        if slot < 0:
+            errstr_set("pipe: out of pipe channels")
             return 1
-        pl_rfd[pi] = pair[0]
-        pl_wfd[pi] = pair[1]
-        pipe_chan_binds = pipe_chan_binds + 1
+        pl_pipe[pi] = slot
         pi = pi + 1
-    # launch each stage; bind the right pipe Chans at /fd/0 and /fd/1
+    # Launch each stage; bind its in/out pipe Chans at /fd/0 and /fd/1.
     si: uint64 = 0
     while si < nstages:
-        in_fd: int32 = 0
-        out_fd: int32 = 1
+        in_p:  int32 = -1
+        out_p: int32 = -1
         if si > 0:
-            in_fd = pl_rfd[si - 1]       # consumer's /fd/0 = prev pipe
+            in_p = pl_pipe[si - 1]       # consumer's /fd/0 = prev pipe
         if si < npipes:
-            out_fd = pl_wfd[si]          # producer's /fd/1 = this pipe
-        pid: int32 = run_one_command(nd_kid_at(plnode, si),
-                                     in_fd, out_fd, 2, 0)
-        pl_pids[si] = pid
+            out_p = pl_pipe[si]          # producer's /fd/1 = this pipe
+        pl_pids[si] = run_one_command(nd_kid_at(plnode, si),
+                                      in_p, out_p, 0)
         si = si + 1
-    # close all pipe fds in the shell so EOF propagates
-    pi = 0
-    while pi < npipes:
-        sys_close(pl_rfd[pi])
-        sys_close(pl_wfd[pi])
-        pi = pi + 1
-    # wait on every stage; the pipeline's status is the last stage's
+    # Wait on every stage; the pipeline's status is the last stage's.
+    # The shell holds no pipe fd of its own — each pipe Chan is owned
+    # entirely by the two /fd names it was bound at, so EOF propagates
+    # when a stage exits and its Pgrp's /fd table is released.
     last: int32 = 0
     si = 0
     while si < nstages:
@@ -2768,25 +2780,55 @@ def capture_command(sref: uint64) -> int32:
     return v_str_ref(captured_ref)
 
 
+# Scratch /fd slot the shell uses to read a capture pipe (§8). It is
+# a name in the shell's OWN namespace — `{ … }` capture is, like
+# everything else, a Chan bound at an /fd/N name.
+CAPTURE_FD: int32 = 9
+
+
+# Saved argv arena for the nested-capture case (see below).
+cap_argv_save: Array[64, uint64]
+
+
 def _run_and_capture(cmdnode: int32) -> uint64:
-    # Spawn the (single-stage) command with stdout bound to a pipe;
-    # drain the pipe; return an interned string ref of the output
-    # with a single trailing newline stripped.
-    pair: Array[2, int32]
-    if sys_pipe(&pair[0]) < 0:
-        return 0
-    rfd: int32 = pair[0]
-    wfd: int32 = pair[1]
+    # Spawn the (single-stage) command with /fd/1 bound to a pipe
+    # Chan; the shell binds the pipe's read end at its own /fd/9,
+    # opens that name to get a readable fd, drains it. Returns an
+    # interned string ref of the output with one trailing newline
+    # stripped. Command substitution is just another /fd bind (§7/§8).
     k: int32 = nd_kind[cast[uint64](cmdnode)]
+    if k != ND_CMD:
+        # capture of a pipeline stage — not wired at this milestone
+        return 0
+    slot: int32 = sys_pipechan()
+    if slot < 0:
+        return 0
+    # Read end at the shell's own /fd/9; open it for a readable fd.
+    sys_fdbind(0, CAPTURE_FD, DEVFD_PIPE_R, slot)
+    rfd: int32 = sys_open(cast[Ptr[char]]("/fd/9"))
+    # A `{ … }` substitution can occur INSIDE an outer command's argv
+    # build (`echo X `{ … }``). _argv_build uses the module-global
+    # argv_ptr/argv_n arena — so building the inner command's argv
+    # would clobber the outer build in progress. Snapshot the outer
+    # arena, build the inner one, restore on the way out.
+    saved_argv_n: uint64 = argv_n
+    si: uint64 = 0
+    while si < saved_argv_n and si < ARGV_MAX:
+        cap_argv_save[si] = argv_ptr[si]
+        si = si + 1
+    # Spawn the command; bind the pipe write end at its /fd/1.
+    argc: int32 = _argv_build(cmdnode)
     pid: int32 = -1
-    if k == ND_PIPELINE:
-        # capture the last stage of a pipeline
-        pid = -2
-    if k == ND_CMD:
-        pid = run_one_command(cmdnode, 0, wfd, 2, 0)
-    sys_close(wfd)
+    if argc > 0:
+        cmd: Ptr[uint8] = cast[Ptr[uint8]](argv_ptr[0])
+        rc_b: int32 = run_builtin(cmd, argc)
+        if rc_b < 0:
+            pid = spawn_resolved(cmd, cast[Ptr[uint64]](&argv_ptr[0]))
+            if pid >= 0:
+                sys_fdbind(pid, 1, DEVFD_PIPE_W, slot)
+                _wire_redirects(cmdnode, pid)
     total: uint64 = 0
-    if pid >= 0:
+    if pid >= 0 and rfd >= 0:
         while True:
             n: int64 = sys_read(rfd, &capture_buf[total],
                                 4096 - total)
@@ -2796,7 +2838,18 @@ def _run_and_capture(cmdnode: int32) -> uint64:
             if total >= 4096:
                 break
         sys_waitpid(pid)
-    sys_close(rfd)
+    if rfd >= 0:
+        sys_close(rfd)
+    # Release the shell's scratch /fd/9 binding so the pipe Chan is
+    # reclaimed (re-binding CAPTURE_FD to console drops the pipe ref).
+    sys_fdbind(0, CAPTURE_FD, DEVFD_CONS, 0)
+    # Restore the outer command's argv arena that our nested
+    # _argv_build clobbered (see the snapshot above).
+    ri: uint64 = 0
+    while ri < saved_argv_n and ri < ARGV_MAX:
+        argv_ptr[ri] = cap_argv_save[ri]
+        ri = ri + 1
+    argv_n = saved_argv_n
     # strip exactly one trailing newline
     if total > 0 and capture_buf[total - 1] == 10:
         total = total - 1
@@ -3121,8 +3174,10 @@ def exec_try(node: int32) -> int32:
 
 
 def exec_command(node: int32) -> int32:
-    # A single command stage that is NOT inside a pipeline.
-    rc: int32 = run_one_command(node, 0, 1, 2, 1)
+    # A single command stage that is NOT inside a pipeline. No pipe
+    # Chans (-1, -1); the child's /fd/0,1,2 are inherited from the
+    # shell's namespace (console) and refined by any redirects.
+    rc: int32 = run_one_command(node, -1, -1, 1)
     eval_status = rc
     # exit / help builtins are handled here for the prompt
     nu: uint64 = cast[uint64](node)
@@ -3242,10 +3297,12 @@ def builtin_help():
 
 
 def _run_prebuilt_command(node: int32, argc: int32) -> int32:
-    # run_one_command rebuilds argv internally; for a single command
-    # statement we just defer to it (argv is rebuilt — cheap, and
-    # keeps redirect handling in one place).
-    return run_one_command(node, 0, 1, 2, 1)
+    # exec_statement has ALREADY run _argv_build on `node` (to dispatch
+    # the exit/help/true/false builtins) and argv_ptr is still current.
+    # Pass prebuilt=1 so run_one_command_x does NOT rebuild — a rebuild
+    # would re-RUN any `{ … }` command substitution in the argv. No
+    # pipe Chans for a single command statement (-1, -1).
+    return run_one_command_x(node, -1, -1, 1, 1)
 
 
 def _builtin_kill(argc: int32):
@@ -3489,6 +3546,20 @@ def cont_prompt():
     write_cstr1("> ")
 
 
+def _setup_fd_namespace():
+    # HAMSH §7: make /fd a name in the shell's namespace and seed the
+    # standard streams. `bind '#d' /fd` grafts the fd device so opens
+    # of /fd/N resolve through it. Then /fd/0,1,2 are bound to the
+    # console — the shell's ambient stdio. Every command the shell
+    # spawns inherits this /fd table via the COW Pgrp clone (§9), so
+    # a bare command's stdio "just works" before any pipe/redirect.
+    sys_bind(cast[Ptr[char]]("/fd"), cast[Ptr[char]]("#d"), MREPL_FLAG)
+    # pid 0 == "my own Pgrp". Seed the three standard /fd names.
+    sys_fdbind(0, 0, DEVFD_CONS, 0)
+    sys_fdbind(0, 1, DEVFD_CONS, 0)
+    sys_fdbind(0, 2, DEVFD_CONS, 0)
+
+
 def main() -> int32:
     str_arena_init()
     scope_reset()
@@ -3496,6 +3567,8 @@ def main() -> int32:
     # Seed a minimal environment so $PATH resolves.
     env_set("PATH", "/bin:/sbin:/usr/bin")
     env_set("HOME", "/")
+    # HAMSH §7: stdio as named channels — /fd/0,1,2 in the namespace.
+    _setup_fd_namespace()
     write_cstr1("hamsh — Hamnix shell. Type 'help'.\n")
 
     # If a startup script exists, run it first (init/rc).

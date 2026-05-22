@@ -92,6 +92,12 @@ from mm.slab import kzalloc, kfree
 from sys.src.port9.port.9p_client import (
     p9c_detach, p9c_conn_owner_inc,
 )
+# HAMSH §7: the `#d` fd device keeps a per-Pgrp /fd-name table as a
+# side structure. A Pgrp's /fd table is COW-copied when the Pgrp is
+# cloned (rfork RFNAMEG) and released when the Pgrp's last referer is
+# gone — so the device must be told at both lifecycle points. These
+# are the only two hooks; devfd.ad does not otherwise touch chan.ad.
+from sys.src.port9.port.devfd import devfd_clone_row, devfd_free_row
 
 
 # Chan kind discriminator. CHAN_KIND_NONE marks an unused chan
@@ -330,6 +336,11 @@ def pgrp_clone(src: uint64) -> uint64:
     if new_addr == 0:
         return 0
     _copy_mtab(src, new_addr)
+    # HAMSH §7: COW-copy the source Pgrp's /fd-name table into the
+    # clone, so the child's stdio (/fd/0,1,2) starts as a private
+    # snapshot of the parent's. Pipe ends are refcount-bumped inside
+    # devfd_clone_row.
+    devfd_clone_row(src, new_addr)
     return new_addr
 
 
@@ -388,6 +399,10 @@ def pgrp_ref_dec(p: uint64) -> int32:
         # pointer is dangling after kfree; this is the standard
         # refcount contract (caller must not retain it past ref_dec).
         _detach_srv_conns(p)
+        # HAMSH §7: release the Pgrp's /fd-name table — every pipe end
+        # it still references gets its refcount dropped. Runs before
+        # kfree (it reads the side table keyed by this pointer).
+        devfd_free_row(p)
         kfree(p)
     return new_ref
 
