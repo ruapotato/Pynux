@@ -115,6 +115,8 @@ tests/u-binary/src/dlopen_demo/libanswer.so
 tests/u-binary/src/musl_sigfull/sigfull
 tests/u-binary/src/musl_sigchld/sigchld
 tests/u-binary/src/musl_sigpipe/sigpipe
+tests/u-binary/src/sockopt/sockopt
+tests/u-binary/src/udptest/udptest
 tests/u-binary/busybox
 
 # Debian minbase rootfs staged by tests/distros/debian-minbase/BUILD.sh
