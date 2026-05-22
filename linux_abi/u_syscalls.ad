@@ -78,6 +78,30 @@ from fs.vfs import (
     # already-loaded-DSO check off (st_dev, st_ino).
     vfs_fd_inode,
     vfs_socket_fd_set_record, vfs_socket_fd_get_record,
+    # §5 Layer-2 async I/O: fd-table bridge for epoll/eventfd/timerfd/
+    # signalfd objects + the non-destructive poll readiness probe.
+    vfs_alloc_l2_fd, vfs_fd_marker, vfs_l2_fd_set_buf, vfs_l2_fd_get_buf,
+    vfs_fd_poll, vfs_read_nb, vfs_write_nb,
+)
+# §5 Layer-2 async I/O — the confined epoll/eventfd/timerfd/signalfd
+# object pools + the O_NONBLOCK bitmap. linux_abi/u_epoll.ad is a
+# Layer-2 leaf (printk + jiffy clock only) — these objects exist SOLELY
+# to satisfy Linux guests and never leak into Layer-1 / 9P / Chan code.
+from linux_abi.u_epoll import (
+    FD_EPOLL_MARK, FD_EVENTFD_MARK, FD_TIMERFD_MARK, FD_SIGNALFD_MARK,
+    uep_nonblock_set, uep_nonblock_get,
+    uefd_alloc, uefd_valid, uefd_read, uefd_readable,
+    utfd_alloc, utfd_valid, utfd_arm, utfd_read, utfd_readable,
+    utfd_gettime_remaining, utfd_gettime_interval,
+    usfd_alloc, usfd_valid, usfd_set_mask, usfd_get_mask, usfd_match,
+    usfd_consume,
+    uepoll_alloc, uepoll_valid, uepoll_ctl_add, uepoll_ctl_mod,
+    uepoll_ctl_del, uepoll_intr_slot_live, uepoll_intr_fd_at,
+    uepoll_intr_ev_at, uepoll_intr_data_at, uepoll_oneshot_disable,
+    uepoll_interest_max,
+    EPOLL_CTL_ADD, EPOLL_CTL_MOD, EPOLL_CTL_DEL,
+    EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLONESHOT,
+    EFD_SEMAPHORE,
 )
 # U-socket: socket(2)/connect(2) on a real TCP connection. The TCP
 # stack itself is drivers/net/tcp.ad; u_socket_state.ad is the per-
@@ -120,7 +144,7 @@ from drivers.net.tls import tls_init, tls_handshake
 from kernel.sched.core import (
     TaskStruct, current_task,
     current_task_pid, task_lookup_by_pid, task_exit_current,
-    signal_post, get_cwd_buf, set_task_cwd, current_idx_get,
+    signal_post, signal_pending, get_cwd_buf, set_task_cwd, current_idx_get,
     set_task_fs_base, set_task_clear_child_tid,
     count_live_linux_peers, yield_to_others,
     get_task_sig_handler, set_task_sig_handler,
@@ -141,7 +165,7 @@ from kernel.sched.core import (
     task_brk_max, set_task_brk_max,
     set_current_errstr,
 )
-from arch.x86.kernel.time import get_jiffies, tsc_monotonic_ns
+from arch.x86.kernel.time import get_jiffies, tsc_monotonic_ns, HZ
 from drivers.rtc.cmos import rtc_boot_epoch_get
 from mm.slab import kmalloc, kfree, kzalloc
 from mm.page_alloc import alloc_pages, free_pages
@@ -418,6 +442,27 @@ SYS_tgkill:          uint64 = 234
 # nested handler delivery and never switches to the alt stack; the
 # handler just records the values and returns 0 so glibc keeps moving.
 SYS_sigaltstack:     uint64 = 131
+# §5 Layer-2 async I/O — the fd-based event primitives real Linux
+# server daemons are built around. These syscall NUMBERS are the fixed
+# Linux x86_64 ABI values (a Linux ELF binary issues `epoll_wait` as
+# syscall 232 — the number cannot be renumbered); the orchestrator's
+# "use 290+" guidance is for NATIVE Hamnix syscalls in arch/x86/kernel/
+# syscall.ad, and these add NOTHING there — epoll(7) is Layer-2-only and
+# is dispatched entirely through linux_u_syscall_dispatch below. The
+# objects themselves are confined in linux_abi/u_epoll.ad and never leak
+# into Layer 1.
+SYS_epoll_create:    uint64 = 213
+SYS_epoll_wait:      uint64 = 232
+SYS_epoll_ctl:       uint64 = 233
+SYS_epoll_pwait:     uint64 = 281
+SYS_epoll_create1:   uint64 = 291
+SYS_eventfd:         uint64 = 284
+SYS_eventfd2:        uint64 = 290
+SYS_timerfd_create:  uint64 = 283
+SYS_timerfd_settime: uint64 = 286
+SYS_timerfd_gettime: uint64 = 287
+SYS_signalfd:        uint64 = 282
+SYS_signalfd4:       uint64 = 289
 
 
 # Linux errno values returned by stub handlers. Kept local to avoid
@@ -647,8 +692,49 @@ def _u_translate_proc_to_dev(path: Ptr[uint8]) -> int32:
 def _u_read(a0: uint64, a1: uint64, a2: uint64,
             a3: uint64, a4: uint64, a5: uint64) -> int64:
     # ssize_t read(int fd, void *buf, size_t count)
-    n: int64 = vfs_read(cast[int32](a0),
-                        cast[Ptr[uint8]](a1), a2)
+    fd: int32 = cast[int32](a0)
+    marker: uint32 = vfs_fd_marker(fd)
+    nonblock: int32 = _u_fd_is_nonblock(fd)
+    # §5: a signalfd fd delivers signals as readable siginfo records —
+    # vfs.ad has no access to the caller's pending-signal word, so the
+    # signalfd read is serviced here in the Layer-2 shim.
+    if marker == FD_SIGNALFD_MARK:
+        r: int64 = _u_signalfd_read(fd, a1, a2)
+        if r == ELINUX_AGAIN and nonblock == 0:
+            # Blocking signalfd read: yield until a signal arrives.
+            while r == ELINUX_AGAIN:
+                yield_to_others()
+                r = _u_signalfd_read(fd, a1, a2)
+        return r
+    # §5: a non-blocking eventfd / timerfd read must return -EAGAIN when
+    # the object has nothing pending — vfs_read_nb has no would-block
+    # arm for these markers (it would fall through to the blocking
+    # vfs_read), so the non-blocking case is short-circuited here. The
+    # blocking case is left to vfs_read's yield loop.
+    if marker == FD_EVENTFD_MARK or marker == FD_TIMERFD_MARK:
+        if nonblock != 0:
+            ready: int32 = 0
+            if marker == FD_EVENTFD_MARK:
+                es: int32 = cast[int32](vfs_l2_fd_get_buf(fd)) - 1
+                ready = uefd_readable(es)
+            else:
+                ts: int32 = cast[int32](vfs_l2_fd_get_buf(fd)) - 1
+                ready = utfd_readable(ts)
+            if ready == 0:
+                return ELINUX_AGAIN
+        return vfs_read(fd, cast[Ptr[uint8]](a1), a2)
+    # §5: O_NONBLOCK end-to-end. A would-block read on a non-blocking
+    # socket / pipe fd must return -EAGAIN rather than yield-spinning in
+    # vfs_read's blocking loop. vfs_read_nb returns >0 bytes ready,
+    # 0 for would-block, -1 for a true EOF. We translate 0 -> -EAGAIN.
+    if nonblock != 0:
+        nb: int64 = vfs_read_nb(fd, cast[Ptr[uint8]](a1), a2)
+        if nb == 0:
+            return ELINUX_AGAIN
+        if nb < 0:
+            return 0                       # vfs_read_nb -1 == EOF
+        return nb
+    n: int64 = vfs_read(fd, cast[Ptr[uint8]](a1), a2)
     return n
 
 
@@ -664,8 +750,18 @@ def _u_write(a0: uint64, a1: uint64, a2: uint64,
     # daemon-friendly "broken connection ⇒ die" default) or invokes
     # the installed handler. Either way write(2) still returns -EPIPE,
     # so a daemon that ignores SIGPIPE sees the errno and copes.
-    n: int64 = vfs_write(cast[int32](a0),
-                         cast[Ptr[uint8]](a1), a2)
+    # §5: O_NONBLOCK end-to-end. A would-block write on a non-blocking
+    # pipe / socket fd must return -EAGAIN rather than yield-spinning in
+    # vfs_write's blocking loop. vfs_write_nb returns >0 bytes accepted,
+    # 0 for would-block, or a negative errno; 0 maps to -EAGAIN.
+    fd: int32 = cast[int32](a0)
+    n: int64 = 0
+    if _u_fd_is_nonblock(fd) != 0:
+        n = vfs_write_nb(fd, cast[Ptr[uint8]](a1), a2)
+        if n == 0 and a2 != 0:
+            return ELINUX_AGAIN
+    else:
+        n = vfs_write(fd, cast[Ptr[uint8]](a1), a2)
     if n == ELINUX_PIPE:
         signal_post(current_idx_get(), SIGPIPE)
     return n
@@ -702,6 +798,10 @@ def _u_open(a0: uint64, a1: uint64, a2: uint64,
 def _u_close(a0: uint64, a1: uint64, a2: uint64,
              a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int close(int fd)
+    # §5: clear the fd's O_NONBLOCK flag in the Layer-2 bitmap so a
+    # later fd allocated at the same slot starts blocking (the Linux
+    # default) rather than inheriting a stale non-blocking flag.
+    _u_set_fd_nonblock(cast[int32](a0), 0)
     rc: int32 = vfs_close(cast[int32](a0))
     return cast[int64](rc)
 
@@ -802,15 +902,21 @@ def _u_pipe(a0: uint64, a1: uint64, a2: uint64,
 def _u_pipe2(a0: uint64, a1: uint64, a2: uint64,
              a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int pipe2(int pipefd[2], int flags)
-    # Linux's pipe2 == pipe + apply O_CLOEXEC / O_NONBLOCK / O_DIRECT
-    # to both ends atomically. Hamnix has no FD_CLOEXEC bookkeeping
-    # (exec just re-creates the fd table), no O_NONBLOCK on pipes
-    # (vfs_read on FD_PIPE_MARK_R yields rather than returning -EAGAIN),
-    # and no packet-mode O_DIRECT. We forward to vfs_pipe and ignore
-    # flags — same semantic effect as on a Hamnix fd table.
+    # Linux's pipe2 == pipe + apply O_CLOEXEC / O_NONBLOCK / O_DIRECT to
+    # both ends atomically. Hamnix has no FD_CLOEXEC bookkeeping (exec
+    # rebuilds the fd table) and no packet-mode O_DIRECT, but §5 honours
+    # O_NONBLOCK: both fds are flagged so a would-block read/write
+    # returns -EAGAIN — epoll-driven pipe daemons depend on this.
     if a0 == 0:
         return ELINUX_INVAL
     rc: int32 = vfs_pipe(cast[Ptr[int32]](a0))
+    if rc < 0:
+        return cast[int64](rc)
+    if (a1 & O_NONBLOCK_BIT) != 0:
+        rfd: int32 = cast[Ptr[int32]](a0)[0]
+        wfd: int32 = cast[Ptr[int32]](a0)[1]
+        _u_set_fd_nonblock(rfd, 1)
+        _u_set_fd_nonblock(wfd, 1)
     return cast[int64](rc)
 
 
@@ -983,10 +1089,25 @@ def _u_pselect6(a0: uint64, a1: uint64, a2: uint64,
                 a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int pselect6(int n, fd_set *r, fd_set *w, fd_set *e,
     #              const struct timespec *timeout, void *sigmask)
-    # No real readiness machinery yet — return -ENOSYS so busybox
-    # falls back to a blocking read. (A future U-milestone wires
-    # this through actual fd-readiness once tty + pipe gain it.)
-    return ELINUX_NOSYS
+    # §5: same readiness-driven scan as select(2); the timeout is a
+    # struct timespec { i64 tv_sec; i64 tv_nsec } here, and the trailing
+    # sigmask arg is ignored (signals are delivered cooperatively at the
+    # syscall boundary — pselect6's atomic-mask race cannot occur).
+    nfds: uint64 = a0
+    bounded: int32 = 1
+    tj: uint64 = UEP_WAIT_MAX_JIFFIES
+    if a4 != 0:
+        sec:  uint64 = cast[Ptr[uint64]](a4)[0]
+        nsec: uint64 = cast[Ptr[uint64]](a4 + 8)[0]
+        if sec == 0 and nsec == 0:
+            bounded = 0
+        else:
+            tj = sec * HZ + nsec / (1000000000 / HZ)
+            if tj == 0:
+                tj = 1
+            if tj > UEP_WAIT_MAX_JIFFIES:
+                tj = UEP_WAIT_MAX_JIFFIES
+    return _u_select_common(nfds, a1, a2, a3, tj, bounded)
 
 
 def _u_getrusage(a0: uint64, a1: uint64, a2: uint64,
@@ -1410,7 +1531,11 @@ def _u_clock_gettime(a0: uint64, a1: uint64, a2: uint64,
 #       short revents;  // 2 bytes  offset 6
 #   };  // total 8 bytes
 POLLFD_SIZE: uint64 = 8
-POLLIN_BIT:  uint32 = 0x0001
+POLLIN_BIT:   uint32 = 0x0001
+POLLPRI_BIT:  uint32 = 0x0002
+POLLOUT_BIT:  uint32 = 0x0004
+POLLERR_BIT:  uint32 = 0x0008
+POLLHUP_BIT:  uint32 = 0x0010
 POLLNVAL_BIT: uint32 = 0x0020
 
 
@@ -1428,9 +1553,12 @@ def _u_socket(a0: uint64, a1: uint64, a2: uint64,
     domain:    uint32 = cast[uint32](a0)
     sock_type: uint32 = cast[uint32](a1)
     # SOCK_CLOEXEC (0x80000) / SOCK_NONBLOCK (0x800) ride in the high
-    # bits of `type` on Linux. Hamnix has no CLOEXEC table and no
-    # non-blocking sockets yet (see V1 backlog), so mask them off
-    # before the type compare rather than failing the call.
+    # bits of `type` on Linux. Hamnix has no CLOEXEC table, so that bit
+    # is masked off; §5 honours SOCK_NONBLOCK end-to-end — the flag is
+    # captured here and applied to the fd after it is allocated.
+    sock_nonblock: int32 = 0
+    if (cast[uint64](sock_type) & O_NONBLOCK_BIT) != 0:
+        sock_nonblock = 1
     sock_type = sock_type & 0xFF
     if domain != USOCK_AF_INET:
         # Only AF_INET — AF_UNIX / AF_INET6 not supported.
@@ -1477,6 +1605,10 @@ def _u_socket(a0: uint64, a1: uint64, a2: uint64,
         vfs_close(fd)
         set_current_errstr("socket: fd record bind failed")
         return ELINUX_BADF
+    # §5: apply SOCK_NONBLOCK — a would-block read/write on this fd now
+    # returns -EAGAIN instead of blocking (epoll is useless without it).
+    if sock_nonblock != 0:
+        _u_set_fd_nonblock(fd, 1)
     return cast[int64](fd)
 
 
@@ -1790,9 +1922,14 @@ def _u_accept4(a0: uint64, a1: uint64, a2: uint64,
                a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int accept4(int sockfd, struct sockaddr *addr,
     #             socklen_t *addrlen, int flags)
-    # Same shape as accept(2) — flags (CLOEXEC / NONBLOCK) have no
-    # state to apply at this scope.
-    return _u_accept(a0, a1, a2, a3, a4, a5)
+    # Same shape as accept(2). §5: SOCK_NONBLOCK in `flags` is applied
+    # to the freshly-accepted connection fd so an epoll-driven server
+    # loop gets a non-blocking client socket back.
+    nfd: int64 = _u_accept(a0, a1, a2, a3, a4, a5)
+    if nfd >= 0:
+        if (a3 & O_NONBLOCK_BIT) != 0:
+            _u_set_fd_nonblock(cast[int32](nfd), 1)
+    return nfd
 
 
 def _u_bind(a0: uint64, a1: uint64, a2: uint64,
@@ -2180,21 +2317,36 @@ def _u_recvfrom(a0: uint64, a1: uint64, a2: uint64,
     if a4 != 0:
         if a5 != 0:
             cast[Ptr[uint32]](a5)[0] = 0
-    return vfs_read(fd, cast[Ptr[uint8]](a1), a2)
+    # SOCK_STREAM recvfrom degrades to read(2) — route through _u_read
+    # so the §5 O_NONBLOCK path applies (a non-blocking stream socket's
+    # would-block recv must return -EAGAIN, not yield-block).
+    return _u_read(a0, a1, a2, 0, 0, 0)
 
 
-def _u_poll(a0: uint64, a1: uint64, a2: uint64,
-            a3: uint64, a4: uint64, a5: uint64) -> int64:
-    # int poll(struct pollfd *fds, nfds_t nfds, int timeout)
-    # Walk the array. POLLIN is asserted for any open fd that asked
-    # for it (we treat every open fd as ready in a single-task system
-    # — blocking reads still block on actual data arrival); POLLNVAL
-    # is asserted for fds outside the table or in the CLOSED state.
-    # Timeout is ignored — the loop already returns "ready now".
-    if a0 == 0 and a1 != 0:
-        return ELINUX_INVAL
-    base: uint64 = a0
-    nfds: uint64 = a1
+def _u_poll_fd_revents(fd: int32, events: uint32) -> uint32:
+    # The revents for one pollfd entry: probe the fd's real readiness
+    # (non-destructive, via vfs_fd_poll) and intersect with the
+    # requested `events`. POLLERR / POLLHUP / POLLNVAL are reported
+    # unconditionally (Linux semantics — the caller cannot mask them
+    # out). A signalfd needs the caller's pending-signal word, which
+    # vfs.ad cannot see — handled here in the Layer-2 shim.
+    if vfs_fd_is_open(fd) == 0:
+        return POLLNVAL_BIT
+    ready: uint32 = vfs_fd_poll(fd)
+    if vfs_fd_marker(fd) == FD_SIGNALFD_MARK:
+        ss: int32 = cast[int32](vfs_l2_fd_get_buf(fd)) - 1
+        if usfd_match(ss, signal_pending(current_idx_get())) != 0:
+            ready = ready | POLLIN_BIT
+    # The bits the caller may request (POLLIN/PRI/OUT) are masked by
+    # `events`; the error bits always pass through.
+    requestable: uint32 = events | POLLERR_BIT | POLLHUP_BIT \
+                          | POLLNVAL_BIT
+    return ready & requestable
+
+
+def _u_poll_scan(base: uint64, nfds: uint64) -> int64:
+    # One pass over the pollfd array — fill every entry's revents and
+    # return the count of entries that became ready.
     ready: int64 = 0
     i: uint64 = 0
     while i < nfds:
@@ -2202,21 +2354,50 @@ def _u_poll(a0: uint64, a1: uint64, a2: uint64,
         fd:     int32  = cast[Ptr[int32]](entry)[0]
         events: uint32 = cast[uint32](cast[Ptr[uint16]](entry + 4)[0])
         revents: uint32 = 0
-        if fd < 0:
-            # Linux: negative fds are skipped (no revents). Caller has
-            # opted out of polling this slot.
-            revents = 0
-        else:
-            if vfs_fd_is_open(fd) == 0:
-                revents = POLLNVAL_BIT
-            else:
-                if (events & POLLIN_BIT) != 0:
-                    revents = revents | POLLIN_BIT
+        if fd >= 0:
+            revents = _u_poll_fd_revents(fd, events)
         cast[Ptr[uint16]](entry + 6)[0] = cast[uint16](revents)
         if revents != 0:
             ready = ready + 1
         i = i + 1
     return ready
+
+
+def _u_poll(a0: uint64, a1: uint64, a2: uint64,
+            a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int poll(struct pollfd *fds, nfds_t nfds, int timeout)
+    #
+    # §5: a real readiness-driven poll(2). Each pollfd is probed via
+    # the non-destructive vfs_fd_poll readiness model (sockets, pipes,
+    # eventfd/timerfd/signalfd, regular files). `timeout` is honoured:
+    # -1 blocks (bounded — see UEP_WAIT_MAX_JIFFIES), 0 is a single
+    # immediate pass, >0 is milliseconds. negative fds are skipped.
+    if a0 == 0 and a1 != 0:
+        return ELINUX_INVAL
+    base: uint64 = a0
+    nfds: uint64 = a1
+    timeout_ms: int64 = cast[int64](a2)
+    deadline: uint64 = 0
+    bounded: int32 = 1
+    start: uint64 = get_jiffies()
+    if timeout_ms < 0:
+        deadline = start + UEP_WAIT_MAX_JIFFIES
+    elif timeout_ms == 0:
+        bounded = 0
+    else:
+        dj: uint64 = (cast[uint64](timeout_ms) * HZ + 999) / 1000
+        if dj > UEP_WAIT_MAX_JIFFIES:
+            dj = UEP_WAIT_MAX_JIFFIES
+        deadline = start + dj
+    while True:
+        ready: int64 = _u_poll_scan(base, nfds)
+        if ready > 0:
+            return ready
+        if bounded == 0:
+            return 0
+        if get_jiffies() >= deadline:
+            return 0
+        yield_to_others()
 
 
 # =====================================================================
@@ -3044,9 +3225,133 @@ def _u_access(a0: uint64, a1: uint64, a2: uint64,
     return 0
 
 
-def _u_unimpl_select(a0: uint64, a1: uint64, a2: uint64,
-                     a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+# --- select(2) -------------------------------------------------------
+#
+# select(2) uses fd_set bitmaps: word `fd >> 6`, bit `fd & 63`. nfds
+# bounds the highest fd+1 to scan. Hamnix's fd table is 16 slots, so a
+# single 64-bit word covers every possible fd — but we read/write the
+# caller's fd_set at the correct word offset so a libc that allocated a
+# full 128-byte set is satisfied. select is the simpler fallback many
+# programs probe before epoll; §5 makes it readiness-driven.
+
+def _fdset_test(set_ptr: uint64, fd: int32) -> int32:
+    # 1 if `fd` is set in the fd_set at set_ptr.
+    if set_ptr == 0:
+        return 0
+    word: uint64 = cast[uint64](fd) >> 6
+    bit:  uint64 = cast[uint64](fd) & 63
+    w: uint64 = cast[Ptr[uint64]](set_ptr + word * 8)[0]
+    if (w & (cast[uint64](1) << bit)) != 0:
+        return 1
+    return 0
+
+
+def _fdset_clear_all(set_ptr: uint64, nfds: uint64):
+    # Zero every word of the fd_set that covers fds [0, nfds).
+    if set_ptr == 0:
+        return
+    words: uint64 = (nfds + 63) / 64
+    i: uint64 = 0
+    while i < words:
+        cast[Ptr[uint64]](set_ptr + i * 8)[0] = 0
+        i = i + 1
+
+
+def _fdset_add(set_ptr: uint64, fd: int32):
+    if set_ptr == 0:
+        return
+    word: uint64 = cast[uint64](fd) >> 6
+    bit:  uint64 = cast[uint64](fd) & 63
+    cur: uint64 = cast[Ptr[uint64]](set_ptr + word * 8)[0]
+    cast[Ptr[uint64]](set_ptr + word * 8)[0] = \
+        cur | (cast[uint64](1) << bit)
+
+
+def _u_select_scan(nfds: uint64, rd: uint64, wr: uint64, ex: uint64,
+                   out_rd: uint64, out_wr: uint64,
+                   out_ex: uint64) -> int64:
+    # One pass: for each fd in [0, nfds) requested in rd/wr/ex, probe
+    # readiness and build the result sets. Returns the total count of
+    # ready (fd, condition) pairs — select's return value.
+    _fdset_clear_all(out_rd, nfds)
+    _fdset_clear_all(out_wr, nfds)
+    _fdset_clear_all(out_ex, nfds)
+    count: int64 = 0
+    fd: uint64 = 0
+    while fd < nfds:
+        fds: int32 = cast[int32](fd)
+        want_r: int32 = _fdset_test(rd, fds)
+        want_w: int32 = _fdset_test(wr, fds)
+        want_e: int32 = _fdset_test(ex, fds)
+        if want_r != 0 or want_w != 0 or want_e != 0:
+            ev: uint32 = 0
+            if vfs_fd_is_open(fds) != 0:
+                ev = vfs_fd_poll(fds)
+                if vfs_fd_marker(fds) == FD_SIGNALFD_MARK:
+                    ssel: int32 = cast[int32](vfs_l2_fd_get_buf(fds)) - 1
+                    if usfd_match(ssel,
+                                  signal_pending(current_idx_get())) != 0:
+                        ev = ev | POLLIN_BIT
+            # readable: POLLIN or POLLHUP; writable: POLLOUT; the
+            # exception set maps to POLLERR/POLLPRI.
+            if want_r != 0:
+                if (ev & (POLLIN_BIT | POLLHUP_BIT)) != 0:
+                    _fdset_add(out_rd, fds)
+                    count = count + 1
+            if want_w != 0:
+                if (ev & POLLOUT_BIT) != 0:
+                    _fdset_add(out_wr, fds)
+                    count = count + 1
+            if want_e != 0:
+                if (ev & (POLLERR_BIT | POLLPRI_BIT)) != 0:
+                    _fdset_add(out_ex, fds)
+                    count = count + 1
+        fd = fd + 1
+    return count
+
+
+def _u_select_common(nfds: uint64, rd: uint64, wr: uint64, ex: uint64,
+                     timeout_jiffies: uint64, bounded: int32) -> int64:
+    # Shared select / pselect6 body. The caller's three fd_sets are
+    # rewritten IN PLACE to the ready subset. timeout: bounded==0 is a
+    # single immediate pass; otherwise yield-spin until ready or the
+    # jiffy deadline passes.
+    if nfds > 1024:
+        return ELINUX_INVAL
+    start: uint64 = get_jiffies()
+    deadline: uint64 = start + timeout_jiffies
+    while True:
+        n: int64 = _u_select_scan(nfds, rd, wr, ex, rd, wr, ex)
+        if n > 0:
+            return n
+        if bounded == 0:
+            return 0
+        if get_jiffies() >= deadline:
+            return 0
+        yield_to_others()
+
+
+def _u_select(a0: uint64, a1: uint64, a2: uint64,
+              a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int select(int nfds, fd_set *r, fd_set *w, fd_set *e,
+    #            struct timeval *timeout)
+    # struct timeval { i64 tv_sec; i64 tv_usec }. A NULL timeout means
+    # block; a zero timeout is a non-blocking poll.
+    nfds: uint64 = a0
+    bounded: int32 = 1
+    tj: uint64 = UEP_WAIT_MAX_JIFFIES
+    if a4 != 0:
+        sec:  uint64 = cast[Ptr[uint64]](a4)[0]
+        usec: uint64 = cast[Ptr[uint64]](a4 + 8)[0]
+        if sec == 0 and usec == 0:
+            bounded = 0
+        else:
+            tj = sec * HZ + usec / (1000000 / HZ)
+            if tj == 0:
+                tj = 1
+            if tj > UEP_WAIT_MAX_JIFFIES:
+                tj = UEP_WAIT_MAX_JIFFIES
+    return _u_select_common(nfds, a1, a2, a3, tj, bounded)
 
 
 def _u_sched_yield(a0: uint64, a1: uint64, a2: uint64,
@@ -3221,6 +3526,12 @@ def _u_execve(a0: uint64, a1: uint64, a2: uint64,
     # path / bad ELF) do_execve returns a negative Linux errno which
     # we forward unchanged: that's what glibc's execve() wrapper
     # expects to see in %rax to flip errno and report `perror`.
+    #
+    # §5 note: O_NONBLOCK is INTENTIONALLY left intact across execve —
+    # do_execve preserves the fd table (Hamnix has no FD_CLOEXEC), and
+    # Linux likewise preserves O_NONBLOCK on a surviving fd, so the
+    # per-fd bitmap stays valid for the new image. uep_nonblock_clear_
+    # task is used only on task teardown, not here.
     return do_execve(a0, a1, a2)
 
 
@@ -3548,8 +3859,22 @@ def _u_fcntl(a0: uint64, a1: uint64, a2: uint64,
     if cmd == F_SETFD:
         return 0
     if cmd == F_GETFL:
-        return 0
+        # §5: report the fd's access mode + O_NONBLOCK. Hamnix opens
+        # are read-write at the fd-table level, so O_RDWR (2) is the
+        # honest base; OR in O_NONBLOCK (0x800) if the §5 bitmap has it.
+        flv: int64 = 2                       # O_RDWR
+        if _u_fd_is_nonblock(cast[int32](a0)) != 0:
+            flv = flv | cast[int64](O_NONBLOCK_BIT)
+        return flv
     if cmd == F_SETFL:
+        # §5: F_SETFL is how a daemon toggles O_NONBLOCK after open
+        # (the standard fcntl(fd, F_SETFL, fl | O_NONBLOCK) idiom).
+        # Other settable bits (O_APPEND / O_DIRECT) have no fd-table
+        # state to apply; we honour O_NONBLOCK and accept the rest.
+        on: int32 = 0
+        if (a2 & O_NONBLOCK_BIT) != 0:
+            on = 1
+        _u_set_fd_nonblock(cast[int32](a0), on)
         return 0
     if cmd == F_GETLK:
         return 0
@@ -4212,6 +4537,419 @@ def _u_readlinkat(a0: uint64, a1: uint64, a2: uint64,
 
 
 # =====================================================================
+# §5 — Layer-2 async I/O: epoll / eventfd / timerfd / signalfd
+# =====================================================================
+#
+# The fd-based event primitives real Linux server daemons are built
+# around. A daemon registers its socket / pipe / eventfd / timerfd fds
+# into one epoll fd, then loops in epoll_wait. These are Layer-2-ONLY
+# confined objects (linux_abi/u_epoll.ad) — they exist solely to satisfy
+# Linux guests and never become a dependency of native Layer-1 code.
+#
+# Common flag bits (high bits of `type` / standalone flag args). Hamnix
+# has no FD_CLOEXEC table, so *_CLOEXEC is masked off; *_NONBLOCK is
+# honoured end-to-end via the Layer-2 O_NONBLOCK bitmap.
+O_NONBLOCK_BIT:  uint64 = 0x800
+O_CLOEXEC_BIT:   uint64 = 0x80000
+
+# A poll(2) timeout / epoll_wait timeout of this many jiffies is the
+# upper bound we spin-yield before giving up — bounded so a daemon with
+# a genuinely-infinite (-1) timeout and no ready fd can't wedge the
+# cooperative scheduler. ~30 s at HZ=100. A real ready fd returns
+# immediately; this only caps the idle case.
+UEP_WAIT_MAX_JIFFIES: uint64 = 3000
+
+
+def _u_set_fd_nonblock(fd: int32, flags_have_nonblock: int32):
+    # Record / clear O_NONBLOCK for `fd` in the current task's Layer-2
+    # bitmap. Used by socket(SOCK_NONBLOCK), accept4, pipe2, eventfd2,
+    # timerfd_create, signalfd4, and fcntl(F_SETFL).
+    uep_nonblock_set(current_idx_get(), fd, flags_have_nonblock)
+
+
+def _u_fd_is_nonblock(fd: int32) -> int32:
+    return uep_nonblock_get(current_idx_get(), fd)
+
+
+# --- eventfd ---------------------------------------------------------
+
+def _u_eventfd2(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int eventfd2(unsigned int initval, int flags)
+    # flags: EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC.
+    initval: uint64 = a0
+    flags:   uint64 = a1
+    semaphore: int32 = 0
+    if (flags & cast[uint64](EFD_SEMAPHORE)) != 0:
+        semaphore = 1
+    es: int32 = uefd_alloc(initval, semaphore)
+    if es < 0:
+        set_current_errstr("eventfd: object pool exhausted")
+        return ELINUX_MFILE
+    fd: int32 = vfs_alloc_l2_fd(FD_EVENTFD_MARK)
+    if fd < 0:
+        set_current_errstr("eventfd: out of fd slots")
+        return ELINUX_MFILE
+    # fd_buf carries slot+1 (0 == "no object", same encoding as sockets).
+    if vfs_l2_fd_set_buf(fd, cast[uint64](es + 1)) != 0:
+        vfs_close(fd)
+        return ELINUX_BADF
+    if (flags & O_NONBLOCK_BIT) != 0:
+        _u_set_fd_nonblock(fd, 1)
+    return cast[int64](fd)
+
+
+def _u_eventfd(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int eventfd(unsigned int initval) — the flag-less legacy form.
+    return _u_eventfd2(a0, 0, a2, a3, a4, a5)
+
+
+# --- timerfd ---------------------------------------------------------
+
+# clockid values we accept (CLOCK_REALTIME / CLOCK_MONOTONIC) — both map
+# onto the same 100 Hz jiffy clock at this scale.
+UEP_CLOCK_REALTIME:  uint64 = 0
+UEP_CLOCK_MONOTONIC: uint64 = 1
+
+
+def _u_ts_to_jiffies(ts_ptr: uint64) -> uint64:
+    # Convert a struct timespec { i64 tv_sec; i64 tv_nsec } at ts_ptr
+    # into a jiffy count (HZ=100 -> 10 ms granularity). A NULL pointer
+    # or all-zero timespec yields 0.
+    if ts_ptr == 0:
+        return 0
+    sec:  uint64 = cast[Ptr[uint64]](ts_ptr)[0]
+    nsec: uint64 = cast[Ptr[uint64]](ts_ptr + 8)[0]
+    j: uint64 = sec * HZ + nsec / (1000000000 / HZ)
+    # An armed timer with a sub-tick delay still has to fire — round a
+    # non-zero but sub-jiffy delay up to one jiffy.
+    if j == 0:
+        if sec != 0 or nsec != 0:
+            j = 1
+    return j
+
+
+def _u_jiffies_to_ts(j: uint64, ts_ptr: uint64):
+    # Inverse of _u_ts_to_jiffies — write a jiffy count back as a
+    # struct timespec at ts_ptr (used by timerfd_gettime).
+    if ts_ptr == 0:
+        return
+    cast[Ptr[uint64]](ts_ptr)[0]     = j / HZ
+    cast[Ptr[uint64]](ts_ptr + 8)[0] = (j % HZ) * (1000000000 / HZ)
+
+
+def _u_timerfd_create(a0: uint64, a1: uint64, a2: uint64,
+                      a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int timerfd_create(int clockid, int flags)
+    clockid: uint64 = a0
+    flags:   uint64 = a1
+    if clockid != UEP_CLOCK_REALTIME and clockid != UEP_CLOCK_MONOTONIC:
+        set_current_errstr("timerfd_create: unsupported clockid")
+        return ELINUX_INVAL
+    ts: int32 = utfd_alloc()
+    if ts < 0:
+        set_current_errstr("timerfd_create: object pool exhausted")
+        return ELINUX_MFILE
+    fd: int32 = vfs_alloc_l2_fd(FD_TIMERFD_MARK)
+    if fd < 0:
+        set_current_errstr("timerfd_create: out of fd slots")
+        return ELINUX_MFILE
+    if vfs_l2_fd_set_buf(fd, cast[uint64](ts + 1)) != 0:
+        vfs_close(fd)
+        return ELINUX_BADF
+    if (flags & O_NONBLOCK_BIT) != 0:
+        _u_set_fd_nonblock(fd, 1)
+    return cast[int64](fd)
+
+
+def _u_timerfd_settime(a0: uint64, a1: uint64, a2: uint64,
+                       a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int timerfd_settime(int fd, int flags,
+    #                     const struct itimerspec *new,
+    #                     struct itimerspec *old)
+    # struct itimerspec { struct timespec it_interval; it_value; }
+    # — it_interval at offset 0, it_value at offset 16. `flags`
+    # (TFD_TIMER_ABSTIME) is ignored: we treat it_value as relative,
+    # which is what timeout-loop daemons use.
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_marker(fd) != FD_TIMERFD_MARK:
+        return ELINUX_BADF
+    ts: int32 = cast[int32](vfs_l2_fd_get_buf(fd)) - 1
+    if utfd_valid(ts) == 0:
+        return ELINUX_BADF
+    if a2 == 0:
+        return ELINUX_INVAL
+    interval_j: uint64 = _u_ts_to_jiffies(a2)          # it_interval
+    value_j:    uint64 = _u_ts_to_jiffies(a2 + 16)     # it_value
+    # Report the old setting if the caller asked for it.
+    if a3 != 0:
+        _u_jiffies_to_ts(utfd_gettime_interval(ts), a3)
+        _u_jiffies_to_ts(utfd_gettime_remaining(ts), a3 + 16)
+    rc: int64 = utfd_arm(ts, value_j, interval_j)
+    return rc
+
+
+def _u_timerfd_gettime(a0: uint64, a1: uint64, a2: uint64,
+                       a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int timerfd_gettime(int fd, struct itimerspec *curr)
+    fd: int32 = cast[int32](a0)
+    if vfs_fd_marker(fd) != FD_TIMERFD_MARK:
+        return ELINUX_BADF
+    ts: int32 = cast[int32](vfs_l2_fd_get_buf(fd)) - 1
+    if utfd_valid(ts) == 0:
+        return ELINUX_BADF
+    if a1 == 0:
+        return ELINUX_INVAL
+    _u_jiffies_to_ts(utfd_gettime_interval(ts), a1)        # it_interval
+    _u_jiffies_to_ts(utfd_gettime_remaining(ts), a1 + 16)  # it_value
+    return 0
+
+
+# --- signalfd --------------------------------------------------------
+
+def _u_sigset_to_kernel(set_ptr: uint64) -> uint64:
+    # Convert a user sigset_t (an array of words, bit (sig-1) set for
+    # signal `sig`) into Hamnix's sig_pending layout (bit `sig` set).
+    # We read the first 8 bytes — enough for signals 1..64.
+    if set_ptr == 0:
+        return 0
+    user_bits: uint64 = cast[Ptr[uint64]](set_ptr)[0]
+    kern: uint64 = 0
+    sig: uint64 = 1
+    while sig < 64:
+        if (user_bits & (cast[uint64](1) << (sig - 1))) != 0:
+            kern = kern | (cast[uint64](1) << sig)
+        sig = sig + 1
+    return kern
+
+
+def _u_signalfd4(a0: uint64, a1: uint64, a2: uint64,
+                 a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int signalfd4(int fd, const sigset_t *mask, size_t sizemask,
+    #               int flags)
+    # fd == -1 creates a new signalfd; fd >= 0 updates an existing one's
+    # mask. flags: SFD_NONBLOCK | SFD_CLOEXEC.
+    in_fd: int32 = cast[int32](a0)
+    kmask: uint64 = _u_sigset_to_kernel(a1)
+    flags: uint64 = a3
+    if in_fd >= 0:
+        # Update an existing signalfd's accepted-signal mask.
+        if vfs_fd_marker(in_fd) != FD_SIGNALFD_MARK:
+            return ELINUX_INVAL
+        ss_up: int32 = cast[int32](vfs_l2_fd_get_buf(in_fd)) - 1
+        if usfd_valid(ss_up) == 0:
+            return ELINUX_BADF
+        usfd_set_mask(ss_up, kmask)
+        return cast[int64](in_fd)
+    ss: int32 = usfd_alloc(kmask)
+    if ss < 0:
+        set_current_errstr("signalfd: object pool exhausted")
+        return ELINUX_MFILE
+    fd: int32 = vfs_alloc_l2_fd(FD_SIGNALFD_MARK)
+    if fd < 0:
+        set_current_errstr("signalfd: out of fd slots")
+        return ELINUX_MFILE
+    if vfs_l2_fd_set_buf(fd, cast[uint64](ss + 1)) != 0:
+        vfs_close(fd)
+        return ELINUX_BADF
+    if (flags & O_NONBLOCK_BIT) != 0:
+        _u_set_fd_nonblock(fd, 1)
+    return cast[int64](fd)
+
+
+def _u_signalfd(a0: uint64, a1: uint64, a2: uint64,
+                a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int signalfd(int fd, const sigset_t *mask, size_t sizemask)
+    return _u_signalfd4(a0, a1, a2, 0, a4, a5)
+
+
+def _u_signalfd_read(fd: int32, buf: uint64, count: uint64) -> int64:
+    # read(2) on a signalfd fd. Each ready signal is delivered as one
+    # struct signalfd_siginfo (128 bytes); we fill only ssi_signo (the
+    # field daemons read) and zero the rest. Returns -EAGAIN if no
+    # accepted signal is pending. Called from _u_read's fd-kind switch.
+    ss: int32 = cast[int32](vfs_l2_fd_get_buf(fd)) - 1
+    if usfd_valid(ss) == 0:
+        return ELINUX_BADF
+    if count < 128:
+        return ELINUX_INVAL
+    pend: uint64 = signal_pending(current_idx_get())
+    ready: uint64 = usfd_match(ss, pend)
+    if ready == 0:
+        return ELINUX_AGAIN
+    # Deliver as many siginfo records as fit in the caller's buffer.
+    written: uint64 = 0
+    sig: uint64 = 1
+    while sig < 64:
+        if written + 128 > count:
+            break
+        if (ready & (cast[uint64](1) << sig)) != 0:
+            rec: uint64 = buf + written
+            memset(cast[Ptr[uint8]](rec), 0, 128)
+            cast[Ptr[uint32]](rec)[0] = cast[uint32](sig)   # ssi_signo
+            usfd_consume(ss, sig)
+            written = written + 128
+        sig = sig + 1
+    if written == 0:
+        return ELINUX_AGAIN
+    return cast[int64](written)
+
+
+# --- epoll -----------------------------------------------------------
+
+def _u_epoll_create1(a0: uint64, a1: uint64, a2: uint64,
+                     a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int epoll_create1(int flags) — flags: EPOLL_CLOEXEC only.
+    es: int32 = uepoll_alloc()
+    if es < 0:
+        set_current_errstr("epoll_create: object pool exhausted")
+        return ELINUX_MFILE
+    fd: int32 = vfs_alloc_l2_fd(FD_EPOLL_MARK)
+    if fd < 0:
+        set_current_errstr("epoll_create: out of fd slots")
+        return ELINUX_MFILE
+    if vfs_l2_fd_set_buf(fd, cast[uint64](es + 1)) != 0:
+        vfs_close(fd)
+        return ELINUX_BADF
+    return cast[int64](fd)
+
+
+def _u_epoll_create(a0: uint64, a1: uint64, a2: uint64,
+                    a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int epoll_create(int size) — `size` is a historical hint, ignored.
+    return _u_epoll_create1(0, a1, a2, a3, a4, a5)
+
+
+def _u_epoll_ctl(a0: uint64, a1: uint64, a2: uint64,
+                 a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
+    # struct epoll_event { uint32 events; uint64 data; } — PACKED on
+    # x86_64 (12 bytes): events at offset 0, data at offset 4.
+    epfd: int32 = cast[int32](a0)
+    op:   uint32 = cast[uint32](a1)
+    fd:   int32 = cast[int32](a2)
+    if vfs_fd_marker(epfd) != FD_EPOLL_MARK:
+        return ELINUX_BADF
+    es: int32 = cast[int32](vfs_l2_fd_get_buf(epfd)) - 1
+    if uepoll_valid(es) == 0:
+        return ELINUX_BADF
+    # A fd can't watch itself, and the watched fd must be open.
+    if fd == epfd:
+        return ELINUX_INVAL
+    if op != EPOLL_CTL_DEL:
+        if vfs_fd_is_open(fd) == 0:
+            return ELINUX_BADF
+    events: uint32 = 0
+    data0:  uint64 = 0
+    if a3 != 0:
+        events = cast[Ptr[uint32]](a3)[0]
+        data0  = cast[Ptr[uint64]](a3 + 4)[0]
+    if op == EPOLL_CTL_ADD:
+        return uepoll_ctl_add(es, fd, events, data0)
+    if op == EPOLL_CTL_MOD:
+        return uepoll_ctl_mod(es, fd, events, data0)
+    if op == EPOLL_CTL_DEL:
+        return uepoll_ctl_del(es, fd)
+    return ELINUX_INVAL
+
+
+def _u_epoll_scan(es: int32, out_events: uint64,
+                  maxevents: int32) -> int64:
+    # One non-blocking pass over an epoll object's interest list. For
+    # each live+enabled slot: probe the watched fd's readiness, AND it
+    # with the requested mask, and on a hit write one struct
+    # epoll_event to the caller's array. Returns the number of ready
+    # fds written (>= 0). EPOLLONESHOT slots that fire are auto-disabled.
+    nready: int64 = 0
+    imax: uint64 = uepoll_interest_max()
+    i: uint64 = 0
+    while i < imax:
+        if nready >= cast[int64](maxevents):
+            break
+        if uepoll_intr_slot_live(es, i) != 0:
+            wfd:  int32 = uepoll_intr_fd_at(es, i)
+            want: uint32 = uepoll_intr_ev_at(es, i)
+            data0: uint64 = uepoll_intr_data_at(es, i)
+            # Readiness from the non-destructive vfs probe. A signalfd
+            # in the interest set needs the caller's pending-signal
+            # word — vfs_fd_poll reports 0 for it, so we special-case.
+            ready: uint32 = vfs_fd_poll(wfd)
+            if vfs_fd_marker(wfd) == FD_SIGNALFD_MARK:
+                ss: int32 = cast[int32](vfs_l2_fd_get_buf(wfd)) - 1
+                if usfd_match(ss, signal_pending(current_idx_get())) != 0:
+                    ready = ready | EPOLLIN
+            # POLLERR / POLLHUP are always reported regardless of the
+            # requested mask (Linux semantics); POLLIN/POLLOUT only if
+            # the caller asked. The bit layouts coincide.
+            revents: uint32 = ready & (want | EPOLLERR | EPOLLHUP)
+            if revents != 0:
+                rec: uint64 = out_events + cast[uint64](nready) * 12
+                cast[Ptr[uint32]](rec)[0]     = revents
+                cast[Ptr[uint64]](rec + 4)[0] = data0
+                nready = nready + 1
+                if (want & EPOLLONESHOT) != 0:
+                    uepoll_oneshot_disable(es, i)
+        i = i + 1
+    return nready
+
+
+def _u_epoll_wait(a0: uint64, a1: uint64, a2: uint64,
+                  a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int epoll_wait(int epfd, struct epoll_event *events,
+    #                int maxevents, int timeout)
+    # timeout: -1 == block indefinitely, 0 == return immediately,
+    # >0 == milliseconds. Level-triggered. We yield-spin until a fd is
+    # ready or the deadline passes (bounded — see UEP_WAIT_MAX_JIFFIES).
+    epfd: int32 = cast[int32](a0)
+    out:  uint64 = a1
+    maxevents: int32 = cast[int32](a2)
+    timeout_ms: int64 = cast[int64](a3)
+    if vfs_fd_marker(epfd) != FD_EPOLL_MARK:
+        return ELINUX_BADF
+    es: int32 = cast[int32](vfs_l2_fd_get_buf(epfd)) - 1
+    if uepoll_valid(es) == 0:
+        return ELINUX_BADF
+    if maxevents <= 0 or out == 0:
+        return ELINUX_INVAL
+    # Compute the absolute deadline in jiffies.
+    deadline: uint64 = 0
+    bounded: int32 = 1
+    start: uint64 = get_jiffies()
+    if timeout_ms < 0:
+        # Infinite: cap at UEP_WAIT_MAX_JIFFIES so a daemon with no
+        # ready fd can't wedge the cooperative scheduler forever.
+        deadline = start + UEP_WAIT_MAX_JIFFIES
+    elif timeout_ms == 0:
+        bounded = 0                       # single non-blocking pass
+    else:
+        # ms -> jiffies (HZ=100 -> 10 ms/jiffy). Round up.
+        dj: uint64 = (cast[uint64](timeout_ms) * HZ + 999) / 1000
+        if dj > UEP_WAIT_MAX_JIFFIES:
+            dj = UEP_WAIT_MAX_JIFFIES
+        deadline = start + dj
+    while True:
+        n: int64 = _u_epoll_scan(es, out, maxevents)
+        if n > 0:
+            return n
+        if bounded == 0:
+            return 0                      # timeout == 0: immediate return
+        if get_jiffies() >= deadline:
+            return 0                      # timed out, nothing ready
+        yield_to_others()
+
+
+def _u_epoll_pwait(a0: uint64, a1: uint64, a2: uint64,
+                   a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # epoll_pwait(epfd, events, maxevents, timeout, sigmask) — the
+    # sigmask arg lets a daemon atomically swap its signal mask for the
+    # wait. Hamnix delivers signals cooperatively at the syscall
+    # boundary, so the atomic-swap race epoll_pwait guards against can't
+    # occur here — forward to epoll_wait, ignoring sigmask.
+    return _u_epoll_wait(a0, a1, a2, a3, a4, a5)
+
+
+# =====================================================================
 # Central dispatch
 # =====================================================================
 
@@ -4275,7 +5013,7 @@ def linux_u_syscall_dispatch(nr: uint64,
     if nr == SYS_pipe:
         return _u_pipe(a0, a1, a2, a3, a4, a5)
     if nr == SYS_select:
-        return _u_unimpl_select(a0, a1, a2, a3, a4, a5)
+        return _u_select(a0, a1, a2, a3, a4, a5)
     if nr == SYS_sched_yield:
         return _u_sched_yield(a0, a1, a2, a3, a4, a5)
     if nr == SYS_mremap:
@@ -4471,6 +5209,32 @@ def linux_u_syscall_dispatch(nr: uint64,
     # the syscall during signal setup and stalls if it returns -ENOSYS.
     if nr == SYS_sigaltstack:
         return _u_sigaltstack(a0, a1, a2, a3, a4, a5)
+    # §5: Layer-2 async I/O — epoll / eventfd / timerfd / signalfd. The
+    # event primitives real Linux server daemons (epoll_wait loops) need.
+    if nr == SYS_epoll_create:
+        return _u_epoll_create(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_epoll_create1:
+        return _u_epoll_create1(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_epoll_ctl:
+        return _u_epoll_ctl(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_epoll_wait:
+        return _u_epoll_wait(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_epoll_pwait:
+        return _u_epoll_pwait(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_eventfd:
+        return _u_eventfd(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_eventfd2:
+        return _u_eventfd2(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_timerfd_create:
+        return _u_timerfd_create(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_timerfd_settime:
+        return _u_timerfd_settime(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_timerfd_gettime:
+        return _u_timerfd_gettime(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_signalfd:
+        return _u_signalfd(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_signalfd4:
+        return _u_signalfd4(a0, a1, a2, a3, a4, a5)
     # Unknown syscall — same convention as Linux: log + return -ENOSYS.
     # The printk includes nr so a trace of "unknown linux syscall X"
     # tells you exactly which entry to add to the ladder above.
