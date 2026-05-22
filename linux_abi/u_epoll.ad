@@ -1,0 +1,728 @@
+# linux_abi/u_epoll.ad — Layer-2 async-I/O notification objects.
+#
+# epoll / eventfd / timerfd / signalfd — the fd-based event primitives
+# real Linux server daemons are built around. A typical Linux network
+# daemon is an `epoll_wait` loop: register socket fds + an eventfd (for
+# self-wakeups) + a timerfd (for timeouts) into one epoll fd, then
+# block in epoll_wait until any becomes ready.
+#
+# ---------------------------------------------------------------------
+# BOUNDARY-DISCIPLINE LAW
+#
+# These objects are the *antithesis* of Plan 9's "everything is a file".
+# epoll/eventfd/timerfd/signalfd exist SOLELY as confined kernel objects
+# to satisfy Linux guests — they are Layer-2-ONLY. Nothing in this
+# module may ever become a dependency of native (Layer-1) code, of the
+# 9P / namespace / Chan resource model, or of any path under
+# sys/src/9/port/. The flow is strictly one-directional:
+#
+#     linux_u_syscall_dispatch (Layer 2)  ->  this module
+#     fs/vfs.ad read/write/close arms     ->  this module
+#
+# fs/vfs.ad imports the FD_*_MARK constants below ONLY so it can route a
+# Linux-ABI eventfd/timerfd/signalfd fd's read/write back here; that is
+# a Layer-2 leaf dependency, not Layer 1 consuming an epoll object.
+#
+# This module is a near-leaf: it imports printk + the jiffy clock + the
+# slab only. It does NOT import fs/vfs.ad or u_syscalls.ad — the fd
+# table is reached through the small accessor surface fs/vfs.ad exposes,
+# called from u_syscalls.ad. That keeps the import graph acyclic.
+#
+# ---------------------------------------------------------------------
+# Layout
+#
+# Every object pool is a set of flat parallel arrays in top-level BSS —
+# NOT Arrays of structs (the U9 nested-frame-Array compiler quirk:
+# structs-in-arrays inside nested frames miscompile; parallel arrays
+# sidestep it). Pool sizes are deliberately small — a single daemon
+# under test needs a handful of each.
+#
+# An epoll/eventfd/timerfd/signalfd fd is a real per-task fd-table slot
+# tagged with one of the FD_*_MARK markers below; its fd_buf carries
+# `slot_id + 1` (0 == "no object", same +1 encoding u_socket_state uses)
+# so a dup'd fd shares the underlying object and close just zeroes the
+# slot. fs/vfs.ad's vfs_close calls the matching *_release here before
+# the slot is wiped.
+
+from kernel.printk.printk import printk0
+from arch.x86.kernel.time import get_jiffies
+
+
+# =====================================================================
+# FD markers
+# =====================================================================
+#
+# Unique uint32 fd_idx tags. They live in the 0xFFFFFFxx block the rest
+# of the FD_*_MARK family occupies. The whole 0xFFFFFFE0..0xFFFFFFFF
+# range is already taken (core.ad's stdio/cdev marks at 0xE7..0xFF, and
+# the colocated marks FD_CHAN 0xE0 / FD_SOCKETPAIR 0xE2 / FD_P9 0xE3 /
+# FD_DISKSTATS 0xE4 / FD_MOUNTS 0xE5 / FD_STAT 0xE6), so the §5 markers
+# take the next free block down — 0xFFFFFFDC..0xFFFFFFDF — well clear of
+# the FD_PROC family at 0xFE000000.
+#
+# Declared HERE rather than in core.ad on purpose: core.ad is Layer-1
+# territory and must not gain knowledge of Layer-2 objects. core.ad's
+# close_fd_in_task / copy_fd_entry fall through cleanly for an unknown
+# marker (no backing slot to release, fields copied verbatim), so a
+# Layer-2 marker it has never heard of is handled correctly — the
+# object teardown happens in fs/vfs.ad's vfs_close, which DOES import
+# these. This is the exact pattern FD_SOCKETPAIR_MARK / FD_CHAN_MARK use.
+FD_EPOLL_MARK:    uint32 = 0xFFFFFFDF
+FD_EVENTFD_MARK:  uint32 = 0xFFFFFFDE
+FD_TIMERFD_MARK:  uint32 = 0xFFFFFFDD
+FD_SIGNALFD_MARK: uint32 = 0xFFFFFFDC
+
+
+# =====================================================================
+# Errno subset (Linux negative-errno return convention)
+# =====================================================================
+UEP_EBADF:  int64 = -9
+UEP_EINVAL: int64 = -22
+UEP_EMFILE: int64 = -24
+UEP_ENOMEM: int64 = -12
+UEP_EEXIST: int64 = -17
+UEP_ENOENT: int64 = -2
+UEP_EAGAIN: int64 = -11
+
+
+# =====================================================================
+# epoll event bits (Linux <sys/epoll.h>)
+# =====================================================================
+EPOLLIN:      uint32 = 0x001
+EPOLLPRI:     uint32 = 0x002
+EPOLLOUT:     uint32 = 0x004
+EPOLLERR:     uint32 = 0x008
+EPOLLHUP:     uint32 = 0x010
+EPOLLRDHUP:   uint32 = 0x2000
+EPOLLONESHOT: uint32 = 0x40000000
+EPOLLET:      uint32 = 0x80000000
+
+# epoll_ctl ops.
+EPOLL_CTL_ADD: uint32 = 1
+EPOLL_CTL_DEL: uint32 = 2
+EPOLL_CTL_MOD: uint32 = 3
+
+
+# =====================================================================
+# O_NONBLOCK per-fd tracking
+# =====================================================================
+#
+# The TaskStruct fd table (kernel/sched/core.ad) has no per-fd flags
+# word and core.ad is off-limits to grow one. O_NONBLOCK is a Linux-ABI
+# concept anyway, so it is tracked HERE, in Layer 2, keyed by
+# (task slot, fd number). NTASKS is 16 and the fd table is 16 slots, so
+# a flat 256-byte bitmap covers every (task, fd) pair. Set by
+# fcntl(F_SETFL), socket(SOCK_NONBLOCK), pipe2(O_NONBLOCK),
+# accept4(SOCK_NONBLOCK), eventfd2/timerfd/signalfd with their NONBLOCK
+# flags. Consulted by u_syscalls.ad's read/write/accept/recvfrom arms to
+# choose the non-blocking path.
+UEP_NTASKS:  uint64 = 16
+UEP_NRFDS:   uint64 = 16
+uep_nonblock: Array[256, uint8]    # [task*16 + fd] -> 1 if O_NONBLOCK
+
+
+def uep_nonblock_init():
+    i: uint64 = 0
+    while i < 256:
+        uep_nonblock[i] = 0
+        i = i + 1
+
+
+def uep_nonblock_set(task_idx: uint64, fd: int32, on: int32):
+    # Mark / clear O_NONBLOCK for (task, fd). Out-of-range is ignored.
+    if fd < 0:
+        return
+    fdu: uint64 = cast[uint64](fd)
+    if task_idx >= UEP_NTASKS or fdu >= UEP_NRFDS:
+        return
+    if on != 0:
+        uep_nonblock[task_idx * UEP_NRFDS + fdu] = 1
+    else:
+        uep_nonblock[task_idx * UEP_NRFDS + fdu] = 0
+
+
+def uep_nonblock_get(task_idx: uint64, fd: int32) -> int32:
+    # 1 if (task, fd) is in non-blocking mode, else 0.
+    if fd < 0:
+        return 0
+    fdu: uint64 = cast[uint64](fd)
+    if task_idx >= UEP_NTASKS or fdu >= UEP_NRFDS:
+        return 0
+    if uep_nonblock[task_idx * UEP_NRFDS + fdu] != 0:
+        return 1
+    return 0
+
+
+# =====================================================================
+# eventfd pool
+# =====================================================================
+#
+# An eventfd is a 64-bit counter. write(8 bytes) adds; read(8 bytes)
+# returns the counter and resets it to 0 (or, in EFD_SEMAPHORE mode,
+# returns 1 and decrements). A read on a zero counter blocks (or
+# -EAGAIN if non-blocking); an event-loop daemon uses an eventfd as a
+# wakeup channel registered in its epoll set.
+UEFD_MAX: uint64 = 16
+uefd_inuse:     Array[16, uint8]
+uefd_count:     Array[16, uint64]   # the 64-bit counter
+uefd_semaphore: Array[16, uint8]    # 1 if EFD_SEMAPHORE
+
+EFD_SEMAPHORE: uint32 = 0x1
+EFD_NONBLOCK:  uint32 = 0x800       # == O_NONBLOCK
+EFD_CLOEXEC:   uint32 = 0x80000
+
+
+def uefd_init():
+    i: uint64 = 0
+    while i < UEFD_MAX:
+        uefd_inuse[i]     = 0
+        uefd_count[i]     = 0
+        uefd_semaphore[i] = 0
+        i = i + 1
+
+
+def uefd_alloc(initval: uint64, semaphore: int32) -> int32:
+    i: uint64 = 0
+    while i < UEFD_MAX:
+        if uefd_inuse[i] == 0:
+            uefd_inuse[i]     = 1
+            uefd_count[i]     = initval
+            uefd_semaphore[i] = cast[uint8](semaphore & 1)
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def uefd_release(slot: int32):
+    if slot < 0:
+        return
+    su: uint64 = cast[uint64](slot)
+    if su >= UEFD_MAX:
+        return
+    uefd_inuse[su]     = 0
+    uefd_count[su]     = 0
+    uefd_semaphore[su] = 0
+
+
+def uefd_valid(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if su >= UEFD_MAX:
+        return 0
+    if uefd_inuse[su] == 0:
+        return 0
+    return 1
+
+
+def uefd_readable(slot: int32) -> int32:
+    # 1 if a read would return immediately (counter non-zero).
+    if uefd_valid(slot) == 0:
+        return 0
+    if uefd_count[cast[uint64](slot)] != 0:
+        return 1
+    return 0
+
+
+def uefd_read(slot: int32) -> int64:
+    # Returns the value to hand back to the user's 8-byte read, or
+    # -EAGAIN if the counter is zero (caller decides block vs. errno).
+    if uefd_valid(slot) == 0:
+        return UEP_EINVAL
+    su: uint64 = cast[uint64](slot)
+    cur: uint64 = uefd_count[su]
+    if cur == 0:
+        return UEP_EAGAIN
+    if uefd_semaphore[su] != 0:
+        uefd_count[su] = cur - 1
+        return 1
+    uefd_count[su] = 0
+    return cast[int64](cur)
+
+
+def uefd_write(slot: int32, addend: uint64) -> int64:
+    # Add `addend` to the counter. Linux rejects 0xFFFFFFFFFFFFFFFF and
+    # an add that would overflow past (2^64 - 2) with -EINVAL; an
+    # over-the-max add on a real Linux would block until a read drains
+    # it, but at this scale a plain -EINVAL is the honest answer.
+    if uefd_valid(slot) == 0:
+        return UEP_EINVAL
+    if addend == 0xFFFFFFFFFFFFFFFF:
+        return UEP_EINVAL
+    su: uint64 = cast[uint64](slot)
+    cur: uint64 = uefd_count[su]
+    # Overflow guard: max counter value is 2^64 - 2.
+    if cur + addend < cur:
+        return UEP_EINVAL
+    uefd_count[su] = cur + addend
+    return 8
+
+
+# =====================================================================
+# timerfd pool
+# =====================================================================
+#
+# A timerfd delivers timer expirations as a readable fd: read(8 bytes)
+# returns the number of expirations since the last read (and clears the
+# count). Backed by the 100 Hz jiffy clock. timerfd_settime arms it
+# with an initial delay + optional repeat interval, both in jiffies.
+UTFD_MAX: uint64 = 16
+utfd_inuse:    Array[16, uint8]
+utfd_armed:    Array[16, uint8]    # 1 if currently armed
+utfd_expiry:   Array[16, uint64]   # absolute jiffy of next expiry
+utfd_interval: Array[16, uint64]   # repeat interval in jiffies, 0 == one-shot
+utfd_ticks:    Array[16, uint64]   # unread expirations accumulated
+
+TFD_NONBLOCK: uint32 = 0x800
+TFD_CLOEXEC:  uint32 = 0x80000
+
+
+def utfd_init():
+    i: uint64 = 0
+    while i < UTFD_MAX:
+        utfd_inuse[i]    = 0
+        utfd_armed[i]    = 0
+        utfd_expiry[i]   = 0
+        utfd_interval[i] = 0
+        utfd_ticks[i]    = 0
+        i = i + 1
+
+
+def utfd_alloc() -> int32:
+    i: uint64 = 0
+    while i < UTFD_MAX:
+        if utfd_inuse[i] == 0:
+            utfd_inuse[i]    = 1
+            utfd_armed[i]    = 0
+            utfd_expiry[i]   = 0
+            utfd_interval[i] = 0
+            utfd_ticks[i]    = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def utfd_release(slot: int32):
+    if slot < 0:
+        return
+    su: uint64 = cast[uint64](slot)
+    if su >= UTFD_MAX:
+        return
+    utfd_inuse[su]    = 0
+    utfd_armed[su]    = 0
+    utfd_expiry[su]   = 0
+    utfd_interval[su] = 0
+    utfd_ticks[su]    = 0
+
+
+def utfd_valid(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if su >= UTFD_MAX:
+        return 0
+    if utfd_inuse[su] == 0:
+        return 0
+    return 1
+
+
+def utfd_arm(slot: int32, delay_jiffies: uint64,
+             interval_jiffies: uint64) -> int64:
+    # Arm (delay > 0) or disarm (delay == 0) the timer. delay is
+    # relative to now; interval 0 makes it one-shot.
+    if utfd_valid(slot) == 0:
+        return UEP_EINVAL
+    su: uint64 = cast[uint64](slot)
+    if delay_jiffies == 0 and interval_jiffies == 0:
+        utfd_armed[su]    = 0
+        utfd_expiry[su]   = 0
+        utfd_interval[su] = 0
+        return 0
+    now: uint64 = get_jiffies()
+    d: uint64 = delay_jiffies
+    if d == 0:
+        # delay 0 but a repeat interval set: fire one interval out.
+        d = interval_jiffies
+    utfd_expiry[su]   = now + d
+    utfd_interval[su] = interval_jiffies
+    utfd_armed[su]    = 1
+    utfd_ticks[su]    = 0
+    return 0
+
+
+def _utfd_advance(su: uint64):
+    # Roll the expiry forward past `now`, accumulating one tick per
+    # missed period. Called by both the readiness probe and the read.
+    if utfd_armed[su] == 0:
+        return
+    now: uint64 = get_jiffies()
+    if now < utfd_expiry[su]:
+        return
+    # First expiry crossed.
+    utfd_ticks[su] = utfd_ticks[su] + 1
+    if utfd_interval[su] == 0:
+        # One-shot: stop after the single fire.
+        utfd_armed[su] = 0
+        return
+    # Periodic: count every whole interval elapsed since the deadline.
+    nxt: uint64 = utfd_expiry[su] + utfd_interval[su]
+    while now >= nxt:
+        utfd_ticks[su] = utfd_ticks[su] + 1
+        nxt = nxt + utfd_interval[su]
+    utfd_expiry[su] = nxt
+
+
+def utfd_readable(slot: int32) -> int32:
+    # Non-destructive: advance the timer model, report 1 if expirations
+    # are pending.
+    if utfd_valid(slot) == 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    _utfd_advance(su)
+    if utfd_ticks[su] != 0:
+        return 1
+    return 0
+
+
+def utfd_read(slot: int32) -> int64:
+    # Returns the expiration count to hand to the user's 8-byte read,
+    # or -EAGAIN if none have fired yet.
+    if utfd_valid(slot) == 0:
+        return UEP_EINVAL
+    su: uint64 = cast[uint64](slot)
+    _utfd_advance(su)
+    t: uint64 = utfd_ticks[su]
+    if t == 0:
+        return UEP_EAGAIN
+    utfd_ticks[su] = 0
+    return cast[int64](t)
+
+
+def utfd_gettime_remaining(slot: int32) -> uint64:
+    # Jiffies until the next expiry (0 if disarmed / already due).
+    if utfd_valid(slot) == 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if utfd_armed[su] == 0:
+        return 0
+    now: uint64 = get_jiffies()
+    if now >= utfd_expiry[su]:
+        return 0
+    return utfd_expiry[su] - now
+
+
+def utfd_gettime_interval(slot: int32) -> uint64:
+    if utfd_valid(slot) == 0:
+        return 0
+    return utfd_interval[cast[uint64](slot)]
+
+
+# =====================================================================
+# signalfd pool
+# =====================================================================
+#
+# signalfd lets a daemon receive signals as a readable fd instead of an
+# async handler. We record the accepted signal mask; the readable check
+# and the read consult the calling task's sig_pending word (passed in
+# by the u_syscalls.ad shim — this module does not import core.ad).
+USFD_MAX: uint64 = 8
+usfd_inuse:    Array[8, uint8]
+usfd_mask:     Array[8, uint64]    # signals this fd accepts (1<<sig bits)
+usfd_consumed: Array[8, uint64]    # signals already delivered via read(2)
+
+SFD_NONBLOCK: uint32 = 0x800
+SFD_CLOEXEC:  uint32 = 0x80000
+
+
+def usfd_init():
+    i: uint64 = 0
+    while i < USFD_MAX:
+        usfd_inuse[i]    = 0
+        usfd_mask[i]     = 0
+        usfd_consumed[i] = 0
+        i = i + 1
+
+
+def usfd_alloc(mask: uint64) -> int32:
+    i: uint64 = 0
+    while i < USFD_MAX:
+        if usfd_inuse[i] == 0:
+            usfd_inuse[i]    = 1
+            usfd_mask[i]     = mask
+            usfd_consumed[i] = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def usfd_release(slot: int32):
+    if slot < 0:
+        return
+    su: uint64 = cast[uint64](slot)
+    if su >= USFD_MAX:
+        return
+    usfd_inuse[su]    = 0
+    usfd_mask[su]     = 0
+    usfd_consumed[su] = 0
+
+
+def usfd_valid(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if su >= USFD_MAX:
+        return 0
+    if usfd_inuse[su] == 0:
+        return 0
+    return 1
+
+
+def usfd_set_mask(slot: int32, mask: uint64):
+    if usfd_valid(slot) == 0:
+        return
+    usfd_mask[cast[uint64](slot)] = mask
+
+
+def usfd_get_mask(slot: int32) -> uint64:
+    if usfd_valid(slot) == 0:
+        return 0
+    return usfd_mask[cast[uint64](slot)]
+
+
+def usfd_match(slot: int32, sig_pending: uint64) -> uint64:
+    # The subset of `sig_pending` this signalfd should deliver NOW:
+    # pending AND accepted-by-mask AND not-already-consumed. Signal
+    # numbers are 1..63; both sig_pending and the stored mask use the
+    # kernel's (1 << sig) bit layout — the u_syscalls.ad shim converts
+    # the user's sigset_t (bit sig-1) into this layout at signalfd(2)
+    # time.
+    if usfd_valid(slot) == 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    fresh: uint64 = sig_pending & ~usfd_consumed[su]
+    return fresh & usfd_mask[su]
+
+
+def usfd_consume(slot: int32, sig: uint64):
+    # Mark signal `sig` (1..63) as delivered through this signalfd so a
+    # later read does not re-report the same latched pending bit. Hamnix
+    # has no public sig_pending clearer (that lives in core.ad, Layer 1,
+    # off-limits here), so the signalfd dedups its own deliveries — the
+    # correct behaviour for the standard "block signals, drain them via
+    # signalfd" daemon pattern.
+    if usfd_valid(slot) == 0:
+        return
+    if sig == 0 or sig >= 64:
+        return
+    su: uint64 = cast[uint64](slot)
+    usfd_consumed[su] = usfd_consumed[su] | (cast[uint64](1) << sig)
+
+
+# =====================================================================
+# epoll pool
+# =====================================================================
+#
+# An epoll object is an interest list: a set of (fd, events, user_data)
+# tuples. epoll_ctl mutates it; epoll_wait scans it, probing each fd's
+# readiness, and reports the ready subset. Level-triggered only (the
+# subset ordinary Linux daemons rely on); EPOLLET is accepted and
+# recorded but behaves level-triggered, which is a safe superset (an
+# edge-triggered consumer still drains the fd, it just gets a few extra
+# wakeups). EPOLLONESHOT is honoured: a fd that fires is auto-disabled
+# until re-armed with EPOLL_CTL_MOD.
+#
+# Pool: UEPOLL_MAX epoll objects, each with UEPOLL_INTEREST_MAX slots.
+# Backed by flat parallel arrays indexed [epoll_slot*INTEREST_MAX + i].
+UEPOLL_MAX:          uint64 = 8
+UEPOLL_INTEREST_MAX: uint64 = 64
+# 8 * 64 == 512 interest slots total.
+uepoll_inuse:   Array[8, uint8]
+uepoll_intr_used: Array[512, uint8]    # 1 if this interest slot is live
+uepoll_intr_fd:   Array[512, int32]    # watched fd
+uepoll_intr_ev:   Array[512, uint32]   # requested event mask
+uepoll_intr_dat0: Array[512, uint64]   # epoll_data union (user cookie)
+uepoll_intr_enab: Array[512, uint8]    # 1 enabled, 0 = ONESHOT-disabled
+
+
+def uepoll_init():
+    i: uint64 = 0
+    while i < UEPOLL_MAX:
+        uepoll_inuse[i] = 0
+        i = i + 1
+    j: uint64 = 0
+    while j < UEPOLL_MAX * UEPOLL_INTEREST_MAX:
+        uepoll_intr_used[j] = 0
+        uepoll_intr_fd[j]   = -1
+        uepoll_intr_ev[j]   = 0
+        uepoll_intr_dat0[j] = 0
+        uepoll_intr_enab[j] = 0
+        j = j + 1
+
+
+def uepoll_alloc() -> int32:
+    i: uint64 = 0
+    while i < UEPOLL_MAX:
+        if uepoll_inuse[i] == 0:
+            uepoll_inuse[i] = 1
+            # Clear this object's interest slice.
+            base: uint64 = i * UEPOLL_INTEREST_MAX
+            k: uint64 = 0
+            while k < UEPOLL_INTEREST_MAX:
+                uepoll_intr_used[base + k] = 0
+                uepoll_intr_fd[base + k]   = -1
+                uepoll_intr_ev[base + k]   = 0
+                uepoll_intr_dat0[base + k] = 0
+                uepoll_intr_enab[base + k] = 0
+                k = k + 1
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def uepoll_release(slot: int32):
+    if slot < 0:
+        return
+    su: uint64 = cast[uint64](slot)
+    if su >= UEPOLL_MAX:
+        return
+    base: uint64 = su * UEPOLL_INTEREST_MAX
+    k: uint64 = 0
+    while k < UEPOLL_INTEREST_MAX:
+        uepoll_intr_used[base + k] = 0
+        k = k + 1
+    uepoll_inuse[su] = 0
+
+
+def uepoll_valid(slot: int32) -> int32:
+    if slot < 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if su >= UEPOLL_MAX:
+        return 0
+    if uepoll_inuse[su] == 0:
+        return 0
+    return 1
+
+
+def _uepoll_find(su: uint64, fd: int32) -> int64:
+    # Return the interest-slot index (global, into the flat arrays) for
+    # `fd` in epoll object `su`, or -1 if not registered.
+    base: uint64 = su * UEPOLL_INTEREST_MAX
+    k: uint64 = 0
+    while k < UEPOLL_INTEREST_MAX:
+        if uepoll_intr_used[base + k] != 0:
+            if uepoll_intr_fd[base + k] == fd:
+                return cast[int64](base + k)
+        k = k + 1
+    return -1
+
+
+def uepoll_ctl_add(slot: int32, fd: int32, events: uint32,
+                   data0: uint64) -> int64:
+    # EPOLL_CTL_ADD — register `fd`. -EEXIST if already registered,
+    # -ENOMEM if the interest list is full.
+    if uepoll_valid(slot) == 0:
+        return UEP_EBADF
+    su: uint64 = cast[uint64](slot)
+    if _uepoll_find(su, fd) >= 0:
+        return UEP_EEXIST
+    base: uint64 = su * UEPOLL_INTEREST_MAX
+    k: uint64 = 0
+    while k < UEPOLL_INTEREST_MAX:
+        if uepoll_intr_used[base + k] == 0:
+            uepoll_intr_used[base + k] = 1
+            uepoll_intr_fd[base + k]   = fd
+            uepoll_intr_ev[base + k]   = events
+            uepoll_intr_dat0[base + k] = data0
+            uepoll_intr_enab[base + k] = 1
+            return 0
+        k = k + 1
+    return UEP_ENOMEM
+
+
+def uepoll_ctl_mod(slot: int32, fd: int32, events: uint32,
+                   data0: uint64) -> int64:
+    # EPOLL_CTL_MOD — update events/data, and re-enable a slot a prior
+    # EPOLLONESHOT fire disabled. -ENOENT if `fd` is not registered.
+    if uepoll_valid(slot) == 0:
+        return UEP_EBADF
+    su: uint64 = cast[uint64](slot)
+    idx: int64 = _uepoll_find(su, fd)
+    if idx < 0:
+        return UEP_ENOENT
+    gi: uint64 = cast[uint64](idx)
+    uepoll_intr_ev[gi]   = events
+    uepoll_intr_dat0[gi] = data0
+    uepoll_intr_enab[gi] = 1
+    return 0
+
+
+def uepoll_ctl_del(slot: int32, fd: int32) -> int64:
+    # EPOLL_CTL_DEL — drop `fd` from the interest list.
+    if uepoll_valid(slot) == 0:
+        return UEP_EBADF
+    su: uint64 = cast[uint64](slot)
+    idx: int64 = _uepoll_find(su, fd)
+    if idx < 0:
+        return UEP_ENOENT
+    uepoll_intr_used[cast[uint64](idx)] = 0
+    return 0
+
+
+# epoll_wait iteration accessors — u_syscalls.ad walks the interest
+# list with these (it cannot see the flat arrays directly, and keeping
+# the walk here keeps the layout private). For each slot index 0..
+# UEPOLL_INTEREST_MAX-1, the shim asks: is it a live+enabled entry?
+# what fd / events / data? then probes fd readiness itself (via the
+# fs/vfs accessor) and, on a hit, calls uepoll_oneshot_disable if the
+# slot requested EPOLLONESHOT.
+
+def uepoll_intr_slot_live(slot: int32, i: uint64) -> int32:
+    # 1 if interest slot `i` of epoll object `slot` is live AND enabled.
+    if uepoll_valid(slot) == 0:
+        return 0
+    if i >= UEPOLL_INTEREST_MAX:
+        return 0
+    gi: uint64 = cast[uint64](slot) * UEPOLL_INTEREST_MAX + i
+    if uepoll_intr_used[gi] == 0:
+        return 0
+    if uepoll_intr_enab[gi] == 0:
+        return 0
+    return 1
+
+
+def uepoll_intr_fd_at(slot: int32, i: uint64) -> int32:
+    gi: uint64 = cast[uint64](slot) * UEPOLL_INTEREST_MAX + i
+    return uepoll_intr_fd[gi]
+
+
+def uepoll_intr_ev_at(slot: int32, i: uint64) -> uint32:
+    gi: uint64 = cast[uint64](slot) * UEPOLL_INTEREST_MAX + i
+    return uepoll_intr_ev[gi]
+
+
+def uepoll_intr_data_at(slot: int32, i: uint64) -> uint64:
+    gi: uint64 = cast[uint64](slot) * UEPOLL_INTEREST_MAX + i
+    return uepoll_intr_dat0[gi]
+
+
+def uepoll_oneshot_disable(slot: int32, i: uint64):
+    # After a slot with EPOLLONESHOT reports ready, disable it until the
+    # daemon re-arms it with EPOLL_CTL_MOD.
+    gi: uint64 = cast[uint64](slot) * UEPOLL_INTEREST_MAX + i
+    uepoll_intr_enab[gi] = 0
+
+
+def uepoll_interest_max() -> uint64:
+    return UEPOLL_INTEREST_MAX
+
+
+def u_epoll_init():
+    # One-shot bring-up — reset every Layer-2 async-I/O pool. Called
+    # from the kernel init path next to usock_init().
+    uep_nonblock_init()
+    uefd_init()
+    utfd_init()
+    usfd_init()
+    uepoll_init()
+    printk0("[u_epoll] Layer-2 epoll/eventfd/timerfd/signalfd pools ready\n")
