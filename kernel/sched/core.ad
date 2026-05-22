@@ -1548,8 +1548,8 @@ def close_fd_in_task(task: Ptr[TaskStruct], fdu: uint64):
     elif fi == FD_EXT4_MARK:
         ext4_close(cast[int32](task[0].fd_buf[fdu]))
     elif fi == FD_SOCKET_MARK:
-        # §10: a socket fd carries a backing record (linux_abi/
-        # u_socket_state.ad) and, behind it, an in-kernel stack slot —
+        # §10: a socket fd carries a backing record (fs/
+        # socket_state.ad) and, behind it, an in-kernel stack slot —
         # a TCP connection slot (drivers/net/tcp.ad) or a UDP socket
         # slot (drivers/net/udp.ad). vfs_close releases these explicitly
         # before reaching here, but a task that EXITS without close()-

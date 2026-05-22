@@ -104,14 +104,15 @@ from linux_abi.u_epoll import (
     EFD_SEMAPHORE,
 )
 # U-socket: socket(2)/connect(2) on a real TCP connection. The TCP
-# stack itself is drivers/net/tcp.ad; u_socket_state.ad is the per-
+# stack itself is drivers/net/tcp.ad; fs/socket_state.ad is the per-
 # socket-fd backing-record store shared with fs/vfs.ad's read/write/
-# close dispatch arms.
+# close dispatch arms. socket_state.ad is a Layer-0/1-neutral leaf
+# (it carries no Linux-ABI behaviour) — hence its fs/ home.
 from drivers.net.tcp import (
     tcp_connect, TCP_ERR_NOSLOT, TCP_ERR_ARP, TCP_ERR_REFUSED,
     TCP_ERR_TIMEOUT, tcp_listen, tcp_accept,
 )
-from linux_abi.u_socket_state import (
+from fs.socket_state import (
     usock_alloc, usock_free, usock_valid, usock_set_state,
     usock_set_tcp_slot, usock_get_state, usock_get_tcp_slot,
     usock_fdbuf_for_record, usock_record_for_fdbuf,
@@ -1544,7 +1545,7 @@ def _u_socket(a0: uint64, a1: uint64, a2: uint64,
     # int socket(int domain, int type, int protocol)
     #
     # Allocate a socket fd PLUS a per-socket-fd backing record
-    # (linux_abi/u_socket_state.ad) that connect(2) / read / write /
+    # (fs/socket_state.ad) that connect(2) / read / write /
     # close / sendto / recvfrom use to reach the in-kernel stack.
     # Supported combinations are AF_INET + SOCK_STREAM (TCP) and, as of
     # §10, AF_INET + SOCK_DGRAM (UDP). Everything else is rejected with

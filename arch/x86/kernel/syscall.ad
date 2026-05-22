@@ -303,6 +303,9 @@ SYS_TLS_CONNECT: uint64 = 277                  # a0=fd, a1=hostname ptr, a2=host
 # in a process's Pgrp; pipe / redirect / dup all reduce to "bind a
 # Chan at /fd/N". 278..280 are the next free slots above SYS_TLS_CONNECT.
 SYS_FDBIND:      uint64 = 278  # a0=pid(0=self), a1=fdnum, a2=kind, a3=arg; THE bind primitive (pipe/redirect/dup)
+# 279 is intentionally reserved/skipped — no syscall has ever occupied
+# it. The gap is deliberate (it leaves a slot free between the /fd-bind
+# primitive and the pipe-chan primitive), not a missing entry.
 SYS_PIPECHAN:    uint64 = 280  # returns a pipe SLOT id (not fds); the chan ends for an /fd bind
 SYS_OPENCHAN:    uint64 = 281  # a0=path, a1=write; opens a file as a channel, returns the tmpfs slot
 SYS_NSID:        uint64 = 282  # returns an opaque per-Pgrp namespace identity (the Pgrp pointer)

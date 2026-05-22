@@ -1,4 +1,4 @@
-# linux_abi/u_socket_state.ad — per-socket-fd backing store.
+# fs/socket_state.ad — per-socket-fd backing store.
 #
 # U-track milestone: bridge userland socket(2)/connect(2)/read/write/
 # close on a socket fd to the real in-kernel TCP/IP stack
@@ -8,10 +8,15 @@
 # slot is behind it, what AF_*/SOCK_* it was created as, whether it
 # has reached the connected/closed state).
 #
-# This module is a leaf — it imports nothing but printk — so both
-# fs/vfs.ad (read/write/close dispatch arms) and
-# linux_abi/u_syscalls.ad (the _u_socket / _u_connect bodies) can
-# import it without creating an import cycle.
+# BOUNDARY NOTE: this module is a pure leaf — it imports nothing but
+# printk and carries no Layer-2 (Linux-ABI) behaviour. It is a plain
+# socket-fd backing record, so its home is fs/ (Layer-0/1-neutral,
+# next to fs/socketpair.ad) — NOT linux_abi/. fs/vfs.ad's socket-fd
+# read/write/close dispatch arms (a Layer-1 surface) import it, and so
+# does linux_abi/u_syscalls.ad's socket(2)/connect(2) bodies (Layer 2);
+# being a leaf, it creates no import cycle for either. It was moved out
+# of linux_abi/ so fs/vfs.ad (Layer 1) no longer imports anything from
+# the Layer-2 linux_abi/ tree.
 #
 # ---------------------------------------------------------------------
 # Layout

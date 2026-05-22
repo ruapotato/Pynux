@@ -5,7 +5,7 @@
 # server daemons rely on — SO_REUSEADDR, SO_RCVBUF, TCP_NODELAY,
 # SO_ERROR, SO_BROADCAST — through the setsockopt(2)/getsockopt(2)
 # syscalls bridged to the per-socket-record option store
-# (linux_abi/u_socket_state.ad) by linux_abi/u_syscalls.ad.
+# (fs/socket_state.ad) by linux_abi/u_syscalls.ad.
 #
 # Pure round-trip — no network traffic. Also confirms an unmodelled
 # option is REJECTED with -ENOPROTOOPT rather than silently accepted.

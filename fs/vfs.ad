@@ -181,14 +181,16 @@ from fs.socketpair import (
 # U-socket: read/write/close on a connected AF_INET SOCK_STREAM fd
 # routes through the real in-kernel TCP stack. tcp.ad is an import
 # leaf (it pulls in ip/eth/arp/virtio_net but never fs/vfs.ad), so no
-# cycle. u_socket_state.ad is the per-socket-fd backing-record store —
+# cycle. fs/socket_state.ad is the per-socket-fd backing-record store —
 # also a leaf — shared with linux_abi/u_syscalls.ad's socket(2)/
-# connect(2) bodies.
+# connect(2) bodies. It lives in fs/ (not linux_abi/) because it is a
+# Layer-0/1-neutral leaf, so fs/vfs.ad (Layer 1) imports nothing from
+# the Layer-2 linux_abi/ tree here.
 from drivers.net.tcp import (
     tcp_send, tcp_recv, tcp_recv_nb, tcp_recv_pending, tcp_slot_at_eof,
     tcp_close, tcp_listen_close,
 )
-from linux_abi.u_socket_state import (
+from fs.socket_state import (
     usock_record_for_fdbuf, usock_get_state, usock_get_tcp_slot,
     usock_set_state, usock_set_tcp_slot, usock_free,
     usock_is_tls, usock_set_tls, usock_get_type,
@@ -1556,7 +1558,7 @@ def vfs_fd_is_socket(fd: int32) -> int32:
 
 
 def vfs_socket_fd_set_record(fd: int32, fdbuf: uint64) -> int32:
-    # U-socket: stash the encoded u_socket_state record id (produced
+    # U-socket: stash the encoded socket_state record id (produced
     # by usock_fdbuf_for_record) into a socket fd's per-task fd_buf.
     # linux_abi/u_syscalls.ad's socket(2) handler calls this after it
     # has allocated both the fd and the backing record — fd_buf can't
@@ -2202,7 +2204,7 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     if file_idx == FD_SOCKET_MARK:
         # U-socket: a socket fd backed by a live TCP connection routes
         # read(2) into the real stack via tcp_recv. fd_buf carries the
-        # u_socket_state record id (encoded +1; 0 == no record). A
+        # socket_state record id (encoded +1; 0 == no record). A
         # socket that was created but never connect()'d — or one whose
         # connect() failed, or one already closed — has no TCP slot and
         # reads as immediate EOF (the same answer the U35 stub gave).
@@ -2652,7 +2654,7 @@ def vfs_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
     if file_idx == FD_SOCKET_MARK:
         # U-socket: a socket fd backed by a live TCP connection routes
         # write(2) into the real stack via tcp_send. fd_buf carries the
-        # u_socket_state record id (+1 encoded). A socket that was
+        # socket_state record id (+1 encoded). A socket that was
         # never connect()'d has no TCP slot — Linux returns -ENOTCONN
         # for write on an unconnected stream socket; we don't have that
         # errno wired, so -EPIPE is the closest fit (also what a

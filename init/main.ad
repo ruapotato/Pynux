@@ -138,7 +138,7 @@ from drivers.net.tcp import (
 )
 from drivers.net.http import http_init, http_get, https_get
 from drivers.net.tls import tls_init
-from linux_abi.u_socket_state import usock_init
+from fs.socket_state import usock_init
 from linux_abi.u_epoll import u_epoll_init
 from fs.cpio import (
     cpio_init, initramfs_entry_count, initramfs_entry_name,
@@ -2179,8 +2179,8 @@ def start_kernel():
     # Initialise the VFS fd table BEFORE any user task issues SYS_OPEN.
     vfs_init()
 
-    # Reset the per-socket-fd backing-record pool (linux_abi/
-    # u_socket_state.ad). BSS is already zero so this is defensive —
+    # Reset the per-socket-fd backing-record pool (fs/
+    # socket_state.ad). BSS is already zero so this is defensive —
     # it gives socket(2)/connect(2) a known-clean record table before
     # any Linux-ABI user binary issues its first socket call.
     usock_init()

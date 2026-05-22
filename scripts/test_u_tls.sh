@@ -12,7 +12,7 @@
 #   * tls_connect(2) — SYS_TLS_CONNECT (277) -> _u_tls_connect in
 #     linux_abi/u_syscalls.ad. Takes a connected socket fd through the
 #     in-kernel TLS 1.3 handshake (drivers/net/tls.ad).
-#   * the per-fd TLS-active flag in linux_abi/u_socket_state.ad.
+#   * the per-fd TLS-active flag in fs/socket_state.ad.
 #   * the TLS-routing read/write/close arms in fs/vfs.ad — once the fd
 #     is TLS-active, write() encrypts and read() decrypts transparently.
 #

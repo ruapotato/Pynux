@@ -39,7 +39,7 @@
 #
 # An epoll/eventfd/timerfd/signalfd fd is a real per-task fd-table slot
 # tagged with one of the FD_*_MARK markers below; its fd_buf carries
-# `slot_id + 1` (0 == "no object", same +1 encoding u_socket_state uses)
+# `slot_id + 1` (0 == "no object", same +1 encoding socket_state uses)
 # so a dup'd fd shares the underlying object and close just zeroes the
 # slot. fs/vfs.ad's vfs_close calls the matching *_release here before
 # the slot is wiped.
