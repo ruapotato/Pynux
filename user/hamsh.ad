@@ -632,13 +632,25 @@ nd_a:    Array[16384, int32]
 nd_b:    Array[16384, int32]
 nd_c:    Array[16384, int32]
 nd_i:    Array[16384, int64]
-nd_str:  Array[512, uint64]
-nd_ks:   Array[512, uint64]    # kid_start into nd_kid
-nd_kn:   Array[512, uint64]    # kid_count
+# nd_str / nd_ks / nd_ke / nd_kn are indexed by node id, so they MUST
+# be sized to NODE_MAX (16384) — a 512-slot array would let nd_new
+# write past the end the moment the session creates its 513th node.
+nd_str:  Array[16384, uint64]
+nd_ks:   Array[16384, int32]   # head slot of the kid linked-list (0 = empty)
+nd_ke:   Array[16384, int32]   # tail slot of the kid linked-list (O(1) append)
+nd_kn:   Array[16384, uint64]  # kid count
 nd_count: uint64 = 1          # node 0 reserved as null
 
-nd_kid:  Array[32768, int32]
-nd_kid_cursor: uint64 = 0
+# Kid storage is a LINKED LIST, not a contiguous run. The previous
+# contiguous-pool design required "push all of one node's kids before
+# touching another node" — which is impossible for any nested parse:
+# parse_block pushes a statement onto the block's list, but building
+# the NEXT statement pushes that statement's OWN word-kids into the
+# pool in between, scattering the block's kid run. A per-slot `next`
+# pointer makes append correct regardless of interleaving.
+nd_kid:      Array[32768, int32]   # the kid node id at this slot
+nd_kid_next: Array[32768, int32]   # next slot in the owner's list (0 = end)
+nd_kid_cursor: uint64 = 1          # slot 0 reserved as the list terminator
 
 # Parser cursor + error.
 ps_pos:   uint64 = 0
@@ -669,28 +681,46 @@ def nd_new(kind: int32) -> int32:
     nd_c[n]    = 0
     nd_i[n]    = 0
     nd_str[n]  = 0
-    nd_ks[n]   = 0
+    nd_ks[n]   = 0          # 0 = empty kid list
+    nd_ke[n]   = 0
     nd_kn[n]   = 0
     return cast[int32](n)
 
 
 def nd_kid_push(node: int32, kid: int32):
-    # Append kid to node's kid list. Kid lists must be built
-    # contiguously — push all kids for one node before starting another.
+    # Append `kid` to `node`'s kid linked-list. Correct regardless of
+    # interleaving — building another node's kid list in between does
+    # not disturb this one (the old contiguous-pool design silently
+    # scattered a block's statements when each statement's own kids
+    # got pushed between two block-level pushes).
     nu: uint64 = cast[uint64](node)
-    if nd_kn[nu] == 0:
-        nd_ks[nu] = nd_kid_cursor
-    if nd_kid_cursor >= 2048:
+    if nd_kid_cursor >= 32768:
         ps_set_err("kid pool full")
         return
-    nd_kid[nd_kid_cursor] = kid
+    slot: uint64 = nd_kid_cursor
     nd_kid_cursor = nd_kid_cursor + 1
+    nd_kid[slot] = kid
+    nd_kid_next[slot] = 0                # end-of-list sentinel
+    if nd_ks[nu] == 0:
+        nd_ks[nu] = cast[int32](slot)    # first kid — becomes the head
+    else:
+        nd_kid_next[cast[uint64](nd_ke[nu])] = cast[int32](slot)
+    nd_ke[nu] = cast[int32](slot)        # new tail
     nd_kn[nu] = nd_kn[nu] + 1
 
 
 def nd_kid_at(node: int32, idx: uint64) -> int32:
+    # Walk the kid linked-list to position `idx`. Blocks / arg lists
+    # are short, so the O(n) walk is cheap.
     nu: uint64 = cast[uint64](node)
-    return nd_kid[nd_ks[nu] + idx]
+    slot: int32 = nd_ks[nu]
+    i: uint64 = 0
+    while slot != 0 and i < idx:
+        slot = nd_kid_next[cast[uint64](slot)]
+        i = i + 1
+    if slot == 0:
+        return 0
+    return nd_kid[cast[uint64](slot)]
 
 
 # --- token cursor helpers -------------------------------------------
@@ -1415,7 +1445,7 @@ def parse_program() -> int32:
 
 def parser_reset():
     nd_count = 1
-    nd_kid_cursor = 0
+    nd_kid_cursor = 1          # slot 0 reserved as the list terminator
 
 
 # ====================================================================
@@ -2929,10 +2959,28 @@ def exec_block(node: int32) -> int32:
 # body to be able to print — so we use rfork(RFPROC|RFNAMEG): the
 # child runs the block in its private namespace and the parent waits.
 
-RFPROC:   int32 = 0x001
-RFNAMEG:  int32 = 0x008
-RFCNAMEG: int32 = 0x010
-RFNOWAIT: int32 = 0x100
+# RF* flag bits — must match sys/src/9/port/sysproc.ad exactly.
+RFPROC:   int32 = 0x001       # create a new process
+RFNAMEG:  int32 = 0x008       # copy namespace (COW Pgrp clone)
+RFCNAMEG: int32 = 0x080       # start child with an EMPTY namespace
+RFNOWAIT: int32 = 0x100       # detach — parent never reaps
+
+
+def _ns_child_ensure_stdio(clean: int32):
+    # A namespace-scope child needs working stdio. Under the default
+    # overlay (RFNAMEG) the /fd table was COW-copied with the Pgrp, so
+    # /fd/0,1,2 are already bound — nothing to do. Under `ns clean`
+    # (RFCNAMEG) the Pgrp is EMPTY: stdio is the process's own streams
+    # and must be re-established by the block (§13 "you bind the
+    # basics yourself"), so re-graft `#d` and seed the standard names.
+    # The rest of the world (/dev, /env, ambient binds) stays absent —
+    # that is the hermetic contract.
+    if clean != 0:
+        sys_bind(cast[Ptr[char]]("/fd"), cast[Ptr[char]]("#d"),
+                 MREPL_FLAG)
+        sys_fdbind(0, 0, DEVFD_CONS, 0)
+        sys_fdbind(0, 1, DEVFD_CONS, 0)
+        sys_fdbind(0, 2, DEVFD_CONS, 0)
 
 
 def exec_ns(node: int32) -> int32:
@@ -2951,6 +2999,7 @@ def exec_ns(node: int32) -> int32:
     pid: int32 = sys_rfork(flags)
     if pid == 0:
         # child: run the body in the private namespace, then exit
+        _ns_child_ensure_stdio(clean)
         ex: int32 = exec_block(nd_b[nu])
         st: uint64 = 0
         if ex == EX_ERROR:
@@ -3482,7 +3531,7 @@ def _maybe_recycle_arenas():
             val_elem_cursor < LISTELEM_MAX - 1024:
         return
     nd_count = 1
-    nd_kid_cursor = 0
+    nd_kid_cursor = 1          # slot 0 reserved as the list terminator
     val_count = 1
     val_elem_cursor = 0
     str_cursor = 1
