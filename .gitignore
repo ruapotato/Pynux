@@ -124,3 +124,4 @@ tests/u-binary/busybox
 # upstream archive is the source of truth). BUILD.sh + MANIFEST.txt +
 # HOWTO.md stay tracked.
 tests/distros/debian-minbase/rootfs/
+tests/u-binary/src/epolltest/epolltest

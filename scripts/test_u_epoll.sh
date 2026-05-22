@@ -27,7 +27,7 @@ cd "$PROJ_ROOT"
 
 ensure_ubin_or_skip test_u_epoll u_epolltest epolltest
 
-ELF=build/hamnix-vmlinux.elf
+ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
 echo "[test_u_epoll] (1/4) Build userland (hamsh + helpers)"
