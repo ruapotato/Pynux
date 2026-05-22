@@ -1,38 +1,37 @@
 #!/usr/bin/env bash
-# scripts/test_distro_namespace.sh - Phase C.5 regression for
-# /bin/distrorun (user/distrorun.ad). Proves the architectural shape
-# of distro-shape namespaces works end-to-end on top of Phase C's
-# rfork (256) + bind (257) + mount (258) primitives:
+# scripts/test_distro_namespace.sh - distro-shape namespace regression.
 #
-#   1. distrorun parses argv, opens the per-distro backing directory
-#      (/var/lib/distros/<distro>/), rfork(RFNAMEG)s to privatise the
-#      namespace, mount()s the backing srvfd at "/" (inert today —
-#      Phase D wires the chan dispatch), binds each distro-shape
-#      subdir (/etc, /usr, /lib, /var) onto backing/{etc,usr,lib,var},
-#      re-binds shared paths (/home, /net, /srv, /dev, /proc), and
-#      exec's the target binary.
+# The bespoke `distrorun` launcher is RETIRED (HAMSH_SPEC §0: one
+# primitive, many skins — no special container command). Running a
+# binary in a distro-shape namespace is now plain namespace verbs:
 #
-#   2. From inside the namespace, /etc/debian_version reads from the
-#      backing's /etc/debian_version ("12.0"), proving the bind
-#      grafted the testdistro tree into the calling task's view.
+#   * /etc/rc.boot defines the Linux runtime namespace as a captured
+#     `ns { }` value named `linuxruntime` — the distro-shape recipe
+#     (graft /etc, /usr, /lib, /lib64, /var onto the backing tree
+#     /var/lib/distros/default/). It is a TEMPLATE (HAMSH_SPEC §11).
+#   * `enter linuxruntime { <cmd> }` forks a child, applies a fresh
+#     COW instance of the template, runs the command, blocks for it.
 #
+# This test boots via the DEFAULT /init shim (so /etc/rc.boot runs and
+# `linuxruntime` is defined), then proves the architectural shape of
+# distro-shape namespaces end-to-end on Phase C's rfork/bind/mount:
+#
+#   1. rc.boot defined the `linuxruntime` namespace value.
+#   2. `enter linuxruntime { /bin/cat /etc/debian_version }` reads
+#      /etc/debian_version from the distro backing
+#      (/var/lib/distros/default/etc/debian_version = "12.4") — the
+#      ns-template's bind grafted the distro tree into the child's
+#      view.
 #   3. From OUTSIDE the namespace (hamsh's own view, unaffected by
-#      the child's rfork), /etc/debian_version still reads Hamnix's
-#      native value ("hamnix/0.1") — the namespace mutation is per-
-#      task, not global.
+#      the enter child's rfork), /etc/debian_version still reads
+#      Hamnix's native value ("hamnix/0.1") — the namespace mutation
+#      is per-task, not global.
+#   4. `enter linuxruntime { ... } && echo CHAIN_OK` — the §11
+#      namespace verbs chain with && / || like any other command.
 #
-# Test backing fixture is in tests/distros/testdistro/ (etc/debian_
-# version = "12.0", etc/os-release with PRETTY_NAME containing
-# "Debian"). build_initramfs.py walks tests/distros/* and embeds each
+# Test backing fixture is tests/distros/default/ (etc/debian_version =
+# "12.4"). build_initramfs.py walks tests/distros/* and embeds each
 # file at /var/lib/distros/<name>/<rel>.
-#
-# PASS markers (grepped below):
-#   [distrorun] bound /etc -> backing/etc ok
-#   [distrorun] entered namespace ok
-#   [testdistro] /etc/debian_version=12.0
-#   [native]    /etc/debian_version=hamnix/0.1
-#
-# Run after Phase C's regressions (test_rfork, test_p9mount) pass.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -41,15 +40,16 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 ELF=build/hamnix-kernel.elf
-HAMSH_ELF=build/user/hamsh.elf
 
-echo "[test_distro_namespace] (1/4) Build userland (hamsh + distrorun)"
+echo "[test_distro_namespace] (1/4) Build userland (hamsh + coreutils)"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 
-echo "[test_distro_namespace] (2/4) Plant /init = hamsh + " \
-     "/var/lib/distros/testdistro/* fixture"
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
+echo "[test_distro_namespace] (2/4) Plant default /init shim + " \
+     "/var/lib/distros/default/* fixture"
+# Default /init = the shim — it execs hamsh with /etc/rc.boot, which
+# defines the `linuxruntime` namespace value. No INIT_ELF override.
+python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_distro_namespace] (3/4) Rebuild kernel image"
 mkdir -p build
@@ -60,46 +60,42 @@ python3 -m compiler.adder compile \
 
 echo "[test_distro_namespace] (4/4) Boot QEMU + drive via hamsh"
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+trap 'rm -f "$LOG"' EXIT
 
 # In-VM script: drive hamsh through (a) native read of
-# /etc/debian_version, (b) distrorun-launched read inside the
-# namespace, (c) a SECOND native read AFTER the namespace command
-# returns. distrorun launches /bin/cat inside the namespace, which
-# reads /etc/debian_version. Inside, the bind makes that resolve to
-# /var/lib/distros/testdistro/etc/debian_version ("12.0"). Outside,
-# hamsh's namespace is unaffected by distrorun's rfork (RFNAMEG only
-# privatises the CURRENT task's view, which for distrorun is a
-# spawned child of hamsh), so the native read after distrorun still
-# sees Hamnix's "hamnix/0.1".
-#
-# Hamnix's /bin/echo doesn't support -n yet, so we emit BANNER lines
-# (full line + newline) followed by a cat invocation. The grep
-# assertions below look for the banner and value bytes anywhere in
-# the log; the BANNER text is unique per phase so misordering would
-# be caught by the post-distrorun banner check.
+# /etc/debian_version, (b) an `enter linuxruntime { cat ... }` read
+# inside the rc-defined namespace, (c) a SECOND native read AFTER the
+# enter returns, (d) an `enter ... && echo` chain. `enter` launches
+# /bin/cat inside the namespace, which reads /etc/debian_version.
+# Inside, the ns-template's bind makes that resolve to
+# /var/lib/distros/default/etc/debian_version ("12.4"). Outside,
+# hamsh's namespace is unaffected (enter rfork's a child), so the
+# native read after enter still sees Hamnix's "hamnix/0.1".
 set +e
 (
-    sleep 3
-    # 1) Baseline native read (before any distrorun call).
+    sleep 4
+    # 1) Baseline native read (before any enter).
     printf '/bin/echo BANNER-NATIVE-PRE\n'
     sleep 1
     printf '/bin/cat /etc/debian_version\n'
     sleep 1
-    # 2) Namespaced read via distrorun.
-    printf '/bin/echo BANNER-TESTDISTRO\n'
+    # 2) Namespaced read via `enter linuxruntime`.
+    printf '/bin/echo BANNER-RUNTIME\n'
     sleep 1
-    printf '/bin/distrorun testdistro /bin/cat /etc/debian_version\n'
-    sleep 2
-    # 3) Native read AFTER the namespaced child returned — proves
+    printf 'enter linuxruntime {\n/bin/cat /etc/debian_version\n}\n'
+    sleep 3
+    # 3) Native read AFTER the entered child returned — proves
     # hamsh's namespace is untouched.
     printf '/bin/echo BANNER-NATIVE-POST\n'
     sleep 1
     printf '/bin/cat /etc/debian_version\n'
     sleep 1
+    # 4) The §11 namespace verbs chain with && like any command.
+    printf 'enter linuxruntime { /bin/true } && /bin/echo CHAIN_OK\n'
+    sleep 3
     printf 'exit\n'
     sleep 1
-) | timeout 30s qemu-system-x86_64 \
+) | timeout 40s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -117,38 +113,18 @@ echo "[test_distro_namespace] --- end output ---"
 
 fail=0
 
-# 1. distrorun ran far enough to bind /etc onto the backing.
-if grep -F -q "[distrorun] bound /etc -> backing/etc ok" "$LOG"; then
-    echo "[test_distro_namespace] OK: distrorun bound /etc into namespace"
+# 1. rc.boot defined the Linux runtime namespace value.
+if grep -F -q "rc.boot: linux runtime namespace defined" "$LOG"; then
+    echo "[test_distro_namespace] OK: rc.boot defined the linuxruntime ns value"
 else
-    echo "[test_distro_namespace] MISS: distrorun didn't bind /etc"
-    fail=1
-fi
-
-# 2. distrorun reached the "namespace ready" banner BEFORE exec.
-if grep -F -q "[distrorun] entered namespace ok" "$LOG"; then
-    echo "[test_distro_namespace] OK: distrorun reached pre-exec banner"
-else
-    echo "[test_distro_namespace] MISS: distrorun never reached exec"
+    echo "[test_distro_namespace] MISS: rc.boot did not define linuxruntime"
     fail=1
 fi
 
 # Helper: assert that VALUE appears in the captured log somewhere
-# within the 20 lines following the BANNER marker. This is the
-# adjacency we get from `echo BANNER\ncat <file>` — Hamnix's echo
-# always trails its line with \n (no -n support), and the next cat
-# output lands on the following lines. The 20-line window covers
-# the kernel's `elf: entry=...` / `execve: jumping ...` printk debug
-# spam, hamsh's prompt redraw, AND (for the distrorun case)
-# distrorun's own pre-exec banners before the child's cat output.
-#
-# `[atkbd-diag]` lines are an unconditional periodic kernel
-# keyboard-poll diagnostic (drivers/input/atkbd.ad::atkbd_diag_tick).
-# They have nothing to do with this test's subject — and when the VM
-# idles between the driver's `sleep` steps the diagnostic emits
-# hundreds of them, which would otherwise blow the 20-line window
-# apart. Skip them entirely: they are neither program output nor a
-# window-consuming line.
+# within the 20 lines following the BANNER marker. `[atkbd-diag]`
+# periodic kernel keyboard-poll lines are skipped — they are neither
+# program output nor window-consuming.
 assert_banner_value() {
     local banner="$1"
     local value="$2"
@@ -169,22 +145,27 @@ assert_banner_value() {
     fi
 }
 
-# 3. Inside the namespace, /etc/debian_version came from testdistro
-#    ("12.0"). distrorun's own pre-exec banner shows up between the
-#    BANNER-TESTDISTRO marker and the cat output; the 8-line window
-#    in assert_banner_value covers that.
-assert_banner_value "BANNER-TESTDISTRO" "12.0" \
-    "namespaced /etc/debian_version reads testdistro backing"
+# 2. Inside the namespace, /etc/debian_version came from the default
+#    distro backing ("12.4").
+assert_banner_value "BANNER-RUNTIME" "12.4" \
+    "enter linuxruntime: /etc/debian_version reads distro backing"
 
-# 4. Outside the namespace (hamsh's own view), /etc/debian_version
-#    still reads Hamnix's native value. We check BOTH the pre-
-#    distrorun and post-distrorun reads — the post one is the real
-#    boundary test (proves distrorun's rfork didn't bleed into
-#    hamsh's namespace).
+# 3. Outside the namespace (hamsh's own view), /etc/debian_version
+#    still reads Hamnix's native value. Both the pre- and post-enter
+#    reads — the post one is the real boundary test (proves the
+#    enter child's rfork didn't bleed into hamsh's namespace).
 assert_banner_value "BANNER-NATIVE-PRE" "hamnix/0.1" \
-    "pre-distrorun native /etc/debian_version reads Hamnix"
+    "pre-enter native /etc/debian_version reads Hamnix"
 assert_banner_value "BANNER-NATIVE-POST" "hamnix/0.1" \
-    "post-distrorun native /etc/debian_version still reads Hamnix"
+    "post-enter native /etc/debian_version still reads Hamnix"
+
+# 4. The namespace verb chained with && (HAMSH_SPEC §11).
+if grep -F -q "CHAIN_OK" "$LOG"; then
+    echo "[test_distro_namespace] OK: enter linuxruntime { } && echo chains"
+else
+    echo "[test_distro_namespace] MISS: enter did not chain with &&"
+    fail=1
+fi
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_distro_namespace] FAIL (qemu rc=$rc)"

@@ -11,12 +11,21 @@
 #
 # U43 closes the loop: it stages ld.so + libc.so.6 + the dynamic
 # binary into a per-distro BACKING tree (/var/lib/distros/dyndistro/)
-# and runs the binary via /bin/distrorun, which:
+# and runs the binary with plain namespace verbs. The bespoke
+# `distrorun` launcher is RETIRED (HAMSH_SPEC §0: one primitive, many
+# skins). The test instead DEFINES the distro-shape namespace as a
+# captured `ns { }` value at the hamsh prompt and ENTERS it:
 #
-#   1. rfork(RFNAMEG) — privatises the calling task's namespace.
-#   2. bind("/lib64", backing/lib64) — grafts the distro's ld.so.
-#   3. bind("/lib",   backing/lib)   — grafts the distro's libc.so.6.
-#   4. exec("/bin/u_dynamic_ns_hello") — the dynamic binary itself.
+#   dyndistns = ns {
+#       bind /lib64 /var/lib/distros/dyndistro/lib64   # the distro's ld.so
+#       bind /lib   /var/lib/distros/dyndistro/lib     # the distro's libc.so.6
+#   }
+#   enter dyndistns { /bin/u_dynamic_ns_hello }
+#
+# `enter` forks a child, does rfork(RFNAMEG) (private namespace),
+# applies the captured template (the two binds above), then runs the
+# body — exactly the sequence distrorun used to hard-code, now plain
+# shell verbs.
 #
 # Inside that namespace the kernel ELF loader's PT_INTERP lookup
 # (fs/elf.ad::_load_interp_elf → ns_blob_ptr → resolve_path) rewrites
@@ -26,8 +35,9 @@
 # opens "/lib/x86_64-linux-gnu/libc.so.6", which vfs_open resolves
 # through the SAME namespace bind to the distro's libc.so.6.
 #
-# The binary itself (/bin/u_dynamic_ns_hello) is left in Hamnix's native
-# /bin — distrorun deliberately does not bind /bin (see distrorun.ad).
+# The binary itself (/bin/u_dynamic_ns_hello) is left in Hamnix's
+# native /bin — the ns template deliberately does not bind /bin, and
+# `enter` overlays on the ambient namespace so native /bin survives.
 # So this test exercises the precise split the §4 mission asked for:
 # binary resolved natively, interpreter + library resolved through
 # the namespace.
@@ -76,7 +86,7 @@ echo "[test_u43_dynamic_namespace]   $(file -b "$UBIN")"
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
-echo "[test_u43_dynamic_namespace] (2/5) Build userland (hamsh + distrorun)"
+echo "[test_u43_dynamic_namespace] (2/5) Build userland (hamsh + coreutils)"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 
@@ -110,10 +120,10 @@ trailer = bi.cpio_trailer()
 assert archive.endswith(trailer), "archive shape changed; review me"
 archive = archive[:-len(trailer)]
 
-# Stage ld.so + libc.so.6 INSIDE the distro backing tree. distrorun
-# binds /var/lib/distros/dyndistro/{lib64,lib} onto /lib64 and /lib;
-# the loader then resolves the dynamic binary's interpreter +
-# library through that namespace bind.
+# Stage ld.so + libc.so.6 INSIDE the distro backing tree. The
+# `dyndistns` ns template binds /var/lib/distros/dyndistro/{lib64,lib}
+# onto /lib64 and /lib; the loader then resolves the dynamic binary's
+# interpreter + library through that namespace bind.
 ldso_data = Path(sys.argv[1]).resolve().read_bytes()
 print(f"  injecting /var/lib/distros/dyndistro/lib64/"
       f"ld-linux-x86-64.so.2 ({len(ldso_data)} bytes)")
@@ -141,7 +151,7 @@ python3 -m compiler.adder compile \
     init/main.ad \
     -o "$ELF" >/dev/null
 
-echo "[test_u43_dynamic_namespace] (5/5) Boot QEMU + run via distrorun"
+echo "[test_u43_dynamic_namespace] (5/5) Boot QEMU + run via enter"
 LOG=$(mktemp)
 # Restore the baseline default initramfs on exit so subsequent tests
 # (and a clean repo state) don't carry forward the +dyndistro form.
@@ -150,7 +160,15 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf '/bin/distrorun dyndistro /bin/u_dynamic_ns_hello\n'
+    # Define the distro-shape namespace as a captured `ns {}` value,
+    # then enter it to run the dynamic binary. This is the retired
+    # distrorun's job expressed as plain namespace verbs (§0/§11).
+    printf 'dyndistns = ns {\n'
+    printf 'bind /lib64 /var/lib/distros/dyndistro/lib64\n'
+    printf 'bind /lib /var/lib/distros/dyndistro/lib\n'
+    printf '}\n'
+    sleep 2
+    printf 'enter dyndistns {\n/bin/u_dynamic_ns_hello\n}\n'
     sleep 6
     printf 'exit\n'
     sleep 1
@@ -172,15 +190,7 @@ echo "[test_u43_dynamic_namespace] --- end output ---"
 
 fail=0
 
-# 1. distrorun privatised the namespace and grafted /lib64 + /lib.
-if grep -F -q "[distrorun] entered namespace ok" "$LOG"; then
-    echo "[test_u43_dynamic_namespace] OK: distrorun entered namespace"
-else
-    echo "[test_u43_dynamic_namespace] MISS: distrorun never reached exec"
-    fail=1
-fi
-
-# 2. The loader detected PT_INTERP — the dynamic-ELF arm fired.
+# 1. The loader detected PT_INTERP — the dynamic-ELF arm fired.
 if grep -F -q "PT_INTERP=" "$LOG"; then
     echo "[test_u43_dynamic_namespace] OK: loader detected PT_INTERP"
 else
@@ -188,11 +198,11 @@ else
     fail=1
 fi
 
-# 3. The interpreter was loaded — recursive ELF load completed. This
+# 2. The interpreter was loaded — recursive ELF load completed. This
 #    proves ns_blob_ptr resolved "/lib64/ld-linux-x86-64.so.2" through
-#    the distrorun bind to the distro tree's ld.so (the interpreter
-#    is NOT staged at the global /lib64 path — only inside the
-#    dyndistro backing — so a load here means the namespace lookup
+#    the `dyndistns` ns-template bind to the distro tree's ld.so (the
+#    interpreter is NOT staged at the global /lib64 path — only inside
+#    the dyndistro backing — so a load here means the namespace lookup
 #    worked).
 if grep -F -q "dynamic load: interp_base=" "$LOG"; then
     echo "[test_u43_dynamic_namespace] OK: interpreter resolved via namespace"
@@ -202,7 +212,7 @@ else
     fail=1
 fi
 
-# 4. PRIMARY: the application's main() ran. ld.so walked the app's
+# 3. PRIMARY: the application's main() ran. ld.so walked the app's
 #    PT_DYNAMIC, resolved DT_NEEDED=[libc.so.6] through the namespace
 #    bind, relocated everything, and jumped to main().
 if grep -F -q "U43 dynamic-ns hello" "$LOG"; then

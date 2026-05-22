@@ -57,4 +57,40 @@ motdsvc = spawn detached bootns {
 }
 
 echo 'rc.boot: boot services launched'
+
+# --- the Linux runtime namespace ------------------------------------
+# HAMSH_SPEC §0 + §11: running a Linux binary is NOT a bespoke
+# `distrorun` command — it is a captured `ns { }` value plus an
+# `enter`. This is the §0 ethos: one primitive (a Chan at a name in a
+# Pgrp), many skins; no special container launcher.
+#
+# `linuxruntime` is the distro-shape namespace recipe (docs/distro-
+# namespaces.md). It grafts the conventional FHS-Linux subtrees
+# (/etc, /usr, /lib, /lib64, /var) onto a distro backing tree under
+# /var/lib/distros/<name>/. The shared paths (/home, /net, /srv,
+# /dev, /proc, /env) are NOT rebound: `enter` overlays this template
+# onto a COW copy of the ambient namespace (HAMSH_SPEC §13 overlay
+# default), so they survive untouched — a Linux binary sees the same
+# /home/$user, /dev/cons, and PATH as a native process. That is the
+# whole job the retired `distrorun` binary used to hard-code.
+#
+# A captured `ns {}` is a TEMPLATE — configured, not entered (§11).
+# Running a Linux binary is then plain namespace verbs:
+#
+#   enter linuxruntime { /bin/apt update }      # synchronous
+#   svc = spawn linuxruntime { /bin/postgres }  # service
+#
+# The backing distro is the conventional `/var/lib/distros/default/`;
+# install another distro tree there (or edit this recipe) to retarget.
+# A `bind` whose backing subtree is absent records cleanly and simply
+# resolves to nothing — exactly as the old distrorun tolerated.
+linuxruntime = ns {
+    bind /etc /var/lib/distros/default/etc
+    bind /usr /var/lib/distros/default/usr
+    bind /lib /var/lib/distros/default/lib
+    bind /lib64 /var/lib/distros/default/lib64
+    bind /var /var/lib/distros/default/var
+}
+echo 'rc.boot: linux runtime namespace defined (enter linuxruntime { ... })'
+
 echo 'rc.boot: init complete -- handing off to interactive shell'

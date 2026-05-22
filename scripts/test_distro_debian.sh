@@ -2,9 +2,16 @@
 # scripts/test_distro_debian.sh - real Debian rootfs running inside a
 # Hamnix distro-shape namespace. The follow-on to
 # scripts/test_distro_namespace.sh (which proves the namespace bind
-# mechanism with a synthetic two-file testdistro fixture); this script
+# mechanism with the rc-defined `linuxruntime` ns value); this script
 # proves the same mechanism with a REAL debootstrap'd Debian rootfs
 # (tests/distros/debian-minbase/rootfs/).
+#
+# The bespoke `distrorun` launcher is RETIRED (HAMSH_SPEC §0). A
+# distro-shape namespace is a captured `ns { }` value entered with
+# plain namespace verbs. This test DEFINES one at the hamsh prompt —
+# `debianns = ns { bind /etc /var/lib/distros/debian-minbase/etc ... }`
+# — and enters it with `enter debianns { ... }`. That is the
+# define-and-enter ergonomics goal: no ceremony, no special command.
 #
 # Boot path:
 #   1. HAMNIX_EMBED_DEBIAN=1 walks tests/distros/debian-minbase/rootfs/
@@ -14,9 +21,9 @@
 #   2. INIT_ELF=hamsh.elf plants hamsh at /init so the boot drops us
 #      at a shell prompt.
 #   3. The kernel is rebuilt with the larger initramfs.
-#   4. QEMU boots; we drive hamsh through `/bin/distrorun debian-minbase
-#      /bin/cat /etc/debian_version` and assert the captured output
-#      contains a plausible Debian release token.
+#   4. QEMU boots; we drive hamsh to define `debianns` then run
+#      `enter debianns { /bin/cat /etc/debian_version }` and assert
+#      the captured output contains a plausible Debian release token.
 #
 # Skip-on-missing: if rootfs/bin/true is absent (host hasn't run
 # tests/distros/debian-minbase/BUILD.sh), this exits 0 with a SKIP
@@ -32,20 +39,20 @@
 #   load as a real ELF interpreter — a separate, larger bring-up.
 #
 #   So the PRIMARY assertion this script makes is:
-#     (a) distrorun successfully entered the namespace
-#         ("[distrorun] entered namespace ok")
+#     (a) `enter debianns { }` successfully entered the namespace
+#         (the cat ran inside it)
 #     (b) the namespace's /etc/debian_version path resolves to the
 #         REAL Debian release string (e.g. "13.5" / "trixie/sid") —
 #         proving the bind grafted the debootstrap'd /etc/ into the
-#         calling task's view.
+#         entered task's view.
 #
 #   That's the same evidence shape test_distro_namespace.sh gathers
-#   for the testdistro fixture, just with a REAL backing tree. When
-#   the dynamic-linker work lands, this script can be extended to
-#   actually exec /bin/true + assert exit 0.
+#   for the default fixture, just with a REAL backing tree. When the
+#   dynamic-linker work lands, this script can be extended to actually
+#   exec /bin/true + assert exit 0.
 #
 # PASS markers (greppable):
-#   [distrorun] entered namespace ok
+#   ENTERED-DEBIAN-NS
 #   <Debian release token in /etc/debian_version, anywhere in the log>
 
 . "$(dirname "$0")/_build_lock.sh"
@@ -73,7 +80,7 @@ echo "[test_distro_debian] expected /etc/debian_version='$EXPECTED_VER'"
 ELF=build/hamnix-kernel.elf
 HAMSH_ELF=build/user/hamsh.elf
 
-echo "[test_distro_debian] (1/4) Build userland (hamsh + distrorun)"
+echo "[test_distro_debian] (1/4) Build userland (hamsh + coreutils)"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 
@@ -97,16 +104,29 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
+    # 0) Define the distro-shape namespace as a captured `ns {}` value
+    #    at the prompt — the define-and-enter ergonomics path. The
+    #    binds graft the debootstrap'd rootfs subtrees onto the FHS
+    #    paths. (Backing-subtree-absent binds record cleanly; only
+    #    /etc is exercised here.)
+    printf 'debianns = ns {\n'
+    printf 'bind /etc /var/lib/distros/debian-minbase/etc\n'
+    printf 'bind /usr /var/lib/distros/debian-minbase/usr\n'
+    printf 'bind /lib /var/lib/distros/debian-minbase/lib\n'
+    printf 'bind /lib64 /var/lib/distros/debian-minbase/lib64\n'
+    printf 'bind /var /var/lib/distros/debian-minbase/var\n'
+    printf '}\n'
+    sleep 2
     # 1) Read /etc/debian_version inside the debian-minbase namespace.
-    #    The bind grafts rootfs/etc/ onto /etc/ inside the rfork'd
-    #    task's view; the cat we exec is Hamnix's /bin/cat (not
-    #    Debian's — see distrorun.ad comment about /bin staying
-    #    native), but it opens "/etc/debian_version" which resolves
-    #    through the Phase C chan_resolve_prefix hook to the embedded
+    #    `enter` forks a child, applies a fresh COW instance of the
+    #    template, runs the body. The bind grafts rootfs/etc/ onto
+    #    /etc/ inside the entered task's view; the cat is Hamnix's
+    #    /bin/cat, but it opens "/etc/debian_version" which resolves
+    #    through the chan_resolve_prefix hook to the embedded
     #    /var/lib/distros/debian-minbase/etc/debian_version.
     printf '/bin/echo BANNER-DEB-VERSION\n'
     sleep 1
-    printf '/bin/distrorun debian-minbase /bin/cat /etc/debian_version\n'
+    printf 'enter debianns {\n/bin/echo ENTERED-DEBIAN-NS\n/bin/cat /etc/debian_version\n}\n'
     sleep 3
     # 2) Sanity check: native /etc/debian_version still reads Hamnix's
     #    string. Demonstrates the namespace mutation is per-task.
@@ -134,13 +154,14 @@ echo "[test_distro_debian] --- end output ---"
 
 fail=0
 
-# 1. distrorun reached its pre-exec banner — the namespace was
-#    privatised, the bind grafted backing/etc onto /etc, and we
-#    exec'd. Hamnix's own /bin/cat is what runs inside.
-if grep -F -q "[distrorun] entered namespace ok" "$LOG"; then
-    echo "[test_distro_debian] OK: distrorun reached pre-exec banner"
+# 1. `enter debianns { }` ran the body inside the namespace — the
+#    namespace was privatised (rfork), the captured ns template's
+#    bind grafted backing/etc onto /etc, and the body ran. Hamnix's
+#    own /bin/echo + /bin/cat are what run inside.
+if grep -F -q "ENTERED-DEBIAN-NS" "$LOG"; then
+    echo "[test_distro_debian] OK: enter debianns { } ran the body inside the ns"
 else
-    echo "[test_distro_debian] MISS: distrorun never reached exec"
+    echo "[test_distro_debian] MISS: enter debianns never ran the body"
     fail=1
 fi
 
@@ -169,11 +190,11 @@ assert_banner_value() {
 assert_banner_value "BANNER-DEB-VERSION" "$EXPECTED_VER" \
     "namespaced /etc/debian_version reads debian-minbase backing"
 
-# 3. After the namespaced child returns, hamsh's own /etc/debian_version
-#    still reads Hamnix's native value — proving distrorun's rfork
-#    didn't bleed into the parent's namespace.
+# 3. After the entered child returns, hamsh's own /etc/debian_version
+#    still reads Hamnix's native value — proving the enter child's
+#    rfork didn't bleed into the parent's namespace.
 assert_banner_value "BANNER-NATIVE-AFTER" "hamnix/0.1" \
-    "post-distrorun native /etc/debian_version still reads Hamnix"
+    "post-enter native /etc/debian_version still reads Hamnix"
 
 if [ "$fail" -ne 0 ]; then
     echo "[test_distro_debian] FAIL (qemu rc=$rc)"

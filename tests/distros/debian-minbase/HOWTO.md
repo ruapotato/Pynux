@@ -2,8 +2,9 @@
 
 A real Debian minbase rootfs used as the backing store for the
 `debian-minbase` distro inside Hamnix's distro-shape namespace
-mechanism (see `docs/distro-namespaces.md` for the spec, and
-`user/distrorun.ad` for the entry-point binary).
+mechanism (see `docs/distro-namespaces.md` for the spec). There is no
+bespoke launcher binary: a distro-shape namespace is a captured
+`ns { }` value entered with plain namespace verbs (`enter`).
 
 This directory is the **infrastructure for staging a real Debian
 rootfs as a distro backing**. The actual binary tree lives in
@@ -17,12 +18,13 @@ The Phase C.5 testdistro fixture (`tests/distros/testdistro/`) is a
 two-file synthetic backing — just `/etc/debian_version` + `/etc/os-release`
 — which proved the namespace bind path. It can't exec anything.
 
-This fixture is a **real Debian rootfs**, so `distrorun debian-minbase
-/bin/true` actually exec's the Debian-shipped `/bin/true` from inside
-the namespace. From here, `deb /bin/cat /etc/debian_version` is a
-genuine read of Debian's release string through the bind, and `deb
-/bin/bash` is the first real distro shell on Hamnix (modulo the
-dynamic-linker follow-up — see "Known limitations").
+This fixture is a **real Debian rootfs**. With a distro-shape
+namespace captured as `debianns = ns { bind /etc ... }`, then
+`enter debianns { /bin/true }` exec's the Debian-shipped `/bin/true`
+from inside the namespace. `enter debianns { /bin/cat /etc/debian_version }`
+is a genuine read of Debian's release string through the bind, and
+`enter debianns { /bin/bash }` is the first real distro shell on
+Hamnix (modulo the dynamic-linker follow-up — see "Known limitations").
 
 ## One-time host build
 
@@ -70,17 +72,24 @@ To boot Hamnix with debian-minbase available:
 `scripts/_kernel_iso.sh` GRUB-ISO shim (QEMU's `-kernel` cannot load the
 `elf64-x86-64` higher-half kernel directly — see `docs/BOOT.md` §1).
 
-Then inside hamsh:
+Then inside hamsh, define the distro-shape namespace once and enter it:
 
-    /bin/distrorun debian-minbase /bin/true
-    /bin/distrorun debian-minbase /bin/cat /etc/debian_version
+    debianns = ns {
+        bind /etc /var/lib/distros/debian-minbase/etc
+        bind /usr /var/lib/distros/debian-minbase/usr
+        bind /lib /var/lib/distros/debian-minbase/lib
+        bind /lib64 /var/lib/distros/debian-minbase/lib64
+        bind /var /var/lib/distros/debian-minbase/var
+    }
+    enter debianns { /bin/true }
+    enter debianns { /bin/cat /etc/debian_version }
 
 ## End-to-end test
 
-`scripts/test_distro_debian.sh` is the regression. It runs distrorun
-against `/bin/true` and checks exit 0, then runs it against
-`/bin/cat /etc/debian_version` and checks the captured output
-contains a plausible Debian release token.
+`scripts/test_distro_debian.sh` is the regression. It defines a
+`debianns` namespace value at the hamsh prompt, then runs
+`enter debianns { /bin/cat /etc/debian_version }` and checks the
+captured output contains a plausible Debian release token.
 
 The test skips cleanly (exit 0) if `rootfs/bin/true` doesn't exist —
 matching `scripts/test_u5_linux_binary.sh`'s skip-on-missing pattern,
@@ -93,8 +102,9 @@ so CI on hosts that haven't run BUILD.sh still passes.
    a working `ld-linux-x86-64.so.2` as the ELF interpreter. Hamnix's
    U-track currently handles static-pie binaries; loading a Debian
    binary through its dynamic linker is a separate, larger
-   bring-up. **This commit ships the infrastructure (rootfs +
-   embedding + distrorun glue) so that work can land independently.**
+   bring-up. **The infrastructure (rootfs + embedding + the
+   `ns {}` / `enter` namespace verbs) is in place so that work can
+   land independently.**
 2. **No `apt update` yet.** That needs working network from inside a
    distro namespace plus a working dynamic linker.
 3. **rootfs is gitignored.** Future contributors hitting this fixture

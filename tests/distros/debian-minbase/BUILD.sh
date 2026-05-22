@@ -10,8 +10,9 @@
 # /lib64/ld-linux-x86-64.so.2). scripts/build_initramfs.py, when invoked
 # with HAMNIX_EMBED_DEBIAN=1, embeds that tree at
 #   /var/lib/distros/debian-minbase/<rel>
-# in the cpio archive so that distrorun(1) can splice it into a
-# privatised Layer-1 namespace and exec real Linux binaries inside.
+# in the cpio archive so that an `ns { bind /etc ... }` value can
+# splice it into a privatised Layer-1 namespace — `enter <that-ns>
+# { ... }` then exec's real Linux binaries inside.
 #
 # Requirements (Debian/Ubuntu host):
 #   sudo apt install debootstrap
@@ -51,9 +52,9 @@ fi
 # --variant=minbase: skip recommended packages, ship only the Essential
 # + Required priority set + whatever --include adds. ~80-150 MB on disk.
 # stable: the current Debian stable release tag (resolves through the
-# mirror). bash + coreutils are explicit because Hamnix's distrorun
-# wants /bin/bash + /bin/true + /bin/cat verifiable inside the
-# namespace; coreutils ships true/false/cat/echo/ls etc.
+# mirror). bash + coreutils are explicit because the distro-shape
+# namespace test wants /bin/bash + /bin/true + /bin/cat verifiable
+# inside the namespace; coreutils ships true/false/cat/echo/ls etc.
 echo "BUILD.sh: running debootstrap (this takes 2-5 minutes)..."
 sudo debootstrap --variant=minbase --include=bash,coreutils \
     stable "${ROOTFS}" http://deb.debian.org/debian
