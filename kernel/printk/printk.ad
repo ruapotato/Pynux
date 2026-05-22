@@ -24,7 +24,34 @@
 
 from drivers.tty.serial.early_8250 import (
     early_putc, early_puts, early_hex_digit, early_print_hex64,
+    console_set_msg_level, console_latch_msg_level, console_begin_msg,
+    PRINTK_LEVEL_EMERG, PRINTK_LEVEL_ALERT, PRINTK_LEVEL_CRIT,
+    PRINTK_LEVEL_ERR, PRINTK_LEVEL_WARN, PRINTK_LEVEL_NOTICE,
+    PRINTK_LEVEL_INFO, PRINTK_LEVEL_DEBUG,
 )
+
+
+# --- Console severity helpers --------------------------------------
+#
+# printk0/printk1/printk2 carry no in-band log level (Hamnix's fixed-
+# arity printk has no '<N>' prefix parser yet). They are the bulk of
+# kernel chatter — driver bring-up banners, diagnostics — so by
+# default they are emitted at INFO: visible on the console during
+# boot, gated to the log buffer only once userland is interactive
+# (see early_8250.ad's console_suppress_level). A caller that needs a
+# message to ALWAYS reach the live console — even at the interactive
+# prompt — should route it through one of the pr_* wrappers below
+# (pr_err / pr_warn / pr_emerg / ...), which stamp a more-severe
+# level.
+#
+# printk_set_level() lets a caller stamp an explicit level for the
+# *next* printk0/1/2 call (for messages whose text already carries
+# its own subsystem tag and should not get a bracketed pr_* prefix).
+# It latches a one-shot in early_8250.ad: the following printk0/1/2
+# honours that level instead of defaulting to INFO.
+
+def printk_set_level(level: int32):
+    console_latch_msg_level(level)
 
 
 def _print_decimal(value: uint64):
@@ -90,6 +117,9 @@ def _emit_format_token(spec: int32, arg: uint64):
 
 def printk0(fmt: Ptr[char]):
     # Zero-arg printk: only %% is meaningful in the format string.
+    # console_begin_msg() defaults this message to INFO unless a
+    # caller pre-latched an explicit level via printk_set_level().
+    console_begin_msg()
     i: int32 = 0
     while fmt[i] != 0:
         c: int32 = fmt[i]
@@ -111,6 +141,9 @@ def printk1(fmt: Ptr[char], arg: uint64):
     # One-arg printk. The first %X spec consumes `arg`; any subsequent
     # specs are emitted verbatim (so a user-visible bug shows up as
     # the literal "%x" / "%d" in the output rather than silent garbage).
+    # console_begin_msg() defaults to INFO unless printk_set_level()
+    # pre-latched an explicit level.
+    console_begin_msg()
     i: int32 = 0
     consumed: int32 = 0
     while fmt[i] != 0:
@@ -133,6 +166,9 @@ def printk1(fmt: Ptr[char], arg: uint64):
 
 def printk2(fmt: Ptr[char], a: uint64, b: uint64):
     # Two-arg printk. Each %X spec consumes the next argument in order.
+    # console_begin_msg() defaults to INFO unless printk_set_level()
+    # pre-latched an explicit level.
+    console_begin_msg()
     i: int32 = 0
     consumed: int32 = 0
     while fmt[i] != 0:
@@ -165,41 +201,57 @@ def printk2(fmt: Ptr[char], a: uint64, b: uint64):
 # tags. When syslog-style log levels matter (e.g. printk_console_level
 # filtering), we'll switch to the in-band '<N>' encoding.
 
+# Each wrapper stamps its severity via console_set_msg_level() before
+# emitting, so the console-loglevel gate in early_8250.ad can decide
+# whether to mirror the line to the live console. EMERG/ALERT/CRIT/
+# ERR/WARN stay below the post-interactive threshold (PRINTK_LEVEL_
+# INFO) and therefore always reach the console — a real error or
+# panic is never silenced. NOTICE/INFO/DEBUG are gated to the log
+# buffer only once userland is interactive.
+
 def pr_emerg(msg: Ptr[char]):
+    console_set_msg_level(PRINTK_LEVEL_EMERG)
     early_puts("[EMERG]  ")
     early_puts(msg)
 
 
 def pr_alert(msg: Ptr[char]):
+    console_set_msg_level(PRINTK_LEVEL_ALERT)
     early_puts("[ALERT]  ")
     early_puts(msg)
 
 
 def pr_crit(msg: Ptr[char]):
+    console_set_msg_level(PRINTK_LEVEL_CRIT)
     early_puts("[CRIT]   ")
     early_puts(msg)
 
 
 def pr_err(msg: Ptr[char]):
+    console_set_msg_level(PRINTK_LEVEL_ERR)
     early_puts("[ERR]    ")
     early_puts(msg)
 
 
 def pr_warn(msg: Ptr[char]):
+    console_set_msg_level(PRINTK_LEVEL_WARN)
     early_puts("[WARN]   ")
     early_puts(msg)
 
 
 def pr_notice(msg: Ptr[char]):
+    console_set_msg_level(PRINTK_LEVEL_NOTICE)
     early_puts("[NOTICE] ")
     early_puts(msg)
 
 
 def pr_info(msg: Ptr[char]):
+    console_set_msg_level(PRINTK_LEVEL_INFO)
     early_puts("[INFO]   ")
     early_puts(msg)
 
 
 def pr_debug(msg: Ptr[char]):
+    console_set_msg_level(PRINTK_LEVEL_DEBUG)
     early_puts("[DEBUG]  ")
     early_puts(msg)

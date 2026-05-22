@@ -111,6 +111,123 @@ printk_line_seq:    uint64 = 0    # next line number to stamp
 printk_at_line_start: int32 = 1   # 1 => next byte begins a fresh line
 
 
+# --- Console log-level gate (post-interactive flood suppression) ----
+#
+# Problem: once the interactive hamsh prompt is up, low-severity
+# kernel printk traffic (driver INFO chatter, the [atkbd-diag] poll
+# line, etc.) keeps splatting onto the same serial console the user
+# is typing into and corrupts the line being edited.
+#
+# Fix: a Linux-style console_loglevel threshold. EVERY byte still
+# goes into the printk ring buffer unconditionally (so `dmesg` always
+# replays the complete kernel log) — only the live console *mirror*
+# (UART transmit + on-screen framebuffer/VGA) is gated.
+#
+# Severity scale mirrors include/linux/kern_levels.h (lower number =
+# more severe):
+#   0 EMERG  1 ALERT  2 CRIT  3 ERR  4 WARN  5 NOTICE  6 INFO  7 DEBUG
+#
+# A message prints to the console only when its level is numerically
+# *below* console_suppress_level (i.e. strictly more severe than the
+# threshold).  During boot the threshold is PRINTK_LEVEL_DEBUG + 1 (8)
+# so everything — including INFO/DEBUG boot diagnostics that the test
+# suite greps for — reaches the console. console_set_interactive()
+# tightens it to PRINTK_LEVEL_INFO once userland is interactive, so
+# from then on only WARN/ERR/CRIT/ALERT/EMERG (a real problem) mirror
+# to the live console; INFO/DEBUG go to the log buffer only.
+
+PRINTK_LEVEL_EMERG:  int32 = 0
+PRINTK_LEVEL_ALERT:  int32 = 1
+PRINTK_LEVEL_CRIT:   int32 = 2
+PRINTK_LEVEL_ERR:    int32 = 3
+PRINTK_LEVEL_WARN:   int32 = 4
+PRINTK_LEVEL_NOTICE: int32 = 5
+PRINTK_LEVEL_INFO:   int32 = 6
+PRINTK_LEVEL_DEBUG:  int32 = 7
+
+# Boot default: 8 — strictly above DEBUG(7), so no level is gated and
+# the whole boot transcript (which tests grep) reaches the console.
+console_suppress_level: int32 = 8
+
+# Severity of the message currently being emitted. printk wrappers
+# set this before each call; it defaults to INFO so any path that
+# prints without setting a level (legacy callers, trap dumps) still
+# mirrors to the console during boot and is treated as ordinary INFO
+# chatter once interactive.
+console_cur_msg_level: int32 = 6
+
+# One-shot "an explicit level was requested for the NEXT printk0/1/2"
+# latch. console_latch_msg_level() raises it; console_begin_msg()
+# (called at the top of every printk0/1/2) consumes it: if a level
+# was explicitly requested it is honoured for that one message and
+# the latch clears, otherwise the message defaults to INFO. This lets
+# a caller do `printk_set_level(NOTICE); printk2(...)` and have the
+# printk2 NOT clobber the level back to INFO.
+console_level_pending: int32 = 0
+
+
+def console_set_msg_level(level: int32):
+    # Set the severity of the message currently being emitted, with
+    # NO latch. For callers that set the level and emit in one go
+    # (the pr_* wrappers, which print via early_puts directly).
+    console_cur_msg_level = level
+
+
+def console_latch_msg_level(level: int32):
+    # Request an explicit severity for the NEXT printk0/1/2 call.
+    # Latches until console_begin_msg() consumes it — used by
+    # printk_set_level() for the cross-call `set then printk` pattern.
+    console_cur_msg_level = level
+    console_level_pending = 1
+
+
+def console_begin_msg():
+    # Called at the top of printk0/1/2. If an explicit level was
+    # latched, honour it for this one message and clear the latch;
+    # otherwise default the message to INFO.
+    if console_level_pending != 0:
+        console_level_pending = 0
+        return
+    console_cur_msg_level = PRINTK_LEVEL_INFO
+
+
+def console_force_mirror():
+    # Mark the bytes about to be emitted as ALWAYS-console-visible,
+    # regardless of the suppression threshold. Used for userland
+    # stdout/stderr and /dev/cons writes: the console-loglevel gate
+    # exists to suppress low-severity *kernel* printk chatter, never
+    # to swallow what a user program (or the shell) prints. Equivalent
+    # to emitting at the most-severe level. Clears any pending latch
+    # so a stale printk_set_level() can't leak into this output.
+    console_cur_msg_level = PRINTK_LEVEL_EMERG
+    console_level_pending = 0
+
+
+def console_set_interactive():
+    # Called once the interactive userland shell is up (the kernel
+    # learns this from the first stdin/console read — see fs/vfs.ad).
+    # Tightens the console threshold so post-interactive INFO/DEBUG
+    # chatter no longer corrupts the line the user is editing; WARN
+    # and more-severe still reach the console.  Idempotent.
+    console_suppress_level = PRINTK_LEVEL_INFO
+
+
+def console_is_interactive() -> int32:
+    # 1 once console_set_interactive() has tightened the threshold.
+    if console_suppress_level <= PRINTK_LEVEL_INFO:
+        return 1
+    return 0
+
+
+def _console_should_mirror() -> int32:
+    # A byte mirrors to the live console only when the current
+    # message's severity is strictly more severe (lower number) than
+    # the suppression threshold.
+    if console_cur_msg_level < console_suppress_level:
+        return 1
+    return 0
+
+
 def _emit_raw(c: int32):
     # Push one byte to every console sink WITHOUT line-prefix logic.
     # This is the old early_putc body; the prefix bytes are routed
@@ -119,8 +236,15 @@ def _emit_raw(c: int32):
     #
     # Mirror the byte into the kernel printk ring buffer BEFORE the
     # blocking UART poll so /proc/kmsg keeps a faithful record even
-    # if the serial transmitter is wedged.
+    # if the serial transmitter is wedged. The ring-buffer push is
+    # UNCONDITIONAL — `dmesg` must always replay the complete log,
+    # including anything suppressed from the live console below.
     printk_log_push(cast[uint8](c & 0xFF))
+    # Console-level gate: low-severity traffic is dropped from the
+    # live console once userland is interactive so it cannot corrupt
+    # the user's command line. It is still in the ring buffer above.
+    if _console_should_mirror() == 0:
+        return
     # Poll LSR.THRE until the transmitter is ready.
     while (inb(UART_PORT + UART_LSR_OFFSET) & UART_LSR_THRE) == 0:
         pass
