@@ -185,9 +185,17 @@ knows which it holds.
   list; redirects select the owning IOAPIC by GSI range (`b15ffc4`).
 
 ## §10 Networking  (off critical path — parallelizable)
-- [ ] **(ARCH)** Expose TCP/UDP as a `/net` 9P file tree
-  (`/net/tcp/clone`, `/net/tcp/N/{ctl,data,status}`); `socket(2)` →
-  Layer-2 consumer of it. Do once the chan layer is real (Phase D).
+- [ ] **(ARCH) — USER-CONFIRMED PRIORITY (2026-05-22).** Expose
+  TCP/UDP as a `/net` 9P file tree (`/net/tcp/clone`,
+  `/net/tcp/N/{ctl,data,status}`); native code opens/reads/writes
+  `/net` files; `socket(2)` becomes a Layer-2 *consumer* that
+  translates onto it. This RETIRES the native `SYS_SOCKET`/`CONNECT`/
+  `BIND`/`LISTEN`/`ACCEPT` syscalls — the architecture audit flagged
+  them as non-Plan-9 Layer-1 calls, and the user ruled Layer 1 must be
+  Plan-9-shaped. Rewires every native net consumer (`apt`, `ifconfig`,
+  `route`, http/tls/dns/sshd) onto `/net`. Wide architectural change —
+  one solo agent; dispatch after the in-flight boundary-law cleanup
+  lands (overlaps `fs/vfs.ad`/`linux_abi`).
 - [ ] Congestion control: slow-start + congestion-avoidance (RFC 5681),
   NewReno or CUBIC.
 - [ ] Multi-listener accept queue / wider TCB table; window scaling +
