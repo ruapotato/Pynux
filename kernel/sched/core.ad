@@ -416,6 +416,24 @@ task_table:  Array[16, TaskStruct]
 next_pid:    uint64 = 1
 current_idx: uint64 = 0                  # index into task_table
 
+# --- Exit-time CLEARTID wake hook (boundary-discipline inversion) ----
+#
+# CLONE_CHILD_CLEARTID is a Linux-ABI (Layer 2) contract: a clone()d
+# pthread registers a user pointer (ctid) that the kernel must zero AND
+# futex-wake when the thread exits, so pthread_join's FUTEX_WAIT loop
+# unblocks. The futex wait-queue table itself lives entirely inside
+# linux_abi/u_syscalls.ad (Layer 2) — the scheduler (Layer 0/1) must
+# NOT name `futex_wake_all` directly, or the native exit path would
+# statically link Layer-2 code (a boundary-law violation).
+#
+# Inversion: Layer 2 registers a "wake on a cleared child-tid address"
+# callback here during bring-up; task_exit_current invokes it through
+# this function pointer. The default is null — a pure native kernel
+# (no Linux ABI linked) simply does nothing on the CLEARTID path, which
+# is correct: native tasks never set clear_child_tid. After this, the
+# scheduler's static link surface touches zero Layer-2 symbols.
+cleartid_wake_hook: Fn[int32, uint64]
+
 # --- Preemption: per-task quantum -----------------------------------
 #
 # Before this change the timer ISR called schedule() on EVERY tick
@@ -1079,11 +1097,18 @@ def task_exit_current(code: int64):
     # arg, zero that uint32 and futex-wake any thread blocked on it.
     # pthread_join's wait loop is exactly FUTEX_WAIT on that address —
     # without this wake, joiners spin forever on a stale non-zero tid.
+    #
+    # The futex wake itself is a Layer-2 (Linux-ABI) concern, so the
+    # scheduler reaches it indirectly through `cleartid_wake_hook` — a
+    # function pointer Layer 2 registers at bring-up. A native-only
+    # build leaves the hook null; native tasks never set clear_child_tid
+    # anyway, so this whole block is a no-op for them.
     ctid: uint64 = task_table[current_idx].clear_child_tid
     if ctid != 0:
         cast[Ptr[int32]](ctid)[0] = 0
         task_table[current_idx].clear_child_tid = 0
-        futex_wake_all(ctid)
+        if cleartid_wake_hook != cast[Fn[int32, uint64]](0):
+            cleartid_wake_hook(ctid)
     # §3: SIGCHLD to the parent. POSIX: a child entering its zombie
     # (STATE_EXITED) state raises SIGCHLD in its parent so a daemon
     # blocked elsewhere learns a child is reapable. We post to the
@@ -1319,6 +1344,18 @@ def current_idx_get() -> uint64:
     # syscall layer when it needs the index (not the pointer or pid)
     # for CWD-related operations on the current task.
     return current_idx
+
+
+def register_cleartid_wake_hook(hook: Fn[int32, uint64]):
+    # Layer 2 (linux_abi/u_syscalls.ad) calls this once during kernel
+    # bring-up to install its futex-wake routine as the exit-time
+    # CLEARTID wake callback. task_exit_current invokes it through the
+    # `cleartid_wake_hook` pointer instead of naming `futex_wake_all`
+    # directly — that keeps the futex wait-queue table, and the whole
+    # futex contract, confined to Layer 2 while still letting a Linux
+    # pthread's exit unblock its joiner. A native-only build never
+    # calls this, so the hook stays null and the CLEARTID path is inert.
+    cleartid_wake_hook = hook
 
 
 def current_task_is_user() -> uint64:

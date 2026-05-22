@@ -165,6 +165,7 @@ from kernel.sched.core import (
     task_brk_end, set_task_brk_end,
     task_brk_max, set_task_brk_max,
     set_current_errstr,
+    register_cleartid_wake_hook,
 )
 from arch.x86.kernel.time import get_jiffies, tsc_monotonic_ns, HZ
 from drivers.rtc.cmos import rtc_boot_epoch_get
@@ -4307,10 +4308,13 @@ ELINUX_AGAIN:          int64  = -11
 # treat as spurious wakeup and retry.
 #
 # Why this lives in u_syscalls.ad and not core.ad: the table is owned
-# by the Linux ABI surface (futex semantics are a userspace contract).
-# core.ad reaches up via the futex_wake_all symbol on the task-exit
-# CLEARTID path — Adder's module dedup lets the upward call resolve
-# without an explicit import cycle.
+# by the Linux ABI surface (futex semantics are a userspace contract)
+# and must stay confined to Layer 2 — the scheduler (Layer 0/1) must
+# not statically depend on a Layer-2 symbol. The task-exit CLEARTID
+# path needs a futex wake, but instead of core.ad naming
+# `futex_wake_all`, Layer 2 registers it as a callback via
+# register_cleartid_wake_hook (see u_syscalls_init below). The
+# scheduler invokes that function pointer; it never links this table.
 FUTEX_NSLOTS: uint64 = 32
 futex_addr:   Array[32, uint64]   # 0 means "free slot"
 futex_slot:   Array[32, int32]    # task slot index of the waiter
@@ -4318,10 +4322,12 @@ futex_slot:   Array[32, int32]    # task slot index of the waiter
 
 def futex_wake_all(uaddr: uint64) -> int32:
     # Wake every waiter parked on `uaddr`. Returns the count of slots
-    # we cleared. Called from task_exit_current's CLEARTID handshake
-    # and from FUTEX_WAKE. The woken task itself doesn't need to be
-    # state-poked here — _u_futex's WAIT loop polls futex_addr[my_slot]
-    # after each yield_to_others, so clearing the slot is enough.
+    # we cleared. Invoked from task_exit_current's CLEARTID handshake
+    # (indirectly, through the cleartid_wake_hook function pointer this
+    # module registers in u_syscalls_init) and directly from FUTEX_WAKE.
+    # The woken task itself doesn't need to be state-poked here —
+    # _u_futex's WAIT loop polls futex_addr[my_slot] after each
+    # yield_to_others, so clearing the slot is enough.
     i: uint64 = 0
     woke: int32 = 0
     while i < FUTEX_NSLOTS:
@@ -4331,6 +4337,16 @@ def futex_wake_all(uaddr: uint64) -> int32:
             woke = woke + 1
         i = i + 1
     return woke
+
+
+def u_syscalls_init():
+    # Layer-2 bring-up hook, called once from init/main.ad alongside
+    # usock_init / u_epoll_init. It registers futex_wake_all as the
+    # scheduler's exit-time CLEARTID wake callback — that is how a
+    # clone()d pthread's exit unblocks pthread_join's FUTEX_WAIT loop
+    # WITHOUT the scheduler statically depending on this Layer-2 file.
+    register_cleartid_wake_hook(futex_wake_all)
+    printk0("[u_syscalls] CLEARTID futex-wake hook registered\n")
 
 
 def _u_futex(a0: uint64, a1: uint64, a2: uint64,

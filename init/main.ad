@@ -140,6 +140,7 @@ from drivers.net.http import http_init, http_get, https_get
 from drivers.net.tls import tls_init
 from fs.socket_state import usock_init
 from linux_abi.u_epoll import u_epoll_init
+from linux_abi.u_syscalls import u_syscalls_init
 from fs.cpio import (
     cpio_init, initramfs_entry_count, initramfs_entry_name,
     initramfs_entry_data, initramfs_entry_size,
@@ -2189,6 +2190,14 @@ def start_kernel():
     # epoll / eventfd / timerfd / signalfd objects + the O_NONBLOCK
     # bitmap. Same defensive-clean rationale as usock_init above.
     u_epoll_init()
+
+    # Layer-2 bring-up: register the Linux-ABI exit-time CLEARTID
+    # futex-wake callback with the scheduler. Until this runs, the
+    # scheduler's cleartid_wake_hook is null and a clone()d pthread's
+    # exit would not wake its joiner — so this must precede any
+    # Linux-ABI user task. The scheduler never names a Layer-2 symbol
+    # directly; the callback is the boundary-respecting inversion.
+    u_syscalls_init()
 
     # --- HTTPS local smoke (TLS 1.3) gated on cpio marker -----
     # Runs only when scripts/test_net_https.sh planted /etc/tls-test
