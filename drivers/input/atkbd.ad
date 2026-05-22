@@ -768,29 +768,58 @@ atkbd_diag_ticks:    uint64 = 0
 atkbd_diag_emitted:  uint64 = 0       # diag lines emitted so far
 ATKBD_DIAG_INTERVAL: uint64 = 500     # ticks between prints (~5 s at 100 Hz)
 
-# Gate the periodic [atkbd-diag] line so it does NOT flood QEMU boots
-# (which now slows boot and drowns the test logs). The diagnostic exists
-# to investigate the dead keyboard on the real Asus laptop; it stays
-# fully alive there:
+# --- Periodic-diagnostic gating ---------------------------------------
+#
+# The [atkbd-diag] poll line is leftover keyboard-bring-up
+# instrumentation. Left running it prints every ~5 s forever and, once
+# the user is at the interactive hamsh prompt, splats onto the same
+# serial console and overwrites the line being typed:
+#
+#   [000338] [atkbd-diag] irq1_count=85 poll_calls=6500 bytes_from_0x60=87 ...
+#   [000339] [atkbd-diag] irq1_count=85 poll_calls=7000 bytes_from_0x60=87 ...
+#
+# In normal operation the periodic line is therefore SILENT. We keep
+# the diagnostic capability — it was load-bearing for the dead-keyboard
+# investigation on the real Asus laptop — in two ways:
 #
 #   * ONE boot-time sample is always emitted (~5 s in), so every
-#     transcript — QEMU or real hardware — still records the initial
-#     irq1/poll/bytes state once.
-#   * After that, the periodic line only keeps printing once a real
-#     PS/2 byte has been observed on port 0x60 (atkbd_bytes_0x60 > 0).
-#     On the real laptop the moment the user touches the keyboard the
-#     diagnostic resumes; on a QEMU acceptance boot (no synthetic
-#     input) atkbd_bytes_0x60 stays 0 and the log stays clean.
+#     transcript still records the initial irq1/poll/bytes state once.
+#   * The recurring line only prints when ATKBD_DIAG_VERBOSE is turned
+#     on — a debug flag, OFF by default. A real-hardware bring-up
+#     session calls atkbd_diag_set_verbose(1) (e.g. from a debug build
+#     or a console command) to re-arm the continuous sampling; a
+#     normal boot never floods.
+#
+# The one-shot controller bring-up transcript in atkbd_controller_init()
+# (also tagged [atkbd-diag]) is unaffected — it prints once at boot,
+# never on a timer, so it cannot flood.
+
+atkbd_diag_verbose: int32 = 0         # 0 => periodic line silent (default)
+
+
+def atkbd_diag_set_verbose(on: int32):
+    # Debug knob: enable (on != 0) or disable the recurring
+    # [atkbd-diag] poll line. Off by default; flip it on only for a
+    # real-hardware keyboard bring-up session.
+    if on != 0:
+        atkbd_diag_verbose = 1
+    else:
+        atkbd_diag_verbose = 0
+
+
+def atkbd_diag_get_verbose() -> int32:
+    return atkbd_diag_verbose
 
 
 def atkbd_diag_tick():
     atkbd_diag_ticks = atkbd_diag_ticks + 1
     if (atkbd_diag_ticks % ATKBD_DIAG_INTERVAL) != 0:
         return
-    # After the first (boot-time) sample, stay silent until a real PS/2
-    # byte has been seen — keeps QEMU boots clean without losing the
-    # real-hardware diagnostic the instant the user types.
-    if atkbd_diag_emitted >= 1 and atkbd_bytes_0x60 == 0:
+    # First (boot-time) sample is always emitted, so every transcript
+    # records the initial irq1/poll/bytes state once. After that the
+    # recurring line is gated behind the ATKBD_DIAG_VERBOSE debug flag
+    # so a normal boot — and the interactive prompt — stays quiet.
+    if atkbd_diag_emitted >= 1 and atkbd_diag_verbose == 0:
         return
     atkbd_diag_emitted = atkbd_diag_emitted + 1
     # printk maxes out at two %-args (printk2); the line needs four
