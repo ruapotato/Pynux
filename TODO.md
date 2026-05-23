@@ -318,7 +318,7 @@ Everything in §5 is Layer-2-only per the boundary law.
     completion (command + path, `c2a062d`).
   - [x] `distrorun` retired (`1cdc34f`) — the Linux runtime is a
     captured `ns {}` value in `/etc/rc.boot`; running a Linux binary is
-    `enter linuxruntime { … }`. `&&`/`||` now chains `ns`/`enter`/`spawn`.
+    `enter linux { … }`. `&&`/`||` now chains `ns`/`enter`/`spawn`.
   - Known follow-up: nested `` `{ } `` command-substitution clobbers.
 - CPython: trim the frozen stdlib set; PGO/LTO; C extensions (`_ssl`,
   `_socket`, ...) once a U-track `ld.so` exists.

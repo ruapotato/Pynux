@@ -118,7 +118,7 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
 - **Userspace**: `hamsh` is now a clean-sheet Python-flavored shell
   (single language, C-style `{ }` blocks, dynamically typed) and runs
   as **PID 1 init** — `/etc/rc.boot` is hamsh script that assembles the
-  boot namespace and defines `linuxruntime` as a captured `ns {}` value
+  boot namespace and defines `linux` as a captured `ns {}` value
   (no more hard-coded `distrorun`). Full interactive line editor:
   Left/Right/Home/End/Delete cursor editing, cursor-aware backspace,
   Up/Down history (48-entry ring), Tab completion (command + path),
@@ -330,28 +330,36 @@ hamsh$ cmd 2>&1 | tee log
 
 ### The Linux runtime — running unmodified Linux ELFs
 
-`/etc/rc.boot` defines `linuxruntime` as a `ns { }` template that grafts
-the conventional FHS paths (`/etc`, `/usr`, `/lib`, `/lib64`, `/var`)
-onto a Debian-shaped subtree under `/var/lib/distros/default/`. To run
-a Linux binary, `enter` that namespace:
+`/etc/rc.boot` defines `linux` as a `ns clean { }` template that
+grafts the distro tree at `/var/lib/distros/default/` onto `/` (so
+anywhere a Debian package writes is INSIDE the container, not on the
+host) and explicitly re-shares only `/home`, `/dev`, `/proc`, `/srv`,
+`/n`. `debian` is a duplicate-body alias for the same template.
+
+The `clean` modifier means `enter linux { … }` does NOT inherit the
+ambient namespace — the only paths visible inside are the ones the
+template binds. An `apt install` does not contaminate the host's
+`/bin`, `/etc`, `/usr`, `/lib`, `/lib64`, `/var`, `/opt`, `/root`, or
+`/tmp`; all of those resolve into the distro tree.
 
 ```
-hamsh$ enter linuxruntime { /bin/apt --version }     # synchronous
-hamsh$ enter linuxruntime { /bin/sh }                # interactive Linux sh; `exit` returns
-hamsh$ svc = spawn linuxruntime { /bin/postgres }    # detached service
-hamsh$ kill $svc                                     # tear it down
+hamsh$ enter linux { /bin/apt --version }     # synchronous
+hamsh$ enter linux { /bin/sh }                # interactive Linux sh; `exit` returns
+hamsh$ enter debian { /bin/cat /etc/debian_version }
+hamsh$ svc = spawn linux { /bin/postgres }    # detached service
+hamsh$ kill $svc                              # tear it down
 ```
 
 There is no `distrorun` command; running a Linux binary is plain
 namespace verbs. If the binary isn't in your distrofs yet, install it
 first — the native-Adder `apt` lands real Debian packages into the
-linuxruntime tree:
+linux tree:
 
 ```
 hamsh$ apt update
 hamsh$ apt install bash
 hamsh$ ls /var/lib/distros/default/usr/bin   # what's installed
-hamsh$ enter linuxruntime { /bin/bash --version }
+hamsh$ enter linux { /bin/bash --version }
 ```
 
 ### Errors via errstr — `try` / `except`
@@ -398,7 +406,7 @@ Interactive keys at the prompt:
 PID 1 is hamsh executing `/etc/rc.boot`. The rc is plain hamsh —
 applies the namespace recipe (`bind /srv '#s'`, `bind /proc '#p'`,
 `bind /n '#/'`), launches detached services with `spawn detached`,
-defines `linuxruntime`, then drops to the interactive prompt. Edit the
+defines `linux`, then drops to the interactive prompt. Edit the
 file to change boot — no kernel recompile needed.
 
 ---
