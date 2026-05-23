@@ -84,6 +84,33 @@ __stack_chk_fail:
      */
     .globl _start
 _start:
+    /* TEMP_DEBUG_HAMSH_BRINGUP — real-hardware (Asus UEFI) bring-up.
+     * Emit the earliest possible "I am alive in ring 3" marker BEFORE
+     * touching any C-runtime state, BEFORE the argv shuffle into main.
+     * If this line shows up on the framebuffer, the kernel's SYSRETQ
+     * out of execve actually landed in user code AND userland writes
+     * via sys_write(2, ...) reach the console — narrowing any silent
+     * post-execve gap to "between _start and main()'s first print".
+     *
+     * Calling convention: %rdi = argc, %rsi = argv on entry from the
+     * kernel. The syscall clobbers %rax / %rcx / %r11; we use %rdi /
+     * %rsi / %rdx as direct syscall arg regs (so we must save and
+     * restore the argc/argv pair across the call). Stack push/pop is
+     * fine — the kernel handed us a 16-byte-aligned user stack with
+     * usable room (see arch/x86/kernel/sched/core.ad).
+     *
+     * Remove together with the matching markers in user/hamsh.ad once
+     * the silent-hamsh-on-real-hardware bug is debugged. */
+    pushq   %rdi                            /* save argc */
+    pushq   %rsi                            /* save argv */
+    movq    $8, %rax                        /* SYS_WRITE */
+    movq    $2, %rdi                        /* fd 2 = stderr -> framebuffer */
+    leaq    _hamsh_runtime_start_mark(%rip), %rsi
+    movq    $_hamsh_runtime_start_mark_end - _hamsh_runtime_start_mark, %rdx
+    syscall
+    popq    %rsi                            /* restore argv */
+    popq    %rdi                            /* restore argc */
+
     /* The kernel pre-loaded %rdi = argc, %rsi = argv before iretq/
      * sysretq landed us here (see arch/x86/kernel/sched/core.ad's
      * _build_initial_kstack and syscall_64.S's do_execve_finish).
@@ -100,6 +127,18 @@ _start:
     /* Defensive: if SYS_EXIT ever returns (it shouldn't), spin. */
     jmp     .L_start_hang
 
+    /* TEMP_DEBUG_HAMSH_BRINGUP — earliest-possible ring-3 marker
+     * string. Sits in .rodata which init.lds merges into the single
+     * PT_LOAD .text segment, so it loads alongside _start with no
+     * extra program header. RIP-relative leaq above resolves with a
+     * 32-bit displacement — fine within one PT_LOAD. */
+    .section .rodata
+    .align 8
+_hamsh_runtime_start_mark:
+    .ascii "[hamsh-runtime] _start\n"
+_hamsh_runtime_start_mark_end:
+
+    .section .text, "ax"
 
     /* --- sys_write(fd, buf, count) -> int64 -------------------------- */
     .globl sys_write

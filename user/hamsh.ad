@@ -4501,6 +4501,13 @@ def _hb_check_and_emit():
     hb_next_jiffies = now + HB_PERIOD_JIFFIES
 
 
+# TEMP_DEBUG_HAMSH_BRINGUP — fire a one-shot marker the first time the
+# interactive line editor runs. Once-flag (not per-keystroke) so the
+# log stays readable; the periodic [hamsh-alive] heartbeat covers the
+# "still running" question once we're past stage 8.
+ed_first_entry: int32 = 1
+
+
 def ed_readline() -> int64:
     # Read and edit ONE physical line interactively. Returns the line
     # length in ed_buf (the trailing newline is NOT stored — the caller
@@ -4518,6 +4525,14 @@ def ed_readline() -> int64:
     # shell is being scheduled on a box whose keyboard is broken. Remove
     # this poll-and-yield (and the heartbeat hook) once real-hardware
     # keyboard input works.
+    # TEMP_DEBUG_HAMSH_BRINGUP — first ed_readline call. The very next
+    # observable signal will be the [hamsh-alive] heartbeat (cadence
+    # ~3s); if stage-08 prints but no heartbeat ever follows, the bug
+    # is in the sys_read_nb / sys_yield loop on real silicon.
+    if ed_first_entry != 0:
+        ed_first_entry = 0
+        sys_write(2, cast[Ptr[uint8]]("[hamsh:stage-08] ed-readline-first\n"),
+                  cstr_len(cast[Ptr[uint8]]("[hamsh:stage-08] ed-readline-first\n")))
     ed_len = 0
     ed_cur = 0
     ed_esc_state = 0
@@ -5083,16 +5098,47 @@ def _setup_fd_namespace():
     sys_fdbind(0, 2, DEVFD_CONS, 0)
 
 
+# TEMP_DEBUG_HAMSH_BRINGUP
+# Real-hardware (Asus UEFI) bring-up: hamsh prints nothing on the
+# framebuffer after execve. /init's two "[init] ..." lines render fine,
+# so userland-to-framebuffer DOES work up to the execve into hamsh —
+# but no `[hamsh] M16.35 shell ready` ever appears. We need to know
+# whether _start runs at all and, if it does, exactly where the startup
+# wedges. Emission goes through sys_write(fd=2, ...) — the FD_STDERR_MARK
+# arm in fs/vfs.ad routes every byte through early_putc_user, which
+# unconditionally mirrors to UART + framebuffer (no console-loglevel
+# gate). Same proven path /init's writes used.
+#
+# Remove together with the runtime.S `_start` marker once the bring-up
+# bug is debugged.
+def _dbg_stage(msg: Ptr[uint8]):
+    sys_write(2, msg, cstr_len(msg))
+
+
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    # TEMP_DEBUG_HAMSH_BRINGUP — first line hamsh main() runs. If we
+    # see this but not the next marker, the bug is inside str_arena_init
+    # or one of its peers; if we don't see this, control never reached
+    # main() at all (call from _start in runtime.S broke).
+    _dbg_stage(cast[Ptr[uint8]]("[hamsh:stage-01] main-enter\n"))
     str_arena_init()
     scope_reset()
     errstr_clear()
     _cmp_init_builtins()        # seed the Tab-completion builtin table
+    # TEMP_DEBUG_HAMSH_BRINGUP — arenas and builtin table initialised.
+    _dbg_stage(cast[Ptr[uint8]]("[hamsh:stage-02] arenas-ready\n"))
     # Seed a minimal environment so $PATH resolves.
     env_set("PATH", "/bin:/sbin:/usr/bin")
     env_set("HOME", "/")
+    # TEMP_DEBUG_HAMSH_BRINGUP — argv/envp baseline resolved. We
+    # haven't read argv[1] yet (rc dispatch); that's stage 5.
+    _dbg_stage(cast[Ptr[uint8]]("[hamsh:stage-03] env-seeded\n"))
     # HAMSH §7: stdio as named channels — /fd/0,1,2 in the namespace.
     _setup_fd_namespace()
+    # TEMP_DEBUG_HAMSH_BRINGUP — /fd namespace bound; heartbeat is
+    # initialised on first ed_readline idle tick (lazy), so there is no
+    # dedicated _hb_init call to mark.
+    _dbg_stage(cast[Ptr[uint8]]("[hamsh:stage-04] fd-ns-ready\n"))
     write_cstr1("hamsh — Hamnix shell. Type 'help'.\n")
     # Stable readiness marker — the shared scripts/_qemu_drive.sh test
     # harness waits for this exact line before feeding input (the
@@ -5124,6 +5170,8 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
     # /etc/hamsh.rc per-user startup script.
     if argc >= 2 and argv != cast[Ptr[uint64]](0):
         rc_path: Ptr[char] = cast[Ptr[char]](argv[1])
+        # TEMP_DEBUG_HAMSH_BRINGUP — about to open the boot rc.
+        _dbg_stage(cast[Ptr[uint8]]("[hamsh:stage-05] rc-open\n"))
         write_cstr1("[hamsh] init: sourcing boot rc ")
         write_cstr1(cast[Ptr[uint8]](rc_path))
         write_cstr1("\n")
@@ -5131,9 +5179,15 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             write_cstr1("[hamsh] init: boot rc ")
             write_cstr1(cast[Ptr[uint8]](rc_path))
             write_cstr1(" not found\n")
+        # TEMP_DEBUG_HAMSH_BRINGUP — boot rc finished (success or
+        # silently-absent fallthrough); about to enter interactive loop.
+        _dbg_stage(cast[Ptr[uint8]]("[hamsh:stage-06] rc-done\n"))
     else:
         # If a per-user startup script exists, run it first (init/rc).
         _run_rc_path(cast[Ptr[char]]("/etc/hamsh.rc"))
+    # TEMP_DEBUG_HAMSH_BRINGUP — entering the interactive read-eval
+    # loop. Next marker fires once per ed_readline call.
+    _dbg_stage(cast[Ptr[uint8]]("[hamsh:stage-07] loop-enter\n"))
 
     # Interactive read-eval loop. Each logical line is built up from one
     # or more physical lines (a `{ }` block continues across lines). Each
