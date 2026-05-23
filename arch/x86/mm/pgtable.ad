@@ -245,11 +245,11 @@ def pgtable_extend_from_e820():
     # RAM byte the firmware reported.
     #
     # If the boot path didn't supply a multiboot1 info struct (the
-    # UEFI direct-boot path today — e820.ad's EFI fallback installs
-    # the same 2..240 MiB memblock window we already had), there's
-    # nothing to extend: the existing 4 GiB identity map already
-    # covers every memblock byte. Return early and emit a log line
-    # so the absence is visible.
+    # UEFI direct-boot path), there's nothing to extend FROM the
+    # multiboot mmap — but the EFI stub already stamped the FULL
+    # 512-entry PDPT (M16.152), so every byte e820.ad's EFI walker
+    # might hand to memblock is already identity-mapped. Return early
+    # and emit a log line so the absence is visible.
     #
     # ALSO dump the live PDPT base + current 1 GiB coverage on this
     # branch so a UEFI real-hardware capture shows the same shape of

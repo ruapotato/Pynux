@@ -4,33 +4,48 @@
 # for early boot: walking the firmware-reported memory map and turning
 # it into something the allocators can trust. Linux gets its map from
 # the BIOS e820 call (or EFI memmap) packaged into a boot_params
-# struct; we get the same information from the multiboot1 info struct
-# that QEMU's `-kernel` loader hands us via EBX at the 32-bit entry
-# point. arch/x86/boot/header.S stashed the pointer into the `mb_info`
-# global; boot_info_asm.S exposes a read accessor.
+# struct; we get the same information from one of two sources
+# depending on the boot path:
+#
+#   - multiboot1 (BIOS GRUB / QEMU `-kernel`-via-iso): the loader
+#     hands EBX → multiboot_info to arch/x86/boot/header.S, which
+#     stashes it in `mb_info`. The MMAP entries live in the same
+#     blob — see the "Multiboot1 info struct" layout below.
+#
+#   - UEFI direct boot (arch/x86/boot/efi_stub.S): the stub calls
+#     BootServices->GetMemoryMap right before ExitBootServices, then
+#     stashes the {buf_phys, size_bytes, desc_size, desc_version}
+#     tuple into the kernel's `efi_mmap_info` struct
+#     (boot_info_asm.S, populated via handoff slot +68 in header.S's
+#     multiboot header). The descriptors are EFI_MEMORY_DESCRIPTOR
+#     records — see _efi_mmap_walk() for the layout.
+#
+# Strategy (both paths): walk the entries, log each, find the LARGEST
+# "free RAM" region whose base is at or above max(2 MiB,
+# kernel_image_end), and call memblock_set_region() to widen
+# memblock's pool to that region. memblock today carries a single
+# contiguous region, so the largest free chunk is the best we can do
+# without changing memblock's API. The remainder of usable RAM is
+# left in a documented hole — fragmented systems thus carry less
+# memblock-backed allocator than they technically have, but every
+# byte memblock hands out is provably free (no overlap with firmware
+# reservations).
 #
 # Multiboot1 info struct (only the slots we read):
 #   offset  0:  flags         (uint32)
 #   offset 44:  mmap_length   (uint32)         iff flags & (1 << 6)
 #   offset 48:  mmap_addr     (uint32)
 #
-# Each memory-map entry, packed (NOTE: 64-bit fields are 4-byte
-# aligned, not 8 — x86_64 tolerates the unaligned read):
+# Each multiboot1 memory-map entry, packed (NOTE: 64-bit fields are
+# 4-byte aligned, not 8 — x86_64 tolerates the unaligned read):
 #   offset 0:  size_of_this_entry   (uint32, NOT counting itself)
 #   offset 4:  base                 (uint64)
 #   offset 12: length               (uint64)
 #   offset 20: type                 (uint32)
 #
-# Type code 1 = "available RAM" (the only one we feed to memblock).
-# 2 = reserved, 3 = ACPI reclaimable, 4 = NVS, 5 = bad. The other
-# kinds we just log for visibility.
-#
-# Strategy: walk the entries, print each, find the LARGEST available
-# region whose base is >= MIN_BASE (= 2 MiB — keeps our kernel image
-# out of the way), and call memblock_set_region() to widen memblock's
-# pool to that region. With QEMU's default 256 MiB map this means
-# memblock typically grows from the hardcoded 2..240 MiB to the full
-# ~256 MiB usable.
+# Multiboot1 type code 1 = "available RAM" (the only one we feed to
+# memblock). 2 = reserved, 3 = ACPI reclaimable, 4 = NVS, 5 = bad.
+# The other kinds we just log for visibility.
 
 from kernel.printk.printk import printk0, printk1, printk2
 from mm.memblock import memblock_set_region
@@ -52,6 +67,19 @@ extern def get_efi_fb_bpp() -> uint32
 extern def get_efi_fb_base() -> uint64
 extern def get_efi_fb_size() -> uint64
 
+# EFI memory-map accessors (boot_info_asm.S). Populated by
+# arch/x86/boot/efi_stub.S right BEFORE ExitBootServices when the
+# kernel boots via UEFI. Zero on BIOS / multiboot1 boots, so callers
+# must gate on get_efi_mmap_present(). When present, the descriptor
+# array at buf_phys (size = size_bytes, stride = desc_size) is a
+# valid EFI_MEMORY_DESCRIPTOR sequence; see _efi_mmap_walk below for
+# the layout this kernel walks.
+extern def get_efi_mmap_present() -> uint32
+extern def get_efi_mmap_desc_size() -> uint32
+extern def get_efi_mmap_buf_phys() -> uint64
+extern def get_efi_mmap_size_bytes() -> uint64
+extern def get_efi_mmap_desc_version() -> uint32
+
 MULTIBOOT_BOOTLOADER_MAGIC:   uint64 = 0x2BADB002
 MULTIBOOT_INFO_MMAP_BIT:      uint64 = 0x40            # flags bit  6
 MULTIBOOT_INFO_FRAMEBUF_BIT:  uint64 = 0x1000          # flags bit 12
@@ -71,34 +99,77 @@ MMAP_TYPE_BAD:              uint64 = 5
 # floor no longer has to guess.
 E820_MIN_BASE: uint64 = 0x00100000
 
-# --- EFI direct-boot fallback range -------------------------------
+# --- EFI direct-boot last-resort fallback range -------------------
 #
-# When the kernel is entered from the UEFI PE/COFF stub
-# (arch/x86/boot/efi_stub.S) rather than via multiboot1, the
-# multiboot info pointer is unavailable — UEFI hands us a memory
-# map in a completely different shape (EFI_MEMORY_DESCRIPTOR
-# records, packed back-to-back, with `descsize` stride). Parsing
-# the real EFI map is a follow-up: a 2-page descriptor sweep that
-# classifies each entry's Type (EfiConventionalMemory = 7 is "free
-# RAM" for our purposes).
+# Used ONLY when the kernel is entered from the UEFI PE/COFF stub
+# AND the stub failed to hand us a parseable EFI memory map (older
+# stub without the +68 handoff slot, or a firmware that returned an
+# unexpected descriptor version). The normal EFI path now consumes
+# the firmware-reported memory map via _efi_mmap_walk() below — see
+# the "EFI memory-map walker" section.
 #
-# Until that parser lands, we install a conservative hardcoded
-# usable-RAM window in the EFI branch: 2 MiB..240 MiB. Reasoning:
+# Window: 2 MiB..240 MiB. Reasoning:
 #   - Every modern x86_64 system advertises >= 256 MiB of free RAM
-#     in [2 MiB, top_of_low_memory). The reservation below the
-#     top gives safety margin for firmware-reserved holes (the
+#     in [2 MiB, top_of_low_memory). The reservation below the top
+#     gives safety margin for firmware-reserved holes (the
 #     framebuffer + ACPI reclaim + boot-services-data cluster that
 #     OVMF / real firmware typically packs in the 240..256 MiB
 #     range).
 #   - Above 2 MiB stays clear of low BIOS / EBDA / kernel-image
 #     real estate; kernel_image_end() further clamps the floor
 #     dynamically.
-#
-# Documented limitation: this fallback wastes any RAM above
-# 240 MiB. A real EFI map parser unlocks the rest. Tracked in
-# TODO.md.
 EFI_FALLBACK_BASE:   uint64 = 0x00200000     # 2 MiB
 EFI_FALLBACK_LIMIT:  uint64 = 0x0F000000     # 240 MiB
+
+# --- EFI memory descriptor layout ----------------------------------
+#
+# EFI_MEMORY_DESCRIPTOR (UEFI 2.10 §7.2 — EFI_BOOT_SERVICES.GetMemoryMap):
+#
+#   off  0: uint32  Type
+#   off  4: uint32  Pad         (alignment — always 0 today)
+#   off  8: uint64  PhysicalStart
+#   off 16: uint64  VirtualStart
+#   off 24: uint64  NumberOfPages   (4 KiB pages, per UEFI 2.10 §7.2.3)
+#   off 32: uint64  Attribute
+#
+# Total declared size: 40 bytes. BUT: the firmware-reported
+# `desc_size` stride may be LARGER than 40 — UEFI explicitly
+# reserves the right to pad the descriptor for future fields, and
+# real firmware uses 48 bytes today. ALWAYS walk by `desc_size`,
+# never by sizeof(EFI_MEMORY_DESCRIPTOR).
+EFI_MD_OFF_TYPE:        uint64 = 0
+EFI_MD_OFF_PHYS_START:  uint64 = 8
+EFI_MD_OFF_NUM_PAGES:   uint64 = 24
+EFI_PAGE_SIZE:          uint64 = 4096
+
+# EFI_MEMORY_TYPE values that this kernel treats as "free RAM"
+# (UEFI 2.10 §7.2 Table 7-2):
+#
+#   3 = EfiBootServicesCode    - usable after ExitBootServices
+#   4 = EfiBootServicesData    - usable after ExitBootServices
+#   7 = EfiConventionalMemory  - free RAM
+#
+# Everything else (Reserved, RuntimeServices*, ACPIReclaim,
+# ACPIMemoryNVS, MMIO, MMIOPortSpace, PalCode, Persistent, Unaccepted,
+# LoaderCode, LoaderData) is left out of the memblock pool. LoaderCode/
+# Data is deliberately excluded too — that's where the EFI stub's image
+# (including our efi_mmap_buf scratch) lives. Treating those bytes as
+# free would let memblock overwrite the descriptor buffer we're still
+# walking.
+EFI_MT_LOADER_CODE:         uint32 = 1
+EFI_MT_LOADER_DATA:         uint32 = 2
+EFI_MT_BOOT_SERVICES_CODE:  uint32 = 3
+EFI_MT_BOOT_SERVICES_DATA:  uint32 = 4
+EFI_MT_RUNTIME_SERVICES_CODE: uint32 = 5
+EFI_MT_RUNTIME_SERVICES_DATA: uint32 = 6
+EFI_MT_CONVENTIONAL_MEMORY: uint32 = 7
+EFI_MT_UNUSABLE_MEMORY:     uint32 = 8
+EFI_MT_ACPI_RECLAIM_MEMORY: uint32 = 9
+EFI_MT_ACPI_MEMORY_NVS:     uint32 = 10
+EFI_MT_MEMORY_MAPPED_IO:    uint32 = 11
+EFI_MT_MMIO_PORT_SPACE:     uint32 = 12
+EFI_MT_PAL_CODE:            uint32 = 13
+EFI_MT_PERSISTENT_MEMORY:   uint32 = 14
 
 
 # --- boot_via_efi flag --------------------------------------------
@@ -146,28 +217,218 @@ def _type_name(t: uint64) -> Ptr[char]:
     return "????"
 
 
+def _efi_type_name(t: uint32) -> Ptr[char]:
+    # 4-char tag for the per-descriptor log row, matching the shape of
+    # _type_name above (so a UEFI capture and a multiboot1 capture
+    # eyeball-diff cleanly). Anything we treat as "free RAM" (BSCD /
+    # BSDT / CONV) lights up; everything else is a single "RSVD"-ish
+    # bucket because the precise sub-type doesn't matter to memblock.
+    if t == EFI_MT_CONVENTIONAL_MEMORY:
+        return "CONV"
+    if t == EFI_MT_BOOT_SERVICES_CODE:
+        return "BSCD"
+    if t == EFI_MT_BOOT_SERVICES_DATA:
+        return "BSDT"
+    if t == EFI_MT_LOADER_CODE:
+        return "LDCD"
+    if t == EFI_MT_LOADER_DATA:
+        return "LDDT"
+    if t == EFI_MT_RUNTIME_SERVICES_CODE:
+        return "RTCD"
+    if t == EFI_MT_RUNTIME_SERVICES_DATA:
+        return "RTDT"
+    if t == EFI_MT_ACPI_RECLAIM_MEMORY:
+        return "ACPI"
+    if t == EFI_MT_ACPI_MEMORY_NVS:
+        return "NVS "
+    if t == EFI_MT_MEMORY_MAPPED_IO:
+        return "MMIO"
+    if t == EFI_MT_MMIO_PORT_SPACE:
+        return "MMPT"
+    if t == EFI_MT_UNUSABLE_MEMORY:
+        return "BAD "
+    if t == EFI_MT_PERSISTENT_MEMORY:
+        return "PMEM"
+    if t == EFI_MT_PAL_CODE:
+        return "PAL "
+    return "RSVD"
+
+
+def _efi_type_is_free_ram(t: uint32) -> int32:
+    # Per UEFI 2.10 §7.2 Table 7-2 plus the EFI spec wording around
+    # ExitBootServices: EfiConventionalMemory is always free; EfiBoot
+    # ServicesCode and EfiBootServicesData are "owned by the firmware"
+    # while boot services are live, and become free for the OS once
+    # ExitBootServices has been called (which the stub already did
+    # before we get here). Everything else — Reserved, Runtime*,
+    # ACPIReclaim (free only after the OS has parsed the ACPI tables;
+    # not safe to hand to memblock at e820_init time), ACPIMemoryNVS,
+    # MMIO, PalCode, Persistent, Unaccepted, LoaderCode/Data
+    # (LoaderCode/Data is where THIS stub's image and our descriptor
+    # buffer live — including those bytes in the pool would let
+    # memblock overwrite the buffer we're currently walking) — is NOT
+    # safe to mark free.
+    if t == EFI_MT_CONVENTIONAL_MEMORY:
+        return 1
+    if t == EFI_MT_BOOT_SERVICES_CODE:
+        return 1
+    if t == EFI_MT_BOOT_SERVICES_DATA:
+        return 1
+    return 0
+
+
+def _efi_mmap_walk(floor: uint64, best_base_out: Ptr[uint64], best_len_out: Ptr[uint64]) -> int32:
+    # Walk the firmware-reported EFI memory map and return the
+    # LARGEST free-RAM region whose base is at or above `floor`. Same
+    # selection policy as the multiboot1 walker below; keeps memblock's
+    # single-region invariant.
+    #
+    # Returns 1 if a region was found (best_base_out / best_len_out
+    # written), 0 if no usable region was found (caller should fall
+    # back to the conservative 2..240 MiB window).
+    #
+    # Per-descriptor log row (CSV-ish, one line per entry) lets a
+    # serial capture be diffed against a multiboot1 capture for the
+    # same firmware/host. The kernel can be very chatty here because
+    # the descriptor count is bounded (~50-200 entries on real
+    # firmware, ~30 on OVMF).
+    buf:       uint64 = get_efi_mmap_buf_phys()
+    size:      uint64 = get_efi_mmap_size_bytes()
+    desc_size: uint64 = cast[uint64](get_efi_mmap_desc_size())
+    desc_ver:  uint32 = get_efi_mmap_desc_version()
+
+    if buf == 0:
+        return 0
+    if size == 0:
+        return 0
+    if desc_size < 40:
+        # Spec-minimum descriptor size is 40 bytes (Type + Pad +
+        # PhysStart + VirtStart + NumPages + Attribute). A smaller
+        # stride would mean firmware lied — bail safely.
+        printk1("e820: EFI desc_size=%d below spec minimum; ignoring map\n",
+                desc_size)
+        return 0
+
+    printk2("e820: EFI memory map @ %p, %d bytes\n", buf, size)
+    printk2("e820: EFI desc_size=%d desc_version=%d\n",
+            desc_size, cast[uint64](desc_ver))
+    printk0("       idx  type   phys_start         length (bytes)\n")
+
+    best_base:   uint64 = 0
+    best_length: uint64 = 0
+
+    pos: uint64 = buf
+    end: uint64 = buf + size
+    idx: uint64 = 0
+    while pos < end:
+        type_code:  uint32 = cast[Ptr[uint32]](pos + EFI_MD_OFF_TYPE)[0]
+        phys_start: uint64 = cast[Ptr[uint64]](pos + EFI_MD_OFF_PHYS_START)[0]
+        num_pages:  uint64 = cast[Ptr[uint64]](pos + EFI_MD_OFF_NUM_PAGES)[0]
+        length:     uint64 = num_pages * EFI_PAGE_SIZE
+
+        # Compact log row. Two prints because printk2 maxes out at
+        # two args; matches the layout of the multiboot1 walker.
+        printk2("       %d    %s  ", idx,
+                cast[uint64](_efi_type_name(type_code)))
+        printk2("%p  %p\n", phys_start, length)
+
+        if _efi_type_is_free_ram(type_code) != 0:
+            adj_base:   uint64 = phys_start
+            adj_length: uint64 = length
+            if adj_base < floor:
+                shift: uint64 = floor - adj_base
+                if shift >= adj_length:
+                    adj_length = 0
+                else:
+                    adj_base   = floor
+                    adj_length = adj_length - shift
+            if adj_length > best_length:
+                best_base   = adj_base
+                best_length = adj_length
+
+        pos = pos + desc_size
+        idx = idx + 1
+
+    if best_length == 0:
+        return 0
+
+    best_base_out[0] = best_base
+    best_len_out[0]  = best_length
+    return 1
+
+
+def _log_memblock_free(length_bytes: uint64):
+    # Honest-diagnostic one-liner with the value the test scripts
+    # grep for. Format:
+    #
+    #   [memblock] free: 768 MiB
+    #
+    # The number is the size of the single contiguous region e820_init
+    # is about to install via memblock_set_region(). For the EFI walker
+    # path that's the largest free-RAM block the firmware advertised
+    # above the kernel image. For multiboot1 it's the largest
+    # MMAP_TYPE_AVAILABLE region above the floor. For the EFI fallback
+    # it's the size of the conservative 2..240 MiB window.
+    #
+    # Integer-truncated MiB is fine for the smoke test threshold;
+    # callers care about "is this 240 or 768" not "240 vs 240.1".
+    mib: uint64 = length_bytes >> 20
+    printk1("[memblock] free: %d MiB\n", mib)
+
+
 def e820_init():
     # EFI direct-boot path: when the kernel arrives via UEFI rather
     # than multiboot1, the multiboot info pointer is meaningless.
     # The EFI stub (arch/x86/boot/efi_stub.S) sets boot_via_efi=1
-    # before transferring control. We can't yet parse the real EFI
-    # memory map (TODO follow-up), so install a conservative
-    # hardcoded usable-RAM window. The kernel-image-end clamp below
-    # still applies — kernel + initramfs blob never overlap the
-    # allocator pool.
+    # before transferring control AND — when the stub is current —
+    # hands us the firmware-reported EFI memory map via the
+    # efi_mmap_info handoff struct (boot_info_asm.S).
+    #
+    # Primary path: walk the EFI memory map descriptors and pick the
+    # largest free-RAM region above the kernel image end. This is the
+    # only way to discover RAM > 240 MiB on UEFI boots; the fallback
+    # window below is a last resort for older stubs / pathological
+    # firmware.
     if get_boot_via_efi() != 0:
-        printk0("e820: EFI boot path; installing fallback RAM window\n")
+        # Floor: 2 MiB OR kernel-image end, whichever is higher,
+        # page-aligned upward.
         efi_kern_end: uint64 = kernel_image_end()
         efi_kern_end = (efi_kern_end + 4095) & ~cast[uint64](4095)
-        efi_base: uint64 = EFI_FALLBACK_BASE
-        if efi_kern_end > efi_base:
-            efi_base = efi_kern_end
-        if efi_base >= EFI_FALLBACK_LIMIT:
+        efi_floor: uint64 = EFI_FALLBACK_BASE
+        if efi_kern_end > efi_floor:
+            efi_floor = efi_kern_end
+        printk2("e820: EFI boot path; kernel ends @ %p; allocator floor = %p\n",
+                kernel_image_end(), efi_floor)
+
+        if get_efi_mmap_present() != 0:
+            # The stub handed us a real EFI memory map. Walk it.
+            efi_best_base:   uint64 = 0
+            efi_best_length: uint64 = 0
+            found: int32 = _efi_mmap_walk(efi_floor,
+                                          &efi_best_base,
+                                          &efi_best_length)
+            if found != 0:
+                printk2("e820: feeding memblock from EFI map: base=%p length=%p\n",
+                        efi_best_base, efi_best_length)
+                _log_memblock_free(efi_best_length)
+                memblock_set_region(efi_best_base,
+                                    efi_best_base + efi_best_length)
+                return
+            printk0("e820: EFI map present but no usable region above floor; trying fallback\n")
+        else:
+            printk0("e820: EFI map absent (old stub?); using fallback window\n")
+
+        # Last-resort fallback: the conservative hardcoded 2..240 MiB
+        # window. Reached only when (a) the stub is too old to populate
+        # efi_mmap_info, or (b) the firmware's map yielded no
+        # acceptable region.
+        if efi_floor >= EFI_FALLBACK_LIMIT:
             printk0("e820: EFI fallback: kernel image past 240 MiB; keeping memblock default\n")
             return
         printk2("e820: EFI fallback range %p..%p\n",
-                efi_base, EFI_FALLBACK_LIMIT)
-        memblock_set_region(efi_base, EFI_FALLBACK_LIMIT)
+                efi_floor, EFI_FALLBACK_LIMIT)
+        _log_memblock_free(EFI_FALLBACK_LIMIT - efi_floor)
+        memblock_set_region(efi_floor, EFI_FALLBACK_LIMIT)
         return
 
     # Validate that we were entered via multiboot. If not (the magic
@@ -269,6 +530,7 @@ def e820_init():
 
     printk2("e820: feeding memblock: base=%p length=%p\n",
             best_base, best_length)
+    _log_memblock_free(best_length)
     memblock_set_region(best_base, best_base + best_length)
 
 
