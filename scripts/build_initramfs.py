@@ -321,12 +321,12 @@ if _CPIO_STRESS_RAW:
 # to swap in a Hamnix-compiled user binary without touching user/init.S.
 
 
-def cpio_entry(name: str, data: bytes) -> bytes:
+def cpio_entry(name: str, data: bytes, mode: int = 0o100644) -> bytes:
     name_bytes = name.encode() + b"\0"
     header = (
         "070701"
         f"{1:08X}"                      # ino (any non-zero is fine)
-        f"{0o100644:08X}"               # mode = S_IFREG | 0644
+        f"{mode:08X}"                   # mode (S_IFREG | 0644 by default)
         f"{0:08X}"                      # uid
         f"{0:08X}"                      # gid
         f"{1:08X}"                      # nlink
@@ -346,6 +346,23 @@ def cpio_entry(name: str, data: bytes) -> bytes:
     data_pad = (-len(data)) % 4
     return header + name_bytes + (b"\0" * name_pad) \
                   + data + (b"\0" * data_pad)
+
+
+def cpio_symlink(name: str, target: str) -> bytes:
+    # Emit a cpio entry with mode = S_IFLNK | 0777 whose data is the
+    # NUL-terminated link target path. The trailing NUL is INCLUDED in
+    # the entry's filesize so the in-kernel reader (fs/cpio.ad +
+    # fs/vfs.ad's _lookup_name) can treat the bytes as a C-string and
+    # resolve them with the same exact-match path lookup it uses for
+    # regular files.
+    #
+    # The standard Linux cpio writer does NOT NUL-terminate symlink
+    # data — it writes only the link-target bytes. Adding the NUL is
+    # safe for any reader that consults `filesize` (we own the only
+    # reader on the Hamnix side) and keeps the in-kernel string
+    # comparator simple. It costs 1 byte per applet entry.
+    payload = target.encode() + b"\0"
+    return cpio_entry(name, payload, mode=0o120777)
 
 
 def cpio_trailer() -> bytes:
@@ -454,6 +471,76 @@ def build_archive() -> bytes:
                 blob += cpio_entry(name, data)
                 print(f"  embedded {name} ({len(data)} bytes from "
                       f"etc/{ef.name})")
+
+    # Linux runtime shell: plant a busybox-static binary + applet
+    # symlinks into the default distro tree so `enter linux { /bin/sh }`
+    # finds a working shell out of the box. Without this, the default
+    # `linux` namespace recipe (etc/rc.boot: bind / /var/lib/distros/
+    # default) resolves /bin/sh into the distro tree at
+    # /var/lib/distros/default/bin/sh — which doesn't exist, so the
+    # exec returns -ENOENT before anything runs. End-game goal #3
+    # ("Run non-graphical Linux binaries") starts with: the user can
+    # type `enter linux { /bin/sh }` and get a shell.
+    #
+    # SOURCE (preference order, picked the first that works):
+    #   (a) Pre-built host fixture tests/u-binary/u_busybox_musl —
+    #       built once by `make -C tests/u-binary/src/musl_busybox
+    #       install` and gitignored (~1 MB musl-static-PIE ET_DYN
+    #       busybox, no PT_INTERP, OSABI stamped ELFOSABI_LINUX,
+    #       same fixture the U29/U36/U40 tests already use). The
+    #       Hamnix ELF loader knows how to run this shape.
+    #   (b) (Future) build it on the fly from
+    #       tests/u-binary/src/musl_busybox/ if absent — requires
+    #       musl-gcc + a network round-trip to fetch the busybox
+    #       upstream tarball. Skipped for now to keep the default
+    #       ISO build offline-deterministic; if the host hasn't built
+    #       u_busybox_musl yet, the default ISO ships WITHOUT a
+    #       Linux runtime shell (back to the pre-fix behaviour),
+    #       and the build prints a one-line note.
+    #   (c) Host's /usr/bin/busybox (apt-installed busybox-static)
+    #       — REJECTED: on Debian today this is dynamically linked
+    #       (BuildID + interpreter /lib64/ld-linux-x86-64.so.2), so
+    #       running it inside the hermetic distro namespace would
+    #       require a full glibc tree as well. The musl-static-PIE
+    #       fixture is self-contained.
+    #
+    # APPLETS: each applet name is planted as an S_IFLNK cpio entry
+    # pointing at /var/lib/distros/default/bin/busybox. cpio_symlink()
+    # below emits a mode=0o120777 entry with NUL-terminated target
+    # data; fs/vfs.ad's _lookup_name follows the link to the real
+    # busybox bytes. One header per applet vs ~1 MB of duplicate
+    # data per applet — ~15 KB total overhead instead of ~15 MB.
+    bb_src = here / "tests" / "u-binary" / "u_busybox_musl"
+    if bb_src.is_file():
+        bb_bytes = bb_src.read_bytes()
+        bb_target = "/var/lib/distros/default/bin/busybox"
+        blob += cpio_entry(bb_target, bb_bytes, mode=0o100755)
+        # Curated applet list — enough for "this feels like a shell":
+        # sh / ls / cat / echo / cp / mv / rm / mkdir / pwd / grep /
+        # head / tail / wc / true / false / env / printf / date /
+        # sleep / basename / dirname. (cd is a shell builtin and does
+        # not need its own executable.) busybox itself dispatches by
+        # argv[0], so a symlink at /bin/sh -> busybox runs the sh
+        # applet automatically.
+        bb_applets = [
+            "sh", "ash",
+            "ls", "cat", "echo", "cp", "mv", "rm", "mkdir",
+            "pwd", "grep", "head", "tail", "wc",
+            "true", "false", "env", "printf", "date",
+            "sleep", "basename", "dirname",
+        ]
+        for applet in bb_applets:
+            link = f"/var/lib/distros/default/bin/{applet}"
+            blob += cpio_symlink(link, bb_target)
+        print(f"  staged Linux runtime shell: busybox ({len(bb_bytes)} "
+              f"bytes from {bb_src.relative_to(here)}) + "
+              f"{len(bb_applets)} applet symlinks under "
+              f"/var/lib/distros/default/bin/")
+    else:
+        print(f"  WARN: {bb_src.relative_to(here)} absent — `enter linux"
+              f" {{ /bin/sh }}` will not work on this build. Run "
+              f"`make -C tests/u-binary/src/musl_busybox install` to "
+              f"stage the fixture.")
 
     # Distro-shape backing trees. Walk every subdirectory under
     # tests/distros/ and embed each file at

@@ -153,6 +153,7 @@ from fs.cpio import (
     cpio_init,
     initramfs_entry_count, initramfs_entry_name,
     initramfs_entry_data, initramfs_entry_size,
+    initramfs_entry_mode,
 )
 from fs.procfs import is_proc_path, proc_render, proc_buf_size
 from fs.tmpfs import (
@@ -394,7 +395,10 @@ def _strcmp_cstr(a: Ptr[char], b: Ptr[char]) -> int32:
         i = i + 1
 
 
-def _lookup_name(name: Ptr[char]) -> int32:
+def _lookup_name_one(name: Ptr[char]) -> int32:
+    # Single-pass exact-match name lookup. The symlink-resolving
+    # _lookup_name() wraps this and walks the chain when the matched
+    # entry is a S_IFLNK.
     count: uint64 = initramfs_entry_count()
     i: uint64 = 0
     while i < count:
@@ -403,6 +407,50 @@ def _lookup_name(name: Ptr[char]) -> int32:
             return cast[int32](i)
         i = i + 1
     return -1
+
+
+# Mask used to test the cpio mode-field's file-type bits. The high
+# nibble is the type (S_IFREG = 0x8000, S_IFLNK = 0xA000, ...) — same
+# layout Linux's stat(2) reports through st_mode.
+_S_IFMT_MASK:  uint64 = 0xF000
+_S_IFLNK_VAL: uint64 = 0xA000
+
+
+def _lookup_name(name: Ptr[char]) -> int32:
+    # Look up `name` in the cpio archive; if the matched entry is a
+    # symlink, follow the chain (capped at 8 hops) to the target file.
+    # Callers (initramfs_data_ptr / initramfs_data_size /
+    # vfs_read tail / ...) get the *target's* index, so the symlink
+    # is transparent to the rest of the kernel.
+    #
+    # This is the populated-distrofs path: scripts/build_initramfs.py
+    # plants busybox once at /var/lib/distros/default/bin/busybox and
+    # emits applet entries (/var/lib/distros/default/bin/sh, ...ls,
+    # ...cat, ...) as S_IFLNK entries whose data is the absolute path
+    # of the real busybox binary. Without this resolver, an open of
+    # /var/lib/distros/default/bin/sh would return the symlink bytes
+    # ("/var/lib/distros/default/bin/busybox") instead of the ELF.
+    idx: int32 = _lookup_name_one(name)
+    hops: int32 = 0
+    while idx >= 0 and hops < 8:
+        mode: uint64 = initramfs_entry_mode(cast[uint64](idx))
+        if (mode & _S_IFMT_MASK) != _S_IFLNK_VAL:
+            return idx
+        # Symlink: data is the link target as a string. The build
+        # script appends a NUL byte after the bytes covered by the
+        # filesize, so we can treat it as a C-string and reuse the
+        # plain exact-match lookup. (Linux's cpio writers also write
+        # the NUL via the filesize.)
+        target: Ptr[char] = cast[Ptr[char]](
+            initramfs_entry_data(cast[uint64](idx)))
+        idx = _lookup_name_one(target)
+        hops = hops + 1
+    # Either no match at all, or a symlink chain longer than 8 hops —
+    # treat as "not found" so callers fail the open cleanly instead
+    # of spinning.
+    if hops >= 8:
+        return -1
+    return idx
 
 
 def _alloc_fd(task: Ptr[TaskStruct]) -> int32:

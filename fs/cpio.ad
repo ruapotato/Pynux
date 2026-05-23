@@ -35,6 +35,7 @@ class FileEntry:
     name:  uint64        # Ptr[char] (into the cpio blob)
     data:  uint64        # Ptr[uint8]
     size:  uint64
+    mode:  uint64        # cpio mode field (S_IFREG, S_IFLNK, ...)
 
 
 # NR_FILES is the in-kernel cpio index capacity. The table lives in
@@ -104,7 +105,14 @@ def cpio_init():
 
     nr_files = 0
     while pos + 110 <= end:
-        # Filesize at offset 54..61, namesize at offset 94..101.
+        # Mode at offset 14..21, filesize at 54..61, namesize at 94..101.
+        # The mode field carries the file-type bits (S_IFREG, S_IFLNK,
+        # ...) we need to honour symlink entries — see the symlink-
+        # resolving _lookup_name path in fs/vfs.ad. Without preserving
+        # mode, the lookup path can't tell a regular file from a link
+        # to one.
+        mode_v: uint64 = _parse_hex8(
+            cast[Ptr[uint8]](pos + 14))
         filesize: uint64 = _parse_hex8(
             cast[Ptr[uint8]](pos + 54))
         namesize: uint64 = _parse_hex8(
@@ -123,6 +131,7 @@ def cpio_init():
             file_table[nr_files].name = name_ptr
             file_table[nr_files].data = data_ptr
             file_table[nr_files].size = filesize
+            file_table[nr_files].mode = mode_v
             nr_files = nr_files + 1
         else:
             printk1("cpio: file table full at %d entries\n",
@@ -150,3 +159,11 @@ def initramfs_entry_data(idx: uint64) -> Ptr[uint8]:
 
 def initramfs_entry_size(idx: uint64) -> uint64:
     return file_table[idx].size
+
+
+def initramfs_entry_mode(idx: uint64) -> uint64:
+    # Raw cpio mode bits (S_IFREG | 0644, S_IFLNK | 0777, ...). The
+    # high nibble carries the file type; fs/vfs.ad's _lookup_name uses
+    # mode & 0xF000 == 0xA000 to detect a symlink entry and follow it
+    # to the target file.
+    return file_table[idx].mode
