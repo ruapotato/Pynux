@@ -187,15 +187,46 @@ result: int32 = square(5)  # 25
 
 ### Function Pointers
 
-```python
-def handler() -> int32:
-    return 42
+Adder has **first-class function pointers** as a real type. The syntax
+is `Fn[R, A...]` where `R` is the return type and `A...` are the argument
+types. Function pointers are typed, can be stored in globals, passed as
+parameters, returned, and called indirectly. SysV AMD64 indirect-call
+codegen lands the call through `call *%rax`.
 
-def main() -> int32:
-    ptr: Ptr[int32] = &handler
-    result: int32 = ptr()  # Indirect call
-    return result
+```python
+# Declare a function-pointer type. This signature says:
+# "takes (Ptr[uint8], uint64), returns int32".
+on_packet: Fn[int32, Ptr[uint8], uint64]
+
+# Assign a function with a matching signature.
+def my_handler(buf: Ptr[uint8], n: uint64) -> int32:
+    return cast[int32](n)
+
+on_packet = my_handler
+
+# Indirect-call through the function-pointer variable.
+rc: int32 = on_packet(some_buf, some_len)
 ```
+
+Pass them as parameters too:
+
+```python
+def register_handler(fn: Fn[int32, Ptr[uint8], uint64]):
+    on_packet = fn
+```
+
+And null-check before invoking (cast `0` to the matching `Fn[…]` type):
+
+```python
+if on_packet != cast[Fn[int32, Ptr[uint8], uint64]](0):
+    on_packet(buf, len)
+```
+
+Production uses include: `drivers/net/eth.ad`'s `eth_register_tx_hook`
+(every NIC driver registers its TX path this way), `kernel/sched/core.ad`'s
+`cleartid_wake_hook`, the IRQ handler table, the block-device vtable,
+netfilter hooks, and timer callbacks. Reach for `Fn[R, A...]` whenever you
+want a callback — do NOT introduce a global mode-flag enum to dispatch on.
 
 ---
 
