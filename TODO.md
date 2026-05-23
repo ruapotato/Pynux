@@ -8,16 +8,25 @@ maturity).
 
 > **Check [`STATUS.md`](STATUS.md) before picking an item** — it is the
 > source of truth for what shipped. Large chunks already closed: real
-> hardware boot (BIOS + UEFI), the Plan 9 native-syscall surface,
-> per-process namespaces, `distrofs`/`nsrun`, TLS 1.3 + X.509 chain
-> validation, the `dpkg`/`apt`/`httpd` userland, CPython + busybox as
-> musl static-PIE, fork → copy-on-write (incl. mmap VMAs), the
-> higher-half ELF64 kernel, preemptive scheduling, the SSH-2.0 server,
-> xz decompression, apt streaming + GPG verification, `§5` Layer-2
-> async (epoll/eventfd/timerfd/signalfd/O_NONBLOCK), the `/net` 9P
-> file tree + TLS-over-`/net` (Layer 1 is now Plan-9-shaped end-to-end,
-> zero BSD socket syscalls), the hamsh clean-sheet rewrite with init/rc
-> + line editor + Tab completion.
+> hardware boot (Intel NUC end-to-end on 2026-05-23, default ISO,
+> keyboard works, hamsh prompt, `enter linux { /bin/sh }`), bare-metal
+> auto-skip of xHCI live init, EFI memory-map walker (>240 MiB RAM on
+> UEFI), per-task ELF mapping (closed silent-execve on bare metal), the
+> Plan 9 native-syscall surface, per-process namespaces, `distrofs`/
+> `nsrun`, TLS 1.3 + X.509 chain validation, the `dpkg`/`apt`/`httpd`
+> userland, CPython + busybox as musl static-PIE, fork → copy-on-write
+> (incl. mmap VMAs), the higher-half ELF64 kernel, preemptive
+> scheduling, the SSH-2.0 server (now wired into `/etc/rc.boot` as a
+> detached service), xz decompression, **apt streaming over the live
+> deb.debian.org archive** (68,755 packages, 56 MB decompressed) with
+> InRelease OpenPGP verify, **end-to-end install-over-SSH demo**
+> (`apt install hello` against a vanilla ISO from a remote SSH session),
+> `§5` Layer-2 async (epoll/eventfd/timerfd/signalfd/O_NONBLOCK), the
+> `/net` 9P file tree + TLS-over-`/net` (Layer 1 is now Plan-9-shaped
+> end-to-end, zero BSD socket syscalls), native `/net/icmp` + native
+> `ping` (incl. loopback shortcut), the hamsh clean-sheet rewrite with
+> init/rc + line editor + Tab completion, the clean linux/debian
+> namespace recipe, busybox baked into the default distrofs.
 
 **Project-direction docs:** [`docs/architecture.md`](docs/architecture.md)
 (layered model, boundary rules, migration phases),
@@ -268,16 +277,42 @@ Everything in §5 is Layer-2-only per the boundary law.
 ---
 
 # Metal bring-up  (human-in-the-loop lane — excluded from the roadmap)
-- Real-hardware keyboard: the built-in keyboard on the Asus i5-4210U
-  does not respond; leading hypothesis is an EHCI-routed keyboard (the
-  EHCI driver is QEMU-verified, not yet tested on metal).
-- UEFI on the real Asus — Legacy/BIOS confirmed; re-verify the UEFI
-  direct-boot path on that laptop.
-- Real NIC silicon: e1000e EEPROM-walk, r8169 RX on a physical RTL8168,
-  Broadcom tg3, Intel igb — verify against metal.
-- EFI memory-map walker in `e820.ad` (RAM > 240 MiB on UEFI boot); EFI
-  Runtime Services (`GetTime`, `GetVariable`); PE `.reloc` table (Secure
-  Boot prereq); drop the FAT12 32 MiB ESP cap via the GPT-ESP path.
+- **[x] EFI memory-map walker** in `arch/x86/mm/e820.ad`
+  (`83f8de8` + `2fb1eb6`): UEFI path now consumes the firmware
+  `EFI_MEMORY_DESCRIPTOR` array (64 KiB buffer, `7365746` for real
+  laptop firmware that returns 100–300 descriptors at 96/128 B stride),
+  unlocking RAM > 240 MiB. 935 MiB free at `-m 1G` under OVMF.
+- **[x] Bare-metal xHCI auto-skip** (`71961b3`): CPUID 0x40000000
+  hypervisor-leaf check skips `xhci_init`'s MMIO-poll path on real
+  silicon (Intel NUC stall in `_xhci_v1_bringup`'s HCH-clear poll).
+  `ENABLE_XHCI_FORCE_INIT=1` and `ENABLE_XHCI_NO_INIT=1` overrides
+  shipped. `docs/REAL_HARDWARE.md` has the decision matrix.
+- **[x] Per-task ELF mapping** (`61e2b24`): ET_DYN PIE + ELF32 + user
+  stack + brk heap now get explicit per-task 4 KiB PTE chains in the
+  task PML4 instead of relying on the kernel's 1 GiB identity stamp
+  (which silently failed when the allocator gave hamsh's phys bytes
+  outside the identity-mapped range on bare metal).
+- Asus i5-4210U: re-verify UEFI direct boot now that the per-task ELF
+  mapping fix is in. Last test showed `[execve-sysret]` + `[execve-
+  pml4]` walks landed; hamsh's `_start` is expected to fire.
+- Asus built-in keyboard: still doesn't respond under Legacy/BIOS.
+  Leading hypothesis: EHCI-routed. Native EHCI driver (`drivers/usb/
+  ehci.ad`) is QEMU-verified but not yet exercised on metal. Same
+  bare-metal-stall class of bugs exists in `_xhci_v1_bringup`; an
+  EHCI equivalent of the xHCI auto-skip might be needed once we test.
+- Other drivers vulnerable to the same MMIO-stall class — flagged by
+  the bare-metal auto-skip agent's audit:
+  - `drivers/usb/ehci.ad` — BIOS→OS handoff (line ~593), HCRESET clear
+    (~647), port-reset (~750/~760) — same spin-counter shape that
+    doesn't help if the load itself doesn't retire.
+  - `drivers/ata/ahci.ad::_ahci_port_start` (CR/FR polls, CI polls).
+  - `drivers/nvme/nvme.ad` (not yet audited, same architectural
+    pattern).
+- Real NIC silicon: e1000e EEPROM-walk, r8169 RX on a physical
+  RTL8168, Broadcom tg3, Intel igb — verify against metal.
+- EFI Runtime Services (`GetTime`, `GetVariable`); PE `.reloc` table
+  (Secure Boot prereq); drop the FAT12 32 MiB ESP cap via the GPT-ESP
+  path.
 
 # Storage driver maturity
 - AHCI NCQ (serialises on slot 0 today); hot-plug / COMRESET retry;
@@ -293,13 +328,63 @@ Everything in §5 is Layer-2-only per the boundary law.
   blocking read on `/dev/mouse`; MADT IRQ-override consumption.
 
 # Userspace polish
-- `apt` against the live `deb.debian.org` mirror — DONE: `apt update`
-  verifies the real InRelease (`6d72a5d`); `dpkg -i` of the genuine
-  Debian `hello` `.deb` lands all 49 files into the distrofs namespace
-  and they are readable there (`d2fe317` + `463c3e8`).
-  Remaining: run `apt install` itself under `nsrun`; ext4-backed
-  distrofs for reboot persistence; streaming xz + larger `.deb`/index
-  caps for big packages.
+- **[x] `apt` against the live `deb.debian.org` mirror — fully closed.**
+  `apt update http://deb.debian.org/debian stable main` now streams the
+  real 13.3 MB Packages.gz → 56,547,292 bytes decompressed → 68,755
+  packages, with the `InRelease` OpenPGP signature verified against the
+  baked Debian-archive key. The blocker was `user/apt.ad`'s streaming
+  gz fetch treating `sys_read()==0` as FIN — actually a 5-s
+  `tcp_recv` timeout that fires on real-CDN latency; fix mirrors the
+  sshd retry-on-timeout idiom (`1eeabb1`).
+- **[~] `/tmp/apt/Packages` cache cap (in flight, agent `a747ba7f`):**
+  cache caps at 512 KiB — alphabetically only resolves `0ad..and`. Any
+  package past that (`bash`, `nginx`, `python3`) is invisible to
+  `apt show` / `apt install`. Needs a chunked persistent store +
+  sorted-by-name index over the 68,755-stanza inflated text.
+- **[~] post-inflate SSH-spawn leak (in flight, same agent):** after a
+  56 MB single-process inflate, subsequent SSH sessions fail to spawn
+  `hamsh`. Resource exhaustion of unknown shape (vma slots? task
+  slots? fds? pipes? kmalloc?).
+- **[x] vanilla-ISO install-over-SSH demo** (`0f30263`): `/etc/rc.boot`
+  spawns sshd as a detached service; `PIPE_MAX` raised 8→32 so nsrun's
+  distrofs daemons + the SSH session bridge can coexist; `sshd::_bridge_session`
+  closes its pipes cleanly on every exit path (no more leak after 4
+  sessions); `tcp_smoke_test` gated on `/etc/tcp-smoke-test` so default
+  boots don't ARP-stall in net_smoke pre-`time_init`.
+- Remaining demo gap to "ssh in → apt install nginx → curl from host":
+  the chunked apt cache (in flight) AND `enter linux { /usr/bin/<pkg> }`
+  finding files that apt installed via nsrun (architectural —
+  distrofs needs to persist across `enter linux` invocations; today
+  each fresh `enter linux` starts a brand-new nsrun ns that doesn't
+  share the previous one's distrofs daemons).
+- **[x] hamsh maturation** — line editor (`df27310`), Tab completion
+  (`c2a062d`), distrorun retired in favor of `enter linux { … }`
+  (`1cdc34f`), boot-time per-PID-1 `/etc/rc.boot` (`341af32`), clean
+  isolation by default (`07c3063`), `[hamsh-alive]` heartbeat
+  (TEMP_DEBUG, to be ripped later).
+- **[x] Native ping over `/net/icmp`** (`0782728`, `d97c3aa`,
+  `7dc8450`) — Plan-9-shape ICMP as the third proto under `/net`. Plus
+  IP loopback shortcut (`62fbac3`) so `ping 127.0.0.1` works without a
+  NIC.
+- Known follow-up: nested `` `{ } `` command-substitution clobbers
+  (hamsh).
+- CPython: trim the frozen stdlib set; PGO/LTO; C extensions (`_ssl`,
+  `_socket`, ...) once a U-track `ld.so` exists.
+- busybox `ls` enumeration XFAIL (musl DIR-fd round-trip) — re-confirm
+  after the `%rdi` fix; busybox `sh -c "a|b"` internal-pipeline `#GP`.
+- `/bin` tool audit for cwd-relative defaults.
+- [x] SSH follow-ups — publickey auth, generated+persisted host key,
+  RFC 6979 deterministic ECDSA nonce — `5cd02bb`.
+- `enter linux { /bin/sh }` interactive stdin: opens but typing doesn't
+  reach the Linux process. The clean linux ns doesn't currently wire
+  stdin through to the entered process; sshd-driven sessions are not
+  affected (they get their own pty from the SSH protocol).
+- TEMP_DEBUG cleanup pass when bring-up stabilizes: the `[hamsh-alive]`
+  heartbeat, `[execve-sysret]` register dump, `[execve-pml4]` walk,
+  trap-EMERG-level bumps, `[I TOLD YOU SO]` sentinel, the hamsh
+  `_dbg_stage` markers (`[hamsh:_start hit]`, `[hamsh:stage-NN]`),
+  per-binary `[runtime:NAME] _start` markers — all tagged with
+  `TEMP_DEBUG_*` comments for grep-and-remove.
 - hamsh clean-sheet rewrite (`docs/HAMSH_SPEC.md`) — **§18 stages
   1–11 all LANDED** (`183fc4a`, `dcabf01`, `72853f4`): single
   Python-flavored language; `/fd` (`#d`) + `/env` devices;

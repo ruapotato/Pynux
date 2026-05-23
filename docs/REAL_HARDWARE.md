@@ -60,6 +60,23 @@ The rest of this doc unpacks each step.
 Hardware support shipped by milestone. Anything not listed is not
 supported.
 
+### Confirmed real-hardware boots
+
+- **Intel NUC** (2026-05-23, default ISO): boots Legacy/BIOS end-to-
+  end. Kernel banner → boot checkpoints → hamsh interactive prompt
+  → atkbd keyboard input → native binaries on PATH (`ls`, `cat`,
+  `echo`) → `enter linux { /bin/sh }` (busybox baked into default
+  distrofs) → `ping 127.0.0.1` (loopback shortcut, no NIC needed).
+  The bare-metal xHCI auto-skip (§7) is what keeps boot moving past
+  the silicon-MMIO stall in `_xhci_v1_bringup`.
+- **Asus i5-4210U (Haswell ULT)** — Legacy/BIOS boot reached hamsh
+  in M16.156 (FPU + RFLAGS triple-fault fix). The per-task ELF
+  mapping landing (`61e2b24`) is expected to fix the previous UEFI
+  silent-execve issue on this laptop too — re-flash + verify pending.
+  Built-in keyboard still doesn't respond (leading hypothesis: EHCI-
+  routed; native EHCI driver is QEMU-verified, not yet exercised on
+  this metal).
+
 ### CPU
 
 - **x86_64**, SSE2 minimum. Every Intel CPU since Nehalem (2008) and

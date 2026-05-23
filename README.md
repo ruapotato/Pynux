@@ -50,13 +50,20 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
 
 ## What it boots into today
 
-- **Real hardware** — an Asus i5-4210U (Haswell ULT) laptop boots to
-  the `hamsh` shell in Legacy/BIOS mode (M16.156 fixed the
-  ring-3-transition triple-fault that previously killed the boot:
-  `fninit` to reset the FPU, conditional `CR4.OSXSAVE`, and a
-  cleared `RFLAGS.IF` across the first SYSRETQ). The built-in
-  keyboard does **not** work yet on that laptop — see "Known
-  blockers".
+- **Real hardware** — **Hamnix boots end-to-end on real x86_64
+  hardware**. Confirmed on an Intel NUC (post-2026-05-23 default ISO):
+  full Legacy/BIOS boot, keyboard input works, hamsh interactive
+  prompt, native binaries on PATH, the linux runtime
+  (`enter linux { /bin/sh }`), `ping 127.0.0.1`. An Asus i5-4210U
+  (Haswell ULT) reaches hamsh in Legacy/BIOS (M16.156 ring-3
+  triple-fault fix); the new per-task ELF mapping landing
+  (`61e2b24`) is expected to fix the UEFI silent-execve issue on
+  that laptop too — pending reflash + verification. The default ISO
+  **auto-skips xHCI live init on bare metal** (CPUID 0x40000000
+  hypervisor-leaf check) so the NUC's silicon-MMIO-stall in
+  `_xhci_v1_bringup` doesn't wedge boot; force-enable with
+  `ENABLE_XHCI_FORCE_INIT=1` if your hardware handles it. See
+  `docs/REAL_HARDWARE.md`.
 - **Hybrid BIOS+UEFI ISO** built by `scripts/build_iso.sh` — boots under
   SeaBIOS, OVMF UEFI, and GNOME Boxes.
 - **UEFI direct boot**: PE/COFF stub uses SFSP to load the kernel ELF
@@ -140,20 +147,29 @@ Hamnix is a wide project. The minimum-viable shape we're converging on:
 
 Concretely this means closing four named gates:
 
-1. **L40 — boot on real hardware.** **Largely closed.** As of
-   M16.156 an Asus i5-4210U (Haswell ULT) laptop boots all the way
-   to the `hamsh` shell in **Legacy/BIOS mode**. The arc that got
-   there: e820-driven dynamic identity-map extension for >4 GiB RAM,
-   GOP-framebuffer fixes (legacy VGA writes were corrupting the GOP
-   scanout on UEFI), an xHCI self-test guard for boxes with no USB
-   keyboard, and the ring-3-transition triple-fault fix in M16.156.
-   Still open on metal: the laptop's **built-in keyboard does not
-   work** (leading hypothesis: it's on the EHCI USB 2.0 controller,
-   not the i8042 — a native EHCI driver has since landed and is
-   verified under QEMU but **not yet tested on the Asus**), and
-   **UEFI boot on the real Asus is not yet re-confirmed** (only
-   Legacy/BIOS is). `docs/REAL_HARDWARE.md` has the USB-stick recipe
-   + firmware checklist.
+1. **L40 — boot on real hardware.** **Closed for the NUC.** The
+   default `bash scripts/build_iso.sh` ISO boots an Intel NUC
+   end-to-end (Legacy/BIOS): kernel → hamsh shell → interactive
+   keyboard input → native binaries → `enter linux { /bin/sh }` →
+   `ping 127.0.0.1`. Confirmed 2026-05-23. **Asus i5-4210U** (Haswell
+   ULT) reaches hamsh in Legacy/BIOS (M16.156); the UEFI silent-
+   execve issue is expected fixed by the per-task ELF mapping
+   (`61e2b24`) but reflash + verification on metal is pending.
+   Enabling work that landed in this wave: dense `[boot:NN]`
+   checkpoints from `xhci_init` onward; an EFI memory-map walker
+   (`83f8de8 + 2fb1eb6`) that unlocked RAM > 240 MiB on UEFI
+   (935 MiB free at `-m 1G`); the EFI stub now bullet-proofs
+   `GetMemoryMap` with a 64 KiB buffer + return-value check
+   (`7365746`) instead of silently aborting; **bare-metal auto-skip
+   of xHCI live init** (`71961b3`) — CPUID 0x40000000 detects bare
+   metal and skips `_xhci_v1_bringup`'s MMIO-stall path, with
+   `ENABLE_XHCI_FORCE_INIT=1` / `ENABLE_XHCI_NO_INIT=1` overrides;
+   and the per-task ELF mapping fix (`61e2b24`) that closed a
+   silent-on-bare-metal class of bugs where loaded PT_LOAD pages
+   relied on the kernel's 1 GiB identity-map stamp instead of
+   explicit per-task PTE chains. `docs/REAL_HARDWARE.md` has the
+   USB-stick recipe + firmware checklist + the auto-skip decision
+   matrix.
 2. **TLS-CERT — X.509 + RSA-PSS / ECDSA verify with a baked CA store.**
    **Closed.** V0..V7 + V5.1/V5.2/V5.3/V5.4 (commits `f47449e` →
    `dc7676c`, `7bc0ddd`, `f0b26b2`).
@@ -183,11 +199,32 @@ Concretely this means closing four named gates:
    keystroke reaches the kbd FIFO through EHCI under QEMU `usb-ehci` +
    `usb-kbd`. Not yet exercised on the real Asus, where the built-in
    keyboard remains the open hardware blocker.
-4. **Inbound SSH.** Shipped — `user/sshd.ad`, a native-Adder SSH-2.0
-   server: curve25519-sha256 KEX, ECDSA-P256 host key,
-   chacha20-poly1305 cipher, password auth, and an interactive session
-   channel — `ssh` in, run a command, see its output. "Useful server
-   OS" is functionally demonstrated.
+4. **Inbound SSH.** Shipped + wired into the boot rc. The
+   native-Adder SSH-2.0 server (`user/sshd.ad`) uses curve25519-sha256
+   KEX, an ECDSA-P256 host key (self-generated + persisted), the
+   chacha20-poly1305 cipher, and supports password + **publickey
+   authentication** (`HAMNIX_SSH_AUTHKEYS=<pubkey> bash scripts/build_iso.sh`
+   bakes the key into the cpio). `/etc/rc.boot` auto-spawns sshd as a
+   detached service on a vanilla ISO. The end-game demo runs:
+   `ssh -p 22221 -i <key> root@127.0.0.1 'apt install hello'` against
+   a vanilla ISO — sshd authenticates, hamsh spawns inline as the
+   session shell, apt fetches over HTTP, SHA-256-verifies the .deb,
+   and dpkg unpacks 49 files into the distrofs. 5+ back-to-back SSH
+   sessions per boot without leaks (after `0f30263`'s pipe-leak fix).
+   "Useful server OS" is functionally demonstrated.
+
+5. **Live `deb.debian.org` archive.** Closed. `apt update` against
+   `http://deb.debian.org/debian stable main` streams the real
+   Packages.gz end-to-end — **56,547,292 bytes decompressed, 68,755
+   packages** ingested, with the `InRelease` OpenPGP signature
+   verified against the baked Debian-archive key. Diagnosis behind
+   the fix: `sys_read() == 0` on TCP sockets was ambiguous between
+   real FIN and a 5-second `tcp_recv` timeout — `user/apt.ad`'s
+   streaming gzip path treated any zero as FIN, killing large
+   transfers; `1eeabb1` mirrors the sshd retry-on-timeout idiom.
+   Remaining gap to `apt install <large-pkg>`: the 512 KiB
+   `/tmp/apt/Packages` cache cap (alphabetically only resolves
+   `0ad..and`) — being addressed in flight.
 
 Stack-canary compiler hardening (`-fstack-protector-strong` equivalent)
 has landed (`f9d8d2f`) — it catches the class of stack-local overflow
@@ -205,8 +242,9 @@ beyond MVP.
 | Gate | Status | Impact |
 |--|--|--|
 | **TLS cert validation** | **Closed** — apt-over-HTTPS against LE-signed mirrors is MITM-resistant | Full chain validation V0..V7: ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify, ECDSA-P256 verify, PKCS#1 v1.5 verify, chain builder + CA store + validity window, CertificateVerify transcript binding per RFC 8446 §4.4.3, multi-record handshake stitching, TCP per-slot RX ring. V6 added the AES-256-GCM-SHA384 cipher suite (codepoint 0x1302) + SHA-384; V6.1/V7 fixed ISRG Root X1 / RSA-4096 chain validation (x509 SPKI buffer cap + bigint limb count). Remaining real-world fragilities: (a) no CRL/OCSP (intentional per RFC 5280 §6 — out of scope); (b) timing-channel hardening still pending in primitives; (c) `_tls_now_unix` falls back to a build epoch when RTC is unavailable, opening a clock-rolled-back attack on expired certs. |
-| **Real-hardware keyboard** | Open blocker | Hamnix boots to `hamsh` on the real Asus laptop, but the built-in keyboard produces nothing. The atkbd path got an i8042 controller bring-up handshake + IRQ 1 wiring + an ISA-edge IOAPIC redirect fix (`dbd40e6`), all confirmed under QEMU; on the real laptop the keyboard still does not respond. Leading hypothesis: the keyboard is on the EHCI USB 2.0 controller, not the i8042. A native-Adder EHCI driver has since landed (V0 probe/port-enum, V1 control transfers + HID boot keyboard, V2 interrupt-driven delivery) — all verified under QEMU `usb-ehci` + `usb-kbd`, but **not yet tested on the real Asus**. |
-| **UEFI real-hardware boot** | Not re-confirmed | UEFI direct boot reaches `hamsh` under QEMU+OVMF. Legacy/BIOS boot is confirmed on the real Asus; the UEFI path on that laptop has not been re-verified after the M16.151–156 wave. |
+| **Real-hardware keyboard** | **Closed on NUC, open on Asus** | Intel NUC accepts atkbd input end-to-end as of 2026-05-23. Asus i5-4210U built-in keyboard still doesn't respond under Legacy/BIOS; the atkbd-SIGINT path landed (`adce616`); leading hypothesis is the Asus keyboard is on EHCI, not the i8042, and a native-Adder EHCI driver is verified under QEMU `usb-ehci` + `usb-kbd` but not yet exercised on metal. |
+| **UEFI real-hardware boot** | **Improved, pending re-verification on Asus** | UEFI direct boot reaches `hamsh` under QEMU+OVMF. The EFI memory-map walker (`83f8de8 + 2fb1eb6`) unlocks RAM > 240 MiB on UEFI (935 MiB free at `-m 1G`); `7365746` made `GetMemoryMap` robust against real-firmware buffer sizes; bare-metal auto-skip (`71961b3`) keeps `xhci_init` from wedging on real silicon. The per-task ELF mapping landing (`61e2b24`) closed a silent-on-bare-metal class of bugs (PT_LOAD relied on the 1 GiB identity stamp); the Asus UEFI boot is expected to reach hamsh after these landings — pending reflash + re-test. |
+| **Bare-metal xHCI MMIO stall** | **Auto-skipped by default** | `_xhci_v1_bringup`'s HCH-clear MMIO poll stalls the CPU on real NUC silicon (the load instruction itself never retires; no software-side timeout helps). The default boot detects bare metal via CPUID 0x40000000 and skips `xhci_init` entirely; PS/2 + serial + framebuffer + EHCI keep working. Force-enable with `ENABLE_XHCI_FORCE_INIT=1` if your hardware handles live xHCI bringup. Real fix (alternative bringup respecting BIOS handoff state) is deferred. |
 | **`apt` against a live Debian mirror** | Closed | `apt update`/`install` runs end-to-end against the genuine `deb.debian.org` `main` suite over HTTP **and HTTPS** (TLS over `/net`): streams a real `main`-sized index with no fixed-buffer cap, decompresses gzip **and xz**, verifies the `Release`/`InRelease` OpenPGP signature (RSA PKCS#1 v1.5, SHA-512, multi-key keyrings) against the baked Debian-archive key, fetches the `.deb`, SHA-256-verifies it, and `dpkg`-installs it — verified by `test_apt_real_deb` (Debian `hello` 2.10-5 installs and `dpkg -L` lists its files). |
 | **apt/dpkg/httpd under a namespace** | Open — global-path debt | The native `apt`/`dpkg`/`httpd` tools still write *global* paths (a global `/var` tmpfs, `/tmp/...`). Per the Namespace law they must run *under* `nsrun` so `/var/lib/dpkg`, `/var/cache/apt`, `/var/www` resolve through a private `distrofs` namespace. `distrofs` + `nsrun` exist; migrating the tools onto them is open work. |
 | **busybox `ls` enumeration** | Open XFAIL | CPython 3.11.10 and busybox 1.36 run as musl static-PIE binaries in QEMU; `python3 -c` and a multi-applet `busybox sh` pipeline pass. But `busybox ls` directory enumeration prints nothing — musl's `opendir`/`readdir` round-trip the directory fd incorrectly (a direct `getdents64` syscall enumerates fine). busybox `sh`'s *internal* pipeline (`sh -c "a \| b"`) also trips a `#GP`. Both are marked XFAIL in the U-track tests. |
