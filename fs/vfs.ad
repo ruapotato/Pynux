@@ -2330,6 +2330,37 @@ def vfs_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
             return devnet_data_read_nb(devnet_unpack_conn(net_pk),
                                        buf, count)
         return vfs_read(fd, buf, count)
+    if file_idx == FD_STDIN_MARK:
+        # TEMP_DEBUG_HEARTBEAT (see user/hamsh.ad): hamsh's interactive
+        # loop polls stdin non-blocking so it can emit a periodic alive
+        # tick to the framebuffer during real-hardware bring-up. The
+        # blocking vfs_read arm above wedges the task inside the syscall
+        # until kbd/UART produces a byte — useless on a box where the
+        # keyboard isn't yet working. Here we peek the kbd FIFO then the
+        # UART FIFO; on a byte we return it (1 byte; the line editor reads
+        # one byte at a time anyway), on no byte we return 0 ("would
+        # block") so the caller can do its own timed work and yield.
+        #
+        # Same console_set_interactive() handshake as the blocking arm —
+        # the kernel uses the first stdin read as the "interactive prompt
+        # is live" trigger to tighten the console log-level. Remove this
+        # arm alongside the hamsh-side heartbeat once real-hardware
+        # keyboard input works.
+        console_set_interactive()
+        c: int32 = kbd_rx_pop()
+        if c < 0:
+            c = uart_rx_pop()
+        if c < 0:
+            return 0                            # would-block
+        b: uint8 = cast[uint8](c & 0xFF)
+        if b == 13:
+            b = 10                              # CR -> LF (match vfs_read)
+        buf[0] = b
+        if b == 10:
+            # Echo the newline as user output — same as the blocking
+            # arm — so the framebuffer cursor advances on Enter.
+            early_putc_user(10)
+        return 1
     # Anything else: no would-block semantics — fall back to the
     # ordinary blocking read.
     return vfs_read(fd, buf, count)

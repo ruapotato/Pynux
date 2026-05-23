@@ -74,6 +74,15 @@ extern def sys_mount(srvfd: int32, afd: int32, old: Ptr[char],
 extern def sys_nslabel(op: int32, label: Ptr[char], to_path: Ptr[char],
                        from_path: Ptr[char]) -> int32
 
+# TEMP_DEBUG_HEARTBEAT — see ed_readline below. The interactive idle
+# loop emits a periodic alive-tick during real-hardware bring-up so a
+# screen photo distinguishes "shell wedged" from "shell alive, keyboard
+# starved". Needs the kernel jiffies counter (100 Hz) for cadence and
+# sys_yield to cooperate-multitask while polling stdin. Remove once
+# real-hardware keyboard input works on the Asus + Nook.
+extern def sys_get_jiffies() -> uint64
+extern def sys_yield() -> int32
+
 
 # DEVFD_* — the channel-kind selector for sys_fdbind, matching
 # sys/src/9/port/devfd.ad. dup is kind DEVFD_DUP with arg = the
@@ -4433,6 +4442,65 @@ ed_esc_state: int32 = 0
 ed_esc_param: uint64 = 0          # numeric parameter accumulated in CSI
 
 
+# TEMP_DEBUG_HEARTBEAT
+# Remove once real-hardware keyboard input works (Asus + Nook bring-up).
+#
+# The Asus boots all the way to hamsh-as-PID-1 but accepts no keyboard
+# input — internal keyboard nor plugged-in USB keyboard produce
+# anything. From a screen photo we cannot tell whether hamsh is alive
+# but input-starved, or wedged. This emits a periodic "alive" line from
+# hamsh's interactive idle loop straight to fd 2 (stderr), which the
+# post-`05c9ffe` console-split routes unconditionally through
+# early_putc_user to the framebuffer + UART — bypassing the
+# post-interactive console log-level gate. The tick counter is monotonic
+# so a static screen shows N stuck.
+HB_PERIOD_JIFFIES: uint64 = 300       # 100 Hz tick -> 3 s cadence
+hb_tick:           uint64 = 0         # monotonic heartbeat counter
+hb_boot_jiffies:   uint64 = 0         # captured on first heartbeat call
+hb_next_jiffies:   uint64 = 0         # jiffies value at which the next
+                                      # heartbeat is due
+hb_inited:         int32  = 0
+
+
+def _hb_emit_to_stderr():
+    # Build the heartbeat line in a small local scratch and dump it to
+    # fd 2. Using render_int + the shared num_buf is fine here — we only
+    # ever emit one number at a time, and the editor isn't holding
+    # num_buf live across an ed_readline call.
+    sys_write(2, cast[Ptr[uint8]]("[hamsh-alive] tick="),
+              cstr_len(cast[Ptr[uint8]]("[hamsh-alive] tick=")))
+    s_tick: Ptr[uint8] = render_int(cast[int64](hb_tick))
+    sys_write(2, s_tick, cstr_len(s_tick))
+    sys_write(2, cast[Ptr[uint8]](" uptime="),
+              cstr_len(cast[Ptr[uint8]](" uptime=")))
+    up_j: uint64 = sys_get_jiffies() - hb_boot_jiffies
+    up_s: uint64 = up_j / 100         # 100 Hz tick
+    s_up: Ptr[uint8] = render_int(cast[int64](up_s))
+    sys_write(2, s_up, cstr_len(s_up))
+    sys_write(2, cast[Ptr[uint8]]("s\r\n"), 3)
+
+
+def _hb_check_and_emit():
+    # Called from ed_readline's idle poll loop. If at least
+    # HB_PERIOD_JIFFIES have elapsed since the last tick, emit one
+    # heartbeat line and schedule the next one. Cheap when nothing is
+    # due: one jiffies read + one compare.
+    now: uint64 = sys_get_jiffies()
+    if hb_inited == 0:
+        hb_boot_jiffies = now
+        hb_next_jiffies = now + HB_PERIOD_JIFFIES
+        hb_inited = 1
+        return
+    if now < hb_next_jiffies:
+        return
+    hb_tick = hb_tick + 1
+    _hb_emit_to_stderr()
+    # Repaint the prompt + edit buffer so the user's typed-but-unsent
+    # text isn't visually orphaned above the heartbeat line.
+    _ed_redraw()
+    hb_next_jiffies = now + HB_PERIOD_JIFFIES
+
+
 def ed_readline() -> int64:
     # Read and edit ONE physical line interactively. Returns the line
     # length in ed_buf (the trailing newline is NOT stored — the caller
@@ -4441,15 +4509,29 @@ def ed_readline() -> int64:
     # On entry the prompt has already been printed; ed_prompt_kind /
     # ed_prompt_len must be set by the caller so the editor can repaint
     # the line and place the cursor.
+    #
+    # TEMP_DEBUG_HEARTBEAT: the byte read is non-blocking + yield, so we
+    # can fire the periodic alive tick (see _hb_check_and_emit above)
+    # while sitting idle at the prompt. Without this the blocking
+    # sys_read() pins hamsh inside the syscall and no user code runs to
+    # signal liveness — the whole point of the heartbeat is to show the
+    # shell is being scheduled on a box whose keyboard is broken. Remove
+    # this poll-and-yield (and the heartbeat hook) once real-hardware
+    # keyboard input works.
     ed_len = 0
     ed_cur = 0
     ed_esc_state = 0
     ed_esc_param = 0
     rb: Array[1, uint8]
     while True:
-        n: int64 = sys_read(0, &rb[0], 1)
-        if n <= 0:
-            return -1
+        n: int64 = sys_read_nb(0, &rb[0], 1)
+        if n < 0:
+            return -1                         # true EOF / error
+        if n == 0:
+            # Stdin idle — fire the heartbeat if it's due, then yield.
+            _hb_check_and_emit()
+            sys_yield()
+            continue
         c: uint8 = rb[0]
         # Any byte other than Tab ends a consecutive-Tab run, so the
         # next Tab starts a fresh completion (this also covers the
