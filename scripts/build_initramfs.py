@@ -173,6 +173,22 @@ if os.environ.get("ENABLE_XHCI_NO_ATTACH") == "1":
 if os.environ.get("ENABLE_XHCI_NO_INIT") == "1":
     FILES.append(("/etc/xhci-no-init", b"1\n"))
 
+# xHCI live-init force-ENABLE opt-IN. The opposite of
+# ENABLE_XHCI_NO_INIT: setting ENABLE_XHCI_FORCE_INIT=1 plants
+# /etc/xhci-force-init so drivers/usb/xhci.ad's xhci_init() runs the
+# live BAR-MMIO bringup path even on bare metal. Without this marker
+# (and without /etc/xhci-no-init), bare-metal boots auto-skip the
+# live path after CPUID leaf 0x40000000 returns EBX=0 (no hypervisor
+# signature) — see drivers/usb/xhci.ad and docs/REAL_HARDWARE.md.
+# Use this on real hardware where the user already knows the xHCI
+# controller responds to the Hamnix bringup sequence; the user
+# accepts the risk that an unresponsive controller will hang the
+# halt+reset MMIO poll. QEMU CI never sets this — QEMU is detected
+# as a hypervisor (TCG / KVM signature at CPUID 0x40000000) so the
+# live xHCI path runs by default.
+if os.environ.get("ENABLE_XHCI_FORCE_INIT") == "1":
+    FILES.append(("/etc/xhci-force-init", b"1\n"))
+
 # Native `ping` smoke. scripts/test_ping.sh sets ENABLE_PING_SMOKE=1 to
 # plant /etc/ping-smoke-test in the initramfs. The marker is consumed
 # only by the test harness today (a future kernel-side autorun could
