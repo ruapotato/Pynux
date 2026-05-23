@@ -1048,6 +1048,22 @@ def _http_stream_gz_index(port: int64) -> int64:
     status_ok: int32 = 0
     total_out: int64 = 0
     stream_done: int32 = 0
+    # The kernel's socket read returns 0 on EITHER a true peer FIN OR a
+    # per-call timeout-with-no-data (the FD_NET_MARK path's tcp_recv has
+    # a fixed ~5 s budget per syscall — see drivers/net/devnet.ad's
+    # NET_BLOCK_JIFFIES). On the gzip stream of a real Debian
+    # main/Packages.gz (13 MiB compressed, ~57 MiB decompressed) the
+    # transfer easily includes >5 s lulls between TCP segments — CDN
+    # cold-start, congestion control, anything — and a single such lull
+    # was being misread as end-of-stream, so the inflater never saw the
+    # trailer and we bailed with "gzip stream did not reach
+    # end-of-stream". sshd takes the same approach (user/sshd.ad's
+    # _recv_exact): treat read==0 as a benign timeout, retry, and give
+    # up only after a generous total silence budget. 24 retries x 5 s =
+    # ~2 min of total silence is the threshold for "the peer is dead";
+    # any actually-FINing peer still terminates the loop at that point
+    # without further damage.
+    idle: int32 = 0
 
     while True:
         # Read one chunk off the socket. While still in headers we read
@@ -1069,7 +1085,18 @@ def _http_stream_gz_index(port: int64) -> int64:
             sys_close(fd)
             return -1
         if n == 0:
-            break                                       # peer FIN
+            # Either a peer FIN or a 5 s syscall-timeout-with-no-data.
+            # If the gzip stream has already reached end-of-stream
+            # (trailer verified) we're done; otherwise it's a benign
+            # lull we retry, bounded so a dead peer can't wedge us.
+            if stream_done != 0:
+                break
+            idle = idle + 1
+            if idle > 24:
+                # ~2 min of total silence -> treat as a dead peer.
+                break
+            continue
+        idle = 0
 
         if headers_done == 0:
             # Grow the buffered header span and hunt for CRLFCRLF.
