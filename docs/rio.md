@@ -1,5 +1,15 @@
 # rio — Hamnix's file-based window system
 
+**Status:** design spec, deferred behind the server-OS goals. Hamnix
+is currently console-only (VGA text + EFI GOP text-mode framebuffer)
+per the explicit end-game scope in [`STATUS.md`](../STATUS.md) — X11 /
+Wayland / GUI apps are out of scope. This doc captures the rio design
+for whenever the project picks up a graphical UI. The open design
+questions are tracked in `memory/project_rio_open_questions.md`; no
+implementation work is in flight.
+
+---
+
 `rio` is a userspace 9P file server. Each window is a namespace; the
 user manipulates the system by reading and writing files inside that
 namespace. There is no graphical C API. There is no client library to
@@ -8,10 +18,6 @@ under `/dev`, just like every other Plan 9 program. See Plan 9's rio
 for the canonical reference (`/sys/src/cmd/rio/` on 9front), and `rio(1)`
 / `rio(4)` in the Plan 9 4th edition manual for the user-facing
 contract this document mirrors.
-
-This file is the **design spec** for rio's eventual landing in Hamnix.
-**No code is being added in this commit.** The spec is here for review
-before the first `rio.ad` is written.
 
 ---
 

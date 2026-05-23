@@ -2,6 +2,15 @@
 
 **Imported-binary personalities via per-process Layer-1 namespaces.**
 
+> **Status:** the architectural design described here is shipped. The
+> live recipe is in [`/etc/rc.boot`](../etc/rc.boot) — `linux = ns clean
+> { bind / /var/lib/distros/default; bind /home /home; bind /dev '#c'
+> … }` (plus a duplicate-body `debian` alias). The `ns clean { … }`
+> modifier (see [`HAMSH_SPEC.md`](HAMSH_SPEC.md) §13) is what makes
+> `enter linux { … }` hermetic. This doc captures the design
+> rationale; the shipped recipe is the source of truth for the
+> binding list.
+
 In Hamnix, as in Plan 9, there is no global root. The kernel knows
 about file servers — disk filesystem drivers, kernel device drivers,
 9P servers. A namespace is a per-process binding of paths to those

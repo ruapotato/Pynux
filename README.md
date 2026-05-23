@@ -51,19 +51,15 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
 ## What it boots into today
 
 - **Real hardware** — **Hamnix boots end-to-end on real x86_64
-  hardware**. Confirmed on an Intel NUC (post-2026-05-23 default ISO):
-  full Legacy/BIOS boot, keyboard input works, hamsh interactive
-  prompt, native binaries on PATH, the linux runtime
-  (`enter linux { /bin/sh }`), `ping 127.0.0.1`. An Asus i5-4210U
-  (Haswell ULT) reaches hamsh in Legacy/BIOS (M16.156 ring-3
-  triple-fault fix); the new per-task ELF mapping landing
-  (`61e2b24`) is expected to fix the UEFI silent-execve issue on
-  that laptop too — pending reflash + verification. The default ISO
-  **auto-skips xHCI live init on bare metal** (CPUID 0x40000000
-  hypervisor-leaf check) so the NUC's silicon-MMIO-stall in
-  `_xhci_v1_bringup` doesn't wedge boot; force-enable with
-  `ENABLE_XHCI_FORCE_INIT=1` if your hardware handles it. See
-  `docs/REAL_HARDWARE.md`.
+  hardware in both UEFI and Legacy/BIOS modes.** Confirmed
+  2026-05-23 on an Intel NUC and an Asus i5-4210U (Haswell ULT):
+  kernel → hamsh interactive prompt → keyboard input → native
+  binaries on PATH → the linux runtime (`enter linux { /bin/sh }`,
+  busybox baked in) → `ping 127.0.0.1`. The default ISO **auto-skips
+  xHCI live init on bare metal** (CPUID 0x40000000 hypervisor-leaf
+  check) so the NUC's silicon-MMIO-stall in `_xhci_v1_bringup`
+  doesn't wedge boot; force-enable with `ENABLE_XHCI_FORCE_INIT=1`
+  if your hardware handles it. See `docs/REAL_HARDWARE.md`.
 - **Hybrid BIOS+UEFI ISO** built by `scripts/build_iso.sh` — boots under
   SeaBIOS, OVMF UEFI, and GNOME Boxes.
 - **UEFI direct boot**: PE/COFF stub uses SFSP to load the kernel ELF
@@ -147,14 +143,12 @@ Hamnix is a wide project. The minimum-viable shape we're converging on:
 
 Concretely this means closing four named gates:
 
-1. **L40 — boot on real hardware.** **Closed for the NUC.** The
-   default `bash scripts/build_iso.sh` ISO boots an Intel NUC
-   end-to-end (Legacy/BIOS): kernel → hamsh shell → interactive
-   keyboard input → native binaries → `enter linux { /bin/sh }` →
-   `ping 127.0.0.1`. Confirmed 2026-05-23. **Asus i5-4210U** (Haswell
-   ULT) reaches hamsh in Legacy/BIOS (M16.156); the UEFI silent-
-   execve issue is expected fixed by the per-task ELF mapping
-   (`61e2b24`) but reflash + verification on metal is pending.
+1. **L40 — boot on real hardware. Closed.** The default
+   `bash scripts/build_iso.sh` ISO boots both an Intel NUC and an
+   Asus i5-4210U (Haswell ULT) end-to-end on **both Legacy/BIOS and
+   UEFI**: kernel → hamsh shell → interactive keyboard input → native
+   binaries → `enter linux { /bin/sh }` → `ping 127.0.0.1`. Confirmed
+   2026-05-23.
    Enabling work that landed in this wave: dense `[boot:NN]`
    checkpoints from `xhci_init` onward; an EFI memory-map walker
    (`83f8de8 + 2fb1eb6`) that unlocked RAM > 240 MiB on UEFI
@@ -243,7 +237,7 @@ beyond MVP.
 |--|--|--|
 | **TLS cert validation** | **Closed** — apt-over-HTTPS against LE-signed mirrors is MITM-resistant | Full chain validation V0..V7: ASN.1 parser, X.509 walker, RSA-PSS-SHA256 verify, ECDSA-P256 verify, PKCS#1 v1.5 verify, chain builder + CA store + validity window, CertificateVerify transcript binding per RFC 8446 §4.4.3, multi-record handshake stitching, TCP per-slot RX ring. V6 added the AES-256-GCM-SHA384 cipher suite (codepoint 0x1302) + SHA-384; V6.1/V7 fixed ISRG Root X1 / RSA-4096 chain validation (x509 SPKI buffer cap + bigint limb count). Remaining real-world fragilities: (a) no CRL/OCSP (intentional per RFC 5280 §6 — out of scope); (b) timing-channel hardening still pending in primitives; (c) `_tls_now_unix` falls back to a build epoch when RTC is unavailable, opening a clock-rolled-back attack on expired certs. |
 | **Real-hardware keyboard** | **Closed on NUC, open on Asus** | Intel NUC accepts atkbd input end-to-end as of 2026-05-23. Asus i5-4210U built-in keyboard still doesn't respond under Legacy/BIOS; the atkbd-SIGINT path landed (`adce616`); leading hypothesis is the Asus keyboard is on EHCI, not the i8042, and a native-Adder EHCI driver is verified under QEMU `usb-ehci` + `usb-kbd` but not yet exercised on metal. |
-| **UEFI real-hardware boot** | **Improved, pending re-verification on Asus** | UEFI direct boot reaches `hamsh` under QEMU+OVMF. The EFI memory-map walker (`83f8de8 + 2fb1eb6`) unlocks RAM > 240 MiB on UEFI (935 MiB free at `-m 1G`); `7365746` made `GetMemoryMap` robust against real-firmware buffer sizes; bare-metal auto-skip (`71961b3`) keeps `xhci_init` from wedging on real silicon. The per-task ELF mapping landing (`61e2b24`) closed a silent-on-bare-metal class of bugs (PT_LOAD relied on the 1 GiB identity stamp); the Asus UEFI boot is expected to reach hamsh after these landings — pending reflash + re-test. |
+| **UEFI real-hardware boot** | **Closed** — UEFI and Legacy/BIOS both confirmed on the Asus and NUC | UEFI direct boot via the native PE/COFF stub reaches `hamsh` on both real laptops AND under QEMU+OVMF. Supporting landings: EFI memory-map walker (`83f8de8 + 2fb1eb6`) unlocks RAM > 240 MiB on UEFI (935 MiB free at `-m 1G`); `7365746` made `GetMemoryMap` robust against real-firmware buffer sizes; bare-metal auto-skip (`71961b3`) keeps `xhci_init` from wedging on real silicon; the per-task ELF mapping (`61e2b24`) closed a silent-on-bare-metal class of bugs where PT_LOAD pages relied on the 1 GiB identity-map stamp. |
 | **Bare-metal xHCI MMIO stall** | **Auto-skipped by default** | `_xhci_v1_bringup`'s HCH-clear MMIO poll stalls the CPU on real NUC silicon (the load instruction itself never retires; no software-side timeout helps). The default boot detects bare metal via CPUID 0x40000000 and skips `xhci_init` entirely; PS/2 + serial + framebuffer + EHCI keep working. Force-enable with `ENABLE_XHCI_FORCE_INIT=1` if your hardware handles live xHCI bringup. Real fix (alternative bringup respecting BIOS handoff state) is deferred. |
 | **`apt` against a live Debian mirror** | Closed | `apt update`/`install` runs end-to-end against the genuine `deb.debian.org` `main` suite over HTTP **and HTTPS** (TLS over `/net`): streams a real `main`-sized index with no fixed-buffer cap, decompresses gzip **and xz**, verifies the `Release`/`InRelease` OpenPGP signature (RSA PKCS#1 v1.5, SHA-512, multi-key keyrings) against the baked Debian-archive key, fetches the `.deb`, SHA-256-verifies it, and `dpkg`-installs it — verified by `test_apt_real_deb` (Debian `hello` 2.10-5 installs and `dpkg -L` lists its files). |
 | **apt/dpkg/httpd under a namespace** | Open — global-path debt | The native `apt`/`dpkg`/`httpd` tools still write *global* paths (a global `/var` tmpfs, `/tmp/...`). Per the Namespace law they must run *under* `nsrun` so `/var/lib/dpkg`, `/var/cache/apt`, `/var/www` resolve through a private `distrofs` namespace. `distrofs` + `nsrun` exist; migrating the tools onto them is open work. |
