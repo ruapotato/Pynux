@@ -424,16 +424,30 @@ def pci_scan():
     # log; the kernel keeps booting either way.
     e1000e_init_rc: int32 = e1000e_init()
 
-    # TEMP-DEBUG: pause 15 s after e1000e probe so the user can read
-    # the [e1000e] / [pgtable] log lines off the framebuffer on a
+    # TEMP-DEBUG: pause after e1000e probe so the user can read the
+    # [e1000e] / [pgtable] log lines off the framebuffer on a
     # bare-metal box where the keyboard isn't yet working and the
-    # console doesn't support scrollback. Jiffies tick at 100 Hz
-    # (10 ms per jiffy), so 1500 jiffies ≈ 15 s. Remove once we have
-    # a reliable real-hardware ssh path.
-    printk0("[TEMP-DEBUG] 15 s read window — snap the photo now\n")
-    pause_start: uint64 = get_jiffies()
-    while (get_jiffies() - pause_start) < 1500:
-        pass
+    # console doesn't support scrollback.
+    #
+    # Cycle-counted loop, NOT jiffies-based: e1000e_init enables MSI
+    # at vector 0x47 (higher priority than the LAPIC timer); on real
+    # silicon the freshly-armed MSI tends to storm before we've
+    # masked the bring-up cause bits, which starves the LAPIC timer
+    # interrupt and freezes the jiffies counter. A pure cycle loop
+    # doesn't care if interrupts are firing.
+    #
+    # Iteration count tuned for ~15 s on a 3 GHz CPU: a trivial loop
+    # body retires in ~1 cycle on modern Intel, so 4.5e10 iterations
+    # ≈ 15 s. We print a tick every 1e9 iterations (~0.3 s) so the
+    # framebuffer animates and proves we're not actually frozen.
+    printk0("[TEMP-DEBUG] cycle-counted read window — snap the photo now\n")
+    outer: uint64 = 0
+    while outer < 30:
+        inner: uint64 = 0
+        while inner < 500000000:
+            inner = inner + 1
+        printk1("[TEMP-DEBUG] tick %d/30\n", outer)
+        outer = outer + 1
     printk0("[TEMP-DEBUG] read window done — boot continuing\n")
 
     if e1000e_init_rc == 0:
