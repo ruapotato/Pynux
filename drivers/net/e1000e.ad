@@ -370,6 +370,35 @@ E1000_TIPG_DEFAULT:  uint32 = 0x00702008
 # Plus: the writer should READ THE REGISTER BACK after the write
 # to confirm it took effect. If the read doesn't match the value
 # we wrote, the workaround failed.
+# --- I219 PHY init: LANPHYPC toggle (Linux ich8lan.c) -----------
+#
+# After CTRL.RST the I219 PHY can be left in a power state where
+# TX descriptors get "processed" by the MAC but the PHY refuses to
+# transmit them on the wire. The chip's TX engine then re-walks
+# the same descriptor over and over (DD set, TDH stuck).
+#
+# Linux's e1000_toggle_lanphypc_pch_lpt brings the PHY out of this
+# state by:
+#   1. Program FEXTNVM3 with PHY_CFG_COUNTER_50MSEC
+#   2. CTRL |= LANPHYPC_OVERRIDE; CTRL &= ~LANPHYPC_VALUE; write
+#      (software-controlled PHY-power-down)
+#   3. Wait ~20 us
+#   4. CTRL &= ~LANPHYPC_OVERRIDE; write
+#      (return to hardware-controlled PHY-power, exits the low-power
+#      state through the firmware's normal handshake)
+#   5. Poll CTRL_EXT.LPCD (LANPHYPC Change Detected) — up to 20
+#      iters × 5 ms wait
+#   6. Wait 30 ms after toggle completes
+#
+# All constants taken verbatim from Linux's drivers/net/ethernet/
+# intel/e1000e/defines.h + ich8lan.h.
+
+E1000_FEXTNVM3:                         uint64 = 0x0003C
+E1000_FEXTNVM3_PHY_CFG_COUNTER_50MSEC:  uint32 = 0x08000000
+E1000_CTRL_LANPHYPC_OVERRIDE:           uint32 = 0x00010000
+E1000_CTRL_LANPHYPC_VALUE:              uint32 = 0x00020000
+E1000_CTRL_EXT_LPCD:                    uint32 = 0x00000004
+
 E1000_FWSM:                    uint64 = 0x05B54
 E1000_ICH_FWSM_PCIM2PCI:       uint32 = 0x01000000
 E1000_ICH_FWSM_PCIM2PCI_COUNT: uint64 = 2000
@@ -981,6 +1010,61 @@ def _e1000e_is_pch_family(device_id: uint32) -> int32:
     return 0
 
 
+def _e1000e_busy_wait_cycles(n: uint64):
+    # Cycle-counted busy-wait. Used between MMIO writes in the
+    # LANPHYPC PHY-toggle sequence where Linux uses udelay/msleep.
+    # On 3 GHz x86 a tight inc-loop retires in ~1 cycle, so 3000
+    # iters ≈ 1 us, 15M iters ≈ 5 ms, 90M iters ≈ 30 ms.
+    i: uint64 = 0
+    while i < n:
+        i = i + 1
+
+
+def _e1000e_toggle_lanphypc(bar0: uint64):
+    # Power-cycle the I219 PHY via the LANPHYPC bits in CTRL. Mirrors
+    # Linux's e1000_toggle_lanphypc_pch_lpt — the load-bearing fix
+    # for I219 chips that otherwise leave the PHY in a state where
+    # the MAC processes TX descriptors but the PHY refuses to deliver
+    # frames on the wire, leaving the TX engine spinning on the same
+    # descriptor forever.
+    printk0("[e1000e] LANPHYPC toggle start\n")
+    # Step 1: program the 50 ms PHY-config counter.
+    _e1000e_mmio_w32(bar0 + E1000_FEXTNVM3,
+                     E1000_FEXTNVM3_PHY_CFG_COUNTER_50MSEC)
+    # Step 2: software-controlled PHY power down (override=1, value=0).
+    ctrl: uint32 = _e1000e_mmio_r32(bar0 + E1000_CTRL)
+    ctrl = ctrl | E1000_CTRL_LANPHYPC_OVERRIDE
+    ctrl = ctrl & (~E1000_CTRL_LANPHYPC_VALUE)
+    _e1000e_mmio_w32(bar0 + E1000_CTRL, ctrl)
+    # Step 3: ~20 us wait so the PHY registers the power-down.
+    _e1000e_busy_wait_cycles(60000)
+    # Step 4: clear override — hardware-controlled PHY-power resumes
+    # and the firmware brings the PHY back through the normal
+    # power-up handshake.
+    ctrl = ctrl & (~E1000_CTRL_LANPHYPC_OVERRIDE)
+    _e1000e_mmio_w32(bar0 + E1000_CTRL, ctrl)
+    # Step 5: poll CTRL_EXT.LPCD (LANPHYPC Change Detected) for up
+    # to ~100 ms (20 iters × 5 ms). Most chips clear it within one
+    # poll cycle.
+    saw_lpcd: int32 = 0
+    poll: uint64 = 0
+    while poll < 20:
+        ext: uint32 = _e1000e_mmio_r32(bar0 + E1000_CTRL_EXT)
+        if (ext & E1000_CTRL_EXT_LPCD) != 0:
+            saw_lpcd = 1
+            poll = 20
+        else:
+            _e1000e_busy_wait_cycles(15000000)
+            poll = poll + 1
+    if saw_lpcd != 0:
+        printk0("[e1000e] LANPHYPC: LPCD asserted (PHY up)\n")
+    else:
+        printk0("[e1000e] LANPHYPC: LPCD timeout — proceeding anyway\n")
+    # Step 6: 30 ms settle.
+    _e1000e_busy_wait_cycles(90000000)
+    printk0("[e1000e] LANPHYPC toggle done\n")
+
+
 def _e1000e_pch_workarounds(bar0: uint64, device_id: uint32):
     # Only the PCH-integrated parts need this; the 82574L / 82583V /
     # 82573L / 82579LM discrete dies have no manageability path and
@@ -1339,6 +1423,14 @@ def e1000e_init() -> int32:
     # prefetcher stalls and the first DHCP DISCOVER never reaches
     # the wire.
     _e1000e_pch_workarounds(bar0, e1000e_state.device_id)
+
+    # I219 LANPHYPC PHY power-cycle. Linux's
+    # e1000_init_phy_workarounds_pchlan calls this to bring the PHY
+    # out of a post-reset low-power state where the MAC processes
+    # TX descriptors but the PHY won't actually deliver frames. PCH
+    # family only (no-op for 82574L / discrete dies).
+    if _e1000e_is_pch_family(e1000e_state.device_id) != 0:
+        _e1000e_toggle_lanphypc(bar0)
 
     # PHY / link init. Set SLU (Set Link Up) + ASDE (Auto-Speed
     # Detection Enable). On QEMU's emulated 82574L the link is
