@@ -353,28 +353,32 @@ E1000_TIPG_DEFAULT:  uint32 = 0x00702008
 # bits[16..20]=0x01, bits[8..13]=0x14 (= WTHRESH 4 packed at
 # bit 16 + GRAN bit 24).
 E1000_TXDCTL:           uint64 = 0x03828
-# 0x03410000 = GRAN (24) | QUEUE_ENABLE (25) | WTHRESH=4 | HTHRESH=1
-# The previous value (0x01410000) was missing bit 25 — comment in
-# this file used to claim bit 24 was "queue enable", but the Linux
-# define E1000_TXDCTL_QUEUE_ENABLE = 0x02000000 (bit 25), and on
-# real I219 silicon TX wedges after the first descriptor without it
-# (observed Skull Canyon 2026-05-24: first ARP probe tx_ok, then
-# DHCPDISCOVER tx timeout).
-E1000_TXDCTL_I219_DEF:  uint32 = 0x03410000
+# Matches Linux's E1000_TXDCTL_DMA_BURST_ENABLE for FLAG2_DMA_BURST
+# (I217/I218/I219) chips: GRAN (bit 24) | WTHRESH=4 (bits 16-21) |
+# HTHRESH=1 (bit 16 of that field is already in 0x40000).
+# We previously tried setting bit 25 ("QUEUE_ENABLE") on top of this
+# (0x03410000) under the theory it was needed to wake the TX queue.
+# On the Skull Canyon NUC that caused the network to be saturated
+# with unwanted traffic — likely bit 25 means something different on
+# I219 silicon than the 82574L (e.g. enables an auto-transmit /
+# diagnostic mode). Linux for FLAG2_DMA_BURST writes GRAN-only and
+# lets the chip auto-enable the queue when TCTL.EN is set. Reverted
+# to match Linux exactly.
+E1000_TXDCTL_I219_DEF:  uint32 = 0x01410000
 
-# RXDCTL[0] (Receive Descriptor Control, queue 0). On I217/I218/I219
-# the RX DMA engine doesn't fetch from the descriptor ring until
-# this register's QUEUE_ENABLE bit (bit 25) is set. Linux's
-# e1000_configure_rx for FLAG2_DMA_BURST chips writes
+# RXDCTL[0] (Receive Descriptor Control, queue 0). Linux's
+# e1000_configure_rx for FLAG2_DMA_BURST (I217/I218/I219) writes
 # RXDCTL = E1000_RXDCTL_DMA_BURST_ENABLE = 0x01000000 (GRAN bit 24)
-# — and the chip's hardware auto-enables the queue when descriptors
-# become available AND RCTL.EN is set. On the Skull Canyon NUC
-# (I219-V3, 2026-05-24) we observed TPR=high, MPC≈TPR, rx_packets=0:
-# the chip received frames at the wire but every one was a missed
-# packet because no descriptor was claimed. The fix is to set both
-# GRAN (24) and QUEUE_ENABLE (25) to force the engine on.
+# only — the chip's hardware then auto-enables the queue when
+# RCTL.EN is set. We previously tried adding bit 25 ("QUEUE_ENABLE")
+# under the assumption it would wake the queue, but on the Skull
+# Canyon NUC (I219-V3, 2026-05-24) that combination saturated the
+# user's LAN with unwanted traffic AND kept RDH/RDT pinned at 0 —
+# strongly suggesting bit 25 means something different on I219
+# silicon (possibly a reset/diagnostic mode rather than queue
+# enable). Reverted to GRAN-only to match Linux exactly.
 E1000_RXDCTL:           uint64 = 0x02828
-E1000_RXDCTL_I219_DEF:  uint32 = 0x03000000   # GRAN | QUEUE_ENABLE
+E1000_RXDCTL_I219_DEF:  uint32 = 0x01000000   # GRAN only (Linux pattern)
 
 # Legacy TX descriptor CMD byte (offset +11) bits.
 E1000_TXD_CMD_EOP:   uint8 = 0x01           # End Of Packet
@@ -744,20 +748,16 @@ def _e1000e_setup_rx(state: Ptr[E1000e]) -> int32:
     # register is a no-op (or harmlessly accepts the write).
     _e1000e_mmio_w32(bar0 + E1000_RXDCTL, E1000_RXDCTL_I219_DEF)
 
-    # Enable the receiver: EN + BAM + UPE + MPE + BSIZE=2K. UPE and
-    # MPE flip the chip into full promiscuous mode (accept ALL frames
-    # regardless of destination MAC). This is the diagnostic stance
-    # for the Skull Canyon NUC DHCP-stuck issue (2026-05-24): LU=1
-    # stable at 1 Gbps full duplex but rx_packets=0. With UPE+MPE
-    # enabled we'll see whether the chip is actually receiving
-    # anything — if it stays 0, the issue is RX engine wiring (ring,
-    # head/tail, DMA), not address filtering. To be tightened back to
-    # EN+BAM once the bring-up is stable; for now we accept that
-    # promiscuous mode is slightly more permissive than strictly
-    # needed and won't open a security hole because there's no
-    # untrusted code on this NIC's broadcast domain.
+    # Enable the receiver: EN + BAM + BSIZE=2K. We KEEP unicast and
+    # multicast filtering on (no UPE/MPE) — full promiscuous on a
+    # busy LAN swamps the chip's RX engine with traffic it can't
+    # process, observed as TPR=high MPC≈TPR on the Skull Canyon NUC
+    # 2026-05-24. RAL[0]/RAH[0] is the unicast filter (the
+    # firmware-loaded MAC is intact through CTRL.RST per spec, and
+    # the AV bit stays set), so unicast OFFER/ACK destined to our
+    # MAC will be accepted; broadcasts (DHCP DISCOVER reply if the
+    # server sets the B flag, ARP, etc.) come in via BAM.
     rctl: uint32 = E1000_RCTL_EN | E1000_RCTL_BAM \
-                 | E1000_RCTL_UPE | E1000_RCTL_MPE \
                  | E1000_RCTL_BSIZE_2K | E1000_RCTL_SECRC
     _e1000e_mmio_w32(bar0 + E1000_RCTL, rctl)
 
