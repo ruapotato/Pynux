@@ -63,6 +63,7 @@
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.pci.pci import (
     pci_config_read_dword, pci_config_write_dword,
+    pci_find_capability,
     pci_config_read_byte,
     pci_bdf_bus, pci_bdf_dev, pci_bdf_fn, pci_pack_bdf,
     pci_read_bar, PCI_BDF_NONE,
@@ -519,6 +520,33 @@ def _e1000e_pci_find() -> uint32:
             fn = fn + 1
         dev = dev + 1
     return PCI_BDF_NONE
+
+
+PCI_CAP_ID_PCIE: uint32 = 0x10            # PCIe Capability Structure
+PCIE_CAP_LNKCTL: uint32 = 0x10            # Link Control (16-bit) offset
+PCIE_LNKCTL_ASPMC_MASK: uint32 = 0x0003   # bits 0..1 = ASPMC field
+
+
+def _e1000e_disable_aspm(bdf: uint32):
+    cap_off: uint32 = pci_find_capability(bdf, PCI_CAP_ID_PCIE)
+    if cap_off == 0:
+        printk0("[e1000e] no PCIe cap — skipping ASPM disable\n")
+        return
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    # PCIe Link Control is a 16-bit register at cap_off + 0x10. Read
+    # the surrounding dword, mask off ASPMC, write back. We preserve
+    # the upper half (Link Status) and any reserved/locked bits in
+    # Link Control.
+    lnkctl_addr: uint32 = cap_off + PCIE_CAP_LNKCTL
+    d: uint32 = pci_config_read_dword(bus, dev, fn, lnkctl_addr & 0xFC)
+    old: uint32 = d & 0xFFFF
+    new: uint32 = old & (~PCIE_LNKCTL_ASPMC_MASK)
+    d_new: uint32 = (d & 0xFFFF0000) | (new & 0xFFFF)
+    pci_config_write_dword(bus, dev, fn, lnkctl_addr & 0xFC, d_new)
+    printk2("[e1000e] ASPM disable: LNKCTL old=%x new=%x\n",
+            cast[uint64](old), cast[uint64](new))
 
 
 def _e1000e_pci_enable(bdf: uint32):
@@ -1007,6 +1035,19 @@ def e1000e_init() -> int32:
                                               pci_bdf_dev(bdf),
                                               pci_bdf_fn(bdf), 0x04) & 0xFFFF
     printk1("[e1000e] PCI COMMAND post-enable=%x\n", cast[uint64](cmd_after))
+
+    # Disable PCIe ASPM on the I219. The PCH's PCIe link to the
+    # integrated NIC supports L0s/L1 power states; with ASPM enabled
+    # the link can be in L1 at cold boot, and a CPU-side MMIO read
+    # would have to wait for the link to wake. On some Skylake-PCH
+    # silicon the wake path is unreliable and the load stalls forever.
+    # Linux's e1000e disables ASPM unconditionally for the I217/I218/
+    # I219 family for exactly this reason. We mirror that: walk the
+    # capability list for PCIe Cap (ID=0x10), read Link Control at
+    # cap_off + 0x10, clear ASPMC bits 0..1, write back. Pure
+    # config-space ops — no MMIO required, so this is safe even when
+    # the chip's MMIO would otherwise stall.
+    _e1000e_disable_aspm(bdf)
 
     # ME hand-off: blind write CTRL_EXT.DRV_LOAD before any MMIO read.
     # On I217/I218/I219 the on-chip Management Engine gates CSR-read
