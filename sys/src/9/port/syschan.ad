@@ -73,7 +73,7 @@ from sys.src.port9.port.chan import (
 # for that one primitive.
 from sys.src.port9.port.devfd import (
     devfd_bind_cons, devfd_bind_pipe_r, devfd_bind_pipe_w,
-    devfd_bind_file, devfd_dup,
+    devfd_bind_file, devfd_dup, devfd_slot_kind,
     DEVFD_CONS, DEVFD_PIPE_R, DEVFD_PIPE_W, DEVFD_FILE, DEVFD_DUP,
 )
 # HAMSH §7: a local pipe is created here as a devtab pipe Chan pair —
@@ -405,6 +405,23 @@ def do_fdbind(pid: int32, fdnum: int32, kind: int32,
         set_current_errstr("fdbind: bind failed (bad fd / source / table full)")
         return cast[int64](-1)
     return 0
+
+
+# do_fdslot_kind(pid, fdnum) — read-only query: what DEVFD_* kind is
+# bound at /fd/<fdnum> in pid's Pgrp? pid == 0 means "the calling task".
+# Returns the int32 kind (DEVFD_NONE / DEVFD_CONS / DEVFD_PIPE_R / ...)
+# or DEVFD_NONE for any error case (no such process, fdnum out of range,
+# the Pgrp has no /fd table allocated yet). The body is intentionally
+# total — there is no errstr / -1 return — because the natural caller
+# pattern is "if not bound, bind cons" and an error-returning shape would
+# force every caller to handle a case that is functionally identical to
+# DEVFD_NONE.
+
+def do_fdslot_kind(pid: int32, fdnum: int32) -> int64:
+    pg: uint64 = _pgrp_for_pid(pid)
+    if pg == 0:
+        return 0                                # DEVFD_NONE
+    return cast[int64](devfd_slot_kind(pg, fdnum))
 
 
 # do_pipechan() — create a local pipe and return its SLOT id. The slot

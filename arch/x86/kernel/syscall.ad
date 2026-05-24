@@ -167,7 +167,7 @@ from sys.src.port9.port.sysfile import (
 # SYS_BIND (257) / SYS_MOUNT (258) / SYS_UNMOUNT (259).
 from sys.src.port9.port.syschan import (
     do_bind, do_mount, do_unmount,
-    do_fdbind, do_pipechan, do_openchan,
+    do_fdbind, do_pipechan, do_openchan, do_fdslot_kind,
     do_nslabel,
 )
 # SYS_SPAWN namespace inheritance: pgrp_current resolves the caller's
@@ -177,7 +177,19 @@ from sys.src.port9.port.syschan import (
 # child's SPAWN_STDIO_NS stdio fds 0/1/2 are FD_DEVFD_MARK — the
 # Layer-2 mapping onto the names /fd/0,1,2.
 from sys.src.port9.port.chan import pgrp_clone, pgrp_ref_inc, pgrp_current
-from sys.src.port9.port.devfd import FD_DEVFD_MARK, devfd_bind_cons
+from sys.src.port9.port.devfd import (
+    FD_DEVFD_MARK, devfd_bind_cons,
+    devfd_bind_pipe_r, devfd_bind_pipe_w,
+)
+# Legacy integer-fd SYS_SPAWN path needs to read the child's just-installed
+# fd entries to mirror them into the child's /fd/0,1,2 namespace bindings
+# (so a subsequent SPAWN_STDIO_NS spawn from the child sees a coherent
+# stdio namespace, not the parent's stale /fd table). Marks live in
+# kernel/sched/core.ad next to fd_idx.
+from kernel.sched.core import (
+    FD_PIPE_MARK_R, FD_PIPE_MARK_W,
+    FD_STDIN_MARK, FD_STDOUT_MARK, FD_STDERR_MARK, FD_CONS_MARK,
+)
 # Phase C / M16.109: Plan 9 note (signal) primitives. Bodies live in
 # sys/src/9/port/sysnote.ad — mirrors 9front's notify(2)/noted(2) shape.
 # Imported through the port9 directory alias for the same identifier
@@ -338,6 +350,14 @@ SYS_NSLABEL:     uint64 = 285  # a0=op(0=stamp,1=unmount), a1=label, a2=to_path,
 # DHCP ACK can't clobber the operator's config. 286 is the next free
 # slot above SYS_NSLABEL.
 SYS_NETCFG:      uint64 = 286
+# HAMSH §7: query the DEVFD_* kind currently bound at /fd/<fdnum> in a
+# process's Pgrp. Returns DEVFD_NONE (0) if the slot is unbound. Used by
+# hamsh's startup so it can avoid clobbering an /fd/N binding the kernel
+# (or an earlier task in the chain) already set up — e.g. an SSH-spawned
+# hamsh whose /fd/0,1,2 were pre-bound by the legacy-fd SYS_SPAWN path's
+# auto-populate. a0 = pid (0 = self), a1 = fdnum. Returns the int32 kind
+# value (DEVFD_NONE / DEVFD_CONS / DEVFD_PIPE_R / DEVFD_PIPE_W / DEVFD_FILE).
+SYS_FDSLOT_KIND: uint64 = 287
 # HAMSH §7: sys_spawn's stdin_fd / stdout_fd sentinel. When the caller
 # passes SPAWN_STDIO_NS, the child's standard streams are NAMES in its
 # namespace (/fd/0,1,2 via the `#d` device), not dup'd integer fds —
@@ -1747,22 +1767,64 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             dup_fd_to_child(slot, 1, parent, cast[uint64](sout))
         else:
             dup_fd_to_child(slot, 1, parent, cast[uint64](1))
-        # Namespace inheritance: the spawned child SHARES the parent's
-        # Pgrp (mount table) — POSIX fork+exec, and the Plan 9 rule that
-        # a child inherits the parent's namespace unless it rforks.
-        # create_user_task_argv wrote 0 (BSS default) into the child's
-        # pgrp slot; we overwrite it with the parent's resolved Pgrp and
-        # bump the refcount so child + parent both holding it is
-        # accounted for. Without this, a dpkg/apt spawned from inside an
-        # nsrun distro-shape namespace would run in the ROOT namespace
-        # and its writes to /usr would miss the mounted distrofs trees.
+        # Namespace inheritance: give the child a PRIVATE Pgrp — a
+        # pgrp_clone of the parent's resolved Pgrp. The clone deep-copies
+        # mtab (so a child spawned inside an nsrun distro-shape namespace
+        # still sees the parent's mounts at spawn time) AND deep-copies
+        # the /fd-name table via devfd_clone_row (HAMSH §7). pgrp_clone
+        # giving us our own Pgrp is what lets us then bind /fd/0,1,2 on
+        # the child's namespace WITHOUT clobbering the parent's stdio:
+        # this is the fix that unblocks `ssh root@host uname` end-to-end
+        # — sshd spawns hamsh via this legacy integer-fd path, and when
+        # hamsh later spawns `uname` via SPAWN_STDIO_NS, the grandchild
+        # inherits hamsh's /fd table, which now actually points at the
+        # SSH pipes (instead of the stale console binding inherited from
+        # PID 1 through a shared Pgrp). On pgrp_clone OOM, fall back to
+        # sharing the parent's Pgrp — degraded but functional.
         cur_idx: int32 = cast[int32](current_idx_get())
         parent_pg: uint64 = task_pgrp(cur_idx)
         if parent_pg == 0:
             parent_pg = pgrp_current()
             set_task_pgrp(cur_idx, parent_pg)
-        set_task_pgrp(slot, parent_pg)
-        pgrp_ref_inc(parent_pg)
+        child_pg: uint64 = pgrp_clone(parent_pg)
+        if child_pg == 0:
+            # Clone failed — share parent's Pgrp as a fallback so the
+            # spawn still succeeds. The child won't get an isolated /fd
+            # table in this branch, but that is strictly the pre-fix
+            # behaviour (acceptable degradation under OOM).
+            set_task_pgrp(slot, parent_pg)
+            pgrp_ref_inc(parent_pg)
+            return task_pid_at(slot)
+        set_task_pgrp(slot, child_pg)
+        # Mirror the child's just-installed integer fds 0/1/2 into its
+        # private /fd-name table. Walk fd 0/1/2 on the child TaskStruct
+        # and bind the matching DEVFD_* kind at /fd/N. Pipe ends carry a
+        # refcount bump inside devfd_bind_pipe_{r,w}; that is symmetric
+        # with the release done in devfd_free_row when the child's Pgrp
+        # is reaped, so no pipe-end refcount leaks.
+        childp_ns: Ptr[TaskStruct] = task_struct_at(slot)
+        if cast[uint64](childp_ns) != 0:
+            k: uint64 = 0
+            while k < 3:
+                ki: uint32 = childp_ns[0].fd_idx[k]
+                kb: uint64 = childp_ns[0].fd_buf[k]
+                fnum: int32 = cast[int32](k)
+                if ki == FD_PIPE_MARK_R:
+                    devfd_bind_pipe_r(child_pg, fnum, cast[int32](kb))
+                elif ki == FD_PIPE_MARK_W:
+                    devfd_bind_pipe_w(child_pg, fnum, cast[int32](kb))
+                elif ki == FD_STDIN_MARK or ki == FD_STDOUT_MARK \
+                        or ki == FD_STDERR_MARK or ki == FD_CONS_MARK:
+                    devfd_bind_cons(child_pg, fnum)
+                # Other backings (FAT/EXT4/TMPFS/file/buffer/socket):
+                # leave /fd/N unbound here. The child's integer fds keep
+                # working; a SPAWN_STDIO_NS spawn from the child would
+                # see an unbound /fd/N and surface that as -EBADF, which
+                # is a more honest error than silently routing to a stale
+                # parent binding. The two cases above (pipe + console)
+                # cover every real consumer today (sshd, apt/dpkg via
+                # nsrun, distrofs).
+                k = k + 1
         return task_pid_at(slot)
     if nr == SYS_PIPE:
         # Hand a pair of (rfd, wfd) back to the calling task. The
@@ -1983,6 +2045,14 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
                                       cast[int32](a1),
                                       cast[int32](a2),
                                       cast[int32](a3)))
+    if nr == SYS_FDSLOT_KIND:
+        # HAMSH §7: read-only query — what DEVFD_* kind is bound at
+        # /fd/<a1> in pid a0 (0 = self)? Returns DEVFD_NONE (0) for an
+        # unbound slot, bad pid, or out-of-range fdnum. hamsh uses this
+        # to skip its default cons-bind when the kernel (or the parent
+        # process) has already seeded /fd/0,1,2.
+        return cast[uint64](do_fdslot_kind(cast[int32](a0),
+                                           cast[int32](a1)))
     if nr == SYS_PIPECHAN:
         # HAMSH §7: create a local pipe Chan pair; returns the pipe
         # SLOT id (not fds). The shell threads the slot into two
