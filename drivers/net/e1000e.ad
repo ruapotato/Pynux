@@ -326,6 +326,7 @@ E1000_TCTL_EN:       uint32 = 0x00000002
 E1000_TCTL_PSP:      uint32 = 0x00000008
 E1000_TCTL_CT_DEF:   uint32 = 0x000000F0    # CT = 0x0F << 4
 E1000_TCTL_COLD_FD:  uint32 = 0x00040000    # COLD = 0x40 << 12
+E1000_TCTL_RTLC:     uint32 = 0x01000000    # Re-Transmit on Late Collision
 
 # TIPG (Transmit Inter-Packet Gap) — Linux's e1000e uses 8/8/6 on
 # the PCH-integrated I217/I218/I219 family
@@ -353,18 +354,20 @@ E1000_TIPG_DEFAULT:  uint32 = 0x00702008
 # bits[16..20]=0x01, bits[8..13]=0x14 (= WTHRESH 4 packed at
 # bit 16 + GRAN bit 24).
 E1000_TXDCTL:           uint64 = 0x03828
-# Matches Linux's E1000_TXDCTL_DMA_BURST_ENABLE for FLAG2_DMA_BURST
-# (I217/I218/I219) chips: GRAN (bit 24) | WTHRESH=4 (bits 16-21) |
-# HTHRESH=1 (bit 16 of that field is already in 0x40000).
-# We previously tried setting bit 25 ("QUEUE_ENABLE") on top of this
-# (0x03410000) under the theory it was needed to wake the TX queue.
-# On the Skull Canyon NUC that caused the network to be saturated
-# with unwanted traffic — likely bit 25 means something different on
-# I219 silicon than the 82574L (e.g. enables an auto-transmit /
-# diagnostic mode). Linux for FLAG2_DMA_BURST writes GRAN-only and
-# lets the chip auto-enable the queue when TCTL.EN is set. Reverted
-# to match Linux exactly.
-E1000_TXDCTL_I219_DEF:  uint32 = 0x01410000
+E1000_TXDCTL_Q1:        uint64 = 0x03928   # TXDCTL(1) — erratum mirror
+# Per Linux e1000_configure_tx for FLAG2_DMA_BURST (I217/I218/I219):
+#   txdctl &= ~(PTHRESH | HTHRESH | WTHRESH);
+#   txdctl |= E1000_TXDCTL_DMA_BURST_ENABLE;
+# = GRAN bit only (0x01000000), all thresholds cleared.
+#
+# Our previous value 0x01410000 set WTHRESH=4. Linux's comment in
+# configure_tx explicitly warns: "wthresh = 1 ==> burst write is
+# disabled to avoid Tx stalls" — non-zero WTHRESH delays DD writeback
+# until N descriptors are queued, which on the Skull Canyon NUC
+# (2026-05-24) put the chip into a state where it walked the
+# descriptor ring perpetually, transmitting the same 3 packets at
+# ~56k pps. Clear all thresholds.
+E1000_TXDCTL_I219_DEF:  uint32 = 0x01000000
 
 # RXDCTL[0] (Receive Descriptor Control, queue 0). Linux's
 # e1000_configure_rx for FLAG2_DMA_BURST (I217/I218/I219) writes
@@ -968,14 +971,23 @@ def _e1000e_setup_tx(state: Ptr[E1000e]) -> int32:
     # 82574L treats this register as a no-op so it's safe to
     # program the same value across the entire device-id whitelist).
     _e1000e_mmio_w32(bar0 + E1000_TXDCTL, E1000_TXDCTL_I219_DEF)
+    # Linux erratum workaround: TXDCTL(1) mirrors TXDCTL(0). Comment
+    # from drivers/net/ethernet/intel/e1000e/netdev.c: "erratum work
+    # around: set txdctl the same for both queues". Even though we
+    # only use queue 0, queue 1's TXDCTL apparently affects queue 0's
+    # behaviour on this silicon — almost certainly the cause of the
+    # observed Skull Canyon NUC TX descriptor-ring loop (chip kept
+    # re-walking ring at ~56k pps until quiesced).
+    _e1000e_mmio_w32(bar0 + E1000_TXDCTL_Q1, E1000_TXDCTL_I219_DEF)
 
-    # Enable the transmitter. EN + PSP + CT=0x0F + COLD=0x40 — the
-    # composed value 0x000400FA matches Linux's e1000e for full-
-    # duplex Gigabit. CT=0x0F (vs the 82574L datasheet's default of
-    # 0x10) was correlated with TX stalls on I219-LM silicon under
-    # SLIRP / external-switch load before this commit; matching
-    # Linux byte-for-byte sidesteps that.
-    tctl: uint32 = E1000_TCTL_EN | E1000_TCTL_PSP \
+    # Enable the transmitter. EN + PSP + RTLC + CT=0x0F + COLD=0x40.
+    # Linux's e1000_configure_tx for I219 sets PSP|RTLC|CT (NO EN
+    # bit — it auto-enables on first TX). RTLC = Re-Transmit on Late
+    # Collision; required by Linux for the PCH family and a likely
+    # contributor to the chip's pathological TX-loop behaviour when
+    # absent. We include EN explicitly because our TX path expects
+    # the engine already running when we submit the first descriptor.
+    tctl: uint32 = E1000_TCTL_EN | E1000_TCTL_PSP | E1000_TCTL_RTLC \
                  | E1000_TCTL_CT_DEF | E1000_TCTL_COLD_FD
     _e1000e_mmio_w32(bar0 + E1000_TCTL, tctl)
     return 0
@@ -1500,23 +1512,29 @@ def e1000e_have_controller() -> int32:
 
 
 def e1000e_quiesce():
-    # Emergency shutdown of the e1000e TX + RX engines. Called when
-    # DHCP fails to bind, to stop the chip from continuing to
-    # transmit/receive after the OS has given up. On the Skull Canyon
-    # NUC (2026-05-24) we observed the chip getting into a TX
-    # descriptor-ring loop, re-transmitting the same DHCPDISCOVER at
-    # line rate for tens of seconds (~4 GB of identical packets
-    # blasted at the LAN). Disabling TCTL.EN + RCTL.EN halts both
-    # engines without resetting the chip — the cable carrier stays
-    # up so the switch doesn't STP-reconverge.
+    # Emergency CHIP RESET. Stops the TX storm by issuing a full
+    # CTRL.RST — this clears every register on the chip including the
+    # TX descriptor ring head/tail, halting any in-flight transmission
+    # within a microsecond. Tested with TCTL.EN=0 first (Skull Canyon
+    # NUC 2026-05-24); that DID NOT stop the storm. The descriptor-
+    # ring loop on this chip somehow survives RCTL/TCTL disable, so we
+    # use the nuclear option. Posted write, doesn't need a completion.
+    #
+    # After this the chip is effectively dead until next boot.
+    # rx_ring/tx_ring stay non-zero in our state so the defensive
+    # null-checks in poll/tx don't kick in — but TCTL.EN=0 means TX
+    # is gated regardless. Side effect: link state may bounce briefly
+    # which the switch will see as a flap. That's still vastly less
+    # damaging than a 4 GB DHCP storm.
     if e1000e_state.bar0 == 0:
         return
     bar0: uint64 = e1000e_state.bar0
-    tctl: uint32 = _e1000e_mmio_r32(bar0 + E1000_TCTL)
-    _e1000e_mmio_w32(bar0 + E1000_TCTL, tctl & (~E1000_TCTL_EN))
-    rctl: uint32 = _e1000e_mmio_r32(bar0 + E1000_RCTL)
-    _e1000e_mmio_w32(bar0 + E1000_RCTL, rctl & (~E1000_RCTL_EN))
-    printk0("[e1000e] TX + RX engines quiesced (stop-the-storm)\n")
+    # Blind-write CTRL = RST. Same pattern we use at init.
+    _e1000e_mmio_w32(bar0 + E1000_CTRL, E1000_CTRL_RST)
+    printk0("[e1000e] CTRL.RST issued — chip reset (stop-the-storm)\n")
+    # Also clear our state so future code paths bail out cleanly.
+    e1000e_state.tx_ring = 0
+    e1000e_state.rx_ring = 0
 
 
 def e1000e_status_raw() -> uint32:
