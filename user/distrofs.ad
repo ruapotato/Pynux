@@ -88,7 +88,7 @@
 #
 # 9P MESSAGE COVERAGE
 # -------------------
-#   Tversion → Rversion("9P2000", msize=8192)
+#   Tversion → Rversion("9P2000", msize=131072)
 #   Tattach  → Rattach (root qid)
 #   Twalk    → Rwalk   (clone + multi-component walk, partial-walk ok)
 #   Topen    → Ropen   (mode-checked)
@@ -173,9 +173,14 @@ DM_DIR: uint32 = 0x80000000
 P9_TREMOVE: uint8 = 122
 P9_RREMOVE: uint8 = 123
 
-# 9P scratch buffer. msize=8192 is the codec default.
-SRV_BUF_CAP: uint64 = 8192
-srv_buf: Array[8192, uint8]
+# 9P scratch buffer. Sized to match P9C_BUF_LEN in
+# sys/src/9/port/9p_client.ad (128 KiB) — every Twrite that arrives
+# carries its data inline within the message, and the kernel's
+# negotiated msize is the upper bound. Sizing this any smaller would
+# force the client to chunk into many round-trips again (the libc6
+# install bottleneck this constellation of bumps targets).
+SRV_BUF_CAP: uint64 = 131072
+srv_buf: Array[131072, uint8]
 
 # -- Node table (top-level BSS) ----------------------------------------
 #
@@ -620,6 +625,28 @@ def names_equal(a: Ptr[uint8], alen: uint64,
             return 0
         i = i + 1
     return 1
+
+
+def _bcopy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64):
+    # Fast forward byte-copy. 8-byte word loop for the bulk, byte tail
+    # for the residue. dst/src can be unaligned; an unaligned 8-byte
+    # load/store is a single x86_64 mov on every CPU we care about.
+    # Used by _serve_twrite to move whole Twrite payloads (up to one
+    # full msize) into the chunked file-data pool — the byte-by-byte
+    # loop it replaces was the hot inner loop of the libc6 install.
+    da: uint64 = cast[uint64](dst)
+    sa: uint64 = cast[uint64](src)
+    words: uint64 = n >> 3
+    i: uint64 = 0
+    while i < words:
+        dp: Ptr[uint64] = cast[Ptr[uint64]](da + (i << 3))
+        sp: Ptr[uint64] = cast[Ptr[uint64]](sa + (i << 3))
+        dp[0] = sp[0]
+        i = i + 1
+    tail_off: uint64 = words << 3
+    while tail_off < n:
+        dst[tail_off] = src[tail_off]
+        tail_off = tail_off + 1
 
 
 # -- node table ops ----------------------------------------------------
@@ -1321,10 +1348,12 @@ def _serve_twrite(in_len: uint64) -> int32:
             # client loop surfaces the error rather than silently
             # truncating later.
             break
-        i: uint64 = 0
-        while i < copy:
-            node_data[chunk_base + in_chunk + i] = data_p[written + i]
-            i = i + 1
+        # Word-aligned bulk copy. With msize=131072 every Twrite can
+        # land up to ~128 KiB inline; a byte-by-byte loop is the
+        # documented bottleneck the libc6 install ran into.
+        _bcopy(&node_data[chunk_base + in_chunk],
+               cast[Ptr[uint8]](cast[uint64](data_p) + written),
+               copy)
         written = written + copy
     if written == 0 and take > 0:
         return _emit_rerror(tg, "distrofs: file-data pool exhausted")

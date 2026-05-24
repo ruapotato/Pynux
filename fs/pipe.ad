@@ -28,7 +28,15 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
 
 PIPE_MAX: uint64 = 32
-PIPE_CAP: uint64 = 1024
+# Ring capacity. The smoke-test path's 1 KiB original was sized for
+# tiny <100-byte 9P messages; the nsrun-launched distrofs install path
+# carries up to one full msize-sized T-msg per pipe_write
+# (P9_MSIZE_DEFAULT = 128 KiB in lib/9p/9p.ad), and a 1 KiB ring would
+# force ~128 yield/wake cycles per Twrite. Sizing the ring to one full
+# msize collapses each Twrite into a single ring fill -> reader drain
+# context switch, killing the pipe-side half of the libc6 install
+# bottleneck. 32 slots × 128 KiB = 4 MiB worst-case slab use.
+PIPE_CAP: uint64 = 131072
 
 
 class Pipe:
@@ -45,8 +53,8 @@ class Pipe:
 # Keep this length in lockstep with PIPE_MAX above. The Adder type
 # parser wants a literal here, so bump both together. 32 slots covers
 # the ssh-bridge + 3× distrofs (apt install path) and leaves headroom
-# for nested namespaces; each slot is ~64 B of metadata + a 1 KiB ring
-# allocated lazily in pipe_alloc, so 32 KiB worst case.
+# for nested namespaces; each slot is ~64 B of metadata + a PIPE_CAP
+# ring allocated lazily in pipe_alloc.
 pipe_table: Array[32, Pipe]
 
 

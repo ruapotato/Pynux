@@ -91,11 +91,12 @@ from lib.9p.9p import (
     P9_TREAD, P9_TCLUNK,
 )
 
-# 9P scratch buffer. msize=8192 is the codec default; the test fixture
-# never asks for anything larger and we don't grow on demand. Top-
-# level Array (nested-frame quirk avoidance).
-SRV_BUF_CAP: uint64 = 8192
-srv_buf: Array[8192, uint8]
+# 9P scratch buffer. Tracks the kernel client's P9C_BUF_LEN (128 KiB,
+# sys/src/9/port/9p_client.ad) so the demo server can receive a full
+# msize-sized message from a real-fd attach. Top-level Array (nested-
+# frame quirk avoidance).
+SRV_BUF_CAP: uint64 = 131072
+srv_buf: Array[131072, uint8]
 
 # Payload for /hello — "p9demo says hi\n" (15 bytes).
 hello_bytes: Array[16, uint8] = "p9demo says hi\n"

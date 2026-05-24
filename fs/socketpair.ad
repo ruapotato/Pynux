@@ -61,7 +61,15 @@ FD_SOCKETPAIR_MARK: uint32 = 0xFFFFFFE2
 
 
 SOCKPAIR_MAX: uint64 = 32
-SOCKPAIR_CAP: uint64 = 1024
+# Ring capacity per direction. Sized to comfortably hold one full
+# msize-sized 9P message (P9_MSIZE_DEFAULT = 128 KiB) so a single
+# T-msg/R-msg round trip doesn't churn through multiple wake cycles
+# on the sockpair ring. The earlier 1 KiB cap forced ~8 wake cycles
+# per Twrite at msize=8192 and was the documented sockpair-side half
+# of the libc6 install bottleneck. Two rings per pair * 32 slots *
+# 128 KiB = 8 MiB worst-case slab usage but only a handful of pairs
+# are live at a time (distrofs + one or two transient mounts).
+SOCKPAIR_CAP: uint64 = 131072
 
 
 class SocketPair:

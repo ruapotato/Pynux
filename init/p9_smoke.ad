@@ -57,8 +57,10 @@ from sys.src.port9.port.chan import (
 )
 
 
-# Shared responder scratch buffer. Same default msize as the client.
-p9smoke_buf: Array[8192, uint8]
+# Shared responder scratch buffer. Sized to match the client's
+# P9C_BUF_LEN in sys/src/9/port/9p_client.ad (128 KiB) so a full-msize
+# T-msg from the client fits without truncation.
+p9smoke_buf: Array[131072, uint8]
 
 # Pipe slot pair (set by p9_smoke_test before triggering the run).
 p9smoke_tx_slot: int32 = -1     # client writes T-msgs, responder reads
@@ -109,7 +111,7 @@ def _drain_tmsg() -> int32:
             return -1
         got = got + cast[uint64](n)
     sz: uint32 = _peek_size(&p9smoke_buf[0])
-    if cast[uint64](sz) > 8192:
+    if cast[uint64](sz) > cast[uint64](P9C_MSIZE):
         return -1
     while got < cast[uint64](sz):
         n: int64 = pipe_read(p9smoke_tx_slot, &p9smoke_buf[got],
@@ -185,7 +187,7 @@ def _serve_tversion(in_len: uint64) -> int32:
     ver[4] = 48
     ver[5] = 48
     c: P9Cursor
-    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    p9_cursor_init(&c, &p9smoke_buf[0], cast[uint64](P9C_MSIZE))
     n: int32 = p9_emit_rversion(&c, tg, reply_ms, &ver[0], 6)
     if n < 0:
         return -1
@@ -208,7 +210,7 @@ def _serve_tattach(in_len: uint64) -> int32:
         return -1
     # Rattach with root qid (type=DMDIR, vers=0, path=1).
     c: P9Cursor
-    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    p9_cursor_init(&c, &p9smoke_buf[0], cast[uint64](P9C_MSIZE))
     n: int32 = p9_emit_rattach(&c, tg, P9_QTDIR, 0, 1)
     if n < 0:
         return -1
@@ -233,7 +235,7 @@ def _serve_twalk(in_len: uint64) -> int32:
     qpaths: Array[16, uint64]
     if nwname == 0:
         c: P9Cursor
-        p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+        p9_cursor_init(&c, &p9smoke_buf[0], cast[uint64](P9C_MSIZE))
         nout: int32 = p9_emit_rwalk(&c, tg, 0,
                                     &qtypes[0], &qvers[0], &qpaths[0])
         if nout < 0:
@@ -253,7 +255,7 @@ def _serve_twalk(in_len: uint64) -> int32:
     qvers[0]  = 0
     qpaths[0] = 2                        # /hello
     c: P9Cursor
-    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    p9_cursor_init(&c, &p9smoke_buf[0], cast[uint64](P9C_MSIZE))
     nout: int32 = p9_emit_rwalk(&c, tg, 1,
                                 &qtypes[0], &qvers[0], &qpaths[0])
     if nout < 0:
@@ -272,7 +274,7 @@ def _serve_topen(in_len: uint64) -> int32:
     # Ropen — file qid (we don't validate fid; V1 smoke responder is
     # stateless). iounit = 0 → use msize-headers.
     c: P9Cursor
-    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    p9_cursor_init(&c, &p9smoke_buf[0], cast[uint64](P9C_MSIZE))
     n: int32 = p9_emit_ropen(&c, tg, P9_QTFILE, 0, 2, 0)
     if n < 0:
         return -1
@@ -307,7 +309,7 @@ def _serve_tread(in_len: uint64) -> int32:
     if offset > 0 and offset < 6:
         data_ptr = &payload[cast[uint64](offset)]
     c: P9Cursor
-    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    p9_cursor_init(&c, &p9smoke_buf[0], cast[uint64](P9C_MSIZE))
     n: int32 = p9_emit_rread(&c, tg, data_ptr, available)
     if n < 0:
         return -1
@@ -321,7 +323,7 @@ def _serve_tclunk(in_len: uint64) -> int32:
     if rc < cast[int64](0):
         return -1
     c: P9Cursor
-    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    p9_cursor_init(&c, &p9smoke_buf[0], cast[uint64](P9C_MSIZE))
     n: int32 = p9_emit_rclunk(&c, tg)
     if n < 0:
         return -1
@@ -346,7 +348,7 @@ def _emit_rerror(tg: uint16, msg: Ptr[uint8]) -> int32:
     while msg[mlen] != 0:
         mlen = mlen + 1
     c: P9Cursor
-    p9_cursor_init(&c, &p9smoke_buf[0], 8192)
+    p9_cursor_init(&c, &p9smoke_buf[0], cast[uint64](P9C_MSIZE))
     n: int32 = p9_emit_rerror(&c, tg, msg, mlen)
     if n < 0:
         return -1

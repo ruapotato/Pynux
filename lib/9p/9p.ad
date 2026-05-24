@@ -55,7 +55,11 @@
 P9_NOFID:        uint32 = 0xFFFFFFFF
 P9_NOTAG:        uint16 = 0xFFFF
 
-P9_MSIZE_DEFAULT: uint32 = 8192
+P9_MSIZE_DEFAULT: uint32 = 131072       # 128 KiB; sized so one xz drain
+                                        # chunk (lib/xz/xz.ad XZ_OUT_STAGE_CAP
+                                        # = 64 KiB) lands in ONE Twrite, killing
+                                        # the per-chunk round-trip churn that
+                                        # dominated the libc6 install budget.
 P9_MAX_WELEM:     uint64 = 16           # Twalk component cap
 
 # Wstat sentinel values (callers OR these into a Stat to leave a field

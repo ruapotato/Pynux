@@ -49,10 +49,10 @@
 #   - Fid allocator: per-connection, 32 fids, simple high-water
 #     mark + free bitmap. Fid 0 is reserved as the root fid (set by
 #     attach). Fids 1..31 are spendable on Twalk.
-#   - msize: client offers P9_MSIZE_DEFAULT (8192). Server's Rversion
+#   - msize: client offers P9C_MSIZE (128 KiB). Server's Rversion
 #     msize is honoured if smaller. The shared encode/decode buffer
 #     in this module is sized for the default; raising msize beyond
-#     8192 requires growing the buffer too.
+#     P9C_BUF_LEN requires growing p9c_scratch to match.
 #   - I/O dispatch: every srvfd I/O goes through _p9_send + _p9_recv.
 #     In real mode those funnel through vfs_read / vfs_write on the
 #     supplied srvfd. In SMOKE mode (set by p9c_register_smoke_pipes)
@@ -135,9 +135,13 @@ FD_P9_MARK: uint32 = 0xFFFFFFE3
 
 
 # Buffer + msize cap. Raising this needs the same bump to
-# init/p9_smoke.ad's responder buffer.
-P9C_MSIZE: uint32 = 8192
-P9C_BUF_LEN: uint64 = 8192
+# init/p9_smoke.ad's responder buffer AND user/distrofs.ad's SRV_BUF_CAP
+# AND user/p9srv_demo.ad's SRV_BUF_CAP. 128 KiB sized so one xz drain
+# chunk (lib/xz/xz.ad XZ_OUT_STAGE_CAP = 64 KiB) fits inside ONE Twrite,
+# cutting the per-chunk 9P/sockpair round-trip count by ~8x and lifting
+# the libc6 (~13 MiB extracted) install inside its 600 s QEMU budget.
+P9C_MSIZE: uint32 = 131072
+P9C_BUF_LEN: uint64 = 131072
 
 # Per-connection fid pool size. Fid 0 is the root; 1..31 are
 # spendable on Twalk. 32 leaves plenty of headroom for the smoke
@@ -216,8 +220,9 @@ p9_conns: Array[16, P9Conn]
 
 # Shared encode/decode buffer. V1 is synchronous and uses a single
 # global scratchpad — one msize-sized buffer for the most recent
-# T-msg / R-msg. A real concurrent client would per-tag this.
-p9c_scratch: Array[8192, uint8]
+# T-msg / R-msg. A real concurrent client would per-tag this. Size
+# tracks P9C_BUF_LEN above.
+p9c_scratch: Array[131072, uint8]
 
 
 # -- low-level connection helpers ----------------------------------
@@ -562,11 +567,9 @@ def _p9_send(slot: int32, n_bytes: int32) -> int32:
         tx: int32 = p9_conns[su].smoke_tx_slot
         # pipe_write may report a short count under back-pressure; in
         # the smoke test the responder hasn't drained yet so we trust
-        # PIPE_CAP (1024 in fs/pipe.ad) to swallow one msize-sized
-        # T-msg. V1 cap is 8 KiB which exceeds PIPE_CAP -- that's a
-        # known bound: smoke messages stay well under 1 KiB, so the
-        # bound is theoretical here. Real-fd dispatch (V4) won't hit
-        # it.
+        # PIPE_CAP (fs/pipe.ad) to swallow one msize-sized T-msg.
+        # Smoke messages stay well under PIPE_CAP, so the strict
+        # equality is safe in practice.
         written: int64 = pipe_write(tx, &p9c_scratch[0],
                                     cast[uint64](n_bytes))
         if written != cast[int64](n_bytes):
@@ -631,11 +634,10 @@ def _p9_send(slot: int32, n_bytes: int32) -> int32:
         # mount-srvfd-rejection path) still see a visible failure.
         return -1
     # Push the whole T-msg out. pipe_write reports a short count when
-    # the ring is full; we yield + retry. The PIPE_CAP is 1024 bytes
-    # (fs/pipe.ad) and our biggest V0 T-msg (Tversion + 6-byte version
-    # string) is ~25 bytes, so the loop is just defensive — but a
-    # future Twrite carrying a multi-KB payload could legitimately
-    # need it.
+    # the ring is full; we yield + retry. PIPE_CAP (fs/pipe.ad) is
+    # sized to one full P9C_MSIZE T-msg, so a Twrite carrying a
+    # multi-KB payload normally lands in one shot; the loop is the
+    # back-pressure safety net for a slow consumer.
     pushed: uint64 = 0
     total: uint64 = cast[uint64](n_bytes)
     while pushed < total:
