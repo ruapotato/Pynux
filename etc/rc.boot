@@ -68,6 +68,22 @@ sshdsvc = spawn detached bootns {
 
 echo 'rc.boot: boot services launched'
 
+# Static-IP fallback. On the Skull Canyon NUC the e1000e I219 PHY/MAC
+# init isn't yet complete enough to drive DHCP (TX timeouts, RX
+# descriptor ring frozen — being worked) so the box has no
+# dynamically-assigned address. Bake a static config so the box at
+# least has an identity on the LAN, sshd binds to it, and the user
+# can attempt SSH-in once the chip's TX engine starts working.
+#
+# 10.250.10.99/24 with gateway 10.250.10.1 — adjust for your LAN
+# if different. This call is unconditional: if DHCP DID succeed
+# earlier in boot, this overrides it with the static IP (which is
+# fine on the development box, but if you want to keep a DHCP-bound
+# address comment these three lines out).
+ifconfig eth0 10.250.10.99 netmask 255.255.255.0
+ifconfig gw 10.250.10.1
+ifconfig dns 10.250.10.1
+
 # Print the live network config (IPv4 address + netmask + gw + DNS,
 # with source tag — "(dhcp)" or "(static)") so a real-hardware box
 # with no working keyboard can be SSH'd into off the framebuffer. If
