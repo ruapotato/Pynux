@@ -838,3 +838,15 @@ def icmp_init():
     icmp_out_unreach = 0
     icmp_ping_seq = 0
     printk0("icmp: initialized (echo + error messages)\n")
+
+
+# Counter accessors for cross-module smokes (e1000e_traffic.ad's
+# PHASE A assertion needs to observe icmp_in_echo_reply moving).
+# The counters themselves are module-private; exposing read-only
+# getters keeps the contract small.
+def icmp_get_in_echo_reply_count() -> uint64:
+    return icmp_in_echo_reply
+
+
+def icmp_get_in_errors_count() -> uint64:
+    return icmp_in_errors

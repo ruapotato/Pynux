@@ -491,6 +491,19 @@ if os.environ.get("ENABLE_SKY2_KO") == "1":
 if os.environ.get("ENABLE_TG3_KO") == "1":
     FILES.append(("/etc/tg3-ko", b"1\n"))
 
+# e1000e.ko traffic exercise (NIC subsystem proof-of-concept).
+# scripts/test_e1000e_traffic.sh sets ENABLE_E1000E_TRAFFIC_TEST=1 to
+# plant /etc/e1000e-traffic-test, which gates init/main.ad's boot:35.c
+# call to e1000e_traffic_smoke_test (drivers/net/e1000e_traffic.ad).
+# After the existing boot:35.b DHCP exchange establishes a lease via
+# the .ko, the smoke runs three phases — ICMP ping, DNS UDP lookup,
+# 320-packet UDP burst to force >256-entry TX-ring wraparound — to
+# prove regular packet flow works, not just DHCP's ~4-packet happy
+# path. Default boots omit the marker; only the dedicated test sets
+# the env var.
+if os.environ.get("ENABLE_E1000E_TRAFFIC_TEST") == "1":
+    FILES.append(("/etc/e1000e-traffic-test", b"1\n"))
+
 
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.

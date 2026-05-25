@@ -151,6 +151,9 @@ from drivers.net.icmp import icmp_init, icmp_send_echo_request
 from drivers.net.dhcp import (
     dhcp_init, dhcp_discover, dhcp_state_get, dhcp_renew_smoke_test,
 )
+from drivers.net.e1000e_traffic import (
+    e1000e_traffic_smoke_test, e1000e_traffic_marker_found,
+)
 from drivers.net.dns import dns_init, dns_lookup, dns_selftest
 from drivers.net.tcp import (
     tcp_init, tcp_connect, tcp_send, tcp_recv, tcp_close,
@@ -3047,6 +3050,19 @@ def start_kernel():
                     else:
                         cpu_relax()
                     ko_spin = ko_spin + 1
+                # boot:35.c — proof-of-concept traffic exercise. Gated
+                # on /etc/e1000e-traffic-test (planted by
+                # ENABLE_E1000E_TRAFFIC_TEST=1) so default boots stay
+                # single-purpose. Runs WITH IRQs still enabled so the
+                # MSI vector 0x47 keeps firing for RX completion +
+                # __napi_schedule. Validates ICMP ping, DNS UDP, and
+                # TX/RX ring wraparound past the 256-descriptor mark —
+                # the regular-traffic surface that DHCP's ~4 packets
+                # don't exercise. See drivers/net/e1000e_traffic.ad.
+                if dhcp_state_get() == 3:
+                    if e1000e_traffic_marker_found() == 1:
+                        printk0("[boot:35.c] e1000e.ko traffic exercise (PHASE A/B/C)\n")
+                        e1000e_traffic_smoke_test()
                 local_irq_disable()
                 if dhcp_state_get() != 3:
                     printk0("[dhcp] no ACK received during e1000e.ko poll\n")

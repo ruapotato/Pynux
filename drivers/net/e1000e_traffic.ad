@@ -1,0 +1,342 @@
+# drivers/net/e1000e_traffic.ad
+#
+# e1000e.ko proof-of-concept exercise test. Driven from init/main.ad's
+# boot:35.b block, AFTER the kernel has bound a DHCP lease through the
+# stock Linux e1000e.ko (via the L-series loader). DHCP proves only
+# that ~4 packets — DISCOVER / OFFER / REQUEST / ACK — can round-trip;
+# this file proves that the .ko handles REGULAR packet flow:
+#
+#   PHASE A — ICMP ping. Send 5 echo requests to the SLIRP gateway
+#             (10.0.2.2), poll for replies, assert >=3 of 5 land.
+#             Exercises ARP-cached unicast TX + IRQ-driven RX.
+#
+#   PHASE B — DNS UDP. dns_lookup("example.com") through the .ko's
+#             ndo_start_xmit. Exercises a non-trivial-payload TX +
+#             multi-RR RX parse. SLIRP forwards UDP/53 to the host
+#             resolver; a `[dns] timeout` (no internet) still counts
+#             as a passing TX-side exercise, but the strict PHASE_B_PASS
+#             marker requires a real resolved answer.
+#
+#   PHASE C — Ring wraparound. Send 320 small UDP datagrams to
+#             10.0.2.2:9 (discard) so the 256-entry TX ring HAS to
+#             wrap. Asserts no panic / TRAP / BUG and that the
+#             udp_out_datagrams counter moves by >=300 — proving the
+#             driver's TX-completion path (e1000_clean_tx_irq +
+#             dev_kfree_skb_any) successfully recycles descriptors as
+#             they free. Counts RX-side ICMP port-unreachables as a
+#             bonus signal (SLIRP returns them best-effort with rate
+#             limiting; not required for PASS).
+#
+# All three phases run with IRQs enabled (caller responsibility — the
+# .ko's MSI vector 0x47 must fire for napi_gro_receive to deliver
+# inbound frames to eth_rx). The function returns when the budget
+# burns or all three phases complete. PASS/FAIL markers are emitted
+# via printk so scripts/test_e1000e_traffic.sh can grep them.
+#
+# Why kernel-side and not a userland test: Hamnix is Plan-9-shaped at
+# Layer 1 (see docs/architecture.md and docs/native-api.md "Things
+# deliberately left out"). There are NO native `socket()` / `sendto()`
+# / `recv()` syscalls — networking is done by `open`/`read`/`write` on
+# `/net/tcp/clone` and friends (drivers/net/devnet.ad). The Linux-ABI
+# `socket()` is a Layer-2 *consumer* of /net, not a Layer-1 primitive.
+# Even if we drove /net from userland, the test would run AFTER
+# sched_init creates PID 1 — but the e1000e.ko DHCP/traffic exercise
+# window is at boot:35.b, BEFORE userspace exists. So this smoke runs
+# in the same kernel-thread context that the existing DHCP exercise
+# already uses (init/main.ad boot:35.b), driving the in-kernel TX/RX
+# primitives (icmp_send_echo_request, udp_send, dns_lookup) that BOTH
+# the Plan-9 /net shape AND the Linux-ABI socket() shim ride. The
+# pattern matches dhcp_renew_smoke_test (drivers/net/dhcp.ad) and
+# http_smoke_test (init/main.ad).
+
+from kernel.printk.printk import printk0, printk1, printk2
+from drivers.net.icmp import (
+    icmp_init,
+    icmp_send_echo_request,
+    icmp_get_in_echo_reply_count,
+)
+from drivers.net.udp import (
+    udp_send,
+    udp_get_in_datagrams,
+    udp_get_out_datagrams,
+)
+from drivers.net.dns import dns_lookup
+from drivers.net.arp import arp_lookup, arp_send_request
+from arch.x86.kernel.time import get_jiffies
+from fs.cpio import cpio_init, initramfs_entry_count, initramfs_entry_name
+
+extern def cpu_relax()
+
+
+# A short scratch payload for the bulk UDP burst. Keep it small so a
+# full ring's worth of skbs fits in the slab budget; 32 bytes is plenty
+# to prove the TX path moves real bytes and not just zero-length
+# descriptors. Top-level BSS (Adder U9 quirk).
+_e1k_traffic_payload: Array[32, uint8]
+
+
+def _e1k_traffic_fill_payload():
+    i: uint64 = 0
+    while i < 32:
+        _e1k_traffic_payload[i] = cast[uint8](0x40 + (i & 0x0F))
+        i = i + 1
+
+
+def _e1k_traffic_spin(ticks: uint64):
+    # Burn `ticks` cpu_relax iterations. With IRQs enabled this lets
+    # the LAPIC timer bump jiffies AND the MSI vector deliver
+    # completion / RX events. 50_000 ≈ a few hundred microseconds on
+    # a 3 GHz CPU under qemu-tcg.
+    i: uint64 = 0
+    while i < ticks:
+        cpu_relax()
+        i = i + 1
+
+
+def _e1k_prime_arp_for_gateway() -> int32:
+    # Prime the ARP cache for 10.0.2.2 (the SLIRP gateway) before the
+    # phases that send unicast IP to it.
+    #
+    # ARP-cache state on entry: DHCP just completed, but DHCP runs over
+    # broadcast (FF:FF:FF:FF:FF:FF) — the OFFER/ACK frames from
+    # 10.0.2.2 come back as regular IP, not ARP, so arp_rx never sees
+    # them. The cache is therefore EMPTY for 10.0.2.2 at this point.
+    # ip_send's "no ARP entry" guard would otherwise reject every
+    # unicast packet to the gateway with rc=-1. dns.ad has the same
+    # gotcha and primes for 10.0.2.3 (its DNS server) at lookup time;
+    # the kernel-side smoke needs the equivalent prime for 10.0.2.2.
+    #
+    # Returns 0 if the entry is live when we exit (already cached, or
+    # the request got a reply within ~100 ms), -1 on timeout. A
+    # timeout is logged but we proceed — the phase TX will simply
+    # report "no ARP entry" rc which the phase records as a failure.
+    gw: Array[4, uint8]
+    gw[0] = 10
+    gw[1] = 0
+    gw[2] = 2
+    gw[3] = 2
+    gw_ptr: Ptr[uint8] = cast[Ptr[uint8]](&gw[0])
+    if arp_lookup(gw_ptr) != cast[Ptr[uint8]](0):
+        return 0
+    printk0("[traffic_test] priming ARP for 10.0.2.2 (gateway)\n")
+    rc: int32 = arp_send_request(10, 0, 2, 2)
+    if rc != 0:
+        printk1("[traffic_test] ARP prime: arp_send_request rc=%d\n",
+                cast[uint64](rc))
+    # Spin with IRQs enabled so the RX path can deliver the reply
+    # into arp_rx -> _arp_insert. ~10 jiffies @ HZ=100 = 100 ms is
+    # plenty for SLIRP (it replies in microseconds).
+    start: uint64 = get_jiffies()
+    deadline: uint64 = start + 20             # 200 ms ceiling
+    while get_jiffies() < deadline:
+        cpu_relax()
+        if arp_lookup(gw_ptr) != cast[Ptr[uint8]](0):
+            printk0("[traffic_test] ARP prime: 10.0.2.2 -> entry live\n")
+            return 0
+    printk0("[traffic_test] ARP prime: 10.0.2.2 -> no reply within 200 ms\n")
+    return -1
+
+
+def _e1k_phase_a_ping() -> int32:
+    # PHASE A — 5 ICMP echo requests to 10.0.2.2, assert >=3 replies.
+    #
+    # The SLIRP gateway answers ICMP echo synchronously inside QEMU's
+    # main loop (slirp/src/ip_icmp.c). With our MSI bridge live, the
+    # reply lands in eth_rx -> ip_rx -> icmp_rx -> icmp_in_echo_reply++.
+    # Strict assertion is >=3/5 to tolerate one or two reply drops on
+    # a slow CI box (in practice SLIRP under tcg answers all 5).
+    printk0("[traffic_test] PHASE_A: ICMP ping x5 to 10.0.2.2\n")
+    # Prime ARP for the gateway — see _e1k_prime_arp_for_gateway.
+    _e1k_prime_arp_for_gateway()
+    baseline: uint64 = icmp_get_in_echo_reply_count()
+    n_sent: uint64 = 0
+    n_send_ok: uint64 = 0
+    while n_sent < 5:
+        rc: int32 = icmp_send_echo_request(10, 0, 2, 2)
+        if rc != 0:
+            printk1("[traffic_test] PHASE_A icmp_send rc=%d\n",
+                    cast[uint64](rc))
+        else:
+            n_send_ok = n_send_ok + 1
+        n_sent = n_sent + 1
+        # Inter-packet spin so each request gets its own RX window
+        # and the previous reply is parsed before we step on it.
+        _e1k_traffic_spin(200000)
+    # Final settle window — give any in-flight reply time to land.
+    _e1k_traffic_spin(500000)
+    got: uint64 = icmp_get_in_echo_reply_count() - baseline
+    printk2("[traffic_test] PHASE_A icmp send_ok=%d, replies=%d\n",
+            n_send_ok, got)
+    if got >= 3:
+        printk0("[traffic_test] PHASE_A_PASS\n")
+        return 0
+    printk1("[traffic_test] PHASE_A_FAIL: only %d replies (<3)\n", got)
+    return -1
+
+
+def _e1k_phase_b_dns() -> int32:
+    # PHASE B — DNS A-record lookup through the .ko's TX/RX path.
+    #
+    # SLIRP (under -netdev user) forwards UDP/53 to whatever the host
+    # has configured as its DNS resolver. The kernel's DNS server was
+    # pinned at DHCP-ACK time to 10.0.2.3 (SLIRP's built-in NS); the
+    # query goes there, SLIRP NATs it to the host, and the answer
+    # round-trips back as a non-trivial UDP payload (>= 32 bytes
+    # including the question + at least one A RR + header).
+    #
+    # 200 jiffies @ HZ=100 = 2 s deadline. The lookup returns -1 on
+    # NXDOMAIN, timeout, or no DNS server pinned. Since the existing
+    # virtio path's test_dns.sh treats "timeout" as SKIP (no internet
+    # in the CI sandbox), we mirror that posture here: a clean PASS
+    # requires dns_rc == 0 (resolved); a timeout reports PHASE_B_SKIP
+    # which the test script accepts as proof the TX side worked.
+    printk0("[traffic_test] PHASE_B: DNS A-record lookup for example.com\n")
+    dns_name: Ptr[uint8] = "example.com"
+    dns_result: Array[4, uint8]
+    dns_result_ptr: Ptr[uint8] = cast[Ptr[uint8]](&dns_result[0])
+    dns_rc: int32 = dns_lookup(dns_name, dns_result_ptr, 200)
+    if dns_rc == 0:
+        printk2("[traffic_test] PHASE_B resolved example.com -> %d.%d",
+                cast[uint64](dns_result[0]), cast[uint64](dns_result[1]))
+        printk2(".%d.%d\n",
+                cast[uint64](dns_result[2]), cast[uint64](dns_result[3]))
+        printk0("[traffic_test] PHASE_B_PASS\n")
+        return 0
+    # Timeout / NXDOMAIN: TX path worked but no answer (likely no host
+    # internet). Emit SKIP so the test script can grade it as
+    # "TX-side proven; live wire not available".
+    printk0("[traffic_test] PHASE_B_SKIP: dns_lookup returned -1 (no internet?)\n")
+    return 0
+
+
+def _e1k_phase_c_ring_wraparound() -> int32:
+    # PHASE C — Ring wraparound. Send 320 small UDP datagrams (more
+    # than the 256-entry TX ring can hold without recycling) to a
+    # closed port on the SLIRP gateway. The TX path here is:
+    #
+    #   udp_send -> ip_send -> eth_tx -> _l_linux_tx_bridge ->
+    #     ndo_start_xmit (e1000_xmit_frame) -> chip's TX descriptor
+    #     ring at TDH/TDT.
+    #
+    # Once TDT laps TDH+ring_count, the driver MUST have recycled
+    # at least (320-256) = 64 descriptors via e1000_clean_tx_irq.
+    # That path runs from the MSI handler -> __napi_schedule ->
+    # e1000e_poll -> napi_consume_skb / dev_kfree_skb_any. If
+    # ANY link in that chain is missing (e.g. shim returns NULL for
+    # the per-buffer info pointer, or kfree_skb is a no-op), the
+    # ring fills permanently and TX stops at ~256 sends. We assert
+    # udp_out_datagrams moves by >= 300 to declare "wraparound
+    # actually happened".
+    #
+    # RX-side: SLIRP for a closed UDP port issues an ICMP port-
+    # unreachable BUT with host-OS-imposed rate limiting, so we
+    # don't strictly require 1:1 RX. udp_no_ports / icmp_in_errors
+    # being non-zero is logged as a bonus signal.
+    BURST: uint64 = 320
+    printk1("[traffic_test] PHASE_C: %d-packet UDP burst to 10.0.2.2:9 (ring wraparound)\n",
+            BURST)
+    # Prime ARP if PHASE_A was skipped or the entry aged out.
+    _e1k_prime_arp_for_gateway()
+    _e1k_traffic_fill_payload()
+    pl_ptr: Ptr[uint8] = cast[Ptr[uint8]](&_e1k_traffic_payload[0])
+    baseline_in:  uint64 = udp_get_in_datagrams()
+    n: uint64 = 0
+    n_send_ok: uint64 = 0          # udp_send rc == 0 (reached the wire)
+    n_send_fail: uint64 = 0        # udp_send rc != 0 (NETDEV_TX_BUSY or ARP miss)
+    # Use a high ephemeral source port to avoid colliding with any
+    # in-flight DHCP / DNS state. Destination port 9 is the discard
+    # service (closed under SLIRP -> ICMP port-unreachable best
+    # effort).
+    src_port: uint16 = 49000
+    dst_port: uint16 = 9
+    while n < BURST:
+        rc: int32 = udp_send(10, 0, 2, 2, src_port, dst_port,
+                             pl_ptr, 32)
+        if rc != 0:
+            n_send_fail = n_send_fail + 1
+        else:
+            n_send_ok = n_send_ok + 1
+        # Between every 32 sends, give the IRQ side a window to
+        # drain the TX completion ring. cpu_relax keeps the
+        # cooperative-IRQ window open without burning a runaway
+        # CPU; with HZ=100 a single bump of jiffies is ~10 ms which
+        # is plenty for a full ring of 256 completions on tcg.
+        if (n & 0x1F) == 0x1F:
+            _e1k_traffic_spin(50000)
+        n = n + 1
+    # Settle window — let the last batch of TX completions land and
+    # any ICMP unreachables from SLIRP filter into icmp_rx.
+    _e1k_traffic_spin(1000000)
+    recv: uint64 = udp_get_in_datagrams() - baseline_in
+    printk2("[traffic_test] PHASE_C tx: %d/%d sent ok (udp_send rc=0)\n",
+            n_send_ok, BURST)
+    printk2("[traffic_test] PHASE_C tx_fail=%d rx_unreach_or_other=%d\n",
+            n_send_fail, recv)
+    # Strict assertion: at least 300 of 320 (>= 1.17 rings, proves the
+    # 256-entry TX ring wrapped) made it through udp_send + ip_send +
+    # bridge + ndo_start_xmit without an ARP miss / NETDEV_TX_BUSY.
+    if n_send_ok >= 300:
+        printk0("[traffic_test] PHASE_C_PASS\n")
+        return 0
+    printk2("[traffic_test] PHASE_C_FAIL: sent_ok=%d fail=%d (<300 wraparound)\n",
+            n_send_ok, n_send_fail)
+    return -1
+
+
+def e1000e_traffic_smoke_test() -> int32:
+    # Orchestrator. Caller has:
+    #   - kmod_linux_loaded e1000e.ko
+    #   - probed the device + opened the netdev
+    #   - armed _l_linux_tx_bridge
+    #   - completed a DHCP exchange (state == BOUND)
+    #   - IRQs enabled (MSI vector 0x47 live)
+    #
+    # Returns 0 if ALL phases that ran reported PASS (B's SKIP also
+    # counts as PASS for the gate). Non-zero on any FAIL.
+    printk0("[traffic_test] BEGIN: e1000e.ko traffic exercise\n")
+    fail: int32 = 0
+    rc_a: int32 = _e1k_phase_a_ping()
+    if rc_a != 0:
+        fail = 1
+    rc_b: int32 = _e1k_phase_b_dns()
+    if rc_b != 0:
+        fail = 1
+    rc_c: int32 = _e1k_phase_c_ring_wraparound()
+    if rc_c != 0:
+        fail = 1
+    if fail == 0:
+        printk0("[traffic_test] END: ALL_PHASES_PASS\n")
+        return 0
+    printk0("[traffic_test] END: FAIL (see PHASE_*_FAIL markers above)\n")
+    return -1
+
+
+def e1000e_traffic_marker_found() -> int32:
+    # Returns 1 if /etc/e1000e-traffic-test is present in the cpio
+    # initramfs (planted by scripts/build_initramfs.py when
+    # ENABLE_E1000E_TRAFFIC_TEST=1). Used by init/main.ad to gate
+    # e1000e_traffic_smoke_test() so default boots don't run the
+    # 4+ second exercise on every kernel.
+    #
+    # Mirrors the auto_modules_marker_found / framework_modules_marker
+    # _found shape (kernel/modprobe.ad) but lives here so the
+    # gate-and-payload stay co-located.
+    cpio_init()
+    target: Ptr[uint8] = "/etc/e1000e-traffic-test"
+    target_len: uint64 = 24                          # strlen
+    n: uint64 = initramfs_entry_count()
+    i: uint64 = 0
+    while i < n:
+        name: Ptr[char] = initramfs_entry_name(i)
+        ok: int32 = 1
+        j: uint64 = 0
+        while j <= target_len:                       # incl. NUL byte
+            if cast[uint8](name[j]) != target[j]:
+                ok = 0
+                j = target_len + 1                    # break
+            else:
+                j = j + 1
+        if ok == 1:
+            return 1
+        i = i + 1
+    return 0

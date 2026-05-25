@@ -297,6 +297,73 @@ def arp_send_reply(target_mac: Ptr[uint8],
     return eth_tx(cast[Ptr[uint8]](&arp_tx_buf[0]), 60)
 
 
+def arp_send_request(target_ip_b0: uint8, target_ip_b1: uint8,
+                     target_ip_b2: uint8, target_ip_b3: uint8) -> int32:
+    # Build a 42-byte (60-byte padded) "who-has target_ip tell our_ip"
+    # ARP request and hand it to eth_tx. Used to prime the ARP cache
+    # for a host we haven't talked to yet — historically each consumer
+    # (virtio_net.ad, dns.ad) inlined its own builder; this is the
+    # shared one.
+    #
+    # Returns 0 on send success, -1 if our MAC / IP isn't set yet. The
+    # reply (or a gratuitous reply from the target) lands in arp_rx
+    # which populates the (target_ip -> sender_mac) binding via
+    # _arp_insert. Callers typically poll arp_lookup(target_ip) for a
+    # short window after this returns to confirm the entry is live.
+    our_mac: Ptr[uint8] = _arp_get_our_mac()
+    if our_mac == cast[Ptr[uint8]](0):
+        return -1
+    if arp_our_ip[0] == 0 and arp_our_ip[1] == 0 \
+            and arp_our_ip[2] == 0 and arp_our_ip[3] == 0:
+        return -1
+    # Zero/pad to 60 bytes (Ethernet minimum + ARP-body 28 bytes).
+    i: uint64 = 0
+    while i < 64:
+        arp_tx_buf[i] = 0
+        i = i + 1
+    # Ethernet header: dst=broadcast, src=our MAC, ethertype=0x0806.
+    j: uint64 = 0
+    while j < 6:
+        arp_tx_buf[j] = 0xFF
+        arp_tx_buf[6 + j] = our_mac[j]
+        j = j + 1
+    arp_tx_buf[12] = 0x08
+    arp_tx_buf[13] = 0x06
+    # ARP body @ offset 14.
+    arp_tx_buf[14] = 0x00          # htype hi
+    arp_tx_buf[15] = 0x01          # htype lo  (Ethernet)
+    arp_tx_buf[16] = 0x08          # ptype hi
+    arp_tx_buf[17] = 0x00          # ptype lo  (IPv4)
+    arp_tx_buf[18] = 6             # hlen
+    arp_tx_buf[19] = 4             # plen
+    arp_tx_buf[20] = 0x00          # opcode hi
+    arp_tx_buf[21] = 0x01          # opcode lo (REQUEST)
+    # sha = our MAC
+    j = 0
+    while j < 6:
+        arp_tx_buf[22 + j] = our_mac[j]
+        j = j + 1
+    # spa = our IP (network order)
+    arp_tx_buf[28] = arp_our_ip[0]
+    arp_tx_buf[29] = arp_our_ip[1]
+    arp_tx_buf[30] = arp_our_ip[2]
+    arp_tx_buf[31] = arp_our_ip[3]
+    # tha left zero (the responder fills it in on the reply).
+    # tpa = target_ip
+    arp_tx_buf[38] = target_ip_b0
+    arp_tx_buf[39] = target_ip_b1
+    arp_tx_buf[40] = target_ip_b2
+    arp_tx_buf[41] = target_ip_b3
+    printk2("[arp] request who-has %d.%d", cast[uint64](target_ip_b0),
+            cast[uint64](target_ip_b1))
+    printk2(".%d.%d\n", cast[uint64](target_ip_b2),
+            cast[uint64](target_ip_b3))
+    # Pre-compute buffer base (codegen quirk workaround, same as the
+    # other ARP / IP / UDP TX paths).
+    req_ptr: Ptr[uint8] = cast[Ptr[uint8]](&arp_tx_buf[0])
+    return eth_tx(req_ptr, 60)
+
+
 def _arp_get_our_mac() -> Ptr[uint8]:
     # Tiny shim so the import dependency lives in one place. eth_get_mac
     # returns a pointer into eth.ad's nd_mac global, which is filled in

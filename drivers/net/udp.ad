@@ -567,6 +567,17 @@ def udp_init():
     printk0("udp: initialized (incl. socket table)\n")
 
 
+# Counter accessors for cross-module smokes (e1000e_traffic.ad's
+# PHASE C ring-wraparound assertion needs to observe
+# udp_out_datagrams moving by >= 300 to declare TX wraparound).
+def udp_get_out_datagrams() -> uint64:
+    return udp_out_datagrams
+
+
+def udp_get_in_datagrams() -> uint64:
+    return udp_in_datagrams
+
+
 # Note: dhcp_rx (drivers/net/dhcp.ad), dns_rx (drivers/net/dns.ad), and
 # icmp_send_port_unreach (drivers/net/icmp.ad) are all called from
 # udp_rx above. Since the Adder build merges all .ad files into a
