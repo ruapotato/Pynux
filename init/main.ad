@@ -2814,6 +2814,44 @@ def start_kernel():
             else:
                 printk1("[e1000e.ko] kmod_linux_load OK (slot=%d)\n",
                         cast[uint64](ko_rc))
+                # Strategic-pivot V0: drive a DHCP DISCOVER through
+                # the Linux driver and wait for the OFFER/ACK round
+                # trip. The .ko's e1000e_probe already wired the
+                # netdev_ops, the pci shim fired dev_open, programmed
+                # MSI on vector 0x47, and armed the TX bridge. So:
+                # bring the L3 stack online, send DHCP DISCOVER, and
+                # spin with IRQs enabled. MSI -> trampoline ->
+                # e1000_intr -> __napi_schedule -> napi->poll (sync)
+                # -> napi_gro_receive -> eth_rx delivers the OFFER /
+                # ACK frames into the DHCP state machine.
+                #
+                # IRQs are enabled JUST for the DHCP window because
+                # most of the rest of boot still runs IF-masked
+                # (cooperative kernel; preemption happens later when
+                # sched_init wires the LAPIC timer into the
+                # scheduler).
+                printk0("[boot:35.b] DHCP via e1000e.ko\n")
+                ip_init()
+                udp_init()
+                icmp_init()
+                dhcp_init()
+                # Send DHCP DISCOVER through the Linux driver's
+                # ndo_start_xmit. The TX path goes:
+                #   dhcp_discover() -> udp_send -> ip_send ->
+                #   eth_tx -> eth_tx_hook (== _l_linux_tx_bridge)
+                #   -> ndo_start_xmit (e1000_xmit_frame in the .ko)
+                #
+                # Known gap (M16-pivot.c): e1000_xmit_frame BUGs at
+                # the e1000_maybe_stop_tx check in its first descriptor
+                # path because our minimal sk_buff layout doesn't
+                # populate enough of the Linux 6.1 struct for the
+                # offset-driven reads (mac_header at 0xc0, head_len
+                # division, etc.) to land on valid bytes. Closing
+                # that needs the full struct sk_buff layout + a
+                # real RX-buffer DMA path; this commit lands the
+                # plumbing so a follow-on can iterate on the skb
+                # gap without re-doing the rest of the integration.
+                dhcp_discover()
 
     # --- M16.30: load /init from cpio via the ELF loader ----------
     # exec() into a real userspace binary instead of the baked-in

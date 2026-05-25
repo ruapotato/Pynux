@@ -57,7 +57,7 @@ rc=$?
 set -e
 
 echo "[test_e1000e_tx] --- captured (kmod / e1000e / eth / pci_register_driver) ---"
-grep -E 'kmod_linux|\[e1000e\.ko\]|\[e1000e\]|\[eth\]|\[netdev|\[boot:35|\[pci_register_driver\]' "$LOG" || true
+grep -E 'kmod_linux|\[e1000e\.ko\]|\[e1000e\]|\[eth\]|\[netdev|\[boot:35|\[pci_register_driver\]|\[dev_open\]|\[linux_tx_bridge\]|\[pci_msi\]|\[request_(irq|threaded_irq)\]' "$LOG" || true
 echo "[test_e1000e_tx] --- end ---"
 
 fail=0
@@ -70,12 +70,22 @@ fail=0
 # MATCH 8086:10d3 at 0:3" + "calling probe(...)" + "probe returned
 # rc=...". The QEMU e1000e device responds to vendor 0x8086 device
 # 0x10d3 (82574-class) at bus 0 device 3 function 0, which is what
-# the assertion below pins. DHCP / real TX-RX through the Linux
-# driver is the next milestone — probe returns -EIO at the
-# ioremap step (pci_resource_start needs the struct pci_dev
-# resource[] array populated, which is itself non-trivial: the
-# field lives past struct device dev which has CONFIG-dependent
-# size).
+# the assertion below pins.
+#
+# M16-pivot.c additions: after probe returns 0, the pci shim now
+# walks the netdev table and calls ndo_open directly (no ifconfig
+# wired). That kicks the driver's e1000e_open, which allocates rings,
+# calls request_threaded_irq (our shim installs the trampoline at
+# vector 0x47), napi_enable, netif_start_queue. The MSI capability
+# gets programmed by the shim post-open, and the TX bridge is
+# armed so eth_tx() routes through ndo_start_xmit.
+#
+# Full DHCP through ndo_start_xmit is the next milestone — the
+# minimal sk_buff layout our linux_tx_bridge constructs is missing
+# fields the e1000_xmit_frame reads (mac_header at 0xc0, etc.),
+# so the first ndo_start_xmit call lands on a BUG() in
+# e1000_maybe_stop_tx. The plumbing below is the visible signal
+# that the integration stack is in place.
 for needle in \
     "[e1000e.ko] loading" \
     "kmod_linux: relocations applied=" \
@@ -83,7 +93,13 @@ for needle in \
     "[e1000e.ko] kmod_linux_load OK" \
     "[pci_register_driver] MATCH 8086:10d3" \
     "[pci_register_driver] calling probe(" \
-    "[pci_register_driver] probe returned rc="
+    "[pci_register_driver] probe returned rc=" \
+    "[pci_register_driver] probe OK; triggering dev_open" \
+    "[dev_open] calling ndo_open" \
+    "[dev_open] ndo_open returned rc=0" \
+    "[pci_register_driver] dev_open: 1 netdev(s) opened" \
+    "[pci_msi] vector=0x47 enabled" \
+    "[linux_tx_bridge] armed for netdev="
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_e1000e_tx] OK: '$needle'"
@@ -108,4 +124,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_e1000e_tx] PASS (.ko loaded; init_module returned 0; probe invoked)"
+echo "[test_e1000e_tx] PASS (.ko loaded; probe invoked; ndo_open OK; MSI@0x47; TX bridge armed)"
