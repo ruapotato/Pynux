@@ -69,6 +69,13 @@ kernel-modules/**/.tmp_versions/
 # and nvme.ko (PCIe NVMe SSD) for the L-shim storage validation.
 !kernel-modules/ahci/ahci.ko
 !kernel-modules/nvme/nvme.ko
+# Storage maximalism: SCSI mid-layer + libata + libahci + scsi_common.
+# ahci.ko's full modules.dep chain. Loading these unlocks every Linux
+# SCSI driver (sd_mod, sr_mod, st_mod, mpt3sas, qla2xxx, virtio_scsi, ...).
+!kernel-modules/scsi_common/scsi_common.ko
+!kernel-modules/scsi_mod/scsi_mod.ko
+!kernel-modules/libata/libata.ko
+!kernel-modules/libahci/libahci.ko
 # USB host-controller drivers (usbcore + xhci_pci + xhci_hcd +
 # ehci_pci + ehci_hcd).
 !kernel-modules/usbcore/usbcore.ko

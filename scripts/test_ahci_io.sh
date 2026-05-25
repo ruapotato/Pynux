@@ -123,6 +123,52 @@ if ! grep -aF -q "[ahci] hand-rolled smoke-test SKIPPED" "$LOG"; then
 fi
 echo "[test_ahci_io] OK: hand-rolled smoke-test gated, .ko load attempted"
 
+# Storage-maximalism milestone: the modules.dep dep chain must have
+# auto-loaded scsi_common -> scsi_mod -> libata -> libahci BEFORE
+# ahci.ko, and the loader's cross-module ksymtab must have dispatched
+# libata/libahci's real EXPORT_SYMBOL surface to ahci.ko's UND
+# resolutions. Assert both shape markers so a regression that drops
+# back to the single-module insmod path is loud.
+for dep_name in scsi_common scsi_mod libata libahci ahci; do
+    if ! grep -aE -q "kmod_linux: name=${dep_name}" "$LOG"; then
+        echo "[test_ahci_io] FAIL: modules.dep dep chain did not load ${dep_name}"
+        echo "[test_ahci_io] --- full log tail ---"
+        tail -n 80 "$LOG"
+        exit 1
+    fi
+done
+echo "[test_ahci_io] OK: modules.dep chain loaded scsi_common+scsi_mod+libata+libahci+ahci"
+
+# Cross-module ksymtab dispatch: ahci.ko's ahci_host_activate / ata_*
+# must resolve via libahci.ko / libata.ko's ksymtab entries, NOT via
+# the linux_abi/api_ahci.ad shim. Loud regression marker.
+if ! grep -aE -q "\[ksymtab_hit\] ahci -> libahci: ahci_host_activate|\[ksymtab_hit\] libahci -> libata: ata_host_activate" "$LOG"; then
+    echo "[test_ahci_io] FAIL: cross-module ksymtab dispatch did not fire"
+    echo "[test_ahci_io] --- full log tail ---"
+    tail -n 80 "$LOG"
+    exit 1
+fi
+echo "[test_ahci_io] OK: cross-module ksymtab dispatched ahci -> libahci -> libata"
+
+# Storage maximalism: the bridge marker channel.
+#   [bridge=disabled] : L-shim libata/scsi end-to-end completed and
+#                       registered the blockdev — full Linux path,
+#                       no native fallback needed.
+#   [bridge=fallback] : modules loaded fine but Linux's libata path
+#                       didn't complete add_disk; native AHCI driver
+#                       took over to mint sd0 so the ext4 round-trip
+#                       still validates the lower block layer.
+# A "bridge=fallback" outcome is still a PASS for the storage stack
+# (ext4 mount + read + write succeed) but documents the remaining gap
+# in api_block.ad's add_disk shim. Once that shim wraps a gendisk's
+# submit_bio into Hamnix's BlockDeviceOps, this flips to
+# bridge=disabled.
+BRIDGE_DISABLED=$(grep -acF "[bridge=disabled]" "$LOG" || true)
+BRIDGE_FALLBACK=$(grep -acF "[bridge=fallback]" "$LOG" || true)
+BRIDGE_DISABLED=${BRIDGE_DISABLED:-0}
+BRIDGE_FALLBACK=${BRIDGE_FALLBACK:-0}
+echo "[test_ahci_io] bridge_disabled=$BRIDGE_DISABLED bridge_fallback=$BRIDGE_FALLBACK"
+
 # The PASS / FAIL channel.
 PASS_HIT=$(grep -acE "^\[[0-9]+\] \[ahci_io_test\] PASS|\[ahci_io_test\] PASS" "$LOG" || true)
 PASS_HIT=${PASS_HIT:-0}
@@ -130,7 +176,11 @@ FAIL_HIT=$(grep -acE "\[ahci_io_test\] FAIL" "$LOG" || true)
 FAIL_HIT=${FAIL_HIT:-0}
 
 if [ "$PASS_HIT" -ge 1 ]; then
-    echo "[test_ahci_io] PASS: shim-driven storage path mounted ext4 + read /HELLO.TXT"
+    if [ "$BRIDGE_DISABLED" -ge 1 ]; then
+        echo "[test_ahci_io] PASS: L-shim libata/scsi path owns block I/O end-to-end (bridge disabled)"
+    else
+        echo "[test_ahci_io] PASS: shim-driven storage path mounted ext4 + read /HELLO.TXT (bridge=fallback)"
+    fi
     exit 0
 fi
 

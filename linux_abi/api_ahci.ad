@@ -103,6 +103,9 @@ from drivers.ata.ahci import ahci_smoke_test
 # the partition scanner to leave it as a raw filesystem-on-sd0 rather
 # than synthesise a fake partition table that won't fit the disk.
 from drivers.block.partition import partition_disable_mkpart_smoke
+from drivers.pci.pci import pci_read_bar, pci_pack_bdf
+from linux_abi.api_pci import _pci_dev_bus, _pci_dev_dev, _pci_dev_fn
+from kernel.block.blk import find_blockdev
 
 
 # =====================================================================
@@ -170,25 +173,47 @@ def _ahc_ahci_host_activate(host: uint64, sht: uint64) -> int32:
     # ata_host with the SCSI mid-layer + arms per-port IRQs +
     # publishes the SATA links.
     #
-    # L-shim bridge: at this exact point Linux normally hands the
-    # ata_host off to the SCSI mid-layer (scsi_host_alloc +
-    # scsi_scan_host) which would in turn create struct request_queue
-    # + struct gendisk + add_disk(). We don't have a SCSI mid-layer,
-    # so we instead invoke the hand-rolled drivers/ata/ahci.ad bring-
-    # up which performs the same effective publication: PCI scan
-    # (re-finds the same 8086:2922 device the .ko's probe already
-    # matched), ABAR mapping, port reset, IDENTIFY, then
-    # register_blockdev("sd0", ...) plus the partition-table scan
-    # which mints sd0p1 for ext4. The fs/ext4.ad + kernel/block/blk.ad
-    # stack then sees a fully usable storage class device.
+    # ARCHITECTURE NOTE (storage maximalism milestone):
     #
-    # The bridge is idempotent (guarded so repeat probe calls don't
-    # double-register sd0). Failure of the underlying bring-up does
-    # NOT fail the shim — we still return 0 so ahci.ko's probe
-    # completes cleanly and the diagnostic surface stays informative.
-    printk0("[ahci.ko] ahci_host_activate: bridging to native AHCI driver\n")
+    #   When libahci.ko is loaded via the modules.dep chain BEFORE
+    #   ahci.ko (the modules_dep_load_with_deps("ahci", ...) path
+    #   triggered by init/main.ad's boot:35.A), this shim is
+    #   SUPERSEDED by libahci.ko's REAL ahci_host_activate via the
+    #   loader's cross-module ksymtab fallback (linux_abi/loader.ad's
+    #   _sym_addr looks ksymtab FIRST, shim SECOND). In that flow:
+    #
+    #       ahci.ko -> [ksymtab] libahci.ko::ahci_host_activate
+    #                            -> ata_host_register (libata.ko)
+    #                            -> scsi_scan_host (scsi_mod.ko)
+    #                            -> add_disk (api_block.ad shim)
+    #
+    #   The [ksymtab_hit] diag confirms this dispatch ("ahci -> libahci:
+    #   ahci_host_activate").
+    #
+    # SHIM FALLBACK: when libahci.ko is NOT loaded (the legacy
+    # /etc/ahci-ko single-module insmod path), this shim still fires
+    # and bridges to the hand-rolled drivers/ata/ahci.ad bring-up so
+    # the existing test_ahci_io.sh exercise still produces a working
+    # sd0 blockdev for ext4 mount + read/write.
+    #
+    # The full Linux libata -> scsi_mod -> add_disk -> Hamnix
+    # register_blockdev hand-off (the "no-bridge" goal) is the
+    # follow-up: api_block.ad's add_disk shim needs to read the
+    # gendisk's submit_bio + capacity and wrap them into a
+    # BlockDeviceOps. Until that lands, the bridge below is the
+    # safety net.
     if _ahc_host_activate_bridged == 0:
         _ahc_host_activate_bridged = 1
+        # Detect whether the L-shim libata/scsi stack already
+        # registered a SATA block device. If so, no bridge needed.
+        existing: int32 = find_blockdev("sda")
+        if existing < 0:
+            existing = find_blockdev("sd0")
+        if existing >= 0:
+            printk1("[ahci.ko] [bridge=disabled] L-shim libata/scsi path registered slot=%d\n",
+                    cast[uint64](existing))
+            return 0
+        printk0("[ahci.ko] ahci_host_activate: bridging to native AHCI driver\n")
         # Suppress the install-path mkpart-write smoke fixture; our
         # test image is a raw ext4 filesystem with no MBR.
         partition_disable_mkpart_smoke()
@@ -482,17 +507,37 @@ def _ahc_pcim_iomap_table(pdev: uint64) -> uint64:
     # void __iomem * const *pcim_iomap_table(struct pci_dev *).
     # Returns a pointer to an array of 6 BAR-vaddr pointers (one per
     # BAR). ahci.ko reads slot 5 (BAR5 == ABAR, the AHCI register
-    # window). We allocate a 6-slot table and fill it with each BAR's
-    # physical address (==virt in our identity mapping).
+    # window) and dereferences as `void __iomem *` for register-level
+    # MMIO access.
     #
-    # The pdev struct layout in our env: drivers/pci/pci.ad lays out
-    # struct pci_dev so that the BAR array sits at a known offset.
-    # Rather than tracking offsets across pivots, we allocate a
-    # zeroed table here; ahci.ko's BAR5 read returns 0, the
-    # subsequent register-MMIO accesses fault, and probe bails
-    # cleanly with -EIO at the first GHC_CAP read. That's still
-    # past the "probe invoked" floor.
+    # We allocate a 6-slot table and populate each entry with the
+    # REAL BAR physical address as read from PCI configuration space.
+    # Hamnix's identity mapping (phys==virt for the first 4 GiB
+    # including PCI MMIO BARs) means the same uint64 doubles as the
+    # __iomem virtual pointer that ioread32/iowrite32 can deference.
+    # This lets libahci.ko's port-walk code (reading CAP, GHC, PI,
+    # PORT_SSTS, ...) hit live AHCI registers via the L-shim
+    # ioread/iowrite implementations in api_libata.ad — no bridge to
+    # drivers/ata/ahci.ad required for register access.
     table: uint64 = kzalloc(64)                  # 6 ptrs + slack
+    if pdev == 0:
+        return table
+    bus: uint32 = _pci_dev_bus(pdev)
+    devnr: uint32 = _pci_dev_dev(pdev)
+    fn:  uint32 = _pci_dev_fn(pdev)
+    bdf: uint32 = pci_pack_bdf(bus, devnr, fn)
+    slots: Ptr[uint64] = cast[Ptr[uint64]](table)
+    i: uint64 = 0
+    while i < 6:
+        raw: uint32 = pci_read_bar(bdf, cast[uint32](i))
+        addr: uint64 = 0
+        if raw != 0:
+            if (raw & 0x01) == 1:
+                addr = cast[uint64](raw & (~cast[uint32](0x03)))
+            else:
+                addr = cast[uint64](raw & (~cast[uint32](0x0F)))
+        slots[i] = addr
+        i = i + 1
     return table
 
 

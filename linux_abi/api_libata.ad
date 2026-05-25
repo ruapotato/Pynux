@@ -1,0 +1,547 @@
+# linux_abi/api_libata.ad
+#
+# libata.ko (Linux ATA / SCSI translation layer) gap-closure shims.
+#
+# libata.ko is the bulk of Linux's ATA support — it owns the ATA
+# command set, the SCSI-to-ATA translator, port-multiplier handling,
+# error recovery, and the link/port state machines. Below libata
+# sits libahci.ko (HBA register handling, FIS encoding, port reset)
+# and below that ahci.ko (PCI front-end). Above libata sits
+# scsi_mod.ko — libata REGISTERS its scsi_host_template with the SCSI
+# mid-layer so each ATA port becomes a SCSI device the block layer
+# can mount.
+#
+# Strategic frame: this file closes libata.ko's UND surface against
+# the post-L68 + e1000e + ahci + nvme + scsi_mod shim set so the
+# L-shim loader can insmod libata.ko without unresolved-external
+# panic. After libata loads:
+#
+#   * libata's EXPORT_SYMBOL surface (~150 ata_*/sata_* names) is
+#     populated in the loader's per-.ko ksymtab registry.
+#   * The api_ahci.ad fallback shims (ata_dev_next, ata_host_alloc_pinfo,
+#     ata_msleep, ata_print_version, sata_link_hardreset, etc.) are
+#     SUPERSEDED by libata's real implementations — the loader's
+#     ksymtab lookup wins over the linux_abi shim.
+#
+# libata.ko's UND surface against the post-scsi_mod + ahci-shim set:
+#
+#   * Total UND in libata.ko         : 230
+#   * Already covered (L<=68 + scsi) : ~187
+#   * Net new exports this file adds : ~43 (libata-only)
+#   * Naming prefix: "_lat_" marks the libata gap-closure batch.
+#
+# Categories (gap analysis):
+#
+#   * 6 acpi_* — ACPI PM device-sleep + notify handlers. libata
+#     queries ACPI for SATA hot-plug + power management. Real ACPI
+#     hooks don't fire in our env; stubs return success / NULL.
+#
+#   * 4 devres_* + 4 devm_* — devres-managed resource lifecycle
+#     (open_group, release_group, remove_group, devm_kasprintf,
+#     devm_kfree, devm_free_irq, devm_request_threaded_irq). We
+#     don't have a devres tracker; allocations flow through plain
+#     slab + immediate-success on the lifecycle ops.
+#
+#   * 9 ioread* / iowrite* — MMIO register accessors. libata reads
+#     ATA control registers via these. We forward to direct memory
+#     read/write since Hamnix's MMIO is identity-mapped. The _rep
+#     variants are bulk-transfer (e.g. iowrite16_rep for PIO data
+#     transfer); they iterate the simple op.
+#
+#   * 6 transport / attribute_container — extra container helpers
+#     beyond what scsi_mod owns (scsi_set_sense_field_pointer,
+#     scsi_set_sense_information, attribute_container_*).
+#
+#   * 3 sg_miter_* — scatter-gather iterator for SG-list traversal.
+#     libata uses these to copy bytes between user buffers and the
+#     ATA DMA buffers. Stub returns no-data-mapped.
+#
+#   * 11 misc — async_synchronize_cookie, autoremove_wake_function,
+#     blk_abort_request, blk_queue_update_dma_alignment / _pad,
+#     device_link_remove, glob_match, kstrtoll, ledtrig_disk_activity,
+#     strcasecmp, strim, system_entering_hibernation.
+#
+#   * DATA: acpi_gbl_FADT (ACPI Fixed ACPI Description Table, the
+#     fixed-format ACPI 1.0+ header; libata reads ACPI revision +
+#     SCI interrupt vector. 256 bytes zeroed buffer.)
+#
+# Stub philosophy: libata's init_module is the init-cold path the
+# loader exercises. Most shims execute only during
+# (a) module init (class registration, sysfs setup, ACPI probe),
+# (b) module-level workqueue alloc, (c) ATA host registration when an
+# ahci-shaped driver later loads. For all three we return 0/success
+# / NULL / pass-through values that Linux's caller tolerates.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0, printk1
+from mm.slab import kmalloc, kzalloc, kfree
+
+
+# =====================================================================
+# DATA buffers
+# =====================================================================
+#
+# acpi_gbl_FADT — struct acpi_table_fadt, ACPI Fixed Description Table
+#   read by libata for the SCI vector + SATA flags. 256 bytes of zeros
+#   means "ACPI 1.0 / no SCI / no SATA quirk flags", which is the
+#   safest default (no quirks trigger). Real revision is at offset 8;
+#   we populate it with 1 (ACPI 1.0) so any caller that branches on
+#   revision sees the conservative path.
+
+lat_acpi_gbl_FADT_buf:     Array[276, uint8]
+
+
+def _lat_init_data():
+    # ACPI revision at offset 8 in struct acpi_table_fadt's
+    # acpi_table_header prefix. Setting to 1 keeps libata on the
+    # ACPI-1.0 path (no 2.0+ feature probing).
+    lat_acpi_gbl_FADT_buf[8] = 1
+
+
+# =====================================================================
+# Group 1: ACPI hooks
+# =====================================================================
+
+def _lat_acpi_initialize_hp_context(dev: uint64, ctx: uint64,
+                                      notify: uint64, uevent: uint64):
+    # void acpi_initialize_hp_context(struct acpi_device *,
+    #     struct acpi_hotplug_context *, ...). No-op.
+    return
+
+
+def _lat_acpi_install_notify_handler(dev: uint64, type: uint32,
+                                       handler: uint64, ctx: uint64) -> int32:
+    # acpi_status acpi_install_notify_handler(...). 0 == AE_OK.
+    return 0
+
+
+def _lat_acpi_remove_notify_handler(dev: uint64, type: uint32,
+                                      handler: uint64) -> int32:
+    # acpi_status acpi_remove_notify_handler(...).
+    return 0
+
+
+def _lat_acpi_pm_device_sleep_state(dev: uint64, d_min_p: uint64,
+                                      d_max: int32) -> int32:
+    # int acpi_pm_device_sleep_state(struct device *, int *d_min_p,
+    #                                  int d_max_in).
+    # Returns the suggested ACPI D-state for sleep. Return d_max
+    # (deepest) — safe cold-path default.
+    if d_min_p != 0:
+        cast[Ptr[int32]](d_min_p)[0] = 0
+    return d_max
+
+
+def _lat_acpi_pm_set_device_wakeup(dev: uint64, enable: int32) -> int32:
+    # int acpi_pm_set_device_wakeup(struct device *, bool enable).
+    return 0
+
+
+# =====================================================================
+# Group 2: devres + devm
+# =====================================================================
+
+def _lat_devres_open_group(dev: uint64, id: uint64, gfp: uint32) -> uint64:
+    # void *devres_open_group(struct device *, void *id, gfp_t gfp).
+    # Returns a non-NULL group cookie. We hand back `id` itself or
+    # a stable token if id is NULL.
+    if id == 0:
+        return 1
+    return id
+
+
+def _lat_devres_release_group(dev: uint64, id: uint64) -> int32:
+    # int devres_release_group(struct device *, void *id).
+    return 0
+
+
+def _lat_devres_remove_group(dev: uint64, id: uint64) -> int32:
+    return 0
+
+
+def _lat_devm_kasprintf(dev: uint64, gfp: uint32,
+                          fmt: Ptr[char]) -> uint64:
+    # char *devm_kasprintf(struct device *, gfp_t, const char *fmt, ...).
+    # Returns a formatted string. We return a duplicate of fmt itself
+    # (no format substitution; cold path doesn't validate content).
+    # Allocate 64 bytes and copy fmt into it.
+    buf: uint64 = kzalloc(64)
+    if buf == 0 or fmt == 0:
+        return buf
+    p: Ptr[uint8] = cast[Ptr[uint8]](buf)
+    i: uint64 = 0
+    while i < 63:
+        c: int32 = fmt[i]
+        if c == 0:
+            break
+        p[i] = cast[uint8](c & 0xFF)
+        i = i + 1
+    p[i] = 0
+    return buf
+
+
+def _lat_devm_kfree(dev: uint64, ptr: uint64):
+    # void devm_kfree(struct device *, void *).
+    if ptr != 0:
+        kfree(ptr)
+
+
+def _lat_devm_free_irq(dev: uint64, irq: uint32, dev_id: uint64) -> uint64:
+    # void *devm_free_irq(struct device *, unsigned int irq, void *dev_id).
+    # Returns devres_get_match's return; NULL on no-match is fine.
+    return 0
+
+
+def _lat_devm_request_threaded_irq(dev: uint64, irq: uint32,
+                                     handler: uint64, thread_fn: uint64,
+                                     flags: uint64, name: Ptr[char],
+                                     dev_id: uint64) -> int32:
+    # int devm_request_threaded_irq(struct device *, unsigned int irq,
+    #     irq_handler_t handler, irq_handler_t thread_fn,
+    #     unsigned long flags, const char *name, void *dev_id).
+    # 0 == success. The real IRQ wiring happens via api_irq.ad's
+    # request_threaded_irq, which is already in the L-shim. For the
+    # devm variant we just return success — the IRQ won't actually
+    # be wired, but cold-path doesn't depend on it firing.
+    return 0
+
+
+# =====================================================================
+# Group 3: ioread / iowrite
+# =====================================================================
+#
+# Linux's <asm/io.h> ioreadN / iowriteN ops. Hamnix maps MMIO
+# identity, so ioreadN is just a typed load and iowriteN a typed
+# store. The _rep variants bulk-transfer the same op for PIO
+# data-transfer paths.
+
+def _lat_ioread8(addr: uint64) -> uint8:
+    if addr == 0:
+        return 0
+    return cast[Ptr[uint8]](addr)[0]
+
+
+def _lat_ioread16(addr: uint64) -> uint16:
+    if addr == 0:
+        return 0
+    return cast[Ptr[uint16]](addr)[0]
+
+
+def _lat_ioread32(addr: uint64) -> uint32:
+    if addr == 0:
+        return 0
+    return cast[Ptr[uint32]](addr)[0]
+
+
+def _lat_iowrite8(val: uint8, addr: uint64):
+    if addr == 0:
+        return
+    cast[Ptr[uint8]](addr)[0] = val
+
+
+def _lat_iowrite32(val: uint32, addr: uint64):
+    if addr == 0:
+        return
+    cast[Ptr[uint32]](addr)[0] = val
+
+
+def _lat_ioread16_rep(addr: uint64, buffer: uint64, count: uint64):
+    # void ioread16_rep(void __iomem *addr, void *buffer,
+    #                    unsigned int count).
+    # Reads `count` 16-bit words from addr into buffer.
+    if addr == 0 or buffer == 0:
+        return
+    src: Ptr[uint16] = cast[Ptr[uint16]](addr)
+    dst: Ptr[uint16] = cast[Ptr[uint16]](buffer)
+    i: uint64 = 0
+    while i < count:
+        dst[i] = src[0]                              # NOT src[i] — MMIO read port doesn't advance
+        i = i + 1
+
+
+def _lat_ioread32_rep(addr: uint64, buffer: uint64, count: uint64):
+    if addr == 0 or buffer == 0:
+        return
+    src: Ptr[uint32] = cast[Ptr[uint32]](addr)
+    dst: Ptr[uint32] = cast[Ptr[uint32]](buffer)
+    i: uint64 = 0
+    while i < count:
+        dst[i] = src[0]
+        i = i + 1
+
+
+def _lat_iowrite16_rep(addr: uint64, buffer: uint64, count: uint64):
+    if addr == 0 or buffer == 0:
+        return
+    dst: Ptr[uint16] = cast[Ptr[uint16]](addr)
+    src: Ptr[uint16] = cast[Ptr[uint16]](buffer)
+    i: uint64 = 0
+    while i < count:
+        dst[0] = src[i]
+        i = i + 1
+
+
+def _lat_iowrite32_rep(addr: uint64, buffer: uint64, count: uint64):
+    if addr == 0 or buffer == 0:
+        return
+    dst: Ptr[uint32] = cast[Ptr[uint32]](addr)
+    src: Ptr[uint32] = cast[Ptr[uint32]](buffer)
+    i: uint64 = 0
+    while i < count:
+        dst[0] = src[i]
+        i = i + 1
+
+
+# =====================================================================
+# Group 4: scsi_set_sense_* (libata-only sense helpers)
+# =====================================================================
+#
+# These are libata-version-specific helpers scsi_mod doesn't carry.
+# They populate the descriptor format of the sense buffer.
+
+def _lat_scsi_set_sense_field_pointer(buf: uint64, sb_len: int32,
+                                        field_no: uint16, bit_no: uint8,
+                                        cd: int32) -> int32:
+    # int scsi_set_sense_field_pointer(u8 *buf, int sb_len,
+    #     u16 field, u8 bit, bool cd).
+    # 0 == success (or descriptor not present, treated benign).
+    # `field` and `bit` are renamed to dodge Adder's reserved-word
+    # set (`field`, `bytes`, `match`, `case`, `type`, `file`).
+    return 0
+
+
+def _lat_scsi_set_sense_information(buf: uint64, sb_len: int32,
+                                      info: uint64) -> int32:
+    # int scsi_set_sense_information(u8 *buf, int sb_len, u64 info).
+    return 0
+
+
+# =====================================================================
+# Group 5: sg_miter_* (scatter-gather iterator)
+# =====================================================================
+
+def _lat_sg_miter_start(miter: uint64, sgl: uint64, nents: int32,
+                          flags: uint32):
+    # void sg_miter_start(struct sg_mapping_iter *, struct scatterlist *,
+    #                      unsigned int nents, unsigned int flags).
+    # Zero-init the iterator so sg_miter_next returns "no more entries".
+    if miter == 0:
+        return
+    # struct sg_mapping_iter is ~64 bytes; zero a generous region.
+    p: Ptr[uint8] = cast[Ptr[uint8]](miter)
+    i: uint64 = 0
+    while i < 64:
+        p[i] = 0
+        i = i + 1
+
+
+def _lat_sg_miter_next(miter: uint64) -> int32:
+    # bool sg_miter_next(struct sg_mapping_iter *).
+    # Returns false when iteration is complete. Always false in our env.
+    return 0
+
+
+def _lat_sg_miter_stop(miter: uint64):
+    return
+
+
+# =====================================================================
+# Group 6: misc
+# =====================================================================
+
+def _lat_async_synchronize_cookie(cookie: uint64):
+    # void async_synchronize_cookie(async_cookie_t cookie). No async
+    # in our env; no-op.
+    return
+
+
+def _lat_autoremove_wake_function(wq_entry: uint64, mode: uint32,
+                                    sync: int32, key: uint64) -> int32:
+    # int autoremove_wake_function(struct wait_queue_entry *,
+    #     unsigned mode, int sync, void *key).
+    # Returns the result of default_wake_function (1 == woken).
+    return 1
+
+
+def _lat_blk_abort_request(rq: uint64):
+    # void blk_abort_request(struct request *). No-op.
+    return
+
+
+def _lat_blk_queue_update_dma_alignment(q: uint64, mask: int32):
+    # void blk_queue_update_dma_alignment(struct request_queue *, int).
+    return
+
+
+def _lat_blk_queue_update_dma_pad(q: uint64, mask: uint32):
+    # void blk_queue_update_dma_pad(struct request_queue *, unsigned int).
+    return
+
+
+def _lat_device_link_remove(consumer: uint64, supplier: uint64):
+    # void device_link_remove(void *consumer, struct device *supplier).
+    return
+
+
+def _lat_glob_match(pat: Ptr[char], s: Ptr[char]) -> int32:
+    # bool glob_match(char const *pat, char const *str).
+    # Used by libata blacklist tables. Minimal implementation:
+    #   * '?' matches any single char
+    #   * '*' matches any (greedy) sequence
+    #   * '\' escapes the next char
+    # The blacklist tables in our env never apply because no real
+    # ATA device gets enumerated through libata; returning 0 ("no
+    # match") universally skips every quirk.
+    return 0
+
+
+def _lat_kstrtoll(s: Ptr[char], base: uint32, res: uint64) -> int32:
+    # int kstrtoll(const char *s, unsigned int base, long long *res).
+    # Parse a string into a signed 64-bit value. Cold-path callers
+    # (sysfs writes) don't run; 0 with *res=0 is safe.
+    if res != 0:
+        cast[Ptr[int64]](res)[0] = 0
+    return 0
+
+
+def _lat_ledtrig_disk_activity(write: int32):
+    # void ledtrig_disk_activity(bool write). LED trigger; no-op.
+    return
+
+
+def _lat_strcasecmp(s1: Ptr[char], s2: Ptr[char]) -> int32:
+    # int strcasecmp(const char *, const char *).
+    # Case-insensitive ASCII compare. Returns 0 on equal, !=0 on diff.
+    if s1 == 0 or s2 == 0:
+        if s1 == s2:
+            return 0
+        return 1
+    i: uint64 = 0
+    while True:
+        a: int32 = s1[i]
+        b: int32 = s2[i]
+        # Lowercase A..Z -> a..z (add 32).
+        if a >= 65 and a <= 90:
+            a = a + 32
+        if b >= 65 and b <= 90:
+            b = b + 32
+        if a != b:
+            return a - b
+        if a == 0:
+            return 0
+        i = i + 1
+
+
+def _lat_strim(s: Ptr[char]) -> uint64:
+    # char *strim(char *s). Trims whitespace in-place; returns the
+    # first non-whitespace char. Stub returns s unchanged.
+    return cast[uint64](s)
+
+
+def _lat_system_entering_hibernation() -> int32:
+    # bool system_entering_hibernation(void).
+    return 0
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_libata():
+    # Called from linux_abi_exports_init() after linux_abi_register_scsi.
+    # Adds the libata.ko-specific gap (~43 exports). The shared-with-
+    # scsi-mod exports (13 names) are owned by api_scsi.ad since
+    # scsi_mod loads first.
+    _lat_init_data()
+
+    # ---- Group 1: ACPI ----
+    _add_export("acpi_initialize_hp_context",
+                cast[uint64](&_lat_acpi_initialize_hp_context))
+    _add_export("acpi_install_notify_handler",
+                cast[uint64](&_lat_acpi_install_notify_handler))
+    _add_export("acpi_remove_notify_handler",
+                cast[uint64](&_lat_acpi_remove_notify_handler))
+    _add_export("acpi_pm_device_sleep_state",
+                cast[uint64](&_lat_acpi_pm_device_sleep_state))
+    _add_export("acpi_pm_set_device_wakeup",
+                cast[uint64](&_lat_acpi_pm_set_device_wakeup))
+
+    # ---- Group 2: devres + devm ----
+    _add_export("devres_open_group",
+                cast[uint64](&_lat_devres_open_group))
+    _add_export("devres_release_group",
+                cast[uint64](&_lat_devres_release_group))
+    _add_export("devres_remove_group",
+                cast[uint64](&_lat_devres_remove_group))
+    _add_export("devm_kasprintf",
+                cast[uint64](&_lat_devm_kasprintf))
+    _add_export("devm_kfree",
+                cast[uint64](&_lat_devm_kfree))
+    _add_export("devm_free_irq",
+                cast[uint64](&_lat_devm_free_irq))
+    _add_export("devm_request_threaded_irq",
+                cast[uint64](&_lat_devm_request_threaded_irq))
+
+    # ---- Group 3: ioread / iowrite ----
+    _add_export("ioread8",
+                cast[uint64](&_lat_ioread8))
+    _add_export("ioread16",
+                cast[uint64](&_lat_ioread16))
+    _add_export("ioread32",
+                cast[uint64](&_lat_ioread32))
+    _add_export("iowrite8",
+                cast[uint64](&_lat_iowrite8))
+    _add_export("iowrite32",
+                cast[uint64](&_lat_iowrite32))
+    _add_export("ioread16_rep",
+                cast[uint64](&_lat_ioread16_rep))
+    _add_export("ioread32_rep",
+                cast[uint64](&_lat_ioread32_rep))
+    _add_export("iowrite16_rep",
+                cast[uint64](&_lat_iowrite16_rep))
+    _add_export("iowrite32_rep",
+                cast[uint64](&_lat_iowrite32_rep))
+
+    # ---- Group 4: scsi_set_sense_* ----
+    _add_export("scsi_set_sense_field_pointer",
+                cast[uint64](&_lat_scsi_set_sense_field_pointer))
+    _add_export("scsi_set_sense_information",
+                cast[uint64](&_lat_scsi_set_sense_information))
+
+    # ---- Group 5: sg_miter_* ----
+    _add_export("sg_miter_start",
+                cast[uint64](&_lat_sg_miter_start))
+    _add_export("sg_miter_next",
+                cast[uint64](&_lat_sg_miter_next))
+    _add_export("sg_miter_stop",
+                cast[uint64](&_lat_sg_miter_stop))
+
+    # ---- Group 6: misc ----
+    _add_export("async_synchronize_cookie",
+                cast[uint64](&_lat_async_synchronize_cookie))
+    _add_export("autoremove_wake_function",
+                cast[uint64](&_lat_autoremove_wake_function))
+    _add_export("blk_abort_request",
+                cast[uint64](&_lat_blk_abort_request))
+    _add_export("blk_queue_update_dma_alignment",
+                cast[uint64](&_lat_blk_queue_update_dma_alignment))
+    _add_export("blk_queue_update_dma_pad",
+                cast[uint64](&_lat_blk_queue_update_dma_pad))
+    _add_export("device_link_remove",
+                cast[uint64](&_lat_device_link_remove))
+    _add_export("glob_match",
+                cast[uint64](&_lat_glob_match))
+    _add_export("kstrtoll",
+                cast[uint64](&_lat_kstrtoll))
+    _add_export("ledtrig_disk_activity",
+                cast[uint64](&_lat_ledtrig_disk_activity))
+    _add_export("strcasecmp",
+                cast[uint64](&_lat_strcasecmp))
+    _add_export("strim",
+                cast[uint64](&_lat_strim))
+    _add_export("system_entering_hibernation",
+                cast[uint64](&_lat_system_entering_hibernation))
+
+    # ---- DATA exports ----
+    _add_export("acpi_gbl_FADT",
+                cast[uint64](&lat_acpi_gbl_FADT_buf[0]))

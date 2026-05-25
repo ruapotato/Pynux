@@ -84,6 +84,8 @@ from linux_abi.api_e1000e import linux_abi_register_e1000e
 from linux_abi.api_r8169 import linux_abi_register_r8169
 from linux_abi.api_igb import linux_abi_register_igb
 from linux_abi.api_ahci import linux_abi_register_ahci
+from linux_abi.api_scsi import linux_abi_register_scsi
+from linux_abi.api_libata import linux_abi_register_libata
 from linux_abi.api_nvme import linux_abi_register_nvme
 from linux_abi.api_usbcore import linux_abi_register_usbcore
 from linux_abi.api_xhci import linux_abi_register_xhci
@@ -901,6 +903,43 @@ def linux_abi_exports_init():
     # sata_deb_timing_normal, sata_deb_timing_hotplug). Total exports
     # after ahci: 1413 + 53 = 1466.
     linux_abi_register_ahci()
+
+    # Storage maximalism: scsi_mod.ko (SCSI mid-layer) + libata.ko
+    # (ATA / SCSI translation). Bundling these two .ko files +
+    # closing their UND surface unlocks the entire family of stock
+    # Linux SCSI drivers (sd_mod, sr_mod, st_mod, mpt3sas,
+    # megaraid_sas, qla2xxx, virtio_scsi, ...) — once scsi_mod +
+    # libata load, any new SCSI driver only needs its silicon-
+    # specific shim batch, NOT the full SCSI infrastructure.
+    #
+    # api_scsi.ad: ~96 exports (scsi_mod's 83 net-new UND symbols +
+    # 13 shared-with-libata symbols owned here because scsi_mod
+    # loads first via modules.dep). Categories: 37 blk_*/blk_mq_*/
+    # blk_queue_* extensions beyond api_block + api_nvme, 6 sg_*/
+    # scsi_* primitives (scatter-gather + sense-buffer parsing),
+    # 7 sbitmap_*/ida_* (bit + ID allocators), 9 transport_*/
+    # attribute_container_*, 4 trace_seq_*/trace_print_hex_seq,
+    # ~28 misc (devm/sysfs/jiffies/etc), 5 DATA exports
+    # (scsi_command_size_tbl, scsi_device_type, platform_bus,
+    # system_long_wq, param_ops_string).
+    #
+    # api_libata.ad: ~43 exports (libata's net-new UND symbols).
+    # Categories: 5 acpi_*, 7 devres_/devm_, 9 ioread*/iowrite*,
+    # 2 scsi_set_sense_*, 3 sg_miter_*, 12 misc (async/blk_abort/
+    # glob_match/strcasecmp/strim/kstrtoll/ledtrig/wake), 1 DATA
+    # export (acpi_gbl_FADT).
+    #
+    # Loader ordering: modules.dep auto-loads scsi_mod -> libata
+    # -> libahci -> ahci, which means the api_ahci.ad stubs for
+    # ata_* / sata_* / ahci_* are SUPERSEDED at runtime by libata's
+    # real EXPORT_SYMBOL surface via the loader's cross-module
+    # ksymtab fallback (loader-unify commit deb21cc). The shims
+    # below are the floor; libata's real implementations win when
+    # libata is loaded.
+    #
+    # Total exports added by this batch: 96 + 43 = 139.
+    linux_abi_register_scsi()
+    linux_abi_register_libata()
 
     # Storage pivot (Agent D): the 89 new exports the stock Debian
     # nvme.ko (Linux 6.1.0-32 build) needs beyond what L<=68 + e1000e
