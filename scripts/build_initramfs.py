@@ -747,6 +747,19 @@ def build_archive() -> bytes:
             print(f"  embedded {name} ({len(data)} bytes from "
                   f"tests/linux-modules/{ko.name})")
 
+    # Strategic pivot: load Linux's stock e1000e.ko via the L-series
+    # loader rather than continuing to hand-roll an I219 driver. The
+    # .ko is checked in at kernel-modules/e1000e/e1000e.ko (Debian
+    # 6.1.0-32 build, ~668 KiB). Lands at /lib/modules/e1000e.ko so
+    # kernel-side or userspace insmod can fetch it by path.
+    e1000e_ko = here / "kernel-modules" / "e1000e" / "e1000e.ko"
+    if e1000e_ko.is_file():
+        data = e1000e_ko.read_bytes()
+        name = "/lib/modules/e1000e.ko"
+        blob += cpio_entry(name, data)
+        print(f"  embedded {name} ({len(data)} bytes from "
+              f"kernel-modules/e1000e/e1000e.ko)")
+
     # U5: host-built Linux ELF test binaries. Anything staged under
     # tests/u-binary/ (built by tests/u-binary/src/*/Makefile via
     # `make install`) lands at /bin/<name>. These are real Linux ABI
