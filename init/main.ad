@@ -99,7 +99,7 @@ from arch.x86.kernel.module import module_api_init, module_load
 from linux_abi.exports import linux_abi_exports_init
 from linux_abi.loader import kmod_linux_load
 from linux_abi.api_e1000e import e1000e_ko_chip_dump, e1000e_ko_force_tx_enable
-from drivers.pci.pci import e1000e_ko_marker_found
+from linux_abi.api_netdev import netdev_first_registered
 from kernel.modprobe import (
     modprobe_auto_load,
     auto_modules_marker_found,
@@ -138,11 +138,6 @@ from drivers.net.virtio_net import (
     virtio_net_init, virtio_net_poll, virtio_net_rx_packets,
     virtio_net_send_arp_probe, virtio_net_msix_enabled,
     virtio_net_irq_count,
-)
-from drivers.net.e1000e import (
-    e1000e_poll, e1000e_rx_packets, e1000e_have_controller,
-    e1000e_status_raw, e1000e_stat_tpr, e1000e_stat_mpc,
-    e1000e_rdh, e1000e_rdt, e1000e_desc0_status, e1000e_quiesce,
 )
 from drivers.net.ip import ip_init, ip_set_gateway
 from drivers.net.udp import udp_init
@@ -764,91 +759,14 @@ def net_smoke_test():
         # `/etc/tcp-ring-test` marker — same gating pattern as the
         # /etc/tls-test https_local_smoke_test path.
     else:
-        # virtio-net is absent. If e1000e came up in pci_scan() (its
-        # init runs unconditionally before this branch, registering
-        # the eth_tx hook), bring up the L3 stack and drive a DHCP
-        # discover through the e1000e TX path. This is the
-        # Skull-Canyon-class real-hardware path: only one NIC in the
-        # system, and it's the PCH-integrated Intel.
-        #
-        # We KEY OFF the controller-bound predicate, NOT off any RX
-        # activity. The previous gate (e1000e_rx_packets() > 0) only
-        # fired after the kernel's SLIRP-aimed ARP probe (to
-        # 10.0.2.2) got a reply — that's a QEMU-only address, no
-        # response on a real network, no RX, no DHCP. On real
-        # hardware the box has e1000e up + link up + 0 RX packets
-        # (no one's sent anything to us yet — DHCP DISCOVER goes out
-        # FIRST to provoke traffic). Run DHCP whenever the chip is
-        # bound; the discover broadcast is what brings the first
-        # packet onto the wire.
-        if e1000e_have_controller() != 0:
-            ip_init()
-            udp_init()
-            icmp_init()
-            dhcp_init()
-            dns_init()
-            tcp_init()
-            http_init()
-            tls_init()
-            # DHCP via e1000e_tx (routed through eth_tx -> eth_tx_hook).
-            # SLIRP's emulated DHCP server (QEMU) and a real DHCP
-            # server (e.g. a home router) both answer the broadcast
-            # DISCOVER the same way; the only thing changing here is
-            # which NIC driver lifts the frame onto the wire.
-            dhcp_discover()
-            # Poll for up to ~30 s wall-clock on a 3 GHz CPU. The
-            # default of 100M iterations was ~1-3 s, which is fine for
-            # SLIRP's instant emulated DHCP server but too short for
-            # real home routers — observed on Skull Canyon NUC where
-            # DISCOVER goes out cleanly but no OFFER lands in the
-            # 1-3 s window. Cycle-counted (not jiffies — MSI may be
-            # storming and starving the timer interrupt). Diagnostic
-            # ticks every 200M iterations so the framebuffer animates.
-            #
-            # Three exit paths:
-            #   - BOUND reached -> short-circuit out, log the IP
-            #   - poll exhausted -> log timeout + final state
-            #   - (RX would emit its own [dhcp] OFFER/ACK lines along
-            #     the way, so the operator can see progress even if
-            #     the lease never lands)
-            ee_spin: uint64 = 0
-            ee_max:  uint64 = 1000000000
-            ee_tick_next: uint64 = 200000000
-            while ee_spin < ee_max:
-                e1000e_poll()
-                if dhcp_state_get() == 3:           # DHCP_STATE_BOUND
-                    ee_spin = ee_max - 1            # short-circuit out
-                if ee_spin >= ee_tick_next:
-                    printk2("[dhcp] poll tick: state=%d rx=%d\n",
-                            cast[uint64](dhcp_state_get()),
-                            e1000e_rx_packets())
-                    printk1("[dhcp] poll tick: e1000e STATUS=%x (bit1=LU bit0=FD)\n",
-                            cast[uint64](e1000e_status_raw()))
-                    printk2("[dhcp] poll tick: e1000e chipstats TPR=%d MPC=%d\n",
-                            cast[uint64](e1000e_stat_tpr()),
-                            cast[uint64](e1000e_stat_mpc()))
-                    printk2("[dhcp] poll tick: e1000e RDH=%d RDT=%d\n",
-                            cast[uint64](e1000e_rdh()),
-                            cast[uint64](e1000e_rdt()))
-                    printk1("[dhcp] poll tick: e1000e desc0.status=%x\n",
-                            cast[uint64](e1000e_desc0_status()))
-                    ee_tick_next = ee_tick_next + 200000000
-                ee_spin = ee_spin + 1
-            if dhcp_state_get() != 3:
-                printk2("[dhcp] no ACK received during init poll (state=%d rx_packets=%d)\n",
-                        cast[uint64](dhcp_state_get()),
-                        e1000e_rx_packets())
-                # The emergency e1000e_quiesce() that USED to fire here
-                # is gone. With the LANPHYPC PHY toggle (044a2aa) the
-                # TX storm is dead — chip transmits each descriptor
-                # exactly once and stops. Quiescing after DHCP
-                # timeout was killing the chip just before the
-                # operator's laptop tried to ARP/ping the static
-                # IP, leaving the box unreachable. Now we leave the
-                # chip alive so it can answer ARP for 10.250.10.99
-                # even when DHCP couldn't get an OFFER.
-            else:
-                printk0("[dhcp] lease BOUND during init poll\n")
+        # virtio-net is absent. The e1000e DHCP bring-up path now
+        # lives entirely in start_kernel's boot:35.a block, which
+        # kmod_linux_loads the stock Linux e1000e.ko and drives a
+        # DHCP DISCOVER through ndo_start_xmit. That path supersedes
+        # the hand-rolled drivers/net/e1000e.ad that used to live
+        # here; with the hand-rolled driver retired there's no
+        # work left for net_smoke_test to do on an e1000e-only box.
+        printk0("[net_smoke] virtio-net absent; e1000e DHCP deferred to boot:35.a\n")
 
 
 def msix_smoke_test():
@@ -2843,55 +2761,57 @@ def start_kernel():
 
     # Linux-shape modprobe auto-loader. When /etc/auto-modules is
     # present in the initramfs (planted by build_initramfs.py when
-    # ENABLE_AUTO_MODULES=1 — the framework-superset of the legacy
-    # ENABLE_E1000E_KO marker below), walk the PCI bus and load any
-    # .ko in /lib/modules/auto/ that matches a baked
-    # /lib/modules/modules.alias entry. Default boots skip the marker
-    # so existing hand-rolled-driver tests stay deterministic.
+    # ENABLE_AUTO_MODULES=1), walk the PCI bus and load any .ko in
+    # /lib/modules/auto/ that matches a baked /lib/modules/modules.alias
+    # entry. Default boots skip the marker so the e1000e.ko hard-coded
+    # boot:35.a path below is the single source of NIC bring-up.
     if auto_modules_marker_found() == 1:
         printk0("[boot:35.M] modprobe auto-load\n")
         n_auto: uint64 = modprobe_auto_load()
         printk1("[boot:35.M] modprobe auto-load: %d modules loaded\n",
                 n_auto)
 
-    # Strategic-pivot: load Linux's stock e1000e.ko via the L-series
-    # loader when /etc/e1000e-ko marker is present. Replaces the
-    # hand-rolled drivers/net/e1000e.ad path (gated off in pci_scan
-    # when the same marker is set). The .ko bytes are baked into the
-    # initramfs at /lib/modules/e1000e.ko by
-    # scripts/build_initramfs.py.
-    if e1000e_ko_marker_found() == 1:
-        printk0("[boot:35.a] kmod_linux_load /lib/modules/e1000e.ko\n")
-        ko_blob: uint64 = initramfs_data_ptr("/lib/modules/e1000e.ko")
-        ko_size: uint64 = initramfs_data_size("/lib/modules/e1000e.ko")
-        if ko_blob == 0:
-            printk0("[e1000e.ko] /lib/modules/e1000e.ko not in initramfs!\n")
+    # Unconditional e1000e.ko load. The hand-rolled
+    # drivers/net/e1000e.ad has been retired; Linux's stock e1000e.ko
+    # is now the only path that drives Intel Gigabit silicon. The .ko
+    # bytes are baked into the initramfs at /lib/modules/e1000e.ko by
+    # scripts/build_initramfs.py. On boards without an e1000e device
+    # on the bus this is a no-op (the .ko's probe doesn't fire);
+    # the kmod_linux_load itself is cheap (~668 KiB load + relocs +
+    # init_module) and always runs.
+    printk0("[boot:35.a] kmod_linux_load /lib/modules/e1000e.ko\n")
+    ko_blob: uint64 = initramfs_data_ptr("/lib/modules/e1000e.ko")
+    ko_size: uint64 = initramfs_data_size("/lib/modules/e1000e.ko")
+    if ko_blob == 0:
+        printk0("[e1000e.ko] /lib/modules/e1000e.ko not in initramfs!\n")
+    else:
+        printk2("[e1000e.ko] loading %d bytes from %p\n", ko_size, ko_blob)
+        ko_rc: int32 = kmod_linux_load(
+            cast[Ptr[uint8]](ko_blob), ko_size)
+        if ko_rc < 0:
+            printk1("[e1000e.ko] kmod_linux_load failed: rc=%d\n",
+                    cast[uint64](ko_rc))
         else:
-            printk2("[e1000e.ko] loading %d bytes from %p\n", ko_size, ko_blob)
-            ko_rc: int32 = kmod_linux_load(
-                cast[Ptr[uint8]](ko_blob), ko_size)
-            if ko_rc < 0:
-                printk1("[e1000e.ko] kmod_linux_load failed: rc=%d\n",
-                        cast[uint64](ko_rc))
-            else:
-                printk1("[e1000e.ko] kmod_linux_load OK (slot=%d)\n",
-                        cast[uint64](ko_rc))
-                # Strategic-pivot V0: drive a DHCP DISCOVER through
-                # the Linux driver and wait for the OFFER/ACK round
-                # trip. The .ko's e1000e_probe already wired the
-                # netdev_ops, the pci shim fired dev_open, programmed
-                # MSI on vector 0x47, and armed the TX bridge. So:
-                # bring the L3 stack online, send DHCP DISCOVER, and
-                # spin with IRQs enabled. MSI -> trampoline ->
-                # e1000_intr -> __napi_schedule -> napi->poll (sync)
-                # -> napi_gro_receive -> eth_rx delivers the OFFER /
-                # ACK frames into the DHCP state machine.
-                #
-                # IRQs are enabled JUST for the DHCP window because
-                # most of the rest of boot still runs IF-masked
-                # (cooperative kernel; preemption happens later when
-                # sched_init wires the LAPIC timer into the
-                # scheduler).
+            printk1("[e1000e.ko] kmod_linux_load OK (slot=%d)\n",
+                    cast[uint64](ko_rc))
+            # boot:35.b — drive DHCP through the freshly-bound Linux
+            # netdev ONLY if e1000e_probe actually claimed a device on
+            # the PCI bus (i.e. the box has an e1000e NIC). On a
+            # virtio-net-only QEMU run the .ko loads cleanly but no
+            # netdev gets registered, so we skip the DHCP block and
+            # leave net_smoke_test's virtio-net DHCP result intact.
+            #
+            # When the .ko did bind: bring the L3 stack online, send
+            # DHCP DISCOVER, and spin with IRQs enabled. MSI ->
+            # trampoline -> e1000_intr -> __napi_schedule -> napi->poll
+            # (sync) -> napi_gro_receive -> eth_rx delivers the OFFER /
+            # ACK frames into the DHCP state machine.
+            #
+            # IRQs are enabled JUST for the DHCP window because most
+            # of the rest of boot still runs IF-masked (cooperative
+            # kernel; preemption happens later when sched_init wires
+            # the LAPIC timer into the scheduler).
+            if netdev_first_registered() != 0:
                 printk0("[boot:35.b] DHCP via e1000e.ko\n")
                 # Force TCTL.EN — Linux's e1000_watchdog_task normally
                 # OR's this bit when LSC asserts link-up, but we have
@@ -2908,38 +2828,28 @@ def start_kernel():
                 #   dhcp_discover() -> udp_send -> ip_send ->
                 #   eth_tx -> eth_tx_hook (== _l_linux_tx_bridge)
                 #   -> ndo_start_xmit (e1000_xmit_frame in the .ko)
-                #
-                # Closed in this commit (M16-pivot.d): linux_tx_bridge
-                # now populates the full Linux 6.1 sk_buff field set
-                # (mac/network/transport headers, truesize, users,
-                # hdr_len) and seeds the netdev[0xc88] tx_fifo_limit
-                # so e1000_maybe_stop_tx's count<size BUG no longer
-                # fires. With the BUG cleared, the .ko's e1000_xmit_
-                # frame writes the descriptor and bumps TDT — the chip
-                # transmits, and the OFFER/ACK return frames land via
-                # MSI -> trampoline -> __napi_schedule -> napi->poll
-                # -> napi_gro_receive -> eth_rx into dhcp_rx.
                 dhcp_discover()
 
-                # Poll for the DHCP exchange to complete. IRQs must be
-                # enabled for the MSI vector 0x47 to actually fire and
-                # for the driver's __napi_schedule path to run. Match
-                # the e1000e_have_controller() polling pattern: budget
-                # ~30 s wall-clock on a 3 GHz CPU (SLIRP answers in
-                # microseconds; the headroom is for real hardware /
-                # slow CI).
+                # Poll for the DHCP exchange to complete. IRQs must
+                # be enabled for the MSI vector 0x47 to actually fire
+                # and for the driver's __napi_schedule path to run.
+                # Budget ~30 s wall-clock on a 3 GHz CPU (SLIRP
+                # answers in microseconds; the headroom is for real
+                # hardware / slow CI).
                 local_irq_enable()
                 ko_spin: uint64 = 0
                 ko_max:  uint64 = 200000000
                 while ko_spin < ko_max:
-                    if dhcp_state_get() == 3:       # DHCP_STATE_BOUND
-                        ko_spin = ko_max            # short-circuit out
+                    if dhcp_state_get() == 3:   # DHCP_STATE_BOUND
+                        ko_spin = ko_max        # short-circuit out
                     else:
                         cpu_relax()
                     ko_spin = ko_spin + 1
                 local_irq_disable()
                 if dhcp_state_get() != 3:
                     printk0("[dhcp] no ACK received during e1000e.ko poll\n")
+            else:
+                printk0("[boot:35.b] no e1000e netdev bound; DHCP skipped\n")
 
     # --- M16.30: load /init from cpio via the ELF loader ----------
     # exec() into a real userspace binary instead of the baked-in

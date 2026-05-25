@@ -129,10 +129,12 @@ def eth_rx(frame: Ptr[uint8], length: uint64):
 def eth_register_tx_hook(fn: Fn[int32, Ptr[uint8], uint64]):
     # NIC drivers call this from their init path once their TX ring
     # is armed. Last-writer-wins — in net_smoke_test() the boot order
-    # is pci_scan() (e1000e, r8169) then virtio_net_init(), so on a
-    # standard QEMU virtio setup virtio-net naturally ends up as the
-    # bound NIC. On Skull-Canyon-class hardware where virtio-net
-    # finds no device, e1000e's earlier registration sticks.
+    # is pci_scan() (r8169) then virtio_net_init(), so on a standard
+    # QEMU virtio setup virtio-net naturally ends up as the bound NIC.
+    # The Linux e1000e.ko (loaded at boot:35.a) registers its TX
+    # bridge later via the L-shim's linux_tx_bridge_arm, so on
+    # Skull-Canyon-class hardware where virtio-net finds no device,
+    # the .ko's bridge takes over as the bound NIC.
     eth_tx_hook = fn
     printk0("[eth] tx hook registered\n")
 

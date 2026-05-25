@@ -200,30 +200,24 @@ if os.environ.get("ENABLE_XHCI_NO_INIT") == "1":
 if os.environ.get("ENABLE_XHCI_FORCE_INIT") == "1":
     FILES.append(("/etc/xhci-force-init", b"1\n"))
 
-# Strategic-pivot e1000e .ko load. scripts/test_e1000e_tx.sh (when
-# updated to drive Linux's e1000e.ko instead of the hand-rolled
-# drivers/net/e1000e.ad) sets ENABLE_E1000E_KO=1 to plant
-# /etc/e1000e-ko in the initramfs. init/main.ad reads that marker
-# to (a) skip the hand-rolled e1000e_init() in pci_scan and
-# (b) kmod_linux_load /lib/modules/e1000e.ko at boot. Default
-# boot omits the marker so unrelated tests still run against the
-# hand-rolled driver.
-if os.environ.get("ENABLE_E1000E_KO") == "1":
-    FILES.append(("/etc/e1000e-ko", b"1\n"))
+# The /etc/e1000e-ko marker that used to gate the .ko-load path is
+# gone — init/main.ad's boot:35.a now unconditionally kmod_linux_loads
+# /lib/modules/e1000e.ko, which is the only path that drives Intel
+# Gigabit silicon (the hand-rolled drivers/net/e1000e.ad has been
+# retired). No env-var, no marker file, no conditional code path.
 
-# Storage pivot (Agent D): mirror the ENABLE_E1000E_KO pattern for
-# ahci.ko (SATA AHCI controller — covers most stock desktop/laptop
-# SATA silicon). scripts/test_ahci_ko.sh sets ENABLE_AHCI_KO=1 to
-# plant /etc/ahci-ko in the initramfs. A kernel-side autoloader
-# (Agent B's modprobe.ad / init/main.ad wiring) can gate on this
-# marker the same way init/main.ad already gates on /etc/e1000e-ko.
-# In the meantime the test exercises the load path via userspace
-# `insmod /lib/modules/6.12/ahci.ko` (the L-track test pattern).
+# Storage pivot (Agent D): ahci.ko (SATA AHCI controller — covers
+# most stock desktop/laptop SATA silicon). scripts/test_ahci_ko.sh
+# sets ENABLE_AHCI_KO=1 to plant /etc/ahci-ko in the initramfs. A
+# kernel-side autoloader (Agent B's modprobe.ad / init/main.ad
+# wiring) can gate on this marker. In the meantime the test
+# exercises the load path via userspace `insmod /lib/modules/6.12/
+# ahci.ko` (the L-track test pattern).
 if os.environ.get("ENABLE_AHCI_KO") == "1":
     FILES.append(("/etc/ahci-ko", b"1\n"))
 
-# Storage pivot (Agent D): mirror the ENABLE_E1000E_KO pattern for
-# nvme.ko (PCIe NVM Express SSD driver — every modern NVMe device).
+# Storage pivot (Agent D): nvme.ko (PCIe NVM Express SSD driver —
+# every modern NVMe device).
 # scripts/test_nvme_ko.sh sets ENABLE_NVME_KO=1 to plant /etc/nvme-ko.
 # Same userspace-insmod fallback as the ahci block above until a
 # kernel-side autoloader honours the marker.
@@ -414,13 +408,13 @@ if _CPIO_STRESS_RAW:
         FILES.append((f"/cpio-stress/file{_i}", _payload))
 
 # Multi-NIC L-shim scale-out: r8169.ko (Realtek consumer GbE) and
-# igb.ko (Intel server/workstation). Mirrors the ENABLE_E1000E_KO
-# marker shape above. scripts/test_r8169_ko.sh sets ENABLE_R8169_KO=1
-# to plant /etc/r8169-ko; scripts/test_igb_ko.sh sets ENABLE_IGB_KO=1
-# to plant /etc/igb-ko. init/main.ad reads each marker to (a) skip
-# any hand-rolled driver that would conflict and (b) kmod_linux_load
-# the matching /lib/modules/<name>.ko at boot. Default boot omits
-# both markers so unrelated tests run against existing drivers.
+# igb.ko (Intel server/workstation). scripts/test_r8169_ko.sh sets
+# ENABLE_R8169_KO=1 to plant /etc/r8169-ko; scripts/test_igb_ko.sh
+# sets ENABLE_IGB_KO=1 to plant /etc/igb-ko. init/main.ad reads each
+# marker to (a) skip any hand-rolled driver that would conflict and
+# (b) kmod_linux_load the matching /lib/modules/<name>.ko at boot.
+# Default boot omits both markers so unrelated tests run against
+# existing drivers.
 #
 # These env-var markers live at the BOTTOM of this gated-marker
 # section by design: Agent B's auto-modules logic (when it lands) is
@@ -811,22 +805,17 @@ def build_archive() -> bytes:
             print(f"  embedded {name} ({len(data)} bytes from "
                   f"tests/linux-modules/{ko.name})")
 
-    # Strategic pivot: load Linux's stock e1000e.ko via the L-series
-    # loader rather than continuing to hand-roll an I219 driver. The
-    # .ko is checked in at kernel-modules/e1000e/e1000e.ko (Debian
-    # 6.1.0-32 build, ~668 KiB). Lands at /lib/modules/e1000e.ko so
-    # kernel-side or userspace insmod can fetch it by path.
-    #
-    # This single-module path is preserved as a special-case fallback
-    # for the ENABLE_E1000E_KO=1 marker (drives the kernel's hard-
-    # coded boot:35.a path in init/main.ad). The ENABLE_AUTO_MODULES=1
-    # block below SUPERSEDES it — it bakes every kernel-modules/<X>/
-    # *.ko at /lib/modules/auto/<X>.ko + a modules.alias table so the
-    # in-kernel modprobe_auto_load() walks the live PCI bus and picks
-    # the right driver. We keep both shipped so a build with both
-    # markers gets the same e1000e.ko twice (once at the legacy path,
-    # once under auto/) without breaking the existing test_e1000e_tx
-    # regression that pins the /lib/modules/e1000e.ko entry.
+    # Linux's stock e1000e.ko (Debian 6.1.0-32 build, ~668 KiB), checked
+    # in at kernel-modules/e1000e/e1000e.ko. Always planted at
+    # /lib/modules/e1000e.ko — init/main.ad's boot:35.a path
+    # unconditionally kmod_linux_loads it (the hand-rolled
+    # drivers/net/e1000e.ad has been retired). On boards without an
+    # Intel NIC the .ko loads but its probe doesn't bind, so this is
+    # cheap (no-op-on-mismatch). The ENABLE_AUTO_MODULES=1 block below
+    # additionally bakes every kernel-modules/<X>/*.ko at
+    # /lib/modules/auto/<X>.ko + a modules.alias table so the in-kernel
+    # modprobe_auto_load() walks the live PCI bus and picks the right
+    # driver per device — Linux's exact modprobe-by-PCI-ID model.
     e1000e_ko = here / "kernel-modules" / "e1000e" / "e1000e.ko"
     if e1000e_ko.is_file():
         data = e1000e_ko.read_bytes()
@@ -850,9 +839,9 @@ def build_archive() -> bytes:
     # Also plants /etc/auto-modules as the runtime gate: init/main.ad
     # only invokes modprobe_auto_load() when this marker is present,
     # so the default CI boot stays single-purpose and tests that
-    # depend on the hand-rolled drivers (virtio-net + handrolled
-    # e1000e + r8169) keep working. Set ENABLE_AUTO_MODULES=1 to
-    # opt in; CI sets it in scripts/test_auto_modules.sh.
+    # depend on the existing hand-rolled drivers (virtio-net,
+    # r8169) keep working. Set ENABLE_AUTO_MODULES=1 to opt in; CI
+    # sets it in scripts/test_auto_modules.sh.
     if os.environ.get("ENABLE_AUTO_MODULES") == "1":
         kmods_root = here / "kernel-modules"
         n_ko = 0
@@ -890,9 +879,8 @@ def build_archive() -> bytes:
               f"{alias_text.count(chr(10)) - 3 if alias_text else 0} "
               f"alias lines, from {n_ko} .ko files / "
               f"{n_ko_bytes} bytes)")
-        # Runtime gate marker. Mirror the ENABLE_E1000E_KO pattern:
-        # init/main.ad's modprobe_auto_load() block only fires when
-        # this file is present in the initramfs.
+        # Runtime gate marker. init/main.ad's modprobe_auto_load()
+        # block only fires when this file is present in the initramfs.
         FILES.append(("/etc/auto-modules", b"1\n"))
 
     # Multi-NIC scale-out: r8169.ko (Realtek consumer GbE) and igb.ko

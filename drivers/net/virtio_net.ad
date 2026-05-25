@@ -453,11 +453,12 @@ def virtio_net_init() -> int32:
         printk1("[virtio-net] init done; RX queue populated; MSI-X cfg vec=0x%x\n",
                 cast[uint64](VNET_MSIX_VEC_CFG))
         # Take ownership of eth.ad's TX dispatch — on QEMU virtio is
-        # the canonical bring-up NIC, and this runs after e1000e_init
-        # in net_smoke_test() so we deliberately overwrite any hook
-        # the Intel driver left behind. Symmetric registration at
-        # both virtio_net_init exits keeps the MSI-X / INTx paths in
-        # lockstep with respect to the upper-layer dispatch.
+        # the canonical bring-up NIC. The Linux e1000e.ko (loaded later
+        # at boot:35.a) only registers its TX bridge if its probe
+        # binds, so the virtio hook stays in place on virtio-only
+        # boots. Symmetric registration at both virtio_net_init exits
+        # keeps the MSI-X / INTx paths in lockstep with respect to the
+        # upper-layer dispatch.
         eth_register_tx_hook(virtio_net_tx)
         return 0
 

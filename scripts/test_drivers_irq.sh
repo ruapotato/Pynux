@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # scripts/test_drivers_irq.sh — verify per-vector IRQ wiring lands on
-# the wire for the bare-metal drivers (AHCI, NVMe, e1000e, r8169).
-# M16.113 added the IOAPIC + per-vector handler-registration
-# mechanism and proved it on virtio-net at vector 0x40; the device
-# drivers each claim their own vector:
+# the wire for the bare-metal drivers (AHCI, NVMe, r8169) plus the
+# Linux e1000e.ko path. M16.113 added the IOAPIC + per-vector
+# handler-registration mechanism and proved it on virtio-net at
+# vector 0x40; each driver claims its own vector:
 #
 #     AHCI    = 0x41   (IOAPIC INTx)
 #     NVMe    = 0x42   (IOAPIC INTx)
 #     r8169   = 0x44   (IOAPIC INTx, RTL8139)
-#     e1000e  = 0x47   (MSI — bypasses the IOAPIC)
+#     e1000e  = 0x47   (MSI — bypasses the IOAPIC; programmed by the
+#                        Linux e1000e.ko's request_irq via the L-shim)
 #
 # Vector 0x43 is now claimed by virtio-blk (kernel roadmap §9); the
 # e1000e INTx slot it used to hold was retired when e1000e moved to
@@ -16,9 +17,9 @@
 #
 # Each driver registers its irq_handler in the per-vector table; the
 # IOAPIC-routed ones (AHCI / NVMe / r8169) also program a redirection
-# entry, while e1000e programs an MSI capability instead. The polled
-# paths (ahci_smoke_test poll, nvme polled CQ phase drain,
-# e1000e_poll, r8169_poll) all stay as safety-net fallbacks.
+# entry, while e1000e.ko programs an MSI capability via the L-shim.
+# The polled paths (ahci_smoke_test poll, nvme polled CQ phase drain,
+# r8169_poll) all stay as safety-net fallbacks.
 #
 # The test attaches ALL four QEMU devices simultaneously so a single
 # boot exercises every code path, then asserts each driver's IRQ-wire
@@ -28,7 +29,7 @@
 # always provoke a real IRQ in QEMU TCG before the assertion window
 # closes, and we don't want a flake gate. The test bar is "the IRQ
 # wiring registered successfully"; the corresponding regression tests
-# (test_ahci, test_nvme, test_net_e1000e, test_net_r8169) cover the
+# (test_ahci, test_nvme, test_e1000e_tx, test_net_r8169) cover the
 # data-path side.
 
 . "$(dirname "$0")/_build_lock.sh"
@@ -80,7 +81,7 @@ rc=$?
 set -e
 
 echo "[test_drivers_irq] --- captured (ioapic / irq / driver banners) ---"
-grep -aE '\[ioapic\]|\[irq\]|\[ahci\] irq |\[nvme\] irq |\[e1000e\] (irq|MSI) |\[r8169\] irq ' "$LOG" || true
+grep -aE '\[ioapic\]|\[irq\]|\[ahci\] irq |\[nvme\] irq |\[pci_msi\]|\[r8169\] irq ' "$LOG" || true
 echo "[test_drivers_irq] --- end ---"
 
 fail=0
@@ -101,12 +102,12 @@ do
     fi
 done
 
-# e1000e prefers single-vector MSI but falls back to IOAPIC INTx if
-# the device exposes no MSI capability — accept either banner.
-if grep -aE -q '\[e1000e\] MSI vector=|\[e1000e\] INTx fallback pin=' "$LOG"; then
-    echo "[test_drivers_irq] OK: e1000e IRQ wired (MSI or INTx)"
+# The Linux e1000e.ko programs a single-vector MSI via the L-shim;
+# api_pci.ad logs "[pci_msi] vector=0x47 enabled" when it lands.
+if grep -F -q '[pci_msi] vector=0x47 enabled' "$LOG"; then
+    echo "[test_drivers_irq] OK: e1000e.ko MSI wired (vector 0x47)"
 else
-    echo "[test_drivers_irq] MISS: e1000e IRQ not wired"
+    echo "[test_drivers_irq] MISS: e1000e.ko MSI not wired"
     fail=1
 fi
 

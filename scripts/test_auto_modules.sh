@@ -2,12 +2,8 @@
 # scripts/test_auto_modules.sh — regression guard for the Linux-shape
 # modprobe auto-discovery framework (kernel/modprobe.ad).
 #
-# Builds an ISO with BOTH ENABLE_AUTO_MODULES=1 (turn on the
-# auto-discovery framework) AND ENABLE_E1000E_KO=1 (so the legacy
-# single-marker path is also armed — we cross-check that the auto path
-# claims the device first via _already_loaded and the legacy path
-# becomes a no-op for a duplicate device). Boots under QEMU
-# `-device e1000e` and asserts:
+# Builds an ISO with ENABLE_AUTO_MODULES=1 (turn on the auto-discovery
+# framework). Boots under QEMU `-device e1000e` and asserts:
 #
 #   1. The build baked /lib/modules/modules.alias into the cpio
 #      (visible in build_initramfs.py stdout).
@@ -54,7 +50,7 @@ echo "[test_auto_modules] (1/4) Build userland + modules + initramfs"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 INITRAMFS_LOG=$(mktemp)
-ENABLE_AUTO_MODULES=1 ENABLE_E1000E_KO=1 python3 scripts/build_initramfs.py \
+ENABLE_AUTO_MODULES=1 python3 scripts/build_initramfs.py \
     > "$INITRAMFS_LOG" 2>&1
 trap 'rm -f "$INITRAMFS_LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 

@@ -21,55 +21,16 @@
 # vendor_id == 0xFFFF means "no device responding".
 
 from kernel.printk.printk import printk0, printk1, printk2
-from fs.cpio import initramfs_entry_count, initramfs_entry_name, cpio_init
-
-# Cross-import the e1000e probe so it lands in the link graph and
-# `pci_scan()` can drive it. The Adder compiler handles cycles via
-# its hoist-all-decls-to-one-namespace lowering — `drivers/net/eth.ad`
-# already does the same trick with `drivers/net/virtio_net.ad`. We
-# only need the two entry points here; the rest of the driver lives
-# entirely under `drivers/net/e1000e.ad`.
-from drivers.net.e1000e import (
-    e1000e_init, e1000e_poll, e1000e_send_arp_probe, e1000e_rx_packets,
-)
-
-
-def e1000e_ko_marker_found() -> int32:
-    # Returns 1 if the initramfs carries /etc/e1000e-ko, 0 otherwise.
-    # Planted by scripts/build_initramfs.py when ENABLE_E1000E_KO=1
-    # (strategic-pivot mode: load Linux's stock e1000e.ko via the
-    # L-series loader instead of the hand-rolled drivers/net/e1000e.ad).
-    # Both paths drive the same PCI silicon, so they MUST NOT both
-    # bring up the chip — that would cause MMIO conflicts between
-    # the two driver instances. Default boot (no marker) keeps the
-    # hand-rolled path; ENABLE_E1000E_KO=1 swaps to the .ko path.
-    # cpio_init() is idempotent and is also called from start_kernel
-    # later; calling it here makes the marker check robust to the
-    # pre-vfs_init pci_scan call site ordering.
-    cpio_init()
-    target: Ptr[uint8] = "/etc/e1000e-ko"
-    count: uint64 = initramfs_entry_count()
-    i: uint64 = 0
-    while i < count:
-        name: Ptr[char] = initramfs_entry_name(i)
-        np: Ptr[uint8] = cast[Ptr[uint8]](name)
-        ok: int32 = 1
-        j: uint64 = 0
-        while j < 15:                                # 14 chars + NUL
-            if np[j] != target[j]:
-                ok = 0
-                j = 15                               # break
-            else:
-                j = j + 1
-        if ok == 1:
-            return 1
-        i = i + 1
-    return 0
 
 # Cross-import the r8169 probe (Realtek RTL8139 / RTL8168 / RTL8169
-# family) for the same reason as e1000e above. virtio-net is the
-# bring-up NIC; e1000e covers Intel hardware; r8169 covers Realtek,
-# which is the second-most-common NIC family on consumer x86 boxes.
+# family) so it lands in the link graph and `pci_scan()` can drive
+# it. The Adder compiler handles cycles via its hoist-all-decls-to-
+# one-namespace lowering — `drivers/net/eth.ad` does the same trick
+# with `drivers/net/virtio_net.ad`. virtio-net is the bring-up NIC;
+# Intel silicon is now driven by Linux's stock e1000e.ko loaded at
+# start_kernel's boot:35.a (the hand-rolled drivers/net/e1000e.ad
+# has been retired); r8169 covers Realtek, the second-most-common
+# NIC family on consumer x86 boxes.
 from drivers.net.r8169 import (
     r8169_init, r8169_poll, r8169_send_arp_probe, r8169_rx_packets,
 )
@@ -447,42 +408,10 @@ def pci_scan():
     printk1("PCI: scan complete, %d devices found\n",
             cast[uint64](nr_found))
 
-    # Opportunistic probe for the native Intel e1000e Gigabit NIC.
-    # virtio-net (M16.88) covers QEMU's `-device virtio-net`; e1000e
-    # (M16.103) covers QEMU's `-device e1000e` AND real-hardware
-    # Intel PCH NICs from ~2009 onwards. Both are polled — IOAPIC
-    # programming is still outstanding, so neither has a real IRQ
-    # handler yet. A miss (no matching device on the bus) returns
-    # -1 and is silent except for the "[e1000e] no controller found"
-    # log; the kernel keeps booting either way.
-    #
-    # Strategic-pivot gate: when /etc/e1000e-ko is present in the
-    # initramfs, the kernel-side init path will kmod_linux_load
-    # /lib/modules/e1000e.ko and let Linux's stock driver own the
-    # chip. We MUST NOT also bring up the hand-rolled driver — both
-    # would write the same MMIO BARs and corrupt the descriptor rings.
-    if e1000e_ko_marker_found() == 1:
-        printk0("[e1000e] hand-rolled init skipped (/etc/e1000e-ko marker present)\n")
-    else:
-        if e1000e_init() == 0:
-            # M16.114b: kick a single ARP request at SLIRP's gateway
-            # (10.0.2.2). SLIRP doesn't broadcast unsolicited frames,
-            # so without a TX of our own there's nothing on the wire
-            # for the RX ring to receive. The TX path sets EOP|IFCS|RS
-            # and spin-waits for DD writeback, so when
-            # e1000e_send_arp_probe() returns 0 we know the frame is
-            # on the wire. SLIRP answers within a few PCI MMIO reads;
-            # the poll loop below drains whatever lands in the RX ring
-            # (the ARP reply being the expected first frame).
-            e1000e_send_arp_probe()
-            spin: uint64 = 0
-            while spin < 1000000:
-                e1000e_poll()
-                if e1000e_rx_packets() > 0:
-                    # Got at least one frame — short-circuit out so
-                    # the rest of boot doesn't sit in this loop.
-                    spin = 999999
-                spin = spin + 1
+    # Intel e1000e silicon is driven by Linux's stock e1000e.ko (loaded
+    # unconditionally at start_kernel's boot:35.a). The hand-rolled
+    # drivers/net/e1000e.ad that used to probe here has been retired —
+    # the .ko covers the same hardware with battle-tested Linux code.
 
     # Symmetric opportunistic probe for the Realtek r8169 family.
     # Covers QEMU's `-device rtl8139` AND real-hardware consumer

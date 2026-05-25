@@ -17,8 +17,8 @@
 # 10.0.2.2) through the 4-slot 8139 TX path; SLIRP answers with an
 # ARP reply that lands in the circular RX buffer and r8169_poll()
 # delivers it to eth_rx(). The test asserts both the tx-ok log and
-# at least one RX-packet log, matching the V1 acceptance bar that
-# `scripts/test_net_e1000e.sh` already enforces for the Intel NIC.
+# at least one RX-packet log (V1 acceptance bar for a hand-rolled
+# NIC driver).
 #
 # Why rtl8139 and not rtl8169? QEMU's available Realtek device list
 # (verify with `qemu-system-x86_64 -device help | grep -i rtl`) on

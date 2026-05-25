@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # scripts/test_e1000e_tx.sh — regression guard for the e1000e TX path,
-# now driven by Linux's stock e1000e.ko via the L-series loader (the
-# strategic pivot from the hand-rolled drivers/net/e1000e.ad).
+# driven by Linux's stock e1000e.ko via the L-series loader (the
+# hand-rolled drivers/net/e1000e.ad has been retired; the .ko is the
+# only path for Intel Gigabit silicon).
 #
-# Boots the kernel with `-device e1000e` as the ONLY NIC, with the
-# ENABLE_E1000E_KO=1 marker set so init/main.ad's boot:35.a path runs
-# kmod_linux_load /lib/modules/e1000e.ko and pci_scan's hand-rolled
-# e1000e_init is skipped (would conflict on MMIO BARs).
+# Boots the kernel with `-device e1000e` as the ONLY NIC. init/main.ad's
+# boot:35.a runs kmod_linux_load /lib/modules/e1000e.ko unconditionally.
 #
 # Assertions:
 #   1. "[e1000e.ko] loading"            — bytes from cpio archive.
@@ -17,8 +16,7 @@
 #   5. "[napi_gro_receive] rx skb="     — RX bridge delivered a frame.
 #   6. "[dhcp] OFFER ip=10.0.2.15"      — QEMU SLIRP responded.
 #   7. "[dhcp] got ip=10.0.2.15"        — STRATEGIC MILESTONE: full DHCP
-#      DISCOVER/OFFER/REQUEST/ACK round trip via the Linux e1000e.ko —
-#      no hand-rolled drivers/net/e1000e.ad on the QEMU path.
+#      DISCOVER/OFFER/REQUEST/ACK round trip via the Linux e1000e.ko.
 
 . "$(dirname "$0")/_build_lock.sh"
 
@@ -31,7 +29,7 @@ ELF=build/hamnix-kernel.elf
 echo "[test_e1000e_tx] (1/3) Build userland + modules + initramfs"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
-ENABLE_E1000E_KO=1 python3 scripts/build_initramfs.py >/dev/null
+python3 scripts/build_initramfs.py >/dev/null
 
 echo "[test_e1000e_tx] (2/3) Rebuild kernel image"
 python3 -m compiler.adder compile \
