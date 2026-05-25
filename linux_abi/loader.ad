@@ -65,6 +65,7 @@ R_X86_64_PC32:           uint32 = 2
 R_X86_64_PLT32:          uint32 = 4
 R_X86_64_32:             uint32 = 10
 R_X86_64_32S:            uint32 = 11
+R_X86_64_PC64:           uint32 = 24
 R_X86_64_REX_GOTPCRELX:  uint32 = 42
 
 
@@ -425,6 +426,13 @@ def _apply_relocations(image: Ptr[uint8], shnum: uint64):
                 # Standard x86_64 ABI absolute 32-bit relocations.
                 val32: uint64 = s + a
                 _wr_u32(cast[Ptr[uint8]](p), cast[uint32](val32 & 0xFFFFFFFF))
+                nr_applied = nr_applied + 1
+            elif r_type == R_X86_64_PC64:
+                # *(uint64*)P = (uint64)(S + A - P) — PC-relative 64-bit
+                # absolute. The stock e1000e.ko emits this for several
+                # of its data-section pointer tables (DEFAULT_INITIALIZER
+                # macros). Same as R_X86_64_64 except subtract P.
+                _wr_u64(cast[Ptr[uint8]](p), (s + a) - p)
                 nr_applied = nr_applied + 1
             elif r_type == R_X86_64_NONE:
                 pass

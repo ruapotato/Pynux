@@ -200,6 +200,17 @@ if os.environ.get("ENABLE_XHCI_NO_INIT") == "1":
 if os.environ.get("ENABLE_XHCI_FORCE_INIT") == "1":
     FILES.append(("/etc/xhci-force-init", b"1\n"))
 
+# Strategic-pivot e1000e .ko load. scripts/test_e1000e_tx.sh (when
+# updated to drive Linux's e1000e.ko instead of the hand-rolled
+# drivers/net/e1000e.ad) sets ENABLE_E1000E_KO=1 to plant
+# /etc/e1000e-ko in the initramfs. init/main.ad reads that marker
+# to (a) skip the hand-rolled e1000e_init() in pci_scan and
+# (b) kmod_linux_load /lib/modules/e1000e.ko at boot. Default
+# boot omits the marker so unrelated tests still run against the
+# hand-rolled driver.
+if os.environ.get("ENABLE_E1000E_KO") == "1":
+    FILES.append(("/etc/e1000e-ko", b"1\n"))
+
 # Native `ping` smoke. scripts/test_ping.sh sets ENABLE_PING_SMOKE=1 to
 # plant /etc/ping-smoke-test in the initramfs. The marker is consumed
 # only by the test harness today (a future kernel-side autorun could

@@ -97,6 +97,8 @@ from fs.elf import (
 )
 from arch.x86.kernel.module import module_api_init, module_load
 from linux_abi.exports import linux_abi_exports_init
+from linux_abi.loader import kmod_linux_load
+from drivers.pci.pci import e1000e_ko_marker_found
 from kernel.stack_protect import __stack_chk_init
 from drivers.pci.pci import pci_scan
 from drivers.rtc.cmos import rtc_init
@@ -2789,6 +2791,29 @@ def start_kernel():
     # stock .ko loader (linux_abi/loader.ad). Idempotent.
     printk0("[boot:35] linux_abi_exports_init\n")
     linux_abi_exports_init()
+
+    # Strategic-pivot: load Linux's stock e1000e.ko via the L-series
+    # loader when /etc/e1000e-ko marker is present. Replaces the
+    # hand-rolled drivers/net/e1000e.ad path (gated off in pci_scan
+    # when the same marker is set). The .ko bytes are baked into the
+    # initramfs at /lib/modules/e1000e.ko by
+    # scripts/build_initramfs.py.
+    if e1000e_ko_marker_found() == 1:
+        printk0("[boot:35.a] kmod_linux_load /lib/modules/e1000e.ko\n")
+        ko_blob: uint64 = initramfs_data_ptr("/lib/modules/e1000e.ko")
+        ko_size: uint64 = initramfs_data_size("/lib/modules/e1000e.ko")
+        if ko_blob == 0:
+            printk0("[e1000e.ko] /lib/modules/e1000e.ko not in initramfs!\n")
+        else:
+            printk2("[e1000e.ko] loading %d bytes from %p\n", ko_size, ko_blob)
+            ko_rc: int32 = kmod_linux_load(
+                cast[Ptr[uint8]](ko_blob), ko_size)
+            if ko_rc < 0:
+                printk1("[e1000e.ko] kmod_linux_load failed: rc=%d\n",
+                        cast[uint64](ko_rc))
+            else:
+                printk1("[e1000e.ko] kmod_linux_load OK (slot=%d)\n",
+                        cast[uint64](ko_rc))
 
     # --- M16.30: load /init from cpio via the ELF loader ----------
     # exec() into a real userspace binary instead of the baked-in
