@@ -853,7 +853,6 @@ def linux_abi_exports_init():
     # `-device igb` line is the matching fixture when QEMU supports it.
     linux_abi_register_igb()
 
-<<<<<<< HEAD
     # Storage pivot (Agent D): the 53 new exports the stock Debian
     # ahci.ko (Linux 6.1.0-32 build) needs beyond what L<=68 + e1000e
     # already exports. ahci.ko is the SATA AHCI controller driver
