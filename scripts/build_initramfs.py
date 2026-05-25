@@ -24,6 +24,34 @@ time without re-running this script).
 import os
 from pathlib import Path
 
+# Autostub generator. Runs FIRST so any new bundled .ko's mechanical
+# UND symbols (__SCK__*, __SCT__*, __tracepoint_*, retpoline thunks,
+# ...) get a stub emitted into linux_abi/api_autostubs.ad BEFORE the
+# kernel ELF compile step picks that file up. See
+# scripts/gen_autostubs.py for the catalog. The generator is a no-op
+# (writes nothing) when the file is already up to date, so this is
+# cheap even on incremental builds. We tolerate failure (a corrupt
+# .ko shouldn't sink the rest of the build), but a fresh checkout
+# always has all the .ko's so the success path is the common one.
+def _run_gen_autostubs() -> None:
+    try:
+        import subprocess
+        here = Path(__file__).resolve().parent.parent
+        gen = here / "scripts" / "gen_autostubs.py"
+        if not gen.is_file():
+            return
+        # Inherit stdout so the build log shows the summary line.
+        subprocess.run(
+            ["python3", str(gen)],
+            cwd=str(here),
+            check=False,
+        )
+    except Exception as _exc:
+        print(f"[build_initramfs] gen_autostubs.py failed: {_exc}")
+
+
+_run_gen_autostubs()
+
 FILES = [
     ("/motd",       b"Welcome to Hamnix from a real cpio initramfs!\n"
                     b"This file came out of a newc-formatted blob.\n"),
