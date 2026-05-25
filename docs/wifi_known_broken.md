@@ -1,7 +1,23 @@
-# WiFi (cfg80211 + mac80211) — known broken at c2f656a
+# WiFi (cfg80211 + mac80211) — RESOLVED
 
 Landed: c2f656a — `linux_abi: cfg80211 + mac80211 framework shim closure
 (50 + 155 new exports)` (2026-05-25).
+
+Fix-up: see commit `linux_abi: bump MAX_EXPORTS 2048 -> 4096 — wifi
+modules load cleanly` (2026-05-25). Root cause: the EXPORT_SYMBOL table
+was capped at 2048 entries and Hamnix had already accumulated ~2050
+exports BEFORE `linux_abi_register_cfg80211()` ran. The 205 wifi
+`_add_export()` calls all returned early via the `NR_EXPORTS >=
+MAX_EXPORTS` guard, leaving 205 names registered nowhere — which the
+loader then reported as 162 unique unresolved relocations across
+cfg80211.ko (the rest were duplicates / different relocation types
+against the same names). Bumping the cap to 4096 admits every shim
+that was already coded. Both `test_cfg80211_ko.sh` and
+`test_mac80211_ko.sh` now PASS with `applied=41771 skipped=0` for
+cfg80211 and `applied=43566 skipped=0` for mac80211; both `init_module`
+calls return 0. Both test scripts were also hardened to hard-fail on
+`unresolved external symbol`, `TRAP:`, `BUG:`, or any
+`init returned -N` line.
 
 ## State
 

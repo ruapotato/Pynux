@@ -140,6 +140,28 @@ if grep -aE -q "kmod_linux: relocations applied=[0-9]+ skipped=[1-9]" "$LOG"; th
     fail=1
 fi
 
+# Tier-3 strict: any "unresolved external symbol" line is a hard fail.
+if grep -aF -q "unresolved external symbol" "$LOG"; then
+    echo "[test_cfg80211_ko] FAIL: unresolved external symbol reported"
+    grep -aF "unresolved external symbol" "$LOG"
+    fail=1
+fi
+
+# Tier-3 strict: CPU traps / kernel BUGs during boot are a hard fail.
+if grep -aE -q "^TRAP:|^\[[0-9]+\] TRAP:|^BUG:|^\[[0-9]+\] BUG:" "$LOG"; then
+    echo "[test_cfg80211_ko] FAIL: TRAP/BUG reported during boot"
+    grep -aE "TRAP:|BUG:" "$LOG"
+    fail=1
+fi
+
+# Tier-3 strict: init_module must return 0 for every loaded module.
+# Anything else (e.g. "init returned -22") means the .ko refused to init.
+if grep -aE -q "kmod_linux: init returned -[0-9]+" "$LOG"; then
+    echo "[test_cfg80211_ko] FAIL: a module's init_module returned non-zero"
+    grep -aE "kmod_linux: init returned" "$LOG"
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "[test_cfg80211_ko] FAIL (qemu rc=$rc)"
     echo "[test_cfg80211_ko] --- full log tail ---"
