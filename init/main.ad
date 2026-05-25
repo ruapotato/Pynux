@@ -99,7 +99,11 @@ from arch.x86.kernel.module import module_api_init, module_load
 from linux_abi.exports import linux_abi_exports_init
 from linux_abi.loader import kmod_linux_load
 from drivers.pci.pci import e1000e_ko_marker_found
-from kernel.modprobe import modprobe_auto_load, auto_modules_marker_found
+from kernel.modprobe import (
+    modprobe_auto_load,
+    auto_modules_marker_found,
+    framework_modules_marker_found,
+)
 from kernel.stack_protect import __stack_chk_init
 from drivers.pci.pci import pci_scan
 from drivers.rtc.cmos import rtc_init
@@ -2792,6 +2796,49 @@ def start_kernel():
     # stock .ko loader (linux_abi/loader.ad). Idempotent.
     printk0("[boot:35] linux_abi_exports_init\n")
     linux_abi_exports_init()
+
+    # WiFi pivot: cfg80211 + mac80211 are foundational framework
+    # modules — every wifi driver depends on them, but neither has
+    # a PCI alias so the modprobe auto-loader's class-based match
+    # won't pick them up. When /etc/framework-modules is present
+    # (planted by build_initramfs.py when ENABLE_FRAMEWORK_MODULES=1)
+    # we kmod_linux_load them BEFORE the PCI walk so any wifi driver
+    # picked up by modprobe_auto_load can resolve its cfg80211_* /
+    # ieee80211_* / mac80211 symbol references against the live shim
+    # table populated by api_cfg80211 / api_mac80211 plus the
+    # module's own EXPORT_SYMBOLs (once that machinery lands).
+    if framework_modules_marker_found() == 1:
+        printk0("[boot:35.F] framework modules: cfg80211 + mac80211\n")
+        fw_cfg_blob: uint64 = initramfs_data_ptr("/lib/modules/cfg80211.ko")
+        fw_cfg_size: uint64 = initramfs_data_size("/lib/modules/cfg80211.ko")
+        if fw_cfg_blob == 0:
+            printk0("[cfg80211.ko] not in initramfs!\n")
+        else:
+            printk2("[cfg80211.ko] loading %d bytes from %p\n",
+                    fw_cfg_size, fw_cfg_blob)
+            fw_cfg_rc: int32 = kmod_linux_load(
+                cast[Ptr[uint8]](fw_cfg_blob), fw_cfg_size)
+            if fw_cfg_rc < 0:
+                printk1("[cfg80211.ko] kmod_linux_load failed: rc=%d\n",
+                        cast[uint64](fw_cfg_rc))
+            else:
+                printk1("[cfg80211.ko] kmod_linux_load OK (slot=%d)\n",
+                        cast[uint64](fw_cfg_rc))
+        fw_mac_blob: uint64 = initramfs_data_ptr("/lib/modules/mac80211.ko")
+        fw_mac_size: uint64 = initramfs_data_size("/lib/modules/mac80211.ko")
+        if fw_mac_blob == 0:
+            printk0("[mac80211.ko] not in initramfs!\n")
+        else:
+            printk2("[mac80211.ko] loading %d bytes from %p\n",
+                    fw_mac_size, fw_mac_blob)
+            fw_mac_rc: int32 = kmod_linux_load(
+                cast[Ptr[uint8]](fw_mac_blob), fw_mac_size)
+            if fw_mac_rc < 0:
+                printk1("[mac80211.ko] kmod_linux_load failed: rc=%d\n",
+                        cast[uint64](fw_mac_rc))
+            else:
+                printk1("[mac80211.ko] kmod_linux_load OK (slot=%d)\n",
+                        cast[uint64](fw_mac_rc))
 
     # Linux-shape modprobe auto-loader. When /etc/auto-modules is
     # present in the initramfs (planted by build_initramfs.py when

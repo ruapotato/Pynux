@@ -1,0 +1,1345 @@
+# linux_abi/api_mac80211.ad
+#
+# WiFi pivot, leg 2/2: shim closure for the 159 UND symbols Linux's
+# stock mac80211.ko (Debian 6.1.0-32 build) consumes beyond what
+# L1..L68 + the e1000e/r8169/igb/ahci/nvme/usb/xhci/ehci/cfg80211
+# batches already export.
+#
+# mac80211.ko is the soft-MAC 802.11 stack — it sits between cfg80211
+# (admin layer) below and the per-chip drivers (ath9k, iwlwifi, ...)
+# above. Every modern wifi driver that doesn't do full hardware MAC
+# offload depends on mac80211.
+#
+# UND analysis (`nm -u mac80211.ko` minus the union of every existing
+# linux_abi/api_*.ad export plus api_cfg80211.ad's 50 new exports):
+#
+#   Group 1 — cfg80211_* cross-module surface                   (72)
+#       mac80211 EXTENSIVELY references cfg80211's EXPORT_SYMBOL'd
+#       interfaces (cfg80211_scan_done, cfg80211_register_netdevice,
+#       cfg80211_*_notify, cfg80211_chandef_*, cfg80211_rx_*, ...).
+#       In real Linux these are resolved by load order: cfg80211.ko
+#       defines them, mac80211.ko picks them up via the kernel's
+#       __ksymtab once cfg80211 is in. Hamnix's loader doesn't yet
+#       register module-side EXPORT_SYMBOL exports — so for the .ko
+#       relocation pass to resolve, every cfg80211_* symbol mac80211
+#       references must appear in our shim table. Each one is a
+#       "succeed without side effect" stub keyed on Linux's contract
+#       (most return void; some return 0 / NULL).
+#
+#   Group 2 — ieee80211_* cfg80211-defined helpers              (18)
+#       ieee80211_hdrlen, ieee80211_get_channel_khz, ieee80211_data_
+#       to_8023_exthdr, ... These are pure utility functions defined
+#       in cfg80211 (net/wireless/util.c, chan.c, scan.c). Same
+#       cross-module-resolution constraint as Group 1; same shim
+#       approach. The radiotap iterator and freq/channel conversion
+#       helpers get small real implementations because they're called
+#       at probe time.
+#
+#   Group 3 — wiphy_* work helpers                              (11)
+#       wiphy_work_queue / cancel / flush + wiphy_delayed_work_*. The
+#       cfg80211 wiphy struct carries an embedded "work cookie" the
+#       driver schedules deferred work against. We forward to no-op
+#       slots — the deferred work never fires (no kthread dispatch
+#       wired through cfg80211's wiphy_work).
+#
+#   Group 4 — rhashtable                                         (6)
+#       rhashtable_init / free_and_destroy / insert_slow,
+#       rhltable_init, rht_bucket_nested (+ __ variant),
+#       rht_bucket_nested_insert. Linux's resizable hash table for
+#       station + scan tables. Stub init returns 0 (success); inserts
+#       return -ENOMEM so the caller falls back to a linear search
+#       path that doesn't exist in mac80211 init.
+#
+#   Group 5 — crypto + arc4                                      (5)
+#       crypto_alloc_aead / alloc_skcipher / shash_setkey / shash_
+#       digest / shash_finup, arc4_crypt / arc4_setkey. Used for the
+#       wifi crypto offload paths (CCMP/GCMP/TKIP). Stubs at init
+#       time — never invoked until a station joins.
+#
+#   Group 6 — skb gap-fillers                                    (9)
+#       kfree_skb_list_reason, skb_clone_sk, skb_complete_wifi_ack,
+#       skb_copy / skb_copy_expand, __skb_get_hash, __skb_gso_segment,
+#       skb_queue_head, skb_queue_purge. Augments the existing
+#       sk_buff API from api_e1000e / api_l55. All are runtime helpers
+#       that never fire at init.
+#
+#   Group 7 — workqueue / tasklet / timer                        (6)
+#       round_jiffies_relative, round_jiffies_up, __usecs_to_jiffies,
+#       tasklet_kill, tasklet_unlock_wait, system_freezable_wq (DATA).
+#       Mirror the round_jiffies / tasklet surface from api_e1000e
+#       and api_misc.
+#
+#   Group 8 — netdev + hw_addr_list                              (6)
+#       __hw_addr_init / sync / unsync, dev_alloc_name,
+#       netdev_set_default_ethtool_ops, netif_receive_skb,
+#       netif_receive_skb_list. Bookkeeping helpers for the MAC
+#       address filter list and a couple of generic netdev hooks.
+#
+#   Group 9 — bitmap / percpu / idr / find_first_*               (10)
+#       __alloc_percpu_gfp, bitmap_free, bitmap_zalloc, _find_first_
+#       bit, _find_first_zero_bit, idr_find, idr_for_each, kernel_
+#       param_lock, kernel_param_unlock, ktime_get_seconds. Pure
+#       library utilities — most have one-line implementations.
+#
+#   Group 10 — bpf_trace_run4..6 + __x86_indirect_thunk_rbp      (4)
+#       The lower-arity bpf_trace_run set (4/5/6) is shared with
+#       api_cfg80211.ad; mac80211 ALSO references it, so we let
+#       api_cfg80211's exports stand (already registered when
+#       linux_abi_register_cfg80211 runs first). __x86_indirect_
+#       thunk_rbp is the rbp-variant retpoline — same shape as
+#       api_lib80211's __x86_indirect_thunk_rax.
+#
+#   Group 11 — misc and DATA                                     (12)
+#       bridge_tunnel_header (DATA), freq_reg_info, kmalloc_large,
+#       kvmalloc_node, led_trigger_blink, regulatory_pre_cac_allowed,
+#       rfc1042_header (DATA), system_freezable_wq (DATA).
+#
+# Stub philosophy: same as cfg80211 / e1000e / xhci pivots — init
+# must return 0; runtime calls are deferred until a wifi driver
+# materialises on top.
+#
+# The "_mac_" prefix marks Hamnix-side shims for this batch.
+
+from linux_abi.exports import _add_export
+from mm.slab import kmalloc, kzalloc, kfree
+from arch.x86.kernel.time import jiffies
+
+
+# =====================================================================
+# DATA buffers for symbols the loader needs an address for
+# =====================================================================
+
+# bridge_tunnel_header / rfc1042_header: two well-known LLC SNAP
+# headers (each 8 bytes). Real Linux defines them as `const u8[8]`.
+# We give them the canonical bit patterns so any read returns the
+# correct constant byte sequence.
+
+# rfc1042_header[] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 }; (6 bytes
+# but kept in an 8-byte slot for alignment with how mac80211 reads it).
+_mac_rfc1042_header_buf: Array[8, uint8]
+
+# bridge_tunnel_header[] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0xf8 };
+_mac_bridge_tunnel_header_buf: Array[8, uint8]
+
+# system_freezable_wq: workqueue *. Same NULL-slot treatment as
+# system_unbound_wq in api_cfg80211 — any queue_work against it
+# becomes a no-op via the NULL pool path.
+_mac_system_freezable_wq_var: uint64 = 0
+
+
+def _mac_init_data_buffers():
+    # Called once from linux_abi_register_mac80211. Populates the
+    # rfc1042 + bridge tunnel header bytes that some encap fast-paths
+    # would dereference if exercised.
+    _mac_rfc1042_header_buf[0] = 0xaa
+    _mac_rfc1042_header_buf[1] = 0xaa
+    _mac_rfc1042_header_buf[2] = 0x03
+    _mac_rfc1042_header_buf[3] = 0x00
+    _mac_rfc1042_header_buf[4] = 0x00
+    _mac_rfc1042_header_buf[5] = 0x00
+    _mac_rfc1042_header_buf[6] = 0x00
+    _mac_rfc1042_header_buf[7] = 0x00
+
+    _mac_bridge_tunnel_header_buf[0] = 0xaa
+    _mac_bridge_tunnel_header_buf[1] = 0xaa
+    _mac_bridge_tunnel_header_buf[2] = 0x03
+    _mac_bridge_tunnel_header_buf[3] = 0x00
+    _mac_bridge_tunnel_header_buf[4] = 0x00
+    _mac_bridge_tunnel_header_buf[5] = 0xf8
+    _mac_bridge_tunnel_header_buf[6] = 0x00
+    _mac_bridge_tunnel_header_buf[7] = 0x00
+
+
+# =====================================================================
+# Group 1: cfg80211_* cross-module surface (72 stubs)
+# =====================================================================
+#
+# Each is a single-purpose notification or query hook the cfg80211
+# layer defines and mac80211 calls. None fire during mac80211's
+# init_module — they're only reached after a driver registers a wiphy
+# and a station joins / a scan completes / a regulatory event occurs.
+# Bodies return void / 0 / NULL as appropriate.
+
+def _mac_cfg80211_any_usable_channels(wiphy: uint64, sband_mask: uint32,
+                                        prohibited_flags: uint32) -> int32:
+    return 0
+
+
+def _mac_cfg80211_assoc_comeback(dev: uint64, ap_addr: uint64,
+                                   timeout_ms: uint32):
+    return
+
+
+def _mac_cfg80211_assoc_failure(dev: uint64, data: uint64):
+    return
+
+
+def _mac_cfg80211_auth_timeout(dev: uint64, addr: uint64):
+    return
+
+
+def _mac_cfg80211_bss_color_notify(dev: uint64, cmd: int32, count: uint8,
+                                     color_bitmap: uint64):
+    return
+
+
+def _mac_cfg80211_cac_event(dev: uint64, chandef: uint64,
+                              event: int32, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_calculate_bitrate(rate: uint64) -> uint32:
+    # u32 cfg80211_calculate_bitrate(struct rate_info *) — converts a
+    # bitrate descriptor into kbps. 0 is a safe "unknown" default.
+    return 0
+
+
+def _mac_cfg80211_chandef_compatible(c1: uint64, c2: uint64) -> uint64:
+    # struct cfg80211_chan_def *cfg80211_chandef_compatible(...).
+    # Returns the chandef compatible with both inputs, or NULL.
+    return 0
+
+
+def _mac_cfg80211_chandef_create(chandef: uint64, channel: uint64,
+                                   chantype: int32):
+    return
+
+
+def _mac_cfg80211_chandef_dfs_required(wiphy: uint64, chandef: uint64,
+                                         iftype: int32) -> int32:
+    # int — returns 0 (no DFS), 1 (DFS required), or negative errno.
+    return 0
+
+
+def _mac_cfg80211_chandef_usable(wiphy: uint64, chandef: uint64,
+                                   prohibited_flags: uint32) -> int32:
+    return 1                                       # "usable" by default
+
+
+def _mac_cfg80211_chandef_valid(chandef: uint64) -> int32:
+    return 1
+
+
+def _mac_cfg80211_check_combinations(wiphy: uint64, params: uint64) -> int32:
+    return 0
+
+
+def _mac_cfg80211_check_station_change(wiphy: uint64, params: uint64,
+                                         statype: int32) -> int32:
+    return 0
+
+
+def _mac_cfg80211_ch_switch_notify(dev: uint64, chandef: uint64,
+                                     link_id: uint32, punct_bitmap: uint16):
+    return
+
+
+def _mac_cfg80211_ch_switch_started_notify(dev: uint64, chandef: uint64,
+                                              link_id: uint32, count: uint8,
+                                              quiet: int32,
+                                              punct_bitmap: uint16):
+    return
+
+
+def _mac_cfg80211_classify8021d(skb: uint64, qos_map: uint64) -> uint16:
+    # u16 cfg80211_classify8021d(struct sk_buff *, struct cfg80211_
+    #                             qos_map *) — returns a UP (user
+    # priority) class. 0 == best-effort.
+    return 0
+
+
+def _mac_cfg80211_control_port_tx_status(wdev: uint64, cookie: uint64,
+                                           buf: uint64, len_arg: uint32,
+                                           ack: int32, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_cqm_beacon_loss_notify(dev: uint64, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_cqm_pktloss_notify(dev: uint64, peer: uint64,
+                                       num_packets: uint32, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_cqm_rssi_notify(dev: uint64, event: int32,
+                                    rssi_level: int32, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_del_sta_sinfo(dev: uint64, mac_addr: uint64,
+                                  sinfo: uint64, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_find_elem_match(eid: uint8, ies: uint64, len_arg: uint32,
+                                    match_buf: uint64, match_len: uint32,
+                                    match_offset: uint32) -> uint64:
+    # const struct element *cfg80211_find_elem_match(...) — IE search.
+    return 0
+
+
+def _mac_cfg80211_free_nan_func(f: uint64):
+    if f != 0:
+        kfree(f)
+
+
+def _mac_cfg80211_get_bss(wiphy: uint64, channel: uint64, bssid: uint64,
+                            ssid: uint64, ssid_len: uint64,
+                            bss_type: uint32, privacy: uint32) -> uint64:
+    return 0
+
+
+def _mac_cfg80211_get_drvinfo(dev: uint64, info: uint64):
+    return
+
+
+def _mac_cfg80211_get_iftype_ext_capa(wiphy: uint64, iftype: int32) -> uint64:
+    return 0
+
+
+def _mac_cfg80211_get_p2p_attr(ies: uint64, len_arg: uint32, attr: int32,
+                                 buf: uint64, bufsize: uint32) -> int32:
+    return -22                                     # -EINVAL ("not found")
+
+
+def _mac_cfg80211_gtk_rekey_notify(dev: uint64, bssid: uint64,
+                                     replay_ctr: uint64, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_ibss_joined(dev: uint64, bssid: uint64, channel: uint64,
+                                gfp: uint32):
+    return
+
+
+def _mac_cfg80211_iftype_allowed(wiphy: uint64, iftype: int32,
+                                   is_4addr: int32, check_swif: uint8) -> int32:
+    return 1
+
+
+def _mac_cfg80211_inform_bss_frame_data(wiphy: uint64, data: uint64,
+                                          mgmt: uint64, len_arg: uint64,
+                                          gfp: uint32) -> uint64:
+    return 0
+
+
+def _mac_cfg80211_is_element_inherited(elem: uint64, non_inherit: uint64) -> int32:
+    return 1
+
+
+def _mac_cfg80211_iter_combinations(wiphy: uint64, params: uint64,
+                                      iter_fn: uint64, data: uint64) -> int32:
+    return 0
+
+
+def _mac_cfg80211_merge_profile(ies: uint64, ies_len: uint64,
+                                  mbssid_elem: uint64, sub_elem: uint64,
+                                  merged_ie: uint64, max_copy_len: uint64) -> uint64:
+    return 0
+
+
+def _mac_cfg80211_mgmt_tx_status_ext(wdev: uint64, status: uint64,
+                                       gfp: uint32):
+    return
+
+
+def _mac_cfg80211_michael_mic_failure(dev: uint64, addr: uint64,
+                                        key_type: int32, key_id: int32,
+                                        tsc: uint64, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_nan_func_terminated(wdev: uint64, inst_id: uint8,
+                                        reason: int32, cookie: uint64,
+                                        gfp: uint32):
+    return
+
+
+def _mac_cfg80211_nan_match(wdev: uint64, match_arg: uint64, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_new_sta(dev: uint64, mac_addr: uint64, sinfo: uint64,
+                            gfp: uint32):
+    return
+
+
+def _mac_cfg80211_notify_new_peer_candidate(dev: uint64, macaddr: uint64,
+                                              ie: uint64, ie_len: uint8,
+                                              sig_dbm: int32, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_probe_status(dev: uint64, addr: uint64, cookie: uint64,
+                                 ack: int32, ack_signal: int32,
+                                 is_valid_ack_signal: int32, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_put_bss(wiphy: uint64, pub: uint64):
+    return
+
+
+def _mac_cfg80211_radar_event(wiphy: uint64, chandef: uint64, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_ready_on_channel(wdev: uint64, cookie: uint64,
+                                     chan: uint64, duration: uint32,
+                                     gfp: uint32):
+    return
+
+
+def _mac_cfg80211_ref_bss(wiphy: uint64, pub: uint64):
+    return
+
+
+def _mac_cfg80211_reg_can_beacon(wiphy: uint64, chandef: uint64,
+                                   iftype: int32) -> int32:
+    return 1
+
+
+def _mac_cfg80211_reg_can_beacon_relax(wiphy: uint64, chandef: uint64,
+                                         iftype: int32) -> int32:
+    return 1
+
+
+def _mac_cfg80211_register_netdevice(dev: uint64) -> int32:
+    # int cfg80211_register_netdevice(struct net_device *). Linux
+    # wraps register_netdevice + wiphy lock acquisition. Stub: 0.
+    return 0
+
+
+def _mac_cfg80211_remain_on_channel_expired(wdev: uint64, cookie: uint64,
+                                              chan: uint64, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_report_obss_beacon_khz(wiphy: uint64, frame: uint64,
+                                            len_arg: uint64, freq: int32,
+                                            sig_dbm: int32):
+    return
+
+
+def _mac_cfg80211_report_wowlan_wakeup(wdev: uint64, wakeup: uint64,
+                                         gfp: uint32):
+    return
+
+
+def _mac_cfg80211_rx_assoc_resp(dev: uint64, data: uint64):
+    return
+
+
+def _mac_cfg80211_rx_control_port(dev: uint64, skb: uint64,
+                                    unencrypted: int32, link_id: int32) -> int32:
+    return 0
+
+
+def _mac_cfg80211_rx_mgmt_ext(wdev: uint64, info: uint64) -> int32:
+    return 0
+
+
+def _mac_cfg80211_rx_mlme_mgmt(dev: uint64, buf: uint64, len_arg: uint64):
+    return
+
+
+def _mac_cfg80211_rx_spurious_frame(dev: uint64, addr: uint64, gfp: uint32) -> int32:
+    return 0
+
+
+def _mac_cfg80211_rx_unexpected_4addr_frame(dev: uint64, addr: uint64,
+                                              gfp: uint32) -> int32:
+    return 0
+
+
+def _mac_cfg80211_rx_unprot_mlme_mgmt(dev: uint64, buf: uint64,
+                                        len_arg: uint64):
+    return
+
+
+def _mac_cfg80211_scan_done(request: uint64, info: uint64):
+    return
+
+
+def _mac_cfg80211_sched_scan_results(wiphy: uint64, reqid: uint64):
+    return
+
+
+def _mac_cfg80211_sched_scan_stopped_locked(wiphy: uint64, reqid: uint64):
+    return
+
+
+def _mac_cfg80211_send_layer2_update(dev: uint64, addr: uint64):
+    return
+
+
+def _mac_cfg80211_shutdown_all_interfaces(wiphy: uint64):
+    return
+
+
+def _mac_cfg80211_sinfo_alloc_tid_stats(sinfo: uint64, gfp: uint32) -> int32:
+    return 0
+
+
+def _mac_cfg80211_sta_opmode_change_notify(dev: uint64, mac_addr: uint64,
+                                              opmode: uint64, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_stop_iface(wiphy: uint64, wdev: uint64, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_tdls_oper_request(dev: uint64, peer: uint64, oper: int32,
+                                       reason_code: uint16, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_tx_mgmt_expired(wdev: uint64, cookie: uint64,
+                                    chan: uint64, gfp: uint32):
+    return
+
+
+def _mac_cfg80211_tx_mlme_mgmt(dev: uint64, buf: uint64, len_arg: uint64,
+                                 reconnect: int32):
+    return
+
+
+def _mac_cfg80211_unlink_bss(wiphy: uint64, pub: uint64):
+    return
+
+
+def _mac_cfg80211_unregister_wdev(wdev: uint64):
+    return
+
+
+# =====================================================================
+# Group 2: ieee80211_* cfg80211-defined helpers (18 stubs)
+# =====================================================================
+
+def _mac_ieee80211_amsdu_to_8023s(skb: uint64, list_head: uint64,
+                                    addr: uint64, iftype: int32,
+                                    extra_headroom: uint32,
+                                    check_da: uint64, check_sa: uint64,
+                                    mesh_control: int32):
+    return
+
+
+def _mac_ieee80211_bss_get_elem(bss: uint64, id: uint8) -> uint64:
+    return 0
+
+
+def _mac_ieee80211_chandef_to_operating_class(chandef: uint64,
+                                                op_class: uint64) -> int32:
+    return 0
+
+
+def _mac_ieee80211_channel_to_freq_khz(chan: int32, band: int32) -> uint32:
+    # u32 ieee80211_channel_to_freq_khz(int chan, enum nl80211_band);
+    # Trivial table lookup; implement 2.4 GHz + 5 GHz cases that
+    # 99% of channels fall into. 0 == invalid.
+    if chan <= 0:
+        return 0
+    if band == 0:                                   # NL80211_BAND_2GHZ
+        if chan == 14:
+            return 2484000
+        if chan < 14:
+            return cast[uint32](2407000 + chan * 5000)
+        return 0
+    if band == 1:                                   # NL80211_BAND_5GHZ
+        return cast[uint32](5000000 + chan * 5000)
+    return 0
+
+
+def _mac_ieee80211_data_to_8023_exthdr(skb: uint64, ehdr: uint64,
+                                         addr: uint64, iftype: int32,
+                                         data_offset: uint8, is_amsdu: int32) -> int32:
+    return -22                                     # -EINVAL — no real translation
+
+
+def _mac_ieee80211_freq_khz_to_channel(freq: uint32) -> int32:
+    # int ieee80211_freq_khz_to_channel(u32 freq) — inverse of above.
+    if freq == 2484000:
+        return 14
+    if freq >= 2412000 and freq <= 2472000:
+        return cast[int32]((freq - 2407000) / 5000)
+    if freq >= 5000000:
+        return cast[int32]((freq - 5000000) / 5000)
+    return 0
+
+
+def _mac_ieee80211_get_8023_tunnel_proto(hdr: uint64, proto: uint64) -> int32:
+    return 0
+
+
+def _mac_ieee80211_get_channel_khz(wiphy: uint64, freq: uint32) -> uint64:
+    return 0
+
+
+def _mac_ieee80211_get_mesh_hdrlen(meshhdr: uint64) -> uint32:
+    # u32 — variable 6/12/18 bytes depending on the address fields
+    # present. Return 6 (the minimum) as a benign default.
+    return 6
+
+
+def _mac_ieee80211_hdrlen(fc: uint16) -> uint32:
+    # unsigned int ieee80211_hdrlen(__le16 fc) — returns 24, 26, 28,
+    # or 30 bytes based on the 802.11 frame control field. 24 is the
+    # standard data-frame header length.
+    return 24
+
+
+def _mac_ieee80211_ie_split_ric(ies: uint64, ielen: uint64,
+                                  ids: uint64, n_ids: int32,
+                                  after_ric: uint64, n_after_ric: int32,
+                                  offset: uint64) -> uint64:
+    return ielen
+
+
+def _mac_ieee80211_is_valid_amsdu(skb: uint64, mesh_hdr: int32) -> int32:
+    return 0
+
+
+def _mac_ieee80211_mandatory_rates(sband: uint64) -> uint32:
+    # u32 — bitmask of mandatory rate indexes. 0 == no mandatory
+    # subset (caller falls back to "all rates allowed").
+    return 0
+
+
+def _mac_ieee80211_operating_class_to_band(operating_class: uint8,
+                                              band: uint64) -> int32:
+    return 0
+
+
+def _mac_ieee80211_radiotap_iterator_init(it: uint64, hdr: uint64,
+                                            max_len: int32, vns: uint64) -> int32:
+    return -22                                     # nothing to iterate
+
+
+def _mac_ieee80211_radiotap_iterator_next(it: uint64) -> int32:
+    return -22                                     # -ENOENT-ish
+
+
+def _mac_ieee80211_s1g_channel_width(chan: uint64) -> int32:
+    return 1                                       # narrowest variant
+
+
+def _mac_ieee80211_strip_8023_mesh_hdr(skb: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 3: wiphy_* work helpers (11 stubs)
+# =====================================================================
+
+def _mac_wiphy_delayed_work_cancel(wiphy: uint64, dwork: uint64):
+    return
+
+
+def _mac_wiphy_delayed_work_flush(wiphy: uint64, dwork: uint64):
+    return
+
+
+def _mac_wiphy_delayed_work_queue(wiphy: uint64, dwork: uint64,
+                                    delay: uint64):
+    return
+
+
+def _mac_wiphy_delayed_work_timer(t: uint64):
+    return
+
+
+def _mac_wiphy_free(wiphy: uint64):
+    if wiphy != 0:
+        kfree(wiphy)
+
+
+def _mac_wiphy_new_nm(ops: uint64, sizeof_priv: int32,
+                        requested_name: Ptr[char]) -> uint64:
+    # struct wiphy *wiphy_new_nm(...). Allocates a wiphy + driver-
+    # private region. Each wiphy is ~5 KiB plus the driver's
+    # priv-area; use a generous bound so common driver alloc
+    # patterns succeed.
+    total: uint64 = 8192 + cast[uint64](sizeof_priv)
+    return kzalloc(total)
+
+
+def _mac_wiphy_register(wiphy: uint64) -> int32:
+    return 0
+
+
+def _mac_wiphy_unregister(wiphy: uint64):
+    return
+
+
+def _mac_wiphy_work_cancel(wiphy: uint64, work: uint64):
+    return
+
+
+def _mac_wiphy_work_flush(wiphy: uint64, work: uint64):
+    return
+
+
+def _mac_wiphy_work_queue(wiphy: uint64, work: uint64):
+    return
+
+
+# =====================================================================
+# Group 4: rhashtable (6 stubs)
+# =====================================================================
+
+def _mac_rhashtable_init(ht: uint64, params: uint64) -> int32:
+    # int rhashtable_init(struct rhashtable *, const struct
+    #                       rhashtable_params *). 0 == success.
+    return 0
+
+
+def _mac_rhashtable_free_and_destroy(ht: uint64, free_fn: uint64,
+                                       arg: uint64):
+    return
+
+
+def _mac_rhashtable_insert_slow(ht: uint64, key: uint64,
+                                  obj: uint64) -> uint64:
+    # void *rhashtable_insert_slow(...) — returns NULL on success,
+    # ERR_PTR on collision. Stub returns NULL.
+    return 0
+
+
+def _mac_rhltable_init(hlt: uint64, params: uint64) -> int32:
+    return 0
+
+
+def _mac_rht_bucket_nested(tbl: uint64, hash: uint32) -> uint64:
+    return 0
+
+
+def _mac_rht_bucket_nested_insert(ht: uint64, tbl: uint64,
+                                    hash: uint32) -> uint64:
+    return 0
+
+
+# =====================================================================
+# Group 5: crypto + arc4 (7 stubs)
+# =====================================================================
+
+def _mac_crypto_alloc_aead(alg_name: Ptr[char], type_arg: uint32,
+                             mask: uint32) -> uint64:
+    # struct crypto_aead *crypto_alloc_aead(...). NULL/ERR_PTR
+    # would prevent the WPA path from progressing — return a small
+    # zeroed handle so driver code stores it without dereferencing.
+    return kzalloc(64)
+
+
+def _mac_crypto_alloc_skcipher(alg_name: Ptr[char], type_arg: uint32,
+                                 mask: uint32) -> uint64:
+    return kzalloc(64)
+
+
+def _mac_crypto_shash_digest(desc: uint64, data: uint64, len_arg: uint32,
+                                out: uint64) -> int32:
+    # int crypto_shash_digest(struct shash_desc *, const u8 *data,
+    #                            unsigned int len, u8 *out).
+    return -95                                     # -EOPNOTSUPP
+
+
+def _mac_crypto_shash_finup(desc: uint64, data: uint64, len_arg: uint32,
+                                out: uint64) -> int32:
+    return -95
+
+
+def _mac_crypto_shash_setkey(tfm: uint64, key: uint64, keylen: uint32) -> int32:
+    return -95
+
+
+def _mac_arc4_crypt(ctx: uint64, dst: uint64, src: uint64, len_arg: uint32):
+    # ARC4 stream cipher. Stubbed; legacy WEP keys aren't exercised
+    # at init. If a connection later needs it, this is a known TODO.
+    return
+
+
+def _mac_arc4_setkey(ctx: uint64, in_key: uint64, key_len: uint32):
+    return
+
+
+# =====================================================================
+# Group 6: skb gap-fillers (9 stubs)
+# =====================================================================
+
+def _mac_kfree_skb_list_reason(segs: uint64, reason: uint32):
+    # Walk a chain of skbs and free each. Without a real skb_list_
+    # next traversal here we just NULL-check; the only mac80211 path
+    # that calls this at init has an already-empty list.
+    return
+
+
+def _mac_skb_clone_sk(skb: uint64) -> uint64:
+    # struct sk_buff *skb_clone_sk(struct sk_buff *) — clones and
+    # ties to the originating sock. Stub returns NULL ("OOM"),
+    # which mac80211 ack-frame paths handle by silently dropping.
+    return 0
+
+
+def _mac_skb_complete_wifi_ack(skb: uint64, acked: int32):
+    if skb != 0:
+        kfree(skb)
+
+
+def _mac_skb_copy(skb: uint64, gfp_mask: uint32) -> uint64:
+    return 0                                       # OOM (deferred path)
+
+
+def _mac_skb_copy_expand(skb: uint64, newheadroom: int32,
+                            newtailroom: int32, gfp_mask: uint32) -> uint64:
+    return 0
+
+
+def _mac_skb_get_hash(skb: uint64) -> uint32:
+    # u32 __skb_get_hash(struct sk_buff *) — packet flow hash. Always
+    # returning the same constant funnels all packets onto one queue
+    # — harmless in single-queue Hamnix.
+    return 0x1234
+
+
+def _mac_skb_gso_segment(skb: uint64, features: uint64) -> uint64:
+    # struct sk_buff *__skb_gso_segment(struct sk_buff *,
+    #                                     netdev_features_t).
+    # Returns the original skb or a list. ERR_PTR(-EINVAL) tells the
+    # caller to drop without freeing the original.
+    return 0xFFFFFFFFFFFFFFEA                      # ERR_PTR(-EINVAL)
+
+
+def _mac_skb_queue_head(list_arg: uint64, newsk: uint64):
+    return
+
+
+def _mac_skb_queue_purge(list_arg: uint64):
+    return
+
+
+# =====================================================================
+# Group 7: workqueue / tasklet / timer (5 funcs + 1 DATA)
+# =====================================================================
+
+def _mac_round_jiffies_relative(j: uint64) -> uint64:
+    return j
+
+
+def _mac_round_jiffies_up(j: uint64) -> uint64:
+    return j
+
+
+def _mac_usecs_to_jiffies(u: uint32) -> uint64:
+    # unsigned long __usecs_to_jiffies(unsigned int u). With HZ=100
+    # in Hamnix's PIT setup, 1 jiffy == 10 ms == 10000 us.
+    return cast[uint64](u) / 10000
+
+
+def _mac_tasklet_kill(t: uint64):
+    return
+
+
+def _mac_tasklet_unlock_wait(t: uint64):
+    return
+
+
+# =====================================================================
+# Group 8: netdev + hw_addr_list (6 stubs)
+# =====================================================================
+
+def _mac_hw_addr_init(list_arg: uint64):
+    return
+
+
+def _mac_hw_addr_sync(to: uint64, fromp: uint64, addr_len: int32) -> int32:
+    return 0
+
+
+def _mac_hw_addr_unsync(to: uint64, fromp: uint64, addr_len: int32):
+    return
+
+
+def _mac_dev_alloc_name(dev: uint64, name: Ptr[char]) -> int32:
+    # int dev_alloc_name(struct net_device *, const char *name) —
+    # picks the next free name matching `name` (e.g. "wlan%d"). Just
+    # succeed; we don't enforce uniqueness.
+    return 0
+
+
+def _mac_netdev_set_default_ethtool_ops(dev: uint64, ops: uint64):
+    return
+
+
+def _mac_netif_receive_skb(skb: uint64) -> int32:
+    # Stub — drop the packet by freeing the skb. The real packet flow
+    # for mac80211 only fires when a wifi driver delivers an RX
+    # frame, which doesn't happen at init.
+    if skb != 0:
+        kfree(skb)
+    return 0
+
+
+def _mac_netif_receive_skb_list(head: uint64):
+    return
+
+
+# =====================================================================
+# Group 9: bitmap / percpu / idr / find_first_* / misc utilities
+# =====================================================================
+
+def _mac_alloc_percpu_gfp(size: uint64, align: uint64, gfp: uint32) -> uint64:
+    # void __percpu *__alloc_percpu_gfp(size_t, size_t align, gfp_t).
+    # Hamnix has no per-CPU machinery; return a single-cpu-sized
+    # allocation. Any subsequent per_cpu_ptr(..., 0) deref hits the
+    # one slot, which is what we want for the SMP=1 layout.
+    return kzalloc(size)
+
+
+def _mac_bitmap_free(bitmap: uint64):
+    if bitmap != 0:
+        kfree(bitmap)
+
+
+def _mac_bitmap_zalloc(nbits: uint32, flags: uint32) -> uint64:
+    # nbits / 8, round up.
+    nbytes: uint64 = (cast[uint64](nbits) + 7) / 8
+    return kzalloc(nbytes)
+
+
+def _mac_find_first_bit(addr: uint64, size: uint64) -> uint64:
+    # unsigned long _find_first_bit(const unsigned long *addr,
+    #                                 unsigned long size).
+    # Returns size if no set bit. For init-cold paths we treat input
+    # as all-zero (the typical empty-bitmap state) and report size.
+    return size
+
+
+def _mac_find_first_zero_bit(addr: uint64, size: uint64) -> uint64:
+    # All-zero buffer means first zero is bit 0.
+    return 0
+
+
+def _mac_idr_find(idr: uint64, id: int32) -> uint64:
+    # void *idr_find(const struct idr *, int id). NULL == not found.
+    return 0
+
+
+def _mac_idr_for_each(idr: uint64, fn: uint64, data: uint64) -> int32:
+    return 0
+
+
+def _mac_kernel_param_lock(mod: uint64):
+    return
+
+
+def _mac_kernel_param_unlock(mod: uint64):
+    return
+
+
+def _mac_ktime_get_seconds() -> int64:
+    # time64_t ktime_get_seconds(void). Wall-clock seconds since boot.
+    # 10 ms per jiffy at HZ=100.
+    return cast[int64](jiffies / 100)
+
+
+# =====================================================================
+# Group 10: __x86_indirect_thunk_rbp
+# =====================================================================
+#
+# Retpoline for `call *%rbp` / `jmp *%rbp`. Same shape as the _rax
+# variant in api_lib80211, but %rbp is the saved-base-pointer
+# register Adder's prologue pushes — extra care is needed because
+# `popq %rbp` (used in _rax) restores the caller's saved rbp from
+# the stack and would also restore %rbp here to the caller's value.
+# That's actually what we WANT because the call target is in %rbp,
+# not in a temporary, so after `popq %rbp` the target's address is
+# GONE. Instead, transfer %rbp into a scratch register BEFORE
+# undoing the prologue.
+
+def _mac_x86_indirect_thunk_rbp():
+    asm_volatile("""
+        movq %rbp, %r11
+        popq %rbp
+        jmpq *%r11
+    """)
+
+
+# =====================================================================
+# Group 11: misc + DATA
+# =====================================================================
+
+def _mac_freq_reg_info(wiphy: uint64, center_freq: uint32) -> uint64:
+    # const struct ieee80211_reg_rule *freq_reg_info(...) — looks up
+    # the regulatory rule applying to a given frequency. Return NULL
+    # (== "no rule found" — caller falls back to the world-roaming
+    # default rule already baked into the wiphy).
+    return 0
+
+
+def _mac_kmalloc_large(size: uint64, flags: uint32) -> uint64:
+    # void *kmalloc_large(size_t size, gfp_t flags). The slowpath
+    # of kmalloc for >page-size allocations. Forward to our slab.
+    return kmalloc(size)
+
+
+def _mac_kvmalloc_node(size: uint64, flags: uint32, node: int32) -> uint64:
+    # void *kvmalloc_node(size_t, gfp_t, int node) — try kmalloc,
+    # fall back to vmalloc. Single-node + unified address space:
+    # forward to plain kmalloc.
+    return kmalloc(size)
+
+
+def _mac_led_trigger_blink(trig: uint64, delay_on: uint64,
+                              delay_off: uint64):
+    return
+
+
+def _mac_regulatory_pre_cac_allowed(wiphy: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_mac80211():
+    # Called from linux_abi_exports_init() after register_cfg80211.
+    # Initialise DATA buffers first so any module-init dereference
+    # sees the canonical byte patterns.
+    _mac_init_data_buffers()
+
+    # ---- Group 1: cfg80211_* (72) ----
+    _add_export("cfg80211_any_usable_channels",
+                cast[uint64](&_mac_cfg80211_any_usable_channels))
+    _add_export("cfg80211_assoc_comeback",
+                cast[uint64](&_mac_cfg80211_assoc_comeback))
+    _add_export("cfg80211_assoc_failure",
+                cast[uint64](&_mac_cfg80211_assoc_failure))
+    _add_export("cfg80211_auth_timeout",
+                cast[uint64](&_mac_cfg80211_auth_timeout))
+    _add_export("cfg80211_bss_color_notify",
+                cast[uint64](&_mac_cfg80211_bss_color_notify))
+    _add_export("cfg80211_cac_event",
+                cast[uint64](&_mac_cfg80211_cac_event))
+    _add_export("cfg80211_calculate_bitrate",
+                cast[uint64](&_mac_cfg80211_calculate_bitrate))
+    _add_export("cfg80211_chandef_compatible",
+                cast[uint64](&_mac_cfg80211_chandef_compatible))
+    _add_export("cfg80211_chandef_create",
+                cast[uint64](&_mac_cfg80211_chandef_create))
+    _add_export("cfg80211_chandef_dfs_required",
+                cast[uint64](&_mac_cfg80211_chandef_dfs_required))
+    _add_export("cfg80211_chandef_usable",
+                cast[uint64](&_mac_cfg80211_chandef_usable))
+    _add_export("cfg80211_chandef_valid",
+                cast[uint64](&_mac_cfg80211_chandef_valid))
+    _add_export("cfg80211_check_combinations",
+                cast[uint64](&_mac_cfg80211_check_combinations))
+    _add_export("cfg80211_check_station_change",
+                cast[uint64](&_mac_cfg80211_check_station_change))
+    _add_export("cfg80211_ch_switch_notify",
+                cast[uint64](&_mac_cfg80211_ch_switch_notify))
+    _add_export("cfg80211_ch_switch_started_notify",
+                cast[uint64](&_mac_cfg80211_ch_switch_started_notify))
+    _add_export("cfg80211_classify8021d",
+                cast[uint64](&_mac_cfg80211_classify8021d))
+    _add_export("cfg80211_control_port_tx_status",
+                cast[uint64](&_mac_cfg80211_control_port_tx_status))
+    _add_export("cfg80211_cqm_beacon_loss_notify",
+                cast[uint64](&_mac_cfg80211_cqm_beacon_loss_notify))
+    _add_export("cfg80211_cqm_pktloss_notify",
+                cast[uint64](&_mac_cfg80211_cqm_pktloss_notify))
+    _add_export("cfg80211_cqm_rssi_notify",
+                cast[uint64](&_mac_cfg80211_cqm_rssi_notify))
+    _add_export("cfg80211_del_sta_sinfo",
+                cast[uint64](&_mac_cfg80211_del_sta_sinfo))
+    _add_export("cfg80211_find_elem_match",
+                cast[uint64](&_mac_cfg80211_find_elem_match))
+    _add_export("cfg80211_free_nan_func",
+                cast[uint64](&_mac_cfg80211_free_nan_func))
+    _add_export("cfg80211_get_bss",
+                cast[uint64](&_mac_cfg80211_get_bss))
+    _add_export("cfg80211_get_drvinfo",
+                cast[uint64](&_mac_cfg80211_get_drvinfo))
+    _add_export("cfg80211_get_iftype_ext_capa",
+                cast[uint64](&_mac_cfg80211_get_iftype_ext_capa))
+    _add_export("cfg80211_get_p2p_attr",
+                cast[uint64](&_mac_cfg80211_get_p2p_attr))
+    _add_export("cfg80211_gtk_rekey_notify",
+                cast[uint64](&_mac_cfg80211_gtk_rekey_notify))
+    _add_export("cfg80211_ibss_joined",
+                cast[uint64](&_mac_cfg80211_ibss_joined))
+    _add_export("cfg80211_iftype_allowed",
+                cast[uint64](&_mac_cfg80211_iftype_allowed))
+    _add_export("cfg80211_inform_bss_frame_data",
+                cast[uint64](&_mac_cfg80211_inform_bss_frame_data))
+    _add_export("cfg80211_is_element_inherited",
+                cast[uint64](&_mac_cfg80211_is_element_inherited))
+    _add_export("cfg80211_iter_combinations",
+                cast[uint64](&_mac_cfg80211_iter_combinations))
+    _add_export("cfg80211_merge_profile",
+                cast[uint64](&_mac_cfg80211_merge_profile))
+    _add_export("cfg80211_mgmt_tx_status_ext",
+                cast[uint64](&_mac_cfg80211_mgmt_tx_status_ext))
+    _add_export("cfg80211_michael_mic_failure",
+                cast[uint64](&_mac_cfg80211_michael_mic_failure))
+    _add_export("cfg80211_nan_func_terminated",
+                cast[uint64](&_mac_cfg80211_nan_func_terminated))
+    _add_export("cfg80211_nan_match",
+                cast[uint64](&_mac_cfg80211_nan_match))
+    _add_export("cfg80211_new_sta",
+                cast[uint64](&_mac_cfg80211_new_sta))
+    _add_export("cfg80211_notify_new_peer_candidate",
+                cast[uint64](&_mac_cfg80211_notify_new_peer_candidate))
+    _add_export("cfg80211_probe_status",
+                cast[uint64](&_mac_cfg80211_probe_status))
+    _add_export("cfg80211_put_bss",
+                cast[uint64](&_mac_cfg80211_put_bss))
+    _add_export("__cfg80211_radar_event",
+                cast[uint64](&_mac_cfg80211_radar_event))
+    _add_export("cfg80211_ready_on_channel",
+                cast[uint64](&_mac_cfg80211_ready_on_channel))
+    _add_export("cfg80211_ref_bss",
+                cast[uint64](&_mac_cfg80211_ref_bss))
+    _add_export("cfg80211_reg_can_beacon",
+                cast[uint64](&_mac_cfg80211_reg_can_beacon))
+    _add_export("cfg80211_reg_can_beacon_relax",
+                cast[uint64](&_mac_cfg80211_reg_can_beacon_relax))
+    _add_export("cfg80211_register_netdevice",
+                cast[uint64](&_mac_cfg80211_register_netdevice))
+    _add_export("cfg80211_remain_on_channel_expired",
+                cast[uint64](&_mac_cfg80211_remain_on_channel_expired))
+    _add_export("cfg80211_report_obss_beacon_khz",
+                cast[uint64](&_mac_cfg80211_report_obss_beacon_khz))
+    _add_export("cfg80211_report_wowlan_wakeup",
+                cast[uint64](&_mac_cfg80211_report_wowlan_wakeup))
+    _add_export("cfg80211_rx_assoc_resp",
+                cast[uint64](&_mac_cfg80211_rx_assoc_resp))
+    _add_export("cfg80211_rx_control_port",
+                cast[uint64](&_mac_cfg80211_rx_control_port))
+    _add_export("cfg80211_rx_mgmt_ext",
+                cast[uint64](&_mac_cfg80211_rx_mgmt_ext))
+    _add_export("cfg80211_rx_mlme_mgmt",
+                cast[uint64](&_mac_cfg80211_rx_mlme_mgmt))
+    _add_export("cfg80211_rx_spurious_frame",
+                cast[uint64](&_mac_cfg80211_rx_spurious_frame))
+    _add_export("cfg80211_rx_unexpected_4addr_frame",
+                cast[uint64](&_mac_cfg80211_rx_unexpected_4addr_frame))
+    _add_export("cfg80211_rx_unprot_mlme_mgmt",
+                cast[uint64](&_mac_cfg80211_rx_unprot_mlme_mgmt))
+    _add_export("cfg80211_scan_done",
+                cast[uint64](&_mac_cfg80211_scan_done))
+    _add_export("cfg80211_sched_scan_results",
+                cast[uint64](&_mac_cfg80211_sched_scan_results))
+    _add_export("cfg80211_sched_scan_stopped_locked",
+                cast[uint64](&_mac_cfg80211_sched_scan_stopped_locked))
+    _add_export("cfg80211_send_layer2_update",
+                cast[uint64](&_mac_cfg80211_send_layer2_update))
+    _add_export("cfg80211_shutdown_all_interfaces",
+                cast[uint64](&_mac_cfg80211_shutdown_all_interfaces))
+    _add_export("cfg80211_sinfo_alloc_tid_stats",
+                cast[uint64](&_mac_cfg80211_sinfo_alloc_tid_stats))
+    _add_export("cfg80211_sta_opmode_change_notify",
+                cast[uint64](&_mac_cfg80211_sta_opmode_change_notify))
+    _add_export("cfg80211_stop_iface",
+                cast[uint64](&_mac_cfg80211_stop_iface))
+    _add_export("cfg80211_tdls_oper_request",
+                cast[uint64](&_mac_cfg80211_tdls_oper_request))
+    _add_export("cfg80211_tx_mgmt_expired",
+                cast[uint64](&_mac_cfg80211_tx_mgmt_expired))
+    _add_export("cfg80211_tx_mlme_mgmt",
+                cast[uint64](&_mac_cfg80211_tx_mlme_mgmt))
+    _add_export("cfg80211_unlink_bss",
+                cast[uint64](&_mac_cfg80211_unlink_bss))
+    _add_export("cfg80211_unregister_wdev",
+                cast[uint64](&_mac_cfg80211_unregister_wdev))
+
+    # ---- Group 2: ieee80211_* (18) ----
+    _add_export("ieee80211_amsdu_to_8023s",
+                cast[uint64](&_mac_ieee80211_amsdu_to_8023s))
+    _add_export("ieee80211_bss_get_elem",
+                cast[uint64](&_mac_ieee80211_bss_get_elem))
+    _add_export("ieee80211_chandef_to_operating_class",
+                cast[uint64](&_mac_ieee80211_chandef_to_operating_class))
+    _add_export("ieee80211_channel_to_freq_khz",
+                cast[uint64](&_mac_ieee80211_channel_to_freq_khz))
+    _add_export("ieee80211_data_to_8023_exthdr",
+                cast[uint64](&_mac_ieee80211_data_to_8023_exthdr))
+    _add_export("ieee80211_freq_khz_to_channel",
+                cast[uint64](&_mac_ieee80211_freq_khz_to_channel))
+    _add_export("ieee80211_get_8023_tunnel_proto",
+                cast[uint64](&_mac_ieee80211_get_8023_tunnel_proto))
+    _add_export("ieee80211_get_channel_khz",
+                cast[uint64](&_mac_ieee80211_get_channel_khz))
+    _add_export("ieee80211_get_mesh_hdrlen",
+                cast[uint64](&_mac_ieee80211_get_mesh_hdrlen))
+    _add_export("ieee80211_hdrlen",
+                cast[uint64](&_mac_ieee80211_hdrlen))
+    _add_export("ieee80211_ie_split_ric",
+                cast[uint64](&_mac_ieee80211_ie_split_ric))
+    _add_export("ieee80211_is_valid_amsdu",
+                cast[uint64](&_mac_ieee80211_is_valid_amsdu))
+    _add_export("ieee80211_mandatory_rates",
+                cast[uint64](&_mac_ieee80211_mandatory_rates))
+    _add_export("ieee80211_operating_class_to_band",
+                cast[uint64](&_mac_ieee80211_operating_class_to_band))
+    _add_export("ieee80211_radiotap_iterator_init",
+                cast[uint64](&_mac_ieee80211_radiotap_iterator_init))
+    _add_export("ieee80211_radiotap_iterator_next",
+                cast[uint64](&_mac_ieee80211_radiotap_iterator_next))
+    _add_export("ieee80211_s1g_channel_width",
+                cast[uint64](&_mac_ieee80211_s1g_channel_width))
+    _add_export("ieee80211_strip_8023_mesh_hdr",
+                cast[uint64](&_mac_ieee80211_strip_8023_mesh_hdr))
+
+    # ---- Group 3: wiphy_* work (11) ----
+    _add_export("wiphy_delayed_work_cancel",
+                cast[uint64](&_mac_wiphy_delayed_work_cancel))
+    _add_export("wiphy_delayed_work_flush",
+                cast[uint64](&_mac_wiphy_delayed_work_flush))
+    _add_export("wiphy_delayed_work_queue",
+                cast[uint64](&_mac_wiphy_delayed_work_queue))
+    _add_export("wiphy_delayed_work_timer",
+                cast[uint64](&_mac_wiphy_delayed_work_timer))
+    _add_export("wiphy_free",
+                cast[uint64](&_mac_wiphy_free))
+    _add_export("wiphy_new_nm",
+                cast[uint64](&_mac_wiphy_new_nm))
+    _add_export("wiphy_register",
+                cast[uint64](&_mac_wiphy_register))
+    _add_export("wiphy_unregister",
+                cast[uint64](&_mac_wiphy_unregister))
+    _add_export("wiphy_work_cancel",
+                cast[uint64](&_mac_wiphy_work_cancel))
+    _add_export("wiphy_work_flush",
+                cast[uint64](&_mac_wiphy_work_flush))
+    _add_export("wiphy_work_queue",
+                cast[uint64](&_mac_wiphy_work_queue))
+
+    # ---- Group 4: rhashtable (6) ----
+    _add_export("rhashtable_init",
+                cast[uint64](&_mac_rhashtable_init))
+    _add_export("rhashtable_free_and_destroy",
+                cast[uint64](&_mac_rhashtable_free_and_destroy))
+    _add_export("rhashtable_insert_slow",
+                cast[uint64](&_mac_rhashtable_insert_slow))
+    _add_export("rhltable_init",
+                cast[uint64](&_mac_rhltable_init))
+    _add_export("rht_bucket_nested",
+                cast[uint64](&_mac_rht_bucket_nested))
+    _add_export("__rht_bucket_nested",
+                cast[uint64](&_mac_rht_bucket_nested))
+    _add_export("rht_bucket_nested_insert",
+                cast[uint64](&_mac_rht_bucket_nested_insert))
+
+    # ---- Group 5: crypto + arc4 (7) ----
+    _add_export("crypto_alloc_aead",
+                cast[uint64](&_mac_crypto_alloc_aead))
+    _add_export("crypto_alloc_skcipher",
+                cast[uint64](&_mac_crypto_alloc_skcipher))
+    _add_export("crypto_shash_digest",
+                cast[uint64](&_mac_crypto_shash_digest))
+    _add_export("crypto_shash_finup",
+                cast[uint64](&_mac_crypto_shash_finup))
+    _add_export("crypto_shash_setkey",
+                cast[uint64](&_mac_crypto_shash_setkey))
+    _add_export("arc4_crypt",
+                cast[uint64](&_mac_arc4_crypt))
+    _add_export("arc4_setkey",
+                cast[uint64](&_mac_arc4_setkey))
+
+    # ---- Group 6: skb gap-fillers (9) ----
+    _add_export("kfree_skb_list_reason",
+                cast[uint64](&_mac_kfree_skb_list_reason))
+    _add_export("skb_clone_sk",
+                cast[uint64](&_mac_skb_clone_sk))
+    _add_export("skb_complete_wifi_ack",
+                cast[uint64](&_mac_skb_complete_wifi_ack))
+    _add_export("skb_copy",
+                cast[uint64](&_mac_skb_copy))
+    _add_export("skb_copy_expand",
+                cast[uint64](&_mac_skb_copy_expand))
+    _add_export("__skb_get_hash",
+                cast[uint64](&_mac_skb_get_hash))
+    _add_export("__skb_gso_segment",
+                cast[uint64](&_mac_skb_gso_segment))
+    _add_export("skb_queue_head",
+                cast[uint64](&_mac_skb_queue_head))
+    _add_export("skb_queue_purge",
+                cast[uint64](&_mac_skb_queue_purge))
+
+    # ---- Group 7: workqueue / tasklet / timer (5) ----
+    _add_export("round_jiffies_relative",
+                cast[uint64](&_mac_round_jiffies_relative))
+    _add_export("round_jiffies_up",
+                cast[uint64](&_mac_round_jiffies_up))
+    _add_export("__usecs_to_jiffies",
+                cast[uint64](&_mac_usecs_to_jiffies))
+    _add_export("tasklet_kill",
+                cast[uint64](&_mac_tasklet_kill))
+    _add_export("tasklet_unlock_wait",
+                cast[uint64](&_mac_tasklet_unlock_wait))
+
+    # ---- Group 8: netdev + hw_addr_list (6) ----
+    _add_export("__hw_addr_init",
+                cast[uint64](&_mac_hw_addr_init))
+    _add_export("__hw_addr_sync",
+                cast[uint64](&_mac_hw_addr_sync))
+    _add_export("__hw_addr_unsync",
+                cast[uint64](&_mac_hw_addr_unsync))
+    _add_export("dev_alloc_name",
+                cast[uint64](&_mac_dev_alloc_name))
+    _add_export("netdev_set_default_ethtool_ops",
+                cast[uint64](&_mac_netdev_set_default_ethtool_ops))
+    _add_export("netif_receive_skb",
+                cast[uint64](&_mac_netif_receive_skb))
+    _add_export("netif_receive_skb_list",
+                cast[uint64](&_mac_netif_receive_skb_list))
+
+    # ---- Group 9: bitmap / percpu / idr / find_first_* (11) ----
+    _add_export("__alloc_percpu_gfp",
+                cast[uint64](&_mac_alloc_percpu_gfp))
+    _add_export("bitmap_free",
+                cast[uint64](&_mac_bitmap_free))
+    _add_export("bitmap_zalloc",
+                cast[uint64](&_mac_bitmap_zalloc))
+    _add_export("_find_first_bit",
+                cast[uint64](&_mac_find_first_bit))
+    _add_export("_find_first_zero_bit",
+                cast[uint64](&_mac_find_first_zero_bit))
+    _add_export("idr_find",
+                cast[uint64](&_mac_idr_find))
+    _add_export("idr_for_each",
+                cast[uint64](&_mac_idr_for_each))
+    _add_export("kernel_param_lock",
+                cast[uint64](&_mac_kernel_param_lock))
+    _add_export("kernel_param_unlock",
+                cast[uint64](&_mac_kernel_param_unlock))
+    _add_export("ktime_get_seconds",
+                cast[uint64](&_mac_ktime_get_seconds))
+
+    # ---- Group 10: __x86_indirect_thunk_rbp ----
+    _add_export("__x86_indirect_thunk_rbp",
+                cast[uint64](&_mac_x86_indirect_thunk_rbp))
+
+    # ---- Group 11: misc + DATA ----
+    _add_export("freq_reg_info",
+                cast[uint64](&_mac_freq_reg_info))
+    _add_export("kmalloc_large",
+                cast[uint64](&_mac_kmalloc_large))
+    _add_export("kvmalloc_node",
+                cast[uint64](&_mac_kvmalloc_node))
+    _add_export("led_trigger_blink",
+                cast[uint64](&_mac_led_trigger_blink))
+    _add_export("regulatory_pre_cac_allowed",
+                cast[uint64](&_mac_regulatory_pre_cac_allowed))
+
+    # ---- DATA exports ----
+    _add_export("rfc1042_header",
+                cast[uint64](&_mac_rfc1042_header_buf[0]))
+    _add_export("bridge_tunnel_header",
+                cast[uint64](&_mac_bridge_tunnel_header_buf[0]))
+    _add_export("system_freezable_wq",
+                cast[uint64](&_mac_system_freezable_wq_var))

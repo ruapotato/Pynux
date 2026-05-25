@@ -566,3 +566,21 @@ def auto_modules_marker_found() -> int32:
     if idx < 0:
         return 0
     return 1
+
+
+def framework_modules_marker_found() -> int32:
+    # Returns 1 if /etc/framework-modules is in the cpio archive
+    # (planted by scripts/build_initramfs.py when
+    # ENABLE_FRAMEWORK_MODULES=1). Used by init/main.ad to gate the
+    # explicit kmod_linux_load of cfg80211.ko + mac80211.ko BEFORE
+    # the PCI-class-based auto-loader runs. Framework modules don't
+    # carry MODULE_DEVICE_TABLE aliases of their own, so the PCI
+    # walk never matches them; this marker lets the boot path
+    # always-load the foundational wifi stack on opt-in.
+    cpio_init()
+    target: Ptr[uint8] = "/etc/framework-modules"
+    target_len: uint64 = 22                          # strlen
+    idx: int64 = _find_initramfs_entry(target, target_len)
+    if idx < 0:
+        return 0
+    return 1

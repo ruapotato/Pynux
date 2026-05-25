@@ -1,0 +1,709 @@
+# linux_abi/api_cfg80211.ad
+#
+# WiFi pivot, leg 1/2: shim closure for the 50 UND symbols Linux's
+# stock cfg80211.ko (Debian 6.1.0-32 build) consumes beyond what
+# L1..L68 + the e1000e/r8169/igb/ahci/nvme/usb/xhci/ehci batches
+# already export.
+#
+# cfg80211.ko is the 802.11 configuration / admin layer — every WiFi
+# driver (ath*, iwl*, brcmsmac, rt2800, ...) plus mac80211.ko depends
+# on it. cfg80211 has no MODULE_DEVICE_TABLE PCI aliases of its own,
+# so the modprobe auto-loader's PCI-class match never lands cfg80211;
+# instead init/main.ad explicitly insmods the .ko via a
+# /etc/framework-modules marker before walking the bus. "load + init
+# returns 0" is the success contract here — the real wireless surface
+# (registration of an ieee80211_ptr-bearing netdev, scan callbacks,
+# regulatory-domain DFS notification, ...) is exercised only when a
+# driver later boots on top.
+#
+# UND analysis (`nm -u kernel-modules/cfg80211/cfg80211.ko` minus the
+# union of every linux_abi/api_*.ad export):
+#
+#   Group 1 — bpf_trace_run4..10                                  (6)
+#       Extension of the run0..3 family L63 already shims. cfg80211's
+#       tracepoint definitions need higher arities. Each is a no-op
+#       (tracing is off in our env).
+#
+#   Group 2 — rfkill core surface                                 (8)
+#       rfkill_alloc / register / unregister / destroy / blocked /
+#       resume_polling / set_hw_state_reason / set_sw_state. No
+#       physical rfkill switch in QEMU; the entire subsystem stubs
+#       out cleanly (alloc returns a slab buffer for the "rfkill
+#       handle" the driver tracks; rest are no-ops).
+#
+#   Group 3 — generic netlink + nlattr                            (7)
+#       genl_register_family, genl_unregister_family, genlmsg_put,
+#       genlmsg_multicast_allns, netlink_register_notifier,
+#       netlink_unregister_notifier, nla_find. Stubs report success
+#       (no netlink socket layer in Hamnix yet); init never sends a
+#       real netlink message.
+#
+#   Group 4 — wireless extensions (legacy WEXT)                   (5)
+#       wireless_send_event, wireless_nlevent_flush, iwe_stream_add_
+#       event / point / value. The WEXT user-space API has been
+#       deprecated upstream for a decade but cfg80211 still emits
+#       compat events. No userspace consumer here; no-ops.
+#
+#   Group 5 — pernet_device + net namespace plumbing              (8)
+#       register_pernet_device, unregister_pernet_device,
+#       get_net_ns_by_fd, get_net_ns_by_pid, __dev_change_net_
+#       namespace, dev_close, dev_get_by_index, net_ns_type_
+#       operations (DATA). pernet_device mirrors L41's pernet_subsys
+#       (slot table; ->init not invoked because there's no `struct
+#       net` to pass). The net-namespace ID helpers return NULL
+#       (no namespaces); device_get/close are netdev table walks
+#       deferred until a wireless driver actually registers.
+#
+#   Group 6 — keyring + crypto verification                       (4)
+#       key_create_or_update, key_put, keyring_alloc, verify_pkcs7_
+#       signature. cfg80211 uses these for the regulatory-domain
+#       crypto signature on the firmware regdb. We return success
+#       without actually verifying (Hamnix has no kernel keyring;
+#       regdb is loaded as-is — same trust model as a vanilla kernel
+#       built with CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=n).
+#
+#   Group 7 — misc utilities + standalone exports                 (12)
+#       gcd, debugfs_rename, device_rename, __class_register,
+#       inet_csk_get_port, ktime_get_coarse_with_offset, strcpy,
+#       system_unbound_wq (DATA — workqueue *), trace_print_array_
+#       seq, platform_device_register_full, request_firmware_nowait,
+#       __sock_create. Mix of trivial implementations (gcd, strcpy)
+#       and "succeeds without doing anything" stubs for the rest.
+#
+# Stub philosophy: same as the e1000e/r8169/igb pivots. cfg80211.ko's
+# module_init = cfg80211_init in net/wireless/core.c does:
+#   1) register_pernet_device(&cfg80211_pernet_ops)
+#   2) wiphy_sysfs_init() / rdev_ops registration
+#   3) regulatory_init() (loads the regdomain firmware via
+#      request_firmware_nowait — stubbed to fire NULL callback)
+#   4) nl80211_init() (genl_register_family — stubbed to return 0)
+#   5) ieee80211_wireless_init() (netlink notifier register)
+#   6) cfg80211_wext_init() (wireless extension proc entries)
+# Each step returns 0 against our stubs; the module reaches its
+# "cfg80211 loaded" printk and returns 0. Future WiFi-driver agents
+# will iterate by tracing which of these stubs the driver actually
+# calls beyond init and upgrading them in place.
+#
+# Compiler-quirk reminders (from feedback_compiler_quirks.md):
+#   * Adder reserves `bytes`, `match`, `case`, `type` — renamed.
+#   * Use Fn[R, A...] for function pointers; raw uint64 for ABI
+#     pass-throughs that ignore the typed callback signature.
+#   * No default-valued params — every shim arg is explicit.
+#
+# The "_cfg_" prefix marks Hamnix-side shims for this batch.
+
+from linux_abi.exports import _add_export
+from mm.slab import kzalloc, kfree
+from arch.x86.kernel.time import jiffies
+
+
+# =====================================================================
+# DATA buffers for symbols the loader needs an address for
+# =====================================================================
+
+# net_ns_type_operations: struct kobj_type. cfg80211_init touches it
+# when registering its sysfs glue. 256 bytes covers the largest known
+# kobj_type variant; reads return zero (no overridden methods).
+_cfg_net_ns_type_operations_buf:  Array[256, uint8]
+
+# system_unbound_wq: pointer to a workqueue struct. The driver does
+# `queue_work(system_unbound_wq, ...)`; in Hamnix workqueues don't
+# dispatch yet (kernel/workqueue.ad), and even when they do, "unbound"
+# vs "normal" is a scheduling-hint distinction we'd collapse. Hand
+# out the address of a 8-byte slot so any indirect deref reads zero
+# (queue_work sees a NULL pool and bails — equivalent to a no-op).
+_cfg_system_unbound_wq_var:       uint64 = 0
+
+
+# =====================================================================
+# Group 1: bpf_trace_run4..10
+# =====================================================================
+#
+# Extension of the run0..3 set L63 already covers. cfg80211 emits
+# higher-arity tracepoint stubs for the more detailed scan / connect
+# / set-channel events. All return void; tracing is off so the body
+# is empty.
+
+def _cfg_bpf_trace_run4(link: uint64, a: uint64, b: uint64,
+                         c: uint64, d: uint64):
+    return
+
+
+def _cfg_bpf_trace_run5(link: uint64, a: uint64, b: uint64,
+                         c: uint64, d: uint64, e: uint64):
+    return
+
+
+def _cfg_bpf_trace_run6(link: uint64, a: uint64, b: uint64,
+                         c: uint64, d: uint64, e: uint64,
+                         f: uint64):
+    return
+
+
+def _cfg_bpf_trace_run7(link: uint64, a: uint64, b: uint64,
+                         c: uint64, d: uint64, e: uint64,
+                         f: uint64, g: uint64):
+    return
+
+
+def _cfg_bpf_trace_run8(link: uint64, a: uint64, b: uint64,
+                         c: uint64, d: uint64, e: uint64,
+                         f: uint64, g: uint64, h: uint64):
+    return
+
+
+def _cfg_bpf_trace_run10(link: uint64, a: uint64, b: uint64,
+                          c: uint64, d: uint64, e: uint64,
+                          f: uint64, g: uint64, h: uint64,
+                          i: uint64, j: uint64):
+    return
+
+
+# =====================================================================
+# Group 2: rfkill
+# =====================================================================
+#
+# rfkill is Linux's RF-kill-switch abstraction (the laptop "wifi off"
+# hotkey, the airplane-mode toggle). QEMU has no rfkill hardware; the
+# cfg80211 wiphy_register path allocates a `struct rfkill` and pokes
+# it across the lifetime of a wiphy, but never blocks the rfkill bus.
+# Shim discipline:
+#   * rfkill_alloc returns a kzalloc'd handle so subsequent set/get
+#     calls don't dereference NULL.
+#   * register/unregister/destroy track the handle but do nothing.
+#   * blocked() returns 0 (== "not blocked"); the driver sees no
+#     hardware kill bit and brings the radio up normally.
+
+def _cfg_rfkill_alloc(name: Ptr[char], parent: uint64, rftype: uint32,
+                       ops: uint64, ops_data: uint64) -> uint64:
+    # struct rfkill *rfkill_alloc(const char *name, struct device *,
+    #                              enum rfkill_type, const struct
+    #                              rfkill_ops *, void *ops_data);
+    # 256 bytes of zeroed scratch is comfortably larger than struct
+    # rfkill in 6.1 (~120 bytes). The driver stores its handle and
+    # later passes it back to register/set/blocked — no field access
+    # within cfg80211 in init.
+    return kzalloc(256)
+
+
+def _cfg_rfkill_register(rfk: uint64) -> int32:
+    return 0
+
+
+def _cfg_rfkill_unregister(rfk: uint64):
+    return
+
+
+def _cfg_rfkill_destroy(rfk: uint64):
+    if rfk == 0:
+        return
+    kfree(rfk)
+
+
+def _cfg_rfkill_blocked(rfk: uint64) -> int32:
+    # bool rfkill_blocked(struct rfkill *) — 0 == not blocked.
+    return 0
+
+
+def _cfg_rfkill_resume_polling(rfk: uint64):
+    return
+
+
+def _cfg_rfkill_set_hw_state_reason(rfk: uint64, blocked: int32,
+                                      reason: uint64) -> int32:
+    # bool rfkill_set_hw_state_reason — returns prior blocked state.
+    return 0
+
+
+def _cfg_rfkill_set_sw_state(rfk: uint64, blocked: int32) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 3: generic netlink + nlattr
+# =====================================================================
+#
+# nl80211 is the userspace control protocol for cfg80211; it sits on
+# generic netlink. cfg80211_init registers a family table at init —
+# the registration goes through these stubs and reports success.
+# Real netlink wiring is deferred to the "Lnet" milestone where socket
+# AF_NETLINK gets implemented end-to-end.
+
+def _cfg_genl_register_family(family: uint64) -> int32:
+    # int genl_register_family(struct genl_family *). Returns 0 on
+    # success. We don't track the family; the netlink socket layer
+    # that would consume nl80211 messages doesn't exist yet, so the
+    # registration is purely so init returns 0.
+    return 0
+
+
+def _cfg_genl_unregister_family(family: uint64) -> int32:
+    return 0
+
+
+def _cfg_genlmsg_put(skb: uint64, portid: uint32, seq: uint32,
+                      family: uint64, flags: int32, cmd: uint8) -> uint64:
+    # void *genlmsg_put(struct sk_buff *, u32 portid, u32 seq,
+    #                    const struct genl_family *, int flags, u8 cmd);
+    # Reserves header space inside an outbound nlmsg skb and returns
+    # a pointer to the user-payload area. With no netlink sockets,
+    # this is only called on doomed messages — return NULL so the
+    # caller bails out of its message-build path cleanly.
+    return 0
+
+
+def _cfg_genlmsg_multicast_allns(family: uint64, skb: uint64,
+                                   portid: uint32, group: uint32,
+                                   flags: uint32) -> int32:
+    # int genlmsg_multicast_allns(...) — broadcast a notification to
+    # every net-ns subscriber. No subscribers in our env; consume the
+    # skb and report 0 (== ESRCH from the kernel's "no listeners"
+    # path is fine too, but 0 keeps the caller from logging an error).
+    if skb != 0:
+        kfree(skb)
+    return 0
+
+
+def _cfg_netlink_register_notifier(nb: uint64) -> int32:
+    return 0
+
+
+def _cfg_netlink_unregister_notifier(nb: uint64) -> int32:
+    return 0
+
+
+def _cfg_nla_find(head: uint64, len_arg: int32, attrtype: int32) -> uint64:
+    # struct nlattr *nla_find(const struct nlattr *head, int len,
+    #                          int attrtype) — scans `head` for an
+    # attribute of `attrtype`. Init never parses real attribute
+    # tables; return NULL.
+    return 0
+
+
+# =====================================================================
+# Group 4: wireless extensions (legacy WEXT)
+# =====================================================================
+#
+# WEXT is the original ioctl-driven WiFi API (SIOCGIWNAME etc.) that
+# cfg80211 still emits compat events for. No userspace WEXT consumer
+# in Hamnix; all bodies are no-ops or "advance the buffer pointer"
+# helpers that pretend to encode an event.
+
+def _cfg_wireless_send_event(dev: uint64, cmd: uint32, wrqu: uint64,
+                               extra: uint64):
+    # void wireless_send_event(struct net_device *, u32 cmd,
+    #                            union iwreq_data *, const char *extra);
+    return
+
+
+def _cfg_wireless_nlevent_flush():
+    return
+
+
+def _cfg_iwe_stream_add_event(info: uint64, stream: uint64,
+                                ends: uint64, iwe: uint64,
+                                event_len: int32) -> uint64:
+    # char *iwe_stream_add_event(...) — encodes an iw_event into a
+    # user-buffer stream and returns the new write cursor. No real
+    # encoder; just advance the cursor by event_len so the caller
+    # thinks the write happened.
+    return stream + cast[uint64](event_len)
+
+
+def _cfg_iwe_stream_add_point(info: uint64, stream: uint64,
+                                ends: uint64, iwe: uint64,
+                                extra: uint64) -> uint64:
+    # char *iwe_stream_add_point(...) — variant for variable-length
+    # payloads. Return stream unchanged (no copy, no advance).
+    return stream
+
+
+def _cfg_iwe_stream_add_value(info: uint64, event: uint64,
+                                value: uint64, ends: uint64,
+                                iwe: uint64, event_len: int32) -> uint64:
+    # char *iwe_stream_add_value(...) — appends a single value to an
+    # existing event. Advance the cursor by event_len.
+    return value + cast[uint64](event_len)
+
+
+# =====================================================================
+# Group 5: pernet_device + net namespace plumbing
+# =====================================================================
+#
+# `register_pernet_device` is the per-net-namespace registration for
+# device-flavored callbacks (vs pernet_subsys, which is for
+# subsystem-flavored callbacks). Same slot-table treatment as L41's
+# pernet_subsys — record the ops, never call ->init because we have no
+# `struct net` to pass.
+
+MAX_PERNET_DEVICE: uint64 = 4
+
+_cfg_pernet_device_ops: Array[4, uint64]
+
+
+def _cfg_pernet_alloc_slot(ops: uint64) -> int32:
+    i: uint64 = 0
+    while i < MAX_PERNET_DEVICE:
+        if _cfg_pernet_device_ops[i] == 0:
+            _cfg_pernet_device_ops[i] = ops
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _cfg_pernet_find_clear(ops: uint64) -> int32:
+    if ops == 0:
+        return -1
+    i: uint64 = 0
+    while i < MAX_PERNET_DEVICE:
+        if _cfg_pernet_device_ops[i] == ops:
+            _cfg_pernet_device_ops[i] = 0
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+def _cfg_register_pernet_device(ops: uint64) -> int32:
+    if ops == 0:
+        return -22                                  # -EINVAL
+    slot: int32 = _cfg_pernet_alloc_slot(ops)
+    if slot < 0:
+        return -12                                  # -ENOMEM
+    return 0
+
+
+def _cfg_unregister_pernet_device(ops: uint64):
+    _cfg_pernet_find_clear(ops)
+
+
+def _cfg_get_net_ns_by_fd(fd: int32) -> uint64:
+    # struct net *get_net_ns_by_fd(int fd) — looks up a net-ns by an
+    # open netns fd. No namespaces here; return NULL. Callers check
+    # for ERR_PTR; 0 (NULL) is treated as "no such namespace" by the
+    # IS_ERR macro path.
+    return 0
+
+
+def _cfg_get_net_ns_by_pid(pid: int32) -> uint64:
+    return 0
+
+
+def _cfg_dev_change_net_namespace(dev: uint64, src_net: uint64,
+                                    pat: uint64, new_ifindex: int32,
+                                    extack: uint64) -> int32:
+    # int __dev_change_net_namespace(struct net_device *, struct net *,
+    #                                  const char *pat, int new_ifindex,
+    #                                  struct netlink_ext_ack *);
+    # Moves a netdev between namespaces. With only the default
+    # namespace, the move is a no-op success.
+    return 0
+
+
+def _cfg_dev_close(dev: uint64) -> int32:
+    # void dev_close(struct net_device *) — closes a netdev. The
+    # signature is void-return in Linux but some 6.1 source paths
+    # treat it as int. Return 0 to satisfy both.
+    return 0
+
+
+def _cfg_dev_get_by_index(net: uint64, ifindex: int32) -> uint64:
+    # struct net_device *dev_get_by_index(struct net *, int ifindex);
+    # Look up netdev by ifindex; takes a reference. We have no
+    # ifindex-keyed table; return NULL ("no such device").
+    return 0
+
+
+# =====================================================================
+# Group 6: keyring + crypto verification
+# =====================================================================
+#
+# cfg80211 uses the kernel keyring for the regulatory-database
+# signature check (CRDA / regdb). We have no keyring; return
+# success-with-NULL-key throughout. Bypass the signature verify the
+# same way a kernel built with CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=n
+# does — accept any regdb blob.
+
+def _cfg_key_create_or_update(keyring_ref: uint64, ktype: uint64,
+                                description: uint64, payload: uint64,
+                                plen: uint64, perm: uint32,
+                                flags: uint64) -> uint64:
+    # key_ref_t key_create_or_update(...). Return a non-NULL bit-tagged
+    # "key reference" — the cfg80211 code path only checks IS_ERR()
+    # and discards the value. Returning 1 (a non-error, non-NULL ref)
+    # is safe.
+    return 1
+
+
+def _cfg_key_put(key: uint64):
+    return
+
+
+def _cfg_keyring_alloc(description: Ptr[char], uid: uint32, gid: uint32,
+                        cred: uint64, perm: uint32, flags: uint64,
+                        restrict_link: uint64, dest_keyring: uint64) -> uint64:
+    # struct key *keyring_alloc(...). Returns the new keyring's struct
+    # key * (which may be ERR_PTR on failure). Return a non-NULL
+    # sentinel; cfg80211 caches it and only uses it as the
+    # destination for key_create_or_update.
+    return 1
+
+
+def _cfg_verify_pkcs7_signature(data: uint64, len_arg: uint64,
+                                  raw_pkcs7: uint64, pkcs7_len: uint64,
+                                  trusted_keys: uint64, usage: int32,
+                                  view_content: uint64,
+                                  ctx: uint64) -> int32:
+    # int verify_pkcs7_signature(...) — verifies a PKCS#7 signature
+    # against a trusted keyring. Return 0 (success) without verifying.
+    # Same security posture as a kernel with no signed-regdb support
+    # compiled in.
+    return 0
+
+
+# =====================================================================
+# Group 7: misc utilities + standalone exports
+# =====================================================================
+
+def _cfg_gcd(a: uint64, b: uint64) -> uint64:
+    # unsigned long gcd(unsigned long a, unsigned long b). Standard
+    # Euclidean algorithm. cfg80211 uses it for rate-table simplification.
+    if a == 0:
+        return b
+    if b == 0:
+        return a
+    x: uint64 = a
+    y: uint64 = b
+    while y != 0:
+        t: uint64 = y
+        y = x - (x / y) * y                          # x % y without %
+        x = t
+    return x
+
+
+def _cfg_strcpy(dst: Ptr[uint8], src: Ptr[uint8]) -> Ptr[uint8]:
+    # char *strcpy(char *dst, const char *src). Hamnix has memcpy /
+    # strscpy but no plain strcpy in the L-shim. Trivial copy up to
+    # and including the terminating NUL.
+    i: uint64 = 0
+    while True:
+        c: uint8 = src[i]
+        dst[i] = c
+        if c == 0:
+            return dst
+        i = i + 1
+    return dst
+
+
+def _cfg_debugfs_rename(old_dir: uint64, old: uint64,
+                          new_dir: uint64, new_name: Ptr[char]) -> uint64:
+    # struct dentry *debugfs_rename(...). Returns the new dentry or
+    # ERR_PTR. We have no debugfs entries to rename; return NULL.
+    return 0
+
+
+def _cfg_device_rename(dev: uint64, new_name: Ptr[char]) -> int32:
+    # int device_rename(struct device *, const char *) — renames a
+    # device in sysfs. We have no sysfs node to rename; return success.
+    return 0
+
+
+def _cfg_class_register(cls: uint64) -> int32:
+    # int __class_register(struct class *, struct lock_class_key *).
+    # Registers a device class (e.g. /sys/class/ieee80211/). Return 0;
+    # no class hierarchy is materialised, but cfg80211_init only
+    # checks the return value.
+    return 0
+
+
+def _cfg_inet_csk_get_port(sk: uint64, snum: uint16) -> int32:
+    # int inet_csk_get_port(struct sock *, unsigned short snum).
+    # Allocates a local port for a connection-oriented socket. Return
+    # 0 ("success"); cfg80211 references it only via the wireless
+    # extension's set-bind-port path which never fires at init.
+    return 0
+
+
+def _cfg_ktime_get_coarse_with_offset(offs: int32) -> int64:
+    # ktime_t ktime_get_coarse_with_offset(enum tk_offsets);
+    # Coarse-grained wall-clock with optional offset (REAL, BOOT, ...).
+    # Forward to the same jiffies-derived approximation we use for the
+    # other ktime stubs.
+    return cast[int64](jiffies * 10000000)
+
+
+def _cfg_trace_print_array_seq(s: uint64, buf: uint64, count: int32,
+                                 el_size: int32) -> uint64:
+    # const char *trace_print_array_seq(struct trace_seq *, const void *,
+    #                                     int count, int el_size);
+    # Used in tracepoint-print formatters. With tracing off we never
+    # reach the printer; return NULL.
+    return 0
+
+
+def _cfg_platform_device_register_full(pdevinfo: uint64) -> uint64:
+    # struct platform_device *platform_device_register_full(...).
+    # Returns the new pdev or ERR_PTR. cfg80211_init checks
+    # IS_ERR(reg_pdev) and bails with the propagated errno if so —
+    # so returning an ERR_PTR aborts cfg80211 load entirely.
+    # Hand out a kzalloc'd handle (~1 KiB; far larger than struct
+    # platform_device). The handle gets stored in a cfg80211 global
+    # but never dereferenced for field access during init.
+    return kzalloc(1024)
+
+
+def _cfg_request_firmware_nowait(module: uint64, uevent: int32,
+                                   name: Ptr[char], device: uint64,
+                                   gfp: uint32, context: uint64,
+                                   cont: uint64) -> int32:
+    # int request_firmware_nowait(struct module *, bool uevent,
+    #                               const char *name, struct device *,
+    #                               gfp_t, void *context,
+    #                               void (*cont)(const struct firmware *,
+    #                                              void *));
+    # Asynchronously requests a firmware blob, then calls `cont(fw,
+    # context)`. cfg80211 uses this for the regdb. With no firmware
+    # backing store, fire `cont(NULL, context)` synchronously — the
+    # callback is robust to a NULL firmware (it logs and falls back to
+    # the built-in regdomain).
+    if cont == 0:
+        return 0
+    cb: Fn[None, uint64, uint64] = cast[Fn[None, uint64, uint64]](cont)
+    cb(0, context)
+    return 0
+
+
+def _cfg_sock_create(net: uint64, family: int32, sock_type: int32,
+                      protocol: int32, res: uint64, kern: int32) -> int32:
+    # int __sock_create(struct net *, int family, int type, int proto,
+    #                     struct socket **res, int kern);
+    # Creates a kernel-side socket. cfg80211 uses it for the netlink
+    # admin socket. Return -EAFNOSUPPORT so cfg80211_init's optional
+    # socket-creation paths report "unsupported" cleanly without
+    # wedging init.
+    return -97                                       # -EAFNOSUPPORT
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_cfg80211():
+    # Called from linux_abi_exports_init() after the USB module batch.
+    # Adds the 50 exports the stock cfg80211.ko needs beyond every
+    # earlier L-track / pivot batch.
+
+    # ---- Group 1: bpf_trace_run extension ----
+    _add_export("bpf_trace_run4",
+                cast[uint64](&_cfg_bpf_trace_run4))
+    _add_export("bpf_trace_run5",
+                cast[uint64](&_cfg_bpf_trace_run5))
+    _add_export("bpf_trace_run6",
+                cast[uint64](&_cfg_bpf_trace_run6))
+    _add_export("bpf_trace_run7",
+                cast[uint64](&_cfg_bpf_trace_run7))
+    _add_export("bpf_trace_run8",
+                cast[uint64](&_cfg_bpf_trace_run8))
+    _add_export("bpf_trace_run10",
+                cast[uint64](&_cfg_bpf_trace_run10))
+
+    # ---- Group 2: rfkill ----
+    _add_export("rfkill_alloc",
+                cast[uint64](&_cfg_rfkill_alloc))
+    _add_export("rfkill_register",
+                cast[uint64](&_cfg_rfkill_register))
+    _add_export("rfkill_unregister",
+                cast[uint64](&_cfg_rfkill_unregister))
+    _add_export("rfkill_destroy",
+                cast[uint64](&_cfg_rfkill_destroy))
+    _add_export("rfkill_blocked",
+                cast[uint64](&_cfg_rfkill_blocked))
+    _add_export("rfkill_resume_polling",
+                cast[uint64](&_cfg_rfkill_resume_polling))
+    _add_export("rfkill_set_hw_state_reason",
+                cast[uint64](&_cfg_rfkill_set_hw_state_reason))
+    _add_export("rfkill_set_sw_state",
+                cast[uint64](&_cfg_rfkill_set_sw_state))
+
+    # ---- Group 3: generic netlink + nlattr ----
+    _add_export("genl_register_family",
+                cast[uint64](&_cfg_genl_register_family))
+    _add_export("genl_unregister_family",
+                cast[uint64](&_cfg_genl_unregister_family))
+    _add_export("genlmsg_put",
+                cast[uint64](&_cfg_genlmsg_put))
+    _add_export("genlmsg_multicast_allns",
+                cast[uint64](&_cfg_genlmsg_multicast_allns))
+    _add_export("netlink_register_notifier",
+                cast[uint64](&_cfg_netlink_register_notifier))
+    _add_export("netlink_unregister_notifier",
+                cast[uint64](&_cfg_netlink_unregister_notifier))
+    _add_export("nla_find",
+                cast[uint64](&_cfg_nla_find))
+
+    # ---- Group 4: wireless extensions (WEXT) ----
+    _add_export("wireless_send_event",
+                cast[uint64](&_cfg_wireless_send_event))
+    _add_export("wireless_nlevent_flush",
+                cast[uint64](&_cfg_wireless_nlevent_flush))
+    _add_export("iwe_stream_add_event",
+                cast[uint64](&_cfg_iwe_stream_add_event))
+    _add_export("iwe_stream_add_point",
+                cast[uint64](&_cfg_iwe_stream_add_point))
+    _add_export("iwe_stream_add_value",
+                cast[uint64](&_cfg_iwe_stream_add_value))
+
+    # ---- Group 5: pernet_device + namespace ----
+    _add_export("register_pernet_device",
+                cast[uint64](&_cfg_register_pernet_device))
+    _add_export("unregister_pernet_device",
+                cast[uint64](&_cfg_unregister_pernet_device))
+    _add_export("get_net_ns_by_fd",
+                cast[uint64](&_cfg_get_net_ns_by_fd))
+    _add_export("get_net_ns_by_pid",
+                cast[uint64](&_cfg_get_net_ns_by_pid))
+    _add_export("__dev_change_net_namespace",
+                cast[uint64](&_cfg_dev_change_net_namespace))
+    _add_export("dev_close",
+                cast[uint64](&_cfg_dev_close))
+    _add_export("dev_get_by_index",
+                cast[uint64](&_cfg_dev_get_by_index))
+
+    # ---- Group 6: keyring + crypto verification ----
+    _add_export("key_create_or_update",
+                cast[uint64](&_cfg_key_create_or_update))
+    _add_export("key_put",
+                cast[uint64](&_cfg_key_put))
+    _add_export("keyring_alloc",
+                cast[uint64](&_cfg_keyring_alloc))
+    _add_export("verify_pkcs7_signature",
+                cast[uint64](&_cfg_verify_pkcs7_signature))
+
+    # ---- Group 7: misc utilities + standalone exports ----
+    _add_export("gcd",
+                cast[uint64](&_cfg_gcd))
+    _add_export("strcpy",
+                cast[uint64](&_cfg_strcpy))
+    _add_export("debugfs_rename",
+                cast[uint64](&_cfg_debugfs_rename))
+    _add_export("device_rename",
+                cast[uint64](&_cfg_device_rename))
+    _add_export("__class_register",
+                cast[uint64](&_cfg_class_register))
+    _add_export("inet_csk_get_port",
+                cast[uint64](&_cfg_inet_csk_get_port))
+    _add_export("ktime_get_coarse_with_offset",
+                cast[uint64](&_cfg_ktime_get_coarse_with_offset))
+    _add_export("trace_print_array_seq",
+                cast[uint64](&_cfg_trace_print_array_seq))
+    _add_export("platform_device_register_full",
+                cast[uint64](&_cfg_platform_device_register_full))
+    _add_export("request_firmware_nowait",
+                cast[uint64](&_cfg_request_firmware_nowait))
+    _add_export("__sock_create",
+                cast[uint64](&_cfg_sock_create))
+
+    # ---- DATA exports ----
+    _add_export("net_ns_type_operations",
+                cast[uint64](&_cfg_net_ns_type_operations_buf[0]))
+    _add_export("system_unbound_wq",
+                cast[uint64](&_cfg_system_unbound_wq_var))

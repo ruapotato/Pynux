@@ -87,6 +87,8 @@ from linux_abi.api_ehci import linux_abi_register_ehci
 from linux_abi.api_snd_core import linux_abi_register_snd_core
 from linux_abi.api_snd_pcm import linux_abi_register_snd_pcm
 from linux_abi.api_snd_hda import linux_abi_register_snd_hda
+from linux_abi.api_cfg80211 import linux_abi_register_cfg80211
+from linux_abi.api_mac80211 import linux_abi_register_mac80211
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -944,6 +946,13 @@ def linux_abi_exports_init():
     linux_abi_register_snd_core()
     linux_abi_register_snd_pcm()
     linux_abi_register_snd_hda()
+
+    # WiFi pivot: cfg80211 + mac80211 — foundational framework
+    # modules every wifi driver depends on. No PCI alias of their
+    # own — loaded explicitly by init/main.ad via the
+    # /etc/framework-modules marker BEFORE the auto-load PCI walk.
+    linux_abi_register_cfg80211()
+    linux_abi_register_mac80211()
 
 
 def linux_abi_lookup(name: Ptr[char]) -> uint64:

@@ -230,6 +230,18 @@ if os.environ.get("ENABLE_AHCI_KO") == "1":
 if os.environ.get("ENABLE_NVME_KO") == "1":
     FILES.append(("/etc/nvme-ko", b"1\n"))
 
+# WiFi pivot: cfg80211 + mac80211 are the foundational 802.11
+# framework modules. Neither carries a MODULE_DEVICE_TABLE PCI alias
+# of its own, so the modprobe auto-loader's PCI-class match never
+# fires for them — they must be loaded BEFORE any wifi driver
+# (ath*, iwl*, brcmsmac, ...) is brought up. ENABLE_FRAMEWORK_MODULES=1
+# plants /etc/framework-modules; init/main.ad reads the marker and
+# directly insmods /lib/modules/cfg80211.ko + /lib/modules/mac80211.ko
+# during the L-shim init phase. scripts/test_cfg80211_ko.sh and
+# scripts/test_mac80211_ko.sh both set this env var.
+if os.environ.get("ENABLE_FRAMEWORK_MODULES") == "1":
+    FILES.append(("/etc/framework-modules", b"1\n"))
+
 # Native `ping` smoke. scripts/test_ping.sh sets ENABLE_PING_SMOKE=1 to
 # plant /etc/ping-smoke-test in the initramfs. The marker is consumed
 # only by the test harness today (a future kernel-side autorun could
@@ -926,6 +938,31 @@ def build_archive() -> bytes:
             blob += cpio_entry(name, data)
             print(f"  embedded {name} ({len(data)} bytes from "
                   f"kernel-modules/nvme/nvme.ko)")
+
+    # WiFi pivot: cfg80211.ko (configuration/admin layer, ~2.3 MiB)
+    # and mac80211.ko (soft-MAC stack, ~2.4 MiB) — Debian 6.1.0-32
+    # build. Foundational framework modules; every wifi driver
+    # (ath*, iwl*, brcmsmac, ...) depends on these two. Neither has
+    # a MODULE_DEVICE_TABLE PCI alias so the modprobe auto-loader
+    # won't pick them up — init/main.ad's framework-modules block
+    # (gated on /etc/framework-modules, planted via
+    # ENABLE_FRAMEWORK_MODULES=1) loads them explicitly via
+    # kmod_linux_load from these well-known paths.
+    cfg80211_ko = here / "kernel-modules" / "cfg80211" / "cfg80211.ko"
+    if cfg80211_ko.is_file():
+        data = cfg80211_ko.read_bytes()
+        name = "/lib/modules/cfg80211.ko"
+        blob += cpio_entry(name, data)
+        print(f"  embedded {name} ({len(data)} bytes from "
+              f"kernel-modules/cfg80211/cfg80211.ko)")
+
+    mac80211_ko = here / "kernel-modules" / "mac80211" / "mac80211.ko"
+    if mac80211_ko.is_file():
+        data = mac80211_ko.read_bytes()
+        name = "/lib/modules/mac80211.ko"
+        blob += cpio_entry(name, data)
+        print(f"  embedded {name} ({len(data)} bytes from "
+              f"kernel-modules/mac80211/mac80211.ko)")
 
     # U5: host-built Linux ELF test binaries. Anything staged under
     # tests/u-binary/ (built by tests/u-binary/src/*/Makefile via
