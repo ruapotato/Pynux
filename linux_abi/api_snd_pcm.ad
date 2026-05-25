@@ -1,0 +1,550 @@
+# linux_abi/api_snd_pcm.ad
+#
+# Linux ALSA PCM framework (snd-pcm.ko). Stock Debian 6.1.0-32 snd-pcm.ko
+# has 169 UND symbols; L<=68 + the NIC family + api_snd_core resolves
+# 100+ of them. This file closes the remaining ~80-symbol gap so the
+# L-series loader can insmod snd-pcm.ko, plus exposes the snd_pcm_*
+# family entry points so dependent modules (snd-hda-codec / snd-hda-intel)
+# get every "needs snd_pcm_*" external wired straight to a Hamnix-side
+# stub.
+#
+# Categories:
+#
+#   * ~15 snd_pcm_* framework — snd_pcm_new, snd_pcm_set_ops,
+#     snd_pcm_set_sync, snd_pcm_set_managed_buffer_all,
+#     snd_pcm_period_elapsed, snd_pcm_hw_constraint_integer/_minmax/
+#     _step, snd_pcm_hw_limit_rates, snd_pcm_format_width,
+#     snd_pcm_std_chmaps, snd_pcm_add_chmap_ctls, snd_pcm_suspend_all.
+#
+#   * ~35 DMA / page / memory cold-path stubs — dma_alloc_pages /
+#     _free_pages / _noncontiguous / _mmap_pages, dma_can_mmap,
+#     dma_need_sync, dma_sync_sg_*, dma_vmap_noncontiguous, dma_ops,
+#     alloc_pages_exact, free_pages_exact, __vmalloc, vmalloc_to_page,
+#     vmap, vunmap, vm_iomap_memory, vm_map_pages, vm_get_page_prot,
+#     remap_vmalloc_range, set_memory_wb/_wc, set_pages_array_wb/_wc,
+#     sme_me_mask, cachemode2protval, pgprot_writecombine,
+#     __default_kernel_pte_mask, __sg_page_iter_*.
+#
+#   * ~15 kernel utility cold stubs — clear_user_erms /
+#     clear_user_original / clear_user_rep_good (kernel→user clear
+#     primitives — cold without userland), cpu_latency_qos_request_active,
+#     ktime_get_ts64, ktime_get_raw_ts64, gcd, nonseekable_open,
+#     fput, __fdget, simple_strtoul, param_ops_ulong, _raw_spin_trylock.
+#
+# Stub philosophy: every shim returns a benign success or NULL so the
+# module-init walks the PCM framework registration to completion.
+# Real playback / capture stays dormant — opening /dev/snd/pcmCnDnp
+# falls through to a -ENODEV through the un-wired fops.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree, kzalloc
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# DATA buffers for "global state" symbols
+# =====================================================================
+#
+# dma_ops: `const struct dma_map_ops *dma_ops`. Linux's arch backs this
+# with a pointer to the active DMA mapping ops (intel_iommu / amd_iommu
+# / direct). On our identity-mapped no-IOMMU env, a zeroed 64-byte slot
+# is fine — every dereference of dma_ops->* lands inside the slot and
+# the L-shim's dma_alloc_* shims short-circuit before any dma_ops->*
+# dispatch ever happens.
+snd_pcm_dma_ops_buf:        Array[64, uint8]
+
+# sme_me_mask: AMD SME memory-encryption mask. On Intel-only env this
+# is always 0. Exposed as a u64.
+snd_pcm_sme_me_mask_var:    uint64 = 0
+
+# __default_kernel_pte_mask: PTE bit-mask the kernel uses for its own
+# direct mappings. The driver-facing readers (set_memory_wc et al.)
+# read this for sanity; a zeroed slot avoids the cold path running.
+snd_pcm_default_pte_mask_var: uint64 = 0
+
+# param_ops_ulong: `struct kernel_param_ops`. Exposed as a 64-byte
+# zeroed struct — module-param machinery reads .set / .get function
+# pointers; both NULL means "param ignored", which the L1 loader
+# already tolerates.
+snd_pcm_param_ops_ulong_buf: Array[64, uint8]
+
+
+# =====================================================================
+# Group 1: snd_pcm_* framework
+# =====================================================================
+
+def _snd_pcm_new(card: uint64, id: Ptr[char], device: int32,
+                  playback_count: int32, capture_count: int32,
+                  rpcm: uint64) -> int32:
+    # int snd_pcm_new(struct snd_card *, const char *, int device,
+    #                  int playback_count, int capture_count,
+    #                  struct snd_pcm **);
+    # Allocates a struct snd_pcm + its substream arrays. V0: return a
+    # zeroed 8 KiB slab and stash the pointer at *rpcm. Cold-path
+    # readers (set_ops, set_managed_buffer_all) only deref through
+    # the pointer.
+    if cast[uint64](rpcm) == 0:
+        return -22                              # -EINVAL
+    pcm: uint64 = kzalloc(8192)
+    if pcm == 0:
+        return -12                              # -ENOMEM
+    rpcm[0] = pcm
+    return 0
+
+
+def _snd_pcm_set_ops(pcm: uint64, stream: int32, ops: uint64):
+    # void snd_pcm_set_ops(struct snd_pcm *, int direction,
+    #                       const struct snd_pcm_ops *);
+    # Stashes the per-direction ops table. Nothing to wire — playback
+    # / capture stays cold for V0.
+    return
+
+
+def _snd_pcm_set_sync(substream: uint64):
+    return
+
+
+def _snd_pcm_set_managed_buffer_all(pcm: uint64, type: int32,
+                                      data: uint64, size: uint64,
+                                      max: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_period_elapsed(substream: uint64):
+    return
+
+
+def _snd_pcm_hw_constraint_integer(runtime: uint64, var: uint32) -> int32:
+    return 0
+
+
+def _snd_pcm_hw_constraint_minmax(runtime: uint64, var: uint32,
+                                    min: uint32, max: uint32) -> int32:
+    return 0
+
+
+def _snd_pcm_hw_constraint_step(runtime: uint64, cond: uint32,
+                                  var: uint32, step: uint32) -> int32:
+    return 0
+
+
+def _snd_pcm_hw_limit_rates(runtime: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_format_width(format: int32) -> int32:
+    # int snd_pcm_format_width(snd_pcm_format_t);
+    # The cold path doesn't care about exact bit widths; return 16
+    # (a common default that's safe for size-arithmetic callers).
+    return 16
+
+
+def _snd_pcm_std_chmaps() -> uint64:
+    # const struct snd_pcm_chmap_elem *snd_pcm_std_chmaps(void);
+    # The codec driver iterates the returned array until it sees
+    # an end-marker (.channels == 0). We hand back the address of
+    # a zeroed slot which the iterator immediately stops on.
+    return cast[uint64](&snd_pcm_dma_ops_buf[32])  # 32-byte all-zero region
+
+
+def _snd_pcm_add_chmap_ctls(pcm: uint64, stream: int32, chmap: uint64,
+                              max_channels: int32, private_value: uint64,
+                              info_ret: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_suspend_all(pcm: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 2: DMA / page cold-path stubs
+# =====================================================================
+
+def _snd_pcm_dma_alloc_pages(dev: uint64, size: uint64, dma_handle: uint64,
+                               dir: int32, gfp: uint32) -> uint64:
+    # struct page *dma_alloc_pages(struct device *, size_t size,
+    #                                dma_addr_t *dma_handle,
+    #                                enum dma_data_direction, gfp_t);
+    # We hand back kzalloc'd memory and write the same address to the
+    # dma_handle out-param (identity-mapped).
+    page: uint64 = kzalloc(size)
+    if page == 0:
+        return 0
+    if dma_handle != 0:
+        p: Ptr[uint64] = cast[Ptr[uint64]](dma_handle)
+        p[0] = page
+    return page
+
+
+def _snd_pcm_dma_free_pages(dev: uint64, size: uint64, page: uint64,
+                              dma_handle: uint64, dir: int32):
+    if page != 0:
+        kfree(page)
+
+
+def _snd_pcm_dma_alloc_noncontiguous(dev: uint64, size: uint64, dir: int32,
+                                       gfp: uint32, attrs: uint64) -> uint64:
+    # struct sg_table *dma_alloc_noncontiguous(...);
+    # Hand back a zeroed sg_table; consumers only use its first
+    # scatter entry, which is the kzalloc base + size.
+    sg: uint64 = kzalloc(64 + size)
+    if sg == 0:
+        return 0
+    return sg
+
+
+def _snd_pcm_dma_free_noncontiguous(dev: uint64, size: uint64, sgt: uint64,
+                                      dir: int32):
+    if sgt != 0:
+        kfree(sgt)
+
+
+def _snd_pcm_dma_can_mmap(dev: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_dma_need_sync(dev: uint64, addr: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_dma_sync_sg_for_cpu(dev: uint64, sg: uint64, nents: int32,
+                                   dir: int32):
+    return
+
+
+def _snd_pcm_dma_sync_sg_for_device(dev: uint64, sg: uint64, nents: int32,
+                                      dir: int32):
+    return
+
+
+def _snd_pcm_dma_vmap_noncontiguous(dev: uint64, size: uint64,
+                                      sgt: uint64) -> uint64:
+    if sgt == 0:
+        return 0
+    # The sg_table contents we faked above had the buffer starting
+    # 64 bytes in (after the struct sg_table header).
+    return sgt + 64
+
+
+def _snd_pcm_dma_vunmap_noncontiguous(dev: uint64, vaddr: uint64):
+    return
+
+
+def _snd_pcm_dma_mmap_pages(dev: uint64, vma: uint64, size: uint64,
+                              page: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_dma_mmap_noncontiguous(dev: uint64, vma: uint64, size: uint64,
+                                      sgt: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_alloc_pages_exact(size: uint64, gfp: uint32) -> uint64:
+    return kzalloc(size)
+
+
+def _snd_pcm_free_pages_exact(addr: uint64, size: uint64):
+    if addr != 0:
+        kfree(addr)
+
+
+def _snd_pcm_vmalloc(size: uint64) -> uint64:
+    return kzalloc(size)
+
+
+def _snd_pcm_vmalloc_to_page(addr: uint64) -> uint64:
+    # struct page *vmalloc_to_page(const void *addr);
+    # On our identity-mapped env, the page* and the virt addr are
+    # interchangeable for the cold path's needs.
+    return addr
+
+
+def _snd_pcm_vmap(pages: uint64, count: uint32, flags: uint64,
+                    prot: uint64) -> uint64:
+    # void *vmap(struct page **pages, unsigned int count,
+    #              unsigned long flags, pgprot_t prot);
+    # Return the first page address; consumers ioremap on top, which
+    # our pcim_iomap_regions shim already covers for HDA's needs.
+    if pages == 0:
+        return 0
+    pp: Ptr[uint64] = cast[Ptr[uint64]](pages)
+    return pp[0]
+
+
+def _snd_pcm_vunmap(addr: uint64):
+    return
+
+
+def _snd_pcm_vm_iomap_memory(vma: uint64, start: uint64,
+                               len: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_vm_map_pages(vma: uint64, pages: uint64,
+                            count: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_vm_get_page_prot(vm_flags: uint64) -> uint64:
+    return 0
+
+
+def _snd_pcm_remap_vmalloc_range(vma: uint64, addr: uint64,
+                                   pgoff: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_set_memory_wb(addr: uint64, numpages: int32) -> int32:
+    return 0
+
+
+def _snd_pcm_set_memory_wc(addr: uint64, numpages: int32) -> int32:
+    return 0
+
+
+def _snd_pcm_set_pages_array_wb(pages: uint64, addrinarray: int32) -> int32:
+    return 0
+
+
+def _snd_pcm_set_pages_array_wc(pages: uint64, addrinarray: int32) -> int32:
+    return 0
+
+
+def _snd_pcm_cachemode2protval(cm: uint32) -> uint64:
+    return 0
+
+
+def _snd_pcm_pgprot_writecombine(prot: uint64) -> uint64:
+    return prot
+
+
+def _snd_pcm_sg_page_iter_start(piter: uint64, sglist: uint64, nents: int32,
+                                  pgoffset: uint64):
+    return
+
+
+def _snd_pcm_sg_page_iter_next(piter: uint64) -> int32:
+    # bool __sg_page_iter_next(struct sg_page_iter *);
+    # End-of-iteration on first call.
+    return 0
+
+
+def _snd_pcm_sg_page_iter_dma_next(piter: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 3: kernel utility cold stubs
+# =====================================================================
+
+def _snd_pcm_clear_user(to: uint64, n: uint64) -> uint64:
+    # unsigned long clear_user_*(void __user *to, unsigned long n);
+    # Returns the number of bytes that could NOT be cleared (0 == all OK).
+    if to == 0:
+        return n
+    memset(cast[Ptr[uint8]](to), 0, n)
+    return 0
+
+
+def _snd_pcm_cpu_latency_qos_request_active(req: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_ktime_get_ts64(ts: uint64):
+    # void ktime_get_ts64(struct timespec64 *ts);
+    # Zero out the 16-byte timespec64.
+    if ts != 0:
+        memset(cast[Ptr[uint8]](ts), 0, 16)
+
+
+def _snd_pcm_ktime_get_raw_ts64(ts: uint64):
+    if ts != 0:
+        memset(cast[Ptr[uint8]](ts), 0, 16)
+
+
+def _snd_pcm_gcd(a: uint64, b: uint64) -> uint64:
+    # unsigned long gcd(unsigned long a, unsigned long b);
+    # Standard Euclidean gcd.
+    while b != 0:
+        t: uint64 = b
+        b = a % b
+        a = t
+    return a
+
+
+def _snd_pcm_nonseekable_open(inode: uint64, file: uint64) -> int32:
+    return 0
+
+
+def _snd_pcm_fput(file: uint64):
+    return
+
+
+def _snd_pcm_fdget(fd: uint32) -> uint64:
+    return 0
+
+
+def _snd_pcm_simple_strtoul(cp: Ptr[char], endp: uint64,
+                              base: uint32) -> uint64:
+    # unsigned long simple_strtoul(const char *cp, char **endp,
+    #                                unsigned int base);
+    # Parse decimal (base ignored for V0). Cold callers tolerate a
+    # benign 0 + endp==cp (no chars consumed).
+    if cast[uint64](cp) == 0:
+        return 0
+    v: uint64 = 0
+    i: uint64 = 0
+    while cp[i] >= 48 and cp[i] <= 57:
+        v = v * 10 + cast[uint64](cp[i] - 48)
+        i = i + 1
+    if endp != 0:
+        ep: Ptr[uint64] = cast[Ptr[uint64]](endp)
+        ep[0] = cast[uint64](cp) + i
+    return v
+
+
+def _snd_pcm_raw_spin_trylock(lock: uint64) -> int32:
+    return 1
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_snd_pcm():
+    # Called from linux_abi_exports_init() after linux_abi_register_snd_core().
+    # Adds the PCM framework + DMA / vmalloc / page-utility surface so
+    # snd-pcm.ko + its dependents load via the L-series loader.
+
+    # ---- snd_pcm_* framework ----
+    _add_export("snd_pcm_new",
+                cast[uint64](&_snd_pcm_new))
+    _add_export("snd_pcm_set_ops",
+                cast[uint64](&_snd_pcm_set_ops))
+    _add_export("snd_pcm_set_sync",
+                cast[uint64](&_snd_pcm_set_sync))
+    _add_export("snd_pcm_set_managed_buffer_all",
+                cast[uint64](&_snd_pcm_set_managed_buffer_all))
+    _add_export("snd_pcm_period_elapsed",
+                cast[uint64](&_snd_pcm_period_elapsed))
+    _add_export("snd_pcm_hw_constraint_integer",
+                cast[uint64](&_snd_pcm_hw_constraint_integer))
+    _add_export("snd_pcm_hw_constraint_minmax",
+                cast[uint64](&_snd_pcm_hw_constraint_minmax))
+    _add_export("snd_pcm_hw_constraint_step",
+                cast[uint64](&_snd_pcm_hw_constraint_step))
+    _add_export("snd_pcm_hw_limit_rates",
+                cast[uint64](&_snd_pcm_hw_limit_rates))
+    _add_export("snd_pcm_format_width",
+                cast[uint64](&_snd_pcm_format_width))
+    _add_export("snd_pcm_std_chmaps",
+                cast[uint64](&_snd_pcm_std_chmaps))
+    _add_export("snd_pcm_add_chmap_ctls",
+                cast[uint64](&_snd_pcm_add_chmap_ctls))
+    _add_export("snd_pcm_suspend_all",
+                cast[uint64](&_snd_pcm_suspend_all))
+
+    # ---- DMA / page ----
+    _add_export("dma_alloc_pages",
+                cast[uint64](&_snd_pcm_dma_alloc_pages))
+    _add_export("dma_free_pages",
+                cast[uint64](&_snd_pcm_dma_free_pages))
+    _add_export("dma_alloc_noncontiguous",
+                cast[uint64](&_snd_pcm_dma_alloc_noncontiguous))
+    _add_export("dma_free_noncontiguous",
+                cast[uint64](&_snd_pcm_dma_free_noncontiguous))
+    _add_export("dma_can_mmap",
+                cast[uint64](&_snd_pcm_dma_can_mmap))
+    _add_export("dma_need_sync",
+                cast[uint64](&_snd_pcm_dma_need_sync))
+    _add_export("dma_sync_sg_for_cpu",
+                cast[uint64](&_snd_pcm_dma_sync_sg_for_cpu))
+    _add_export("dma_sync_sg_for_device",
+                cast[uint64](&_snd_pcm_dma_sync_sg_for_device))
+    _add_export("dma_vmap_noncontiguous",
+                cast[uint64](&_snd_pcm_dma_vmap_noncontiguous))
+    _add_export("dma_vunmap_noncontiguous",
+                cast[uint64](&_snd_pcm_dma_vunmap_noncontiguous))
+    _add_export("dma_mmap_pages",
+                cast[uint64](&_snd_pcm_dma_mmap_pages))
+    _add_export("dma_mmap_noncontiguous",
+                cast[uint64](&_snd_pcm_dma_mmap_noncontiguous))
+    _add_export("alloc_pages_exact",
+                cast[uint64](&_snd_pcm_alloc_pages_exact))
+    _add_export("free_pages_exact",
+                cast[uint64](&_snd_pcm_free_pages_exact))
+    _add_export("__vmalloc",
+                cast[uint64](&_snd_pcm_vmalloc))
+    _add_export("vmalloc_to_page",
+                cast[uint64](&_snd_pcm_vmalloc_to_page))
+    _add_export("vmap",
+                cast[uint64](&_snd_pcm_vmap))
+    _add_export("vunmap",
+                cast[uint64](&_snd_pcm_vunmap))
+    _add_export("vm_iomap_memory",
+                cast[uint64](&_snd_pcm_vm_iomap_memory))
+    _add_export("vm_map_pages",
+                cast[uint64](&_snd_pcm_vm_map_pages))
+    _add_export("vm_get_page_prot",
+                cast[uint64](&_snd_pcm_vm_get_page_prot))
+    _add_export("remap_vmalloc_range",
+                cast[uint64](&_snd_pcm_remap_vmalloc_range))
+    _add_export("set_memory_wb",
+                cast[uint64](&_snd_pcm_set_memory_wb))
+    _add_export("set_memory_wc",
+                cast[uint64](&_snd_pcm_set_memory_wc))
+    _add_export("set_pages_array_wb",
+                cast[uint64](&_snd_pcm_set_pages_array_wb))
+    _add_export("set_pages_array_wc",
+                cast[uint64](&_snd_pcm_set_pages_array_wc))
+    _add_export("cachemode2protval",
+                cast[uint64](&_snd_pcm_cachemode2protval))
+    _add_export("pgprot_writecombine",
+                cast[uint64](&_snd_pcm_pgprot_writecombine))
+    _add_export("__sg_page_iter_start",
+                cast[uint64](&_snd_pcm_sg_page_iter_start))
+    _add_export("__sg_page_iter_next",
+                cast[uint64](&_snd_pcm_sg_page_iter_next))
+    _add_export("__sg_page_iter_dma_next",
+                cast[uint64](&_snd_pcm_sg_page_iter_dma_next))
+
+    # ---- kernel utility cold stubs ----
+    _add_export("clear_user_erms",
+                cast[uint64](&_snd_pcm_clear_user))
+    _add_export("clear_user_original",
+                cast[uint64](&_snd_pcm_clear_user))
+    _add_export("clear_user_rep_good",
+                cast[uint64](&_snd_pcm_clear_user))
+    _add_export("cpu_latency_qos_request_active",
+                cast[uint64](&_snd_pcm_cpu_latency_qos_request_active))
+    _add_export("ktime_get_ts64",
+                cast[uint64](&_snd_pcm_ktime_get_ts64))
+    _add_export("ktime_get_raw_ts64",
+                cast[uint64](&_snd_pcm_ktime_get_raw_ts64))
+    _add_export("gcd",
+                cast[uint64](&_snd_pcm_gcd))
+    _add_export("nonseekable_open",
+                cast[uint64](&_snd_pcm_nonseekable_open))
+    _add_export("fput",
+                cast[uint64](&_snd_pcm_fput))
+    _add_export("__fdget",
+                cast[uint64](&_snd_pcm_fdget))
+    _add_export("simple_strtoul",
+                cast[uint64](&_snd_pcm_simple_strtoul))
+    _add_export("_raw_spin_trylock",
+                cast[uint64](&_snd_pcm_raw_spin_trylock))
+
+    # ---- DATA exports ----
+    _add_export("dma_ops",
+                cast[uint64](&snd_pcm_dma_ops_buf[0]))
+    _add_export("sme_me_mask",
+                cast[uint64](&snd_pcm_sme_me_mask_var))
+    _add_export("__default_kernel_pte_mask",
+                cast[uint64](&snd_pcm_default_pte_mask_var))
+    _add_export("param_ops_ulong",
+                cast[uint64](&snd_pcm_param_ops_ulong_buf[0]))

@@ -1,0 +1,1085 @@
+# linux_abi/api_snd_hda.ad
+#
+# Linux HDA bus + controller surface (snd-hda-core.ko, snd-hda-codec.ko,
+# snd-hda-intel.ko). Stock Debian 6.1.0-32 binaries together carry ~200
+# unique unresolved externals beyond what L<=68 + the NIC family +
+# api_snd_core + api_snd_pcm covers. This file closes the remaining
+# ~120-symbol gap so the L-series loader can insmod the entire HDA
+# stack (snd_hda_core <- snd_hda_codec <- snd_hda_intel) without modules.dep:
+# every cross-.ko reference resolves to a Hamnix-side stub.
+#
+# Categories:
+#
+#   * ~50 snd_hdac_* — the HDA-Audio Codec bus framework. Lives in
+#     snd-hda-core.ko but is consumed by snd-hda-codec / snd-hda-intel.
+#     snd_hdac_bus_init/_exit/_init_chip/_stop_chip/_send_cmd/_get_response/
+#     _exec_verb_unlocked/_update_rirb/_parse_capabilities/_stop_cmd_io/
+#     _alloc_stream_pages/_free_stream_pages/_handle_stream_irq/
+#     _enter_link_reset, snd_hdac_stream_init/_release/_assign/_setup/
+#     _cleanup/_set_params/_start/_stop/_reset/_sync/_sync_trigger/
+#     _timecounter_init, snd_hdac_codec_read/_write/_link_up/_link_down/
+#     _modalias, snd_hdac_device_init/_register/_unregister/_exit/
+#     _set_chip_name, snd_hdac_power_up/_down/_up_pm/_down_pm/
+#     _sync_power_state, snd_hdac_check_power_state, snd_hdac_display_power,
+#     snd_hdac_i915_init/_set_bclk, snd_hdac_acomp_exit,
+#     snd_hdac_set_codec_wakeup, snd_hdac_dsp_prepare/_trigger/_cleanup,
+#     snd_hdac_query_supported_pcm, snd_hdac_is_supported_format,
+#     snd_hdac_calc_stream_format, snd_hdac_refresh_widgets,
+#     snd_hdac_get_connections/_get_sub_nodes, snd_hdac_read,
+#     _snd_hdac_read_parm, snd_hdac_read_parm_uncached,
+#     snd_hdac_override_parm, snd_hdac_regmap_init/_exit/_read_raw/
+#     _write_raw/_update_raw/_update_raw_once/_sync,
+#     snd_hdac_stop_streams.
+#
+#   * ~10 snd_hda_* — top-level controller surface from snd-hda-codec /
+#     snd-hda-intel. snd_hda_lock_devices/_unlock_devices/_load_patch/
+#     _set_power_save.
+#
+#   * ~10 azx_* — inline'd helpers in snd-hda-intel that get exported
+#     when CONFIG_SND_HDA_INTEL=m. azx_bus_init, azx_codec_configure,
+#     azx_init_chip, azx_init_streams, azx_free_streams, azx_get_pos_*,
+#     azx_interrupt, azx_probe_codecs, azx_stop_all_streams, azx_stop_chip.
+#
+#   * 1 snd_intel_dsp_driver_probe — Intel SST DSP driver-probe helper.
+#
+#   * ~15 generic-kernel — acpi_dev_get_first_match_dev,
+#     acpi_get_first_physical_node, acpi_get_handle, component_*
+#     (bind/master_add/del/match/unbind), pnp_get_resource,
+#     pci_get_class/_get_domain_bus_and_slot/_intx/_match_id/_pr3_present/
+#     _dev_put, pm_runtime_force_resume/_force_suspend/_get_if_active,
+#     vga_switcheroo_register_audio_client/_unregister_client/
+#     _get_client_state, request_firmware_nowait, param_get_int/_set_int/
+#     _ops_bint, bpf_trace_run4.
+#
+#   * ~15 regmap / regcache — regmap_read/_write/_update_bits_base/_exit/
+#     __regmap_init, regcache_cache_only/_mark_dirty/_sync. Used by the
+#     HDA codec verb-cache; cold for V0 (no codec attach).
+#
+#   * ~15 generic utility — kstrndup, kstrtoull, kvasprintf, kmemdup,
+#     kobject_add/_init, skip_spaces, sort, sysfs_emit_at, vsprintf,
+#     strcpy, clocks_calc_mult_shift, current_work.
+#
+# Stub philosophy: every shim is init-cold. The HDA controller's full
+# probe path runs through azx_bus_init -> snd_hdac_bus_parse_capabilities
+# -> azx_init_chip -> azx_init_streams -> azx_probe_codecs. With
+# QEMU's `-device intel-hda` attached, that path lands at probe_codecs
+# which fails benignly (NULL codec response from the RIRB) — exactly
+# the milestone the brief asks for: module loads + probe invokes.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree, kzalloc
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# DATA buffers for "global state" symbols
+# =====================================================================
+
+# param_ops_bint: struct kernel_param_ops for a "buggy int" param type.
+# Same shape as param_ops_int; zeroed 64-byte slot. Module-param
+# readers tolerate NULL .set/.get.
+snd_hda_param_ops_bint_buf:  Array[64, uint8]
+
+
+# =====================================================================
+# Group 1: snd_hdac_bus_* — the HDA-Audio Codec bus
+# =====================================================================
+
+def _snd_hdac_bus_init(bus: uint64, dev: uint64, ops: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_bus_exit(bus: uint64):
+    return
+
+
+def _snd_hdac_bus_init_chip(bus: uint64, full_reset: int32) -> int32:
+    return 0
+
+
+def _snd_hdac_bus_stop_chip(bus: uint64):
+    return
+
+
+def _snd_hdac_bus_send_cmd(bus: uint64, cmd: uint32) -> int32:
+    # Send a 32-bit verb to the codec via the CORB. No codec to talk
+    # to; -ENODEV is the benign no-codec result.
+    return -19
+
+
+def _snd_hdac_bus_get_response(bus: uint64, addr: uint32,
+                                  res: uint64) -> int32:
+    if res != 0:
+        p: Ptr[uint32] = cast[Ptr[uint32]](res)
+        p[0] = 0
+    return -19
+
+
+def _snd_hdac_bus_exec_verb_unlocked(bus: uint64, addr: uint32,
+                                       cmd: uint32, res: uint64) -> int32:
+    if res != 0:
+        p: Ptr[uint32] = cast[Ptr[uint32]](res)
+        p[0] = 0
+    return -19
+
+
+def _snd_hdac_bus_update_rirb(bus: uint64):
+    return
+
+
+def _snd_hdac_bus_parse_capabilities(bus: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_bus_stop_cmd_io(bus: uint64):
+    return
+
+
+def _snd_hdac_bus_alloc_stream_pages(bus: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_bus_free_stream_pages(bus: uint64):
+    return
+
+
+def _snd_hdac_bus_handle_stream_irq(bus: uint64, status: uint32,
+                                       ack: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_bus_enter_link_reset(bus: uint64):
+    return
+
+
+# =====================================================================
+# Group 2: snd_hdac_stream_*
+# =====================================================================
+
+def _snd_hdac_stream_init(bus: uint64, azx_dev: uint64, idx: int32,
+                            direction: int32, tag: int32):
+    return
+
+
+def _snd_hdac_stream_release(azx_dev: uint64):
+    return
+
+
+def _snd_hdac_stream_assign(bus: uint64, substream: uint64) -> uint64:
+    return 0
+
+
+def _snd_hdac_stream_setup(azx_dev: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_stream_cleanup(azx_dev: uint64):
+    return
+
+
+def _snd_hdac_stream_set_params(azx_dev: uint64, format_val: uint32) -> int32:
+    return 0
+
+
+def _snd_hdac_stream_start(azx_dev: uint64, fresh_start: int32):
+    return
+
+
+def _snd_hdac_stream_stop(azx_dev: uint64):
+    return
+
+
+def _snd_hdac_stream_reset(azx_dev: uint64):
+    return
+
+
+def _snd_hdac_stream_sync(azx_dev: uint64, start: int32, streams: uint32):
+    return
+
+
+def _snd_hdac_stream_sync_trigger(azx_dev: uint64, set: int32,
+                                    streams: uint32, reg: uint32):
+    return
+
+
+def _snd_hdac_stream_timecounter_init(azx_dev: uint64, streams: uint32):
+    return
+
+
+def _snd_hdac_stop_streams(bus: uint64):
+    return
+
+
+# =====================================================================
+# Group 3: snd_hdac_codec_*  / snd_hdac_device_*
+# =====================================================================
+
+def _snd_hdac_codec_read(codec: uint64, nid: uint16, flags: int32,
+                           verb: uint32, parm: uint32) -> int32:
+    return 0
+
+
+def _snd_hdac_codec_write(codec: uint64, nid: uint16, flags: int32,
+                            verb: uint32, parm: uint32) -> int32:
+    return 0
+
+
+def _snd_hdac_codec_link_up(codec: uint64):
+    return
+
+
+def _snd_hdac_codec_link_down(codec: uint64):
+    return
+
+
+def _snd_hdac_codec_modalias(codec: uint64, buf: Ptr[char], size: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_device_init(codec: uint64, bus: uint64, name: Ptr[char],
+                            addr: uint32) -> int32:
+    return 0
+
+
+def _snd_hdac_device_exit(codec: uint64):
+    return
+
+
+def _snd_hdac_device_register(codec: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_device_unregister(codec: uint64):
+    return
+
+
+def _snd_hdac_device_set_chip_name(codec: uint64, name: Ptr[char]) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 4: snd_hdac power / dsp / i915 / acomp
+# =====================================================================
+
+def _snd_hdac_power_up(codec: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_power_down(codec: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_power_up_pm(codec: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_power_down_pm(codec: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_sync_power_state(codec: uint64, nid: uint16,
+                                  target_state: uint32) -> uint32:
+    return target_state
+
+
+def _snd_hdac_check_power_state(codec: uint64, nid: uint16,
+                                  target_state: uint32) -> int32:
+    return 1                                    # already in target
+
+
+def _snd_hdac_display_power(bus: uint64, idx: int32, enable: int32):
+    return
+
+
+def _snd_hdac_set_codec_wakeup(bus: uint64, enable: int32):
+    return
+
+
+def _snd_hdac_i915_init(bus: uint64) -> int32:
+    # int snd_hdac_i915_init(struct hdac_bus *);
+    # Init the i915 audio component (Intel iGPU HDMI audio). No i915
+    # in our env; -ENODEV is the benign no-i915 result.
+    return -19
+
+
+def _snd_hdac_i915_set_bclk(bus: uint64):
+    return
+
+
+def _snd_hdac_acomp_exit(bus: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_dsp_prepare(azx_dev: uint64, format_val: uint32, byte_size: uint32,
+                            bufp: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_dsp_trigger(azx_dev: uint64, start: int32):
+    return
+
+
+def _snd_hdac_dsp_cleanup(azx_dev: uint64, dmab: uint64):
+    return
+
+
+# =====================================================================
+# Group 5: snd_hdac_query / format / widgets / params
+# =====================================================================
+
+def _snd_hdac_query_supported_pcm(codec: uint64, nid: uint16,
+                                     ratesp: uint64, formatsp: uint64,
+                                     bpsp: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_is_supported_format(codec: uint64, nid: uint16,
+                                     format: uint32) -> int32:
+    return 1
+
+
+def _snd_hdac_calc_stream_format(rate: uint32, channels: uint32,
+                                    format: int32, maxbps: uint32,
+                                    spdif_ctls: uint16) -> uint32:
+    return 0
+
+
+def _snd_hdac_refresh_widgets(codec: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_get_connections(codec: uint64, nid: uint16,
+                                 conn_list: uint64, max_conns: int32) -> int32:
+    return 0
+
+
+def _snd_hdac_get_sub_nodes(codec: uint64, nid: uint16,
+                               start_id: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_read(codec: uint64, nid: uint16, verb: uint32, parm: uint32,
+                    res: uint64) -> int32:
+    if res != 0:
+        p: Ptr[uint32] = cast[Ptr[uint32]](res)
+        p[0] = 0
+    return 0
+
+
+def __snd_hdac_read_parm(codec: uint64, nid: uint16, parm: int32,
+                            res: uint64) -> int32:
+    if res != 0:
+        p: Ptr[uint32] = cast[Ptr[uint32]](res)
+        p[0] = 0
+    return 0
+
+
+def _snd_hdac_read_parm_uncached(codec: uint64, nid: uint16,
+                                    parm: int32) -> int32:
+    return 0
+
+
+def _snd_hdac_override_parm(codec: uint64, nid: uint16, parm: uint32,
+                               val: uint32) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 6: snd_hdac_regmap_* — verb cache via regmap
+# =====================================================================
+
+def _snd_hdac_regmap_init(codec: uint64) -> int32:
+    return 0
+
+
+def _snd_hdac_regmap_exit(codec: uint64):
+    return
+
+
+def _snd_hdac_regmap_read_raw(codec: uint64, reg: uint32, val: uint64) -> int32:
+    if val != 0:
+        p: Ptr[uint32] = cast[Ptr[uint32]](val)
+        p[0] = 0
+    return 0
+
+
+def _snd_hdac_regmap_write_raw(codec: uint64, reg: uint32, val: uint32) -> int32:
+    return 0
+
+
+def _snd_hdac_regmap_update_raw(codec: uint64, reg: uint32, mask: uint32,
+                                   val: uint32) -> int32:
+    return 0
+
+
+def _snd_hdac_regmap_update_raw_once(codec: uint64, reg: uint32,
+                                        mask: uint32, val: uint32) -> int32:
+    return 0
+
+
+def _snd_hdac_regmap_sync(codec: uint64):
+    return
+
+
+# =====================================================================
+# Group 7: snd_hda_* — top-level controller
+# =====================================================================
+
+def _snd_hda_lock_devices(bus: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_unlock_devices(bus: uint64):
+    return
+
+
+def _snd_hda_load_patch(bus: uint64, fwsize: uint64, fwdata: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_set_power_save(bus: uint64, delay: int32):
+    return
+
+
+# =====================================================================
+# Group 8: azx_* — snd-hda-intel inline'd controller helpers
+# =====================================================================
+
+def _snd_hda_azx_bus_init(chip: uint64, model: Ptr[char], io_ops: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_azx_codec_configure(chip: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_azx_init_chip(chip: uint64, full_reset: int32) -> int32:
+    return 0
+
+
+def _snd_hda_azx_init_streams(chip: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_azx_free_streams(chip: uint64):
+    return
+
+
+def _snd_hda_azx_get_pos_lpib(chip: uint64, azx_dev: uint64) -> uint32:
+    return 0
+
+
+def _snd_hda_azx_get_pos_posbuf(chip: uint64, azx_dev: uint64) -> uint32:
+    return 0
+
+
+def _snd_hda_azx_interrupt(irq: int32, dev_id: uint64) -> int32:
+    # Hardware interrupt handler. IRQ_NONE == 0 (not for us).
+    return 0
+
+
+def _snd_hda_azx_probe_codecs(chip: uint64, max_slots: uint32) -> int32:
+    # int azx_probe_codecs(struct azx *chip, unsigned int max_slots);
+    # Walks slots 0..max_slots looking for a codec response on the
+    # RIRB. No codec on QEMU's hda-output (it answers from the
+    # controller side only); -ENXIO is the benign "no codec found"
+    # return that the controller's probe-path handles by treating the
+    # device as a no-audio HDA bus.
+    return -6
+
+
+def _snd_hda_azx_stop_all_streams(chip: uint64):
+    return
+
+
+def _snd_hda_azx_stop_chip(chip: uint64):
+    return
+
+
+# =====================================================================
+# Group 9: snd_intel_dsp_driver_probe
+# =====================================================================
+
+def _snd_hda_intel_dsp_driver_probe(pci: uint64) -> int32:
+    # int snd_intel_dsp_driver_probe(struct pci_dev *);
+    # Returns the DSP driver type (SST, AVS, SOF, none). 0 == none,
+    # which the HDA controller treats as "use the legacy HDA path".
+    return 0
+
+
+# =====================================================================
+# Group 10: generic-kernel cold stubs
+# =====================================================================
+
+def _snd_hda_acpi_dev_get_first_match_dev(hid: Ptr[char], uid: Ptr[char],
+                                              hrv: int64) -> uint64:
+    return 0
+
+
+def _snd_hda_acpi_get_first_physical_node(adev: uint64) -> uint64:
+    return 0
+
+
+def _snd_hda_acpi_get_handle(parent: uint64, pathname: Ptr[char],
+                                ret_handle: uint64) -> int32:
+    if ret_handle != 0:
+        p: Ptr[uint64] = cast[Ptr[uint64]](ret_handle)
+        p[0] = 0
+    return -5                                   # AE_NOT_FOUND ~ -EIO
+
+
+def _snd_hda_component_bind_all(master: uint64, data: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_component_unbind_all(master: uint64, data: uint64):
+    return
+
+
+def _snd_hda_component_master_add_with_match(parent: uint64, ops: uint64,
+                                                m: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_component_master_del(parent: uint64, ops: uint64):
+    return
+
+
+def _snd_hda_component_match_add_typed(master: uint64, matchptr: uint64,
+                                          compare: uint64, dev: uint64):
+    return
+
+
+def _snd_hda_pnp_get_resource(dev: uint64, type: uint32, num: uint32) -> uint64:
+    return 0
+
+
+def _snd_hda_pci_get_class(class_code: uint32, fr: uint64) -> uint64:
+    return 0
+
+
+def _snd_hda_pci_get_domain_bus_and_slot(domain: int32, bus: uint32,
+                                            devfn: uint32) -> uint64:
+    return 0
+
+
+def _snd_hda_pci_intx(pdev: uint64, enable: int32):
+    return
+
+
+def _snd_hda_pci_match_id(ids: uint64, pdev: uint64) -> uint64:
+    return 0
+
+
+def _snd_hda_pci_pr3_present(pdev: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_pci_dev_put(pdev: uint64):
+    return
+
+
+def _snd_hda_pm_runtime_force_resume(dev: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_pm_runtime_force_suspend(dev: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_pm_runtime_get_if_active(dev: uint64, ign_usage: int32) -> int32:
+    return 0
+
+
+def _snd_hda_vga_switcheroo_register_audio_client(pdev: uint64, ops: uint64,
+                                                     ctype: int32) -> int32:
+    return 0
+
+
+def _snd_hda_vga_switcheroo_unregister_client(pdev: uint64):
+    return
+
+
+def _snd_hda_vga_switcheroo_get_client_state(pdev: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_request_firmware_nowait(module: uint64, uevent: int32,
+                                         name: Ptr[char], device: uint64,
+                                         gfp: uint32, context: uint64,
+                                         cont: uint64) -> int32:
+    # int request_firmware_nowait(struct module *, bool uevent,
+    #                               const char *name, struct device *,
+    #                               gfp_t, void *context,
+    #                               void (*cont)(const struct firmware *, void *));
+    # Async path. We don't supply firmware; the cont callback never
+    # fires in V0. -ENOENT is benign.
+    return -2
+
+
+def _snd_hda_param_get_int(buffer: Ptr[char], kp: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_param_set_int(val: Ptr[char], kp: uint64) -> int32:
+    return 0
+
+
+def _snd_hda_bpf_trace_run4(prog: uint64, a1: uint64, a2: uint64,
+                              a3: uint64, a4: uint64) -> uint32:
+    return 0
+
+
+# =====================================================================
+# Group 11: regmap / regcache cold stubs
+# =====================================================================
+
+def _snd_hda_regmap_init(dev: uint64, bus: uint64, bus_context: uint64,
+                            config: uint64) -> uint64:
+    # struct regmap *__regmap_init(struct device *, const struct regmap_bus *,
+    #                                void *bus_context,
+    #                                const struct regmap_config *);
+    # Return a zeroed slab; consumers deref for an opaque cookie only.
+    return kzalloc(256)
+
+
+def _snd_hda_regmap_exit(map: uint64):
+    if map != 0:
+        kfree(map)
+
+
+def _snd_hda_regmap_read(map: uint64, reg: uint32, val: uint64) -> int32:
+    if val != 0:
+        p: Ptr[uint32] = cast[Ptr[uint32]](val)
+        p[0] = 0
+    return 0
+
+
+def _snd_hda_regmap_write(map: uint64, reg: uint32, val: uint32) -> int32:
+    return 0
+
+
+def _snd_hda_regmap_update_bits_base(map: uint64, reg: uint32, mask: uint32,
+                                         val: uint32, change: uint64,
+                                         async_op: int32, force: int32) -> int32:
+    return 0
+
+
+def _snd_hda_regcache_cache_only(map: uint64, enable: int32):
+    return
+
+
+def _snd_hda_regcache_mark_dirty(map: uint64):
+    return
+
+
+def _snd_hda_regcache_sync(map: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 12: generic utility cold stubs
+# =====================================================================
+
+def _snd_hda_kmemdup(src: uint64, len: uint64, gfp: uint32) -> uint64:
+    blob: uint64 = kzalloc(len)
+    if blob == 0:
+        return 0
+    if src != 0:
+        memcpy(cast[Ptr[uint8]](blob), cast[Ptr[uint8]](src), len)
+    return blob
+
+
+def _snd_hda_kstrndup(s: Ptr[char], len: uint64, gfp: uint32) -> uint64:
+    blob: uint64 = kzalloc(len + 1)
+    if blob == 0:
+        return 0
+    if cast[uint64](s) != 0:
+        memcpy(cast[Ptr[uint8]](blob), cast[Ptr[uint8]](s), len)
+    return blob
+
+
+def _snd_hda_kstrtoull(cp: Ptr[char], base: uint32, res: uint64) -> int32:
+    if res != 0:
+        p: Ptr[uint64] = cast[Ptr[uint64]](res)
+        p[0] = 0
+    return 0
+
+
+def _snd_hda_kvasprintf(gfp: uint32, fmt: Ptr[char], ap: uint64) -> uint64:
+    # char *kvasprintf(gfp_t, const char *fmt, va_list);
+    # Allocate a 64-byte buffer holding the empty string. Real callers
+    # use it for short dev-name strings; the actual content doesn't
+    # affect insmod success.
+    blob: uint64 = kzalloc(64)
+    return blob
+
+
+def _snd_hda_kobject_add(kobj: uint64, parent: uint64, fmt: Ptr[char]) -> int32:
+    return 0
+
+
+def _snd_hda_kobject_init(kobj: uint64, ktype: uint64):
+    return
+
+
+def _snd_hda_skip_spaces(s: Ptr[char]) -> Ptr[char]:
+    if cast[uint64](s) == 0:
+        return s
+    i: uint64 = 0
+    while s[i] == 32 or s[i] == 9:
+        i = i + 1
+    return cast[Ptr[char]](cast[uint64](s) + i)
+
+
+def _snd_hda_sort(base: uint64, num: uint64, size: uint64, cmp: uint64,
+                    swap_fn: uint64):
+    # void sort(void *base, size_t num, size_t size, cmp_func_t cmp,
+    #            swap_func_t swap);
+    # Sort a flat array using cmp. Cold-path callers (codec node lists)
+    # tolerate an unsorted array (the post-load iteration falls back
+    # to linear matching). No-op is correct for V0.
+    return
+
+
+def _snd_hda_sysfs_emit_at(buf: Ptr[char], at: int32, fmt: Ptr[char]) -> int32:
+    return 0
+
+
+def _snd_hda_vsprintf(buf: Ptr[char], fmt: Ptr[char], args: uint64) -> int32:
+    # int vsprintf(char *buf, const char *fmt, va_list args);
+    # Write a NUL byte and return 0. Cold callers tolerate empty
+    # output (they're filling banners that never reach userland).
+    if cast[uint64](buf) != 0:
+        buf[0] = 0
+    return 0
+
+
+def _snd_hda_strcpy(dst: Ptr[char], src: Ptr[char]) -> Ptr[char]:
+    # char *strcpy(char *dst, const char *src);
+    if cast[uint64](dst) == 0 or cast[uint64](src) == 0:
+        return dst
+    i: uint64 = 0
+    while src[i] != 0:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+    return dst
+
+
+def _snd_hda_clocks_calc_mult_shift(mult: uint64, shift: uint64,
+                                       fr: uint32, to: uint32,
+                                       maxsec: uint32):
+    # void clocks_calc_mult_shift(u32 *mult, u32 *shift, u32 from, u32 to,
+    #                                u32 maxsec);
+    # Compute mult/shift for cycle_t -> ns conversion. Cold without
+    # a real timecounter; just write mult=1, shift=0.
+    if mult != 0:
+        p: Ptr[uint32] = cast[Ptr[uint32]](mult)
+        p[0] = 1
+    if shift != 0:
+        p2: Ptr[uint32] = cast[Ptr[uint32]](shift)
+        p2[0] = 0
+
+
+def _snd_hda_current_work() -> uint64:
+    return 0
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_snd_hda():
+    # Called from linux_abi_exports_init() after linux_abi_register_snd_pcm().
+    # Adds the HDA bus + controller surface so snd-hda-core /
+    # snd-hda-codec / snd-hda-intel load via the L-series loader.
+
+    # ---- snd_hdac_bus_* ----
+    _add_export("snd_hdac_bus_init",
+                cast[uint64](&_snd_hdac_bus_init))
+    _add_export("snd_hdac_bus_exit",
+                cast[uint64](&_snd_hdac_bus_exit))
+    _add_export("snd_hdac_bus_init_chip",
+                cast[uint64](&_snd_hdac_bus_init_chip))
+    _add_export("snd_hdac_bus_stop_chip",
+                cast[uint64](&_snd_hdac_bus_stop_chip))
+    _add_export("snd_hdac_bus_send_cmd",
+                cast[uint64](&_snd_hdac_bus_send_cmd))
+    _add_export("snd_hdac_bus_get_response",
+                cast[uint64](&_snd_hdac_bus_get_response))
+    _add_export("snd_hdac_bus_exec_verb_unlocked",
+                cast[uint64](&_snd_hdac_bus_exec_verb_unlocked))
+    _add_export("snd_hdac_bus_update_rirb",
+                cast[uint64](&_snd_hdac_bus_update_rirb))
+    _add_export("snd_hdac_bus_parse_capabilities",
+                cast[uint64](&_snd_hdac_bus_parse_capabilities))
+    _add_export("snd_hdac_bus_stop_cmd_io",
+                cast[uint64](&_snd_hdac_bus_stop_cmd_io))
+    _add_export("snd_hdac_bus_alloc_stream_pages",
+                cast[uint64](&_snd_hdac_bus_alloc_stream_pages))
+    _add_export("snd_hdac_bus_free_stream_pages",
+                cast[uint64](&_snd_hdac_bus_free_stream_pages))
+    _add_export("snd_hdac_bus_handle_stream_irq",
+                cast[uint64](&_snd_hdac_bus_handle_stream_irq))
+    _add_export("snd_hdac_bus_enter_link_reset",
+                cast[uint64](&_snd_hdac_bus_enter_link_reset))
+
+    # ---- snd_hdac_stream_* ----
+    _add_export("snd_hdac_stream_init",
+                cast[uint64](&_snd_hdac_stream_init))
+    _add_export("snd_hdac_stream_release",
+                cast[uint64](&_snd_hdac_stream_release))
+    _add_export("snd_hdac_stream_assign",
+                cast[uint64](&_snd_hdac_stream_assign))
+    _add_export("snd_hdac_stream_setup",
+                cast[uint64](&_snd_hdac_stream_setup))
+    _add_export("snd_hdac_stream_cleanup",
+                cast[uint64](&_snd_hdac_stream_cleanup))
+    _add_export("snd_hdac_stream_set_params",
+                cast[uint64](&_snd_hdac_stream_set_params))
+    _add_export("snd_hdac_stream_start",
+                cast[uint64](&_snd_hdac_stream_start))
+    _add_export("snd_hdac_stream_stop",
+                cast[uint64](&_snd_hdac_stream_stop))
+    _add_export("snd_hdac_stream_reset",
+                cast[uint64](&_snd_hdac_stream_reset))
+    _add_export("snd_hdac_stream_sync",
+                cast[uint64](&_snd_hdac_stream_sync))
+    _add_export("snd_hdac_stream_sync_trigger",
+                cast[uint64](&_snd_hdac_stream_sync_trigger))
+    _add_export("snd_hdac_stream_timecounter_init",
+                cast[uint64](&_snd_hdac_stream_timecounter_init))
+    _add_export("snd_hdac_stop_streams",
+                cast[uint64](&_snd_hdac_stop_streams))
+
+    # ---- snd_hdac_codec_* / snd_hdac_device_* ----
+    _add_export("snd_hdac_codec_read",
+                cast[uint64](&_snd_hdac_codec_read))
+    _add_export("snd_hdac_codec_write",
+                cast[uint64](&_snd_hdac_codec_write))
+    _add_export("snd_hdac_codec_link_up",
+                cast[uint64](&_snd_hdac_codec_link_up))
+    _add_export("snd_hdac_codec_link_down",
+                cast[uint64](&_snd_hdac_codec_link_down))
+    _add_export("snd_hdac_codec_modalias",
+                cast[uint64](&_snd_hdac_codec_modalias))
+    _add_export("snd_hdac_device_init",
+                cast[uint64](&_snd_hdac_device_init))
+    _add_export("snd_hdac_device_exit",
+                cast[uint64](&_snd_hdac_device_exit))
+    _add_export("snd_hdac_device_register",
+                cast[uint64](&_snd_hdac_device_register))
+    _add_export("snd_hdac_device_unregister",
+                cast[uint64](&_snd_hdac_device_unregister))
+    _add_export("snd_hdac_device_set_chip_name",
+                cast[uint64](&_snd_hdac_device_set_chip_name))
+
+    # ---- power / dsp / i915 / acomp ----
+    _add_export("snd_hdac_power_up",
+                cast[uint64](&_snd_hdac_power_up))
+    _add_export("snd_hdac_power_down",
+                cast[uint64](&_snd_hdac_power_down))
+    _add_export("snd_hdac_power_up_pm",
+                cast[uint64](&_snd_hdac_power_up_pm))
+    _add_export("snd_hdac_power_down_pm",
+                cast[uint64](&_snd_hdac_power_down_pm))
+    _add_export("snd_hdac_sync_power_state",
+                cast[uint64](&_snd_hdac_sync_power_state))
+    _add_export("snd_hdac_check_power_state",
+                cast[uint64](&_snd_hdac_check_power_state))
+    _add_export("snd_hdac_display_power",
+                cast[uint64](&_snd_hdac_display_power))
+    _add_export("snd_hdac_set_codec_wakeup",
+                cast[uint64](&_snd_hdac_set_codec_wakeup))
+    _add_export("snd_hdac_i915_init",
+                cast[uint64](&_snd_hdac_i915_init))
+    _add_export("snd_hdac_i915_set_bclk",
+                cast[uint64](&_snd_hdac_i915_set_bclk))
+    _add_export("snd_hdac_acomp_exit",
+                cast[uint64](&_snd_hdac_acomp_exit))
+    _add_export("snd_hdac_dsp_prepare",
+                cast[uint64](&_snd_hdac_dsp_prepare))
+    _add_export("snd_hdac_dsp_trigger",
+                cast[uint64](&_snd_hdac_dsp_trigger))
+    _add_export("snd_hdac_dsp_cleanup",
+                cast[uint64](&_snd_hdac_dsp_cleanup))
+
+    # ---- query / format / widgets / params ----
+    _add_export("snd_hdac_query_supported_pcm",
+                cast[uint64](&_snd_hdac_query_supported_pcm))
+    _add_export("snd_hdac_is_supported_format",
+                cast[uint64](&_snd_hdac_is_supported_format))
+    _add_export("snd_hdac_calc_stream_format",
+                cast[uint64](&_snd_hdac_calc_stream_format))
+    _add_export("snd_hdac_refresh_widgets",
+                cast[uint64](&_snd_hdac_refresh_widgets))
+    _add_export("snd_hdac_get_connections",
+                cast[uint64](&_snd_hdac_get_connections))
+    _add_export("snd_hdac_get_sub_nodes",
+                cast[uint64](&_snd_hdac_get_sub_nodes))
+    _add_export("snd_hdac_read",
+                cast[uint64](&_snd_hdac_read))
+    _add_export("_snd_hdac_read_parm",
+                cast[uint64](&__snd_hdac_read_parm))
+    _add_export("snd_hdac_read_parm_uncached",
+                cast[uint64](&_snd_hdac_read_parm_uncached))
+    _add_export("snd_hdac_override_parm",
+                cast[uint64](&_snd_hdac_override_parm))
+
+    # ---- snd_hdac_regmap_* ----
+    _add_export("snd_hdac_regmap_init",
+                cast[uint64](&_snd_hdac_regmap_init))
+    _add_export("snd_hdac_regmap_exit",
+                cast[uint64](&_snd_hdac_regmap_exit))
+    _add_export("snd_hdac_regmap_read_raw",
+                cast[uint64](&_snd_hdac_regmap_read_raw))
+    _add_export("snd_hdac_regmap_write_raw",
+                cast[uint64](&_snd_hdac_regmap_write_raw))
+    _add_export("snd_hdac_regmap_update_raw",
+                cast[uint64](&_snd_hdac_regmap_update_raw))
+    _add_export("snd_hdac_regmap_update_raw_once",
+                cast[uint64](&_snd_hdac_regmap_update_raw_once))
+    _add_export("snd_hdac_regmap_sync",
+                cast[uint64](&_snd_hdac_regmap_sync))
+
+    # ---- snd_hda_* top-level ----
+    _add_export("snd_hda_lock_devices",
+                cast[uint64](&_snd_hda_lock_devices))
+    _add_export("snd_hda_unlock_devices",
+                cast[uint64](&_snd_hda_unlock_devices))
+    _add_export("snd_hda_load_patch",
+                cast[uint64](&_snd_hda_load_patch))
+    _add_export("snd_hda_set_power_save",
+                cast[uint64](&_snd_hda_set_power_save))
+
+    # ---- azx_* ----
+    _add_export("azx_bus_init",
+                cast[uint64](&_snd_hda_azx_bus_init))
+    _add_export("azx_codec_configure",
+                cast[uint64](&_snd_hda_azx_codec_configure))
+    _add_export("azx_init_chip",
+                cast[uint64](&_snd_hda_azx_init_chip))
+    _add_export("azx_init_streams",
+                cast[uint64](&_snd_hda_azx_init_streams))
+    _add_export("azx_free_streams",
+                cast[uint64](&_snd_hda_azx_free_streams))
+    _add_export("azx_get_pos_lpib",
+                cast[uint64](&_snd_hda_azx_get_pos_lpib))
+    _add_export("azx_get_pos_posbuf",
+                cast[uint64](&_snd_hda_azx_get_pos_posbuf))
+    _add_export("azx_interrupt",
+                cast[uint64](&_snd_hda_azx_interrupt))
+    _add_export("azx_probe_codecs",
+                cast[uint64](&_snd_hda_azx_probe_codecs))
+    _add_export("azx_stop_all_streams",
+                cast[uint64](&_snd_hda_azx_stop_all_streams))
+    _add_export("azx_stop_chip",
+                cast[uint64](&_snd_hda_azx_stop_chip))
+    _add_export("snd_intel_dsp_driver_probe",
+                cast[uint64](&_snd_hda_intel_dsp_driver_probe))
+
+    # ---- generic-kernel cold stubs ----
+    _add_export("acpi_dev_get_first_match_dev",
+                cast[uint64](&_snd_hda_acpi_dev_get_first_match_dev))
+    _add_export("acpi_get_first_physical_node",
+                cast[uint64](&_snd_hda_acpi_get_first_physical_node))
+    _add_export("acpi_get_handle",
+                cast[uint64](&_snd_hda_acpi_get_handle))
+    _add_export("component_bind_all",
+                cast[uint64](&_snd_hda_component_bind_all))
+    _add_export("component_unbind_all",
+                cast[uint64](&_snd_hda_component_unbind_all))
+    _add_export("component_master_add_with_match",
+                cast[uint64](&_snd_hda_component_master_add_with_match))
+    _add_export("component_master_del",
+                cast[uint64](&_snd_hda_component_master_del))
+    _add_export("component_match_add_typed",
+                cast[uint64](&_snd_hda_component_match_add_typed))
+    _add_export("pnp_get_resource",
+                cast[uint64](&_snd_hda_pnp_get_resource))
+    _add_export("pci_get_class",
+                cast[uint64](&_snd_hda_pci_get_class))
+    _add_export("pci_get_domain_bus_and_slot",
+                cast[uint64](&_snd_hda_pci_get_domain_bus_and_slot))
+    _add_export("pci_intx",
+                cast[uint64](&_snd_hda_pci_intx))
+    _add_export("pci_match_id",
+                cast[uint64](&_snd_hda_pci_match_id))
+    _add_export("pci_pr3_present",
+                cast[uint64](&_snd_hda_pci_pr3_present))
+    _add_export("pci_dev_put",
+                cast[uint64](&_snd_hda_pci_dev_put))
+    _add_export("pm_runtime_force_resume",
+                cast[uint64](&_snd_hda_pm_runtime_force_resume))
+    _add_export("pm_runtime_force_suspend",
+                cast[uint64](&_snd_hda_pm_runtime_force_suspend))
+    _add_export("pm_runtime_get_if_active",
+                cast[uint64](&_snd_hda_pm_runtime_get_if_active))
+    _add_export("vga_switcheroo_register_audio_client",
+                cast[uint64](&_snd_hda_vga_switcheroo_register_audio_client))
+    _add_export("vga_switcheroo_unregister_client",
+                cast[uint64](&_snd_hda_vga_switcheroo_unregister_client))
+    _add_export("vga_switcheroo_get_client_state",
+                cast[uint64](&_snd_hda_vga_switcheroo_get_client_state))
+    _add_export("request_firmware_nowait",
+                cast[uint64](&_snd_hda_request_firmware_nowait))
+    _add_export("param_get_int",
+                cast[uint64](&_snd_hda_param_get_int))
+    _add_export("param_set_int",
+                cast[uint64](&_snd_hda_param_set_int))
+    _add_export("bpf_trace_run4",
+                cast[uint64](&_snd_hda_bpf_trace_run4))
+
+    # ---- regmap / regcache ----
+    _add_export("__regmap_init",
+                cast[uint64](&_snd_hda_regmap_init))
+    _add_export("regmap_exit",
+                cast[uint64](&_snd_hda_regmap_exit))
+    _add_export("regmap_read",
+                cast[uint64](&_snd_hda_regmap_read))
+    _add_export("regmap_write",
+                cast[uint64](&_snd_hda_regmap_write))
+    _add_export("regmap_update_bits_base",
+                cast[uint64](&_snd_hda_regmap_update_bits_base))
+    _add_export("regcache_cache_only",
+                cast[uint64](&_snd_hda_regcache_cache_only))
+    _add_export("regcache_mark_dirty",
+                cast[uint64](&_snd_hda_regcache_mark_dirty))
+    _add_export("regcache_sync",
+                cast[uint64](&_snd_hda_regcache_sync))
+
+    # ---- generic utility ----
+    _add_export("kmemdup",
+                cast[uint64](&_snd_hda_kmemdup))
+    _add_export("kstrndup",
+                cast[uint64](&_snd_hda_kstrndup))
+    _add_export("kstrtoull",
+                cast[uint64](&_snd_hda_kstrtoull))
+    _add_export("kvasprintf",
+                cast[uint64](&_snd_hda_kvasprintf))
+    _add_export("kobject_add",
+                cast[uint64](&_snd_hda_kobject_add))
+    _add_export("kobject_init",
+                cast[uint64](&_snd_hda_kobject_init))
+    _add_export("skip_spaces",
+                cast[uint64](&_snd_hda_skip_spaces))
+    _add_export("sort",
+                cast[uint64](&_snd_hda_sort))
+    _add_export("sysfs_emit_at",
+                cast[uint64](&_snd_hda_sysfs_emit_at))
+    _add_export("vsprintf",
+                cast[uint64](&_snd_hda_vsprintf))
+    _add_export("strcpy",
+                cast[uint64](&_snd_hda_strcpy))
+    _add_export("clocks_calc_mult_shift",
+                cast[uint64](&_snd_hda_clocks_calc_mult_shift))
+    _add_export("current_work",
+                cast[uint64](&_snd_hda_current_work))
+
+    # ---- DATA exports ----
+    _add_export("param_ops_bint",
+                cast[uint64](&snd_hda_param_ops_bint_buf[0]))

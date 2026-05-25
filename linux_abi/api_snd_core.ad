@@ -1,0 +1,1006 @@
+# linux_abi/api_snd_core.ad
+#
+# Linux sound-subsystem core (snd.ko) — ALSA's `card` / `device` /
+# `control` / `info` / `hwdep` / `timer` / `jack` framework. Stock
+# Debian 6.1.0-32 snd.ko has 144 UND symbols; L<=68 + the NIC family
+# resolve 100 of them. This file closes the 44-symbol gap so the
+# L-series loader can insmod snd.ko, plus exposes the snd_* family
+# entry points so dependent modules (snd-pcm, snd-hda-core,
+# snd-hda-codec, snd-hda-intel) get every "needs snd_*" external
+# wired straight to a Hamnix-side stub — same V0 strategy the NIC
+# scale-out used (shim ALL cross-.ko refs so modules.dep isn't
+# required for load ordering to work).
+#
+# Categories of fresh exports (count is against the post-igb
+# 1556-export baseline):
+#
+#   * ~50 snd_* framework entry points — snd_card_new/_free/_register/
+#     _disconnect, snd_card_file_add/_remove, snd_device_new/_register/
+#     _disconnect/_free/_initialize, snd_ctl_* (add/remove/new1/find_id/
+#     enum_info/boolean_mono_info/register_ioctl, etc.), snd_info_*
+#     (create_card_entry / create_module_entry / free_entry / register /
+#     get_line / get_str), snd_hwdep_new, snd_jack_new/_report/_set_key,
+#     snd_timer_new/_interrupt/_notify, snd_array_new/_free,
+#     snd_dma_alloc_dir_pages/_free_pages, snd_sgbuf_get_addr/_chunk_size,
+#     snd_kill_fasync, snd_fasync_helper/_free, snd_register_device,
+#     snd_unregister_device, snd_lookup_minor_data, snd_component_add,
+#     snd_power_wait, snd_pci_quirk_lookup/_id, snd_card_rw_proc_new,
+#     snd_pcm_add_chmap_ctls (lives in snd_pcm but is referenced by
+#     snd_hda_core's gap so we point it at the snd_pcm shim — wired
+#     in api_snd_pcm.ad's register call), snd_ctl_apply_vmaster_followers,
+#     snd_ctl_add_vmaster_hook, snd_ctl_make_virtual_master,
+#     snd_ctl_sync_vmaster, _snd_ctl_add_follower, snd_ctl_rename_id.
+#
+#   * 1 snd_* DATA symbol — `snd_major`. Linux's snd-core registers
+#     a sound major (default 116); userland opens /dev/snd/* against
+#     that major. We expose a 4-byte int holding 116 — the value never
+#     changes once snd-core finishes its module-init.
+#
+#   * 1 `sound_class` DATA pointer — Linux's `struct class *sound_class`
+#     points at /sys/class/sound. We expose an 8-byte pointer slot
+#     holding 0 (NULL is OK — code paths that take sound_class only
+#     dereference it inside class_create-style helpers, which our
+#     L<=68 surface already short-circuits).
+#
+#   * 18 generic-kernel cold-path stubs unique to snd.ko's UND gap:
+#     register_sound_special_device, unregister_sound_special (legacy
+#     OSS /dev/dsp-style minor allocator — not used by ALSA's snd_*
+#     callers), proc_create_data, proc_mkdir_mode, proc_set_size,
+#     proc_symlink (per-card /proc entries — cold), input_allocate_device,
+#     input_event, input_free_device, input_register_device,
+#     input_set_capability, input_unregister_device (jack-detect input
+#     device — only registered on real codec hotplug), kobject_set_name
+#     (sysfs name setter — class_create-style helpers don't fire here),
+#     devm_add_action, devm_remove_action, devres_add, __devres_alloc_node,
+#     devres_find, devres_free (devres lifetime tracking — cold without
+#     a real device_release), free_dma, request_dma (legacy ISA-DMA
+#     channel allocator — never fires for PCI HDA), dma_spin_lock,
+#     stream_open, fasync_helper, kill_fasync (file-level helpers —
+#     cold without an /dev/snd/* fd open), single_open_size (procfs
+#     single-shot show — cold), pid_vnr (PID-namespace VID — single
+#     namespace), release_resource (I/O resource tree — cold without
+#     real ISA), strlcat, vmemdup_user, downgrade_write, memcpy_toio,
+#     _raw_read_lock_irqsave, _raw_read_unlock_irqrestore,
+#     _raw_write_lock_irqsave, _raw_write_unlock_irqrestore,
+#     __list_del_entry_valid, kvmalloc_node, xa_destroy, xa_erase,
+#     __xa_insert, xa_load, xa_store_range.
+#
+# Stub philosophy: every shim here is init-cold for a vanilla insmod
+# of snd.ko / snd-pcm.ko / snd-hda-{core,codec,intel}.ko. The PCM
+# playback / capture path stays dormant — opening /dev/snd/pcmC0D0p
+# eventually lands a -ENODEV through the un-wired fops, but the
+# modules themselves load and probe.
+#
+# The "_snd_" prefix marks the Hamnix-side shim — same prefix-naming
+# discipline the NIC-family agents used.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree, kzalloc
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# DATA buffers for "global state" symbols
+# =====================================================================
+#
+# snd_major: Linux's sound-major number. Userland's open("/dev/snd/...")
+# resolves to (sound_major, minor); the value is fixed at 116 in stock
+# kernels. We expose a 4-byte int holding 116.
+snd_major_var:          int32 = 116
+
+# sound_class: struct class *sound_class. Linux populates this in
+# snd-core's module-init via class_create("sound"). Modules that
+# need the pointer (jack-detect, codec sysfs) read it but never
+# dereference deeper than the class_register fast-paths we already
+# short-circuit. Expose an 8-byte slot holding 0.
+snd_sound_class_var:    uint64 = 0
+
+# snd_hda_bus_type: Linux's `struct bus_type snd_hda_bus_type`.
+# Lives at the snd-hda-codec module image but is referenced by
+# every codec module (realtek/hdmi/via/...) and by the controller.
+# Codec module-init paths read bus_type.dev_groups + bus_type.name;
+# a zeroed 256-byte slot keeps every read inside the slot.
+snd_hda_bus_type_buf:   Array[256, uint8]
+
+# dma_spin_lock: kernel-global `spinlock_t dma_spin_lock`. A spinlock_t
+# is a 64-byte (sometimes smaller) struct on x86_64; modules call
+# raw_spin_lock_irqsave(&dma_spin_lock) which only reads/writes the
+# memory at &dma_spin_lock. Without preemption (our env), a zeroed
+# slot works — every lock acquisition succeeds, every release no-ops.
+snd_dma_spin_lock_buf:  Array[64, uint8]
+
+
+# =====================================================================
+# Group 1: snd_card lifecycle
+# =====================================================================
+#
+# A `struct snd_card` is ALSA's top-level container for a single audio
+# device (one PCI HDA controller -> one snd_card). The driver allocates
+# it with snd_card_new, attaches PCM/control/hwdep "devices" to it,
+# then snd_card_register makes /dev/snd/* visible. For V0 we hand back
+# a kzalloc'd 4 KiB buffer that's large enough to back every struct
+# snd_card field the in-tree drivers touch through the pointer (Linux's
+# real struct is ~1.2 KiB at 6.1).
+
+def _snd_card_new(parent: uint64, idx: int32, xid: Ptr[char],
+                   module: uint64, extra_size: int32,
+                   card_ret: Ptr[uint64]) -> int32:
+    # int snd_card_new(struct device *parent, int idx, const char *xid,
+    #                  struct module *, size_t extra_size,
+    #                  struct snd_card **card_ret);
+    # Allocates the snd_card. We return 0 (success) and stash a fresh
+    # 4 KiB zeroed slab into *card_ret.
+    card: uint64 = kzalloc(4096)
+    if card == 0:
+        return -12                              # -ENOMEM
+    if cast[uint64](card_ret) != 0:
+        card_ret[0] = card
+    return 0
+
+
+def _snd_card_free(card: uint64) -> int32:
+    # int snd_card_free(struct snd_card *);
+    # Releases the card. With kzalloc-only backing we kfree it.
+    if card != 0:
+        kfree(card)
+    return 0
+
+
+def _snd_card_disconnect(card: uint64) -> int32:
+    # int snd_card_disconnect(struct snd_card *);
+    # Marks the card for disconnect (driver_unbind path). We don't
+    # track per-card device lists; a no-op success is correct.
+    return 0
+
+
+def _snd_card_register(card: uint64) -> int32:
+    # int snd_card_register(struct snd_card *);
+    # Finalises /dev/snd/* nodes and exposes the card to userland.
+    # Without a real /dev/snd registrar, return success; userland
+    # never finds the device anyway because our chrdev table is
+    # not wired into the L-shim sound class.
+    return 0
+
+
+def _snd_card_file_add(card: uint64, file: uint64) -> int32:
+    # Tracks an open file against a card so refcount drives unbind.
+    return 0
+
+
+def _snd_card_file_remove(card: uint64, file: uint64) -> int32:
+    return 0
+
+
+def _snd_card_rw_proc_new(card: uint64, name: Ptr[char], priv: uint64,
+                            read_op: uint64, write_op: uint64,
+                            entry_ret: uint64) -> int32:
+    # int snd_card_rw_proc_new(struct snd_card *, const char *name,
+    #                            void *priv, snd_info_read_t *,
+    #                            snd_info_write_t *, struct snd_info_entry **);
+    # Adds a procfs entry rooted at /proc/asound/cardN/. Cold path.
+    return 0
+
+
+# =====================================================================
+# Group 2: snd_device lifecycle
+# =====================================================================
+#
+# snd_device is a logical sub-object of an snd_card (PCM, control,
+# hwdep, etc.). The driver hangs each via snd_device_new + snd_device_
+# register; snd_card_register fans out across all attached snd_devices.
+
+def _snd_device_new(card: uint64, dev_type: int32, ops: uint64,
+                     device_data: uint64) -> int32:
+    return 0
+
+
+def _snd_device_register(card: uint64, device_data: uint64) -> int32:
+    return 0
+
+
+def _snd_device_disconnect(card: uint64, device_data: uint64) -> int32:
+    return 0
+
+
+def _snd_device_free(card: uint64, device_data: uint64) -> int32:
+    return 0
+
+
+def _snd_device_initialize(dev: uint64, card: uint64):
+    return
+
+
+# =====================================================================
+# Group 3: snd_ctl_* — mixer-control surface
+# =====================================================================
+#
+# Linux's struct snd_kcontrol exposes mixer knobs (master volume, mute,
+# capture source, etc.). The codec / controller drivers register many
+# at probe. None of them fire at insmod (the read/write paths only
+# engage when alsamixer opens /dev/snd/controlC0). All shim returns
+# are success-shaped + NULL pointers; the driver tolerates "no kctl
+# created" with a benign -ENOMEM path that exits its register loop.
+
+def _snd_ctl_add(card: uint64, kctl: uint64) -> int32:
+    return 0
+
+
+def _snd_ctl_remove(card: uint64, kctl: uint64) -> int32:
+    return 0
+
+
+def _snd_ctl_new1(template: uint64, priv: uint64) -> uint64:
+    # struct snd_kcontrol *snd_ctl_new1(const struct snd_kcontrol_new *,
+    #                                     void *private_data);
+    # Returns NULL (driver checks; treats as -ENOMEM and exits the
+    # register loop cleanly).
+    return 0
+
+
+def _snd_ctl_find_id(card: uint64, id: uint64) -> uint64:
+    return 0
+
+
+def _snd_ctl_rename_id(card: uint64, src_id: uint64, dst_id: uint64) -> int32:
+    return 0
+
+
+def _snd_ctl_enum_info(info: uint64, channels: uint32, items: uint32,
+                        names: uint64) -> int32:
+    # int snd_ctl_enum_info(struct snd_ctl_elem_info *, unsigned int channels,
+    #                        unsigned int items, const char * const names[]);
+    # Fills the info struct describing an enum-type control. Cold path.
+    return 0
+
+
+def _snd_ctl_boolean_mono_info(kctl: uint64, info: uint64) -> int32:
+    return 0
+
+
+def _snd_ctl_get_preferred_subdevice(card: uint64, type: int32) -> int32:
+    return -1
+
+
+def _snd_ctl_register_ioctl(fcn: uint64) -> int32:
+    return 0
+
+
+def _snd_ctl_register_ioctl_compat(fcn: uint64) -> int32:
+    return 0
+
+
+def _snd_ctl_unregister_ioctl(fcn: uint64) -> int32:
+    return 0
+
+
+def _snd_ctl_unregister_ioctl_compat(fcn: uint64) -> int32:
+    return 0
+
+
+def _snd_ctl_make_virtual_master(name: Ptr[char], tlv: uint64) -> uint64:
+    # struct snd_kcontrol *snd_ctl_make_virtual_master(const char *name,
+    #                                                    const unsigned int *tlv);
+    return 0
+
+
+def _snd_ctl_add_vmaster_hook(kctl: uint64, hook: uint64,
+                                priv: uint64) -> int32:
+    return 0
+
+
+def _snd_ctl_apply_vmaster_followers(kctl: uint64, func: uint64,
+                                       arg: uint64):
+    return
+
+
+def _snd_ctl_sync_vmaster(kctl: uint64, hook_only: int32):
+    return
+
+
+def __snd_ctl_add_follower(master: uint64, follower: uint64,
+                              flags: uint32) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 4: snd_info_* — procfs/sysfs info entries
+# =====================================================================
+
+def _snd_info_create_card_entry(card: uint64, name: Ptr[char],
+                                  parent: uint64) -> uint64:
+    return 0
+
+
+def _snd_info_create_module_entry(module: uint64, name: Ptr[char],
+                                    parent: uint64) -> uint64:
+    return 0
+
+
+def _snd_info_free_entry(entry: uint64):
+    return
+
+
+def _snd_info_register(entry: uint64) -> int32:
+    return 0
+
+
+def _snd_info_get_line(buffer: uint64, line: Ptr[char], lineMax: int32) -> int32:
+    # int snd_info_get_line(struct snd_info_buffer *, char *line, int len);
+    # Reads a line from /proc/asound/. EOF == -ENOENT.
+    return -2
+
+
+def _snd_info_get_str(dest: Ptr[char], src: Ptr[char], n: int32) -> Ptr[char]:
+    # char *snd_info_get_str(char *dest, char *src, int len);
+    return cast[Ptr[char]](0)
+
+
+# =====================================================================
+# Group 5: snd_hwdep / snd_jack / snd_timer
+# =====================================================================
+
+def _snd_hwdep_new(card: uint64, name: Ptr[char], device: int32,
+                    rhwdep: uint64) -> int32:
+    return 0
+
+
+def _snd_jack_new(card: uint64, name: Ptr[char], type: int32,
+                   jack_ret: uint64, initial_kctl: int32,
+                   phantom_jack: int32) -> int32:
+    return 0
+
+
+def _snd_jack_report(jack: uint64, status: int32):
+    return
+
+
+def _snd_jack_set_key(jack: uint64, type: int32, keytype: uint32) -> int32:
+    return 0
+
+
+def _snd_timer_new(card: uint64, id: Ptr[char], tid: uint64,
+                    timer_ret: uint64) -> int32:
+    return 0
+
+
+def _snd_timer_interrupt(timer: uint64, ticks_left: uint64):
+    return
+
+
+def _snd_timer_notify(timer: uint64, event: int32, tstamp: uint64):
+    return
+
+
+# =====================================================================
+# Group 6: snd_array_*
+# =====================================================================
+#
+# snd_array is ALSA's grow-on-demand slab — codec drivers use it for
+# arrays of controls / nodes. snd_array_new returns a pointer to the
+# Nth element (allocating as needed); snd_array_free releases.
+
+def _snd_array_new(array: uint64) -> uint64:
+    # struct snd_array { void *list; unsigned int used; unsigned int alloc_max;
+    #                     unsigned int elem_size; unsigned int alloc_align;
+    #                     ... };
+    # Linear bump-allocator over array->list, growing it via krealloc.
+    # We back V0 with a fresh kzalloc each call; the elem_size is at
+    # struct offset 12 (uint32) per snd_array layout. Returning NULL
+    # is a benign "out of memory" the driver tolerates.
+    if array == 0:
+        return 0
+    sz_ptr: Ptr[uint32] = cast[Ptr[uint32]](array + 12)
+    sz: uint64 = cast[uint64](sz_ptr[0])
+    if sz == 0:
+        sz = 64
+    return kzalloc(sz)
+
+
+def _snd_array_free(array: uint64):
+    return
+
+
+# =====================================================================
+# Group 7: snd_dma / snd_sgbuf
+# =====================================================================
+
+def _snd_dma_alloc_dir_pages(type: int32, dev: uint64, dir: int32,
+                              size: uint64, dmab: uint64) -> int32:
+    # int snd_dma_alloc_dir_pages(int type, struct device *, enum dma_data_direction,
+    #                              size_t size, struct snd_dma_buffer *);
+    # dmab fields: dmab->area (cpu va), dmab->addr (dma handle),
+    # dmab->bytes, dmab->dev. For V0 we kzalloc and fill area + bytes;
+    # addr stays 0 since insmod-cold paths don't program DMA.
+    if dmab == 0:
+        return -22                              # -EINVAL
+    area: uint64 = kzalloc(size)
+    if area == 0:
+        return -12                              # -ENOMEM
+    # struct snd_dma_buffer layout (kernel 6.1):
+    #   .dev    (struct snd_dma_device, 24 bytes)
+    #   .area   (void *,        offset 24)
+    #   .addr   (dma_addr_t,    offset 32)
+    #   .bytes  (size_t,        offset 40)
+    #   .private_data (void *,  offset 48)
+    area_ptr: Ptr[uint64] = cast[Ptr[uint64]](dmab + 24)
+    addr_ptr: Ptr[uint64] = cast[Ptr[uint64]](dmab + 32)
+    bytes_ptr: Ptr[uint64] = cast[Ptr[uint64]](dmab + 40)
+    area_ptr[0] = area
+    addr_ptr[0] = area                          # identity-mapped
+    bytes_ptr[0] = size
+    return 0
+
+
+def _snd_dma_free_pages(dmab: uint64):
+    if dmab == 0:
+        return
+    area_ptr: Ptr[uint64] = cast[Ptr[uint64]](dmab + 24)
+    area: uint64 = area_ptr[0]
+    if area != 0:
+        kfree(area)
+        area_ptr[0] = 0
+
+
+def _snd_sgbuf_get_addr(dmab: uint64, offset: uint64) -> uint64:
+    # dma_addr_t snd_sgbuf_get_addr(struct snd_dma_buffer *, size_t offset);
+    # Contiguous V0 backing -> base + offset.
+    if dmab == 0:
+        return 0
+    addr_ptr: Ptr[uint64] = cast[Ptr[uint64]](dmab + 32)
+    return addr_ptr[0] + offset
+
+
+def _snd_sgbuf_get_chunk_size(dmab: uint64, ofs: uint32,
+                                size: uint32) -> uint32:
+    # unsigned int snd_sgbuf_get_chunk_size(struct snd_dma_buffer *,
+    #                                        unsigned int ofs, unsigned int size);
+    # Contiguous backing -> the whole requested chunk is one piece.
+    return size
+
+
+# =====================================================================
+# Group 8: snd_register_device / snd_unregister_device / minor lookup
+# =====================================================================
+
+def _snd_register_device(type: int32, card: uint64, dev: int32,
+                          f_ops: uint64, private_data: uint64,
+                          device: uint64) -> int32:
+    # int snd_register_device(int type, struct snd_card *, int dev,
+    #                          const struct file_operations *, void *priv,
+    #                          struct device *);
+    return 0
+
+
+def _snd_unregister_device(dev: uint64) -> int32:
+    return 0
+
+
+def _snd_lookup_minor_data(minor: uint32, type: int32) -> uint64:
+    # void *snd_lookup_minor_data(unsigned int minor, int type);
+    # Returns the private_data the open path uses. NULL is safe — open
+    # treats it as -ENODEV.
+    return 0
+
+
+# =====================================================================
+# Group 9: snd_component_add / snd_power_wait / snd_kill_fasync
+# =====================================================================
+
+def _snd_component_add(card: uint64, component: Ptr[char]) -> int32:
+    return 0
+
+
+def _snd_power_wait(card: uint64) -> int32:
+    # int snd_power_wait(struct snd_card *);
+    # Used to gate runtime-PM transitions; success-shape always.
+    return 0
+
+
+def _snd_kill_fasync(fasync: uint64, signal: int32, band: int32):
+    return
+
+
+def _snd_fasync_helper(fd: int32, file: uint64, on: int32,
+                        fasync_ret: uint64) -> int32:
+    return 0
+
+
+def _snd_fasync_free(fasync: uint64):
+    return
+
+
+# =====================================================================
+# Group 10: snd_pci_quirk lookup
+# =====================================================================
+#
+# Linux's pci_quirk lookup walks a driver-provided table of
+# (subvendor, subdevice) -> u32 quirk-flags pairs. snd_hda_intel's
+# table includes per-OEM Realtek codec wiring tweaks. With no real
+# OEM PCI device, lookup returns NULL == "no quirk" and the codec
+# falls back to the generic defaults.
+
+def _snd_pci_quirk_lookup(pci: uint64, tbl: uint64) -> uint64:
+    return 0
+
+
+def _snd_pci_quirk_lookup_id(vendor: uint16, device: uint16,
+                               tbl: uint64) -> uint64:
+    return 0
+
+
+# =====================================================================
+# Group 11: generic-kernel cold-path stubs
+# =====================================================================
+
+def _snd_register_sound_special_device(unit: int32, name: Ptr[char],
+                                         fops: uint64) -> int32:
+    # int register_sound_special_device(const struct file_operations *,
+    #                                     int unit, const char *name);
+    # Legacy OSS minor allocator. Return the unit; cold.
+    return unit
+
+
+def _snd_unregister_sound_special(unit: int32) -> int32:
+    return 0
+
+
+def _snd_proc_create_data(name: Ptr[char], mode: int32, parent: uint64,
+                            proc_fops: uint64, data: uint64) -> uint64:
+    return 0
+
+
+def _snd_proc_mkdir_mode(name: Ptr[char], mode: int32,
+                          parent: uint64) -> uint64:
+    return 0
+
+
+def _snd_proc_set_size(entry: uint64, size: uint64):
+    return
+
+
+def _snd_proc_symlink(name: Ptr[char], parent: uint64,
+                       dest: Ptr[char]) -> uint64:
+    return 0
+
+
+def _snd_input_allocate_device() -> uint64:
+    # struct input_dev *input_allocate_device(void);
+    # Returns a 4 KiB zeroed slab — drivers read input_dev->dev and a
+    # couple of fields but never call into a real input subsystem.
+    return kzalloc(4096)
+
+
+def _snd_input_free_device(idev: uint64):
+    if idev != 0:
+        kfree(idev)
+
+
+def _snd_input_register_device(idev: uint64) -> int32:
+    return 0
+
+
+def _snd_input_unregister_device(idev: uint64):
+    return
+
+
+def _snd_input_event(idev: uint64, type: uint32, code: uint32, value: int32):
+    return
+
+
+def _snd_input_set_capability(idev: uint64, type: uint32, code: uint32):
+    return
+
+
+def _snd_kobject_set_name(kobj: uint64, fmt: Ptr[char]) -> int32:
+    # int kobject_set_name(struct kobject *, const char *fmt, ...);
+    # Stashes a sysfs name. Cold path — we don't have sysfs entries
+    # for /sys/class/sound.
+    return 0
+
+
+def _snd_devm_add_action(dev: uint64, action: uint64, data: uint64) -> int32:
+    # int devm_add_action(struct device *, void (*action)(void *), void *data);
+    # Registers a release callback for device_release. Cold without
+    # a real device_release flow.
+    return 0
+
+
+def _snd_devm_remove_action(dev: uint64, action: uint64, data: uint64):
+    return
+
+
+def _snd_devres_add(dev: uint64, res: uint64):
+    return
+
+
+def _snd_devres_alloc_node(release: uint64, size: uint64, gfp: uint32,
+                            node: int32) -> uint64:
+    # void *__devres_alloc_node(dr_release_t, size_t size, gfp_t,
+    #                             int nid, const char *name);
+    # Returns a zeroed slab — the body lives at offset 16 (after the
+    # struct devres header). Cold without device_release.
+    blob: uint64 = kzalloc(size + 16)
+    if blob == 0:
+        return 0
+    return blob + 16
+
+
+def _snd_devres_find(dev: uint64, release: uint64, m: uint64,
+                      data: uint64) -> uint64:
+    return 0
+
+
+def _snd_devres_destroy(dev: uint64, release: uint64, m: uint64,
+                         data: uint64) -> int32:
+    return 0
+
+
+def _snd_devres_free(res: uint64):
+    return
+
+
+def _snd_free_dma(dmanr: uint32):
+    return
+
+
+def _snd_request_dma(dmanr: uint32, name: Ptr[char]) -> int32:
+    # int request_dma(unsigned int dmanr, const char *device_id);
+    # ISA-DMA channel allocator — never fires for PCI HDA. -EINVAL.
+    return -22
+
+
+def _snd_stream_open(inode: uint64, file: uint64) -> int32:
+    return 0
+
+
+def _snd_kill_fasync_generic(fasync: uint64, signal: int32, band: int32):
+    return
+
+
+def _snd_single_open_size(file: uint64, show: uint64, data: uint64,
+                            size: uint64) -> int32:
+    return 0
+
+
+def _snd_pid_vnr(task_pid: uint64) -> int32:
+    return 0
+
+
+def _snd_release_resource(res: uint64) -> int32:
+    return 0
+
+
+def _snd_strlcat(dst: Ptr[char], src: Ptr[char], n: uint64) -> uint64:
+    # size_t strlcat(char *dst, const char *src, size_t size);
+    # Adds NUL-terminated src to dst[]; returns intended length.
+    # Cold path callers (snd_card name composition) tolerate either
+    # the full strlcat or a benign truncation. We do the minimal
+    # correct thing — find end of dst, then byte-copy src bytes.
+    dlen: uint64 = 0
+    while dst[dlen] != 0 and dlen < n:
+        dlen = dlen + 1
+    slen: uint64 = 0
+    while src[slen] != 0:
+        slen = slen + 1
+    if dlen >= n:
+        return dlen + slen
+    i: uint64 = 0
+    while i < slen and dlen + i + 1 < n:
+        dst[dlen + i] = src[i]
+        i = i + 1
+    dst[dlen + i] = 0
+    return dlen + slen
+
+
+def _snd_vmemdup_user(src: uint64, size: uint64) -> uint64:
+    blob: uint64 = kzalloc(size)
+    if blob == 0:
+        return 0
+    if src != 0:
+        memcpy(cast[Ptr[uint8]](blob), cast[Ptr[uint8]](src), size)
+    return blob
+
+
+def _snd_downgrade_write(sem: uint64):
+    return
+
+
+def _snd_memcpy_toio(dst: uint64, src: uint64, n: uint64):
+    # void memcpy_toio(volatile void __iomem *to, const void *from, size_t count);
+    if dst == 0 or src == 0 or n == 0:
+        return
+    memcpy(cast[Ptr[uint8]](dst), cast[Ptr[uint8]](src), n)
+
+
+def _snd_raw_read_lock_irqsave(lock: uint64) -> uint64:
+    return 0
+
+
+def _snd_raw_read_unlock_irqrestore(lock: uint64, flags: uint64):
+    return
+
+
+def _snd_raw_write_lock_irqsave(lock: uint64) -> uint64:
+    return 0
+
+
+def _snd_raw_write_unlock_irqrestore(lock: uint64, flags: uint64):
+    return
+
+
+def _snd_list_del_entry_valid(entry: uint64) -> int32:
+    # bool __list_del_entry_valid(struct list_head *);
+    # Sanity-check in CONFIG_DEBUG_LIST builds. Always-valid (true=1).
+    return 1
+
+
+def _snd_kvmalloc_node(size: uint64, gfp: uint32, node: int32) -> uint64:
+    return kzalloc(size)
+
+
+def _snd_xa_destroy(xa: uint64):
+    return
+
+
+def _snd_xa_erase(xa: uint64, index: uint64) -> uint64:
+    return 0
+
+
+def _snd_xa_insert(xa: uint64, index: uint64, entry: uint64,
+                    gfp: uint32) -> int32:
+    return 0
+
+
+def _snd_xa_load(xa: uint64, index: uint64) -> uint64:
+    return 0
+
+
+def _snd_xa_store_range(xa: uint64, first: uint64, last: uint64,
+                         entry: uint64, gfp: uint32) -> int32:
+    return 0
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_snd_core():
+    # Called from linux_abi_exports_init() after the api_igb batch.
+    # Adds the snd-core surface so snd.ko + every module that depends
+    # on snd_* (snd-pcm, snd-hda-*, snd-hda-intel) loads via the
+    # L-series loader.
+
+    # ---- snd_card lifecycle ----
+    _add_export("snd_card_new",
+                cast[uint64](&_snd_card_new))
+    _add_export("snd_card_free",
+                cast[uint64](&_snd_card_free))
+    _add_export("snd_card_disconnect",
+                cast[uint64](&_snd_card_disconnect))
+    _add_export("snd_card_register",
+                cast[uint64](&_snd_card_register))
+    _add_export("snd_card_file_add",
+                cast[uint64](&_snd_card_file_add))
+    _add_export("snd_card_file_remove",
+                cast[uint64](&_snd_card_file_remove))
+    _add_export("snd_card_rw_proc_new",
+                cast[uint64](&_snd_card_rw_proc_new))
+
+    # ---- snd_device lifecycle ----
+    _add_export("snd_device_new",
+                cast[uint64](&_snd_device_new))
+    _add_export("snd_device_register",
+                cast[uint64](&_snd_device_register))
+    _add_export("snd_device_disconnect",
+                cast[uint64](&_snd_device_disconnect))
+    _add_export("snd_device_free",
+                cast[uint64](&_snd_device_free))
+    _add_export("snd_device_initialize",
+                cast[uint64](&_snd_device_initialize))
+
+    # ---- snd_ctl ----
+    _add_export("snd_ctl_add",
+                cast[uint64](&_snd_ctl_add))
+    _add_export("snd_ctl_remove",
+                cast[uint64](&_snd_ctl_remove))
+    _add_export("snd_ctl_new1",
+                cast[uint64](&_snd_ctl_new1))
+    _add_export("snd_ctl_find_id",
+                cast[uint64](&_snd_ctl_find_id))
+    _add_export("snd_ctl_rename_id",
+                cast[uint64](&_snd_ctl_rename_id))
+    _add_export("snd_ctl_enum_info",
+                cast[uint64](&_snd_ctl_enum_info))
+    _add_export("snd_ctl_boolean_mono_info",
+                cast[uint64](&_snd_ctl_boolean_mono_info))
+    _add_export("snd_ctl_get_preferred_subdevice",
+                cast[uint64](&_snd_ctl_get_preferred_subdevice))
+    _add_export("snd_ctl_register_ioctl",
+                cast[uint64](&_snd_ctl_register_ioctl))
+    _add_export("snd_ctl_register_ioctl_compat",
+                cast[uint64](&_snd_ctl_register_ioctl_compat))
+    _add_export("snd_ctl_unregister_ioctl",
+                cast[uint64](&_snd_ctl_unregister_ioctl))
+    _add_export("snd_ctl_unregister_ioctl_compat",
+                cast[uint64](&_snd_ctl_unregister_ioctl_compat))
+    _add_export("snd_ctl_make_virtual_master",
+                cast[uint64](&_snd_ctl_make_virtual_master))
+    _add_export("snd_ctl_add_vmaster_hook",
+                cast[uint64](&_snd_ctl_add_vmaster_hook))
+    _add_export("snd_ctl_apply_vmaster_followers",
+                cast[uint64](&_snd_ctl_apply_vmaster_followers))
+    _add_export("snd_ctl_sync_vmaster",
+                cast[uint64](&_snd_ctl_sync_vmaster))
+    _add_export("_snd_ctl_add_follower",
+                cast[uint64](&__snd_ctl_add_follower))
+
+    # ---- snd_info ----
+    _add_export("snd_info_create_card_entry",
+                cast[uint64](&_snd_info_create_card_entry))
+    _add_export("snd_info_create_module_entry",
+                cast[uint64](&_snd_info_create_module_entry))
+    _add_export("snd_info_free_entry",
+                cast[uint64](&_snd_info_free_entry))
+    _add_export("snd_info_register",
+                cast[uint64](&_snd_info_register))
+    _add_export("snd_info_get_line",
+                cast[uint64](&_snd_info_get_line))
+    _add_export("snd_info_get_str",
+                cast[uint64](&_snd_info_get_str))
+
+    # ---- snd_hwdep / snd_jack / snd_timer ----
+    _add_export("snd_hwdep_new",
+                cast[uint64](&_snd_hwdep_new))
+    _add_export("snd_jack_new",
+                cast[uint64](&_snd_jack_new))
+    _add_export("snd_jack_report",
+                cast[uint64](&_snd_jack_report))
+    _add_export("snd_jack_set_key",
+                cast[uint64](&_snd_jack_set_key))
+    _add_export("snd_timer_new",
+                cast[uint64](&_snd_timer_new))
+    _add_export("snd_timer_interrupt",
+                cast[uint64](&_snd_timer_interrupt))
+    _add_export("snd_timer_notify",
+                cast[uint64](&_snd_timer_notify))
+
+    # ---- snd_array ----
+    _add_export("snd_array_new",
+                cast[uint64](&_snd_array_new))
+    _add_export("snd_array_free",
+                cast[uint64](&_snd_array_free))
+
+    # ---- snd_dma / snd_sgbuf ----
+    _add_export("snd_dma_alloc_dir_pages",
+                cast[uint64](&_snd_dma_alloc_dir_pages))
+    _add_export("snd_dma_free_pages",
+                cast[uint64](&_snd_dma_free_pages))
+    _add_export("snd_sgbuf_get_addr",
+                cast[uint64](&_snd_sgbuf_get_addr))
+    _add_export("snd_sgbuf_get_chunk_size",
+                cast[uint64](&_snd_sgbuf_get_chunk_size))
+
+    # ---- snd_register_device / snd_lookup_minor_data ----
+    _add_export("snd_register_device",
+                cast[uint64](&_snd_register_device))
+    _add_export("snd_unregister_device",
+                cast[uint64](&_snd_unregister_device))
+    _add_export("snd_lookup_minor_data",
+                cast[uint64](&_snd_lookup_minor_data))
+
+    # ---- misc snd_* ----
+    _add_export("snd_component_add",
+                cast[uint64](&_snd_component_add))
+    _add_export("snd_power_wait",
+                cast[uint64](&_snd_power_wait))
+    _add_export("snd_kill_fasync",
+                cast[uint64](&_snd_kill_fasync))
+    _add_export("snd_fasync_helper",
+                cast[uint64](&_snd_fasync_helper))
+    _add_export("snd_fasync_free",
+                cast[uint64](&_snd_fasync_free))
+    _add_export("snd_pci_quirk_lookup",
+                cast[uint64](&_snd_pci_quirk_lookup))
+    _add_export("snd_pci_quirk_lookup_id",
+                cast[uint64](&_snd_pci_quirk_lookup_id))
+
+    # ---- generic-kernel cold stubs ----
+    _add_export("register_sound_special_device",
+                cast[uint64](&_snd_register_sound_special_device))
+    _add_export("unregister_sound_special",
+                cast[uint64](&_snd_unregister_sound_special))
+    _add_export("proc_create_data",
+                cast[uint64](&_snd_proc_create_data))
+    _add_export("proc_mkdir_mode",
+                cast[uint64](&_snd_proc_mkdir_mode))
+    _add_export("proc_set_size",
+                cast[uint64](&_snd_proc_set_size))
+    _add_export("proc_symlink",
+                cast[uint64](&_snd_proc_symlink))
+    _add_export("input_allocate_device",
+                cast[uint64](&_snd_input_allocate_device))
+    _add_export("input_free_device",
+                cast[uint64](&_snd_input_free_device))
+    _add_export("input_register_device",
+                cast[uint64](&_snd_input_register_device))
+    _add_export("input_unregister_device",
+                cast[uint64](&_snd_input_unregister_device))
+    _add_export("input_event",
+                cast[uint64](&_snd_input_event))
+    _add_export("input_set_capability",
+                cast[uint64](&_snd_input_set_capability))
+    _add_export("kobject_set_name",
+                cast[uint64](&_snd_kobject_set_name))
+    _add_export("devm_add_action",
+                cast[uint64](&_snd_devm_add_action))
+    _add_export("devm_remove_action",
+                cast[uint64](&_snd_devm_remove_action))
+    _add_export("devres_add",
+                cast[uint64](&_snd_devres_add))
+    _add_export("__devres_alloc_node",
+                cast[uint64](&_snd_devres_alloc_node))
+    _add_export("devres_find",
+                cast[uint64](&_snd_devres_find))
+    _add_export("devres_destroy",
+                cast[uint64](&_snd_devres_destroy))
+    _add_export("devres_free",
+                cast[uint64](&_snd_devres_free))
+    _add_export("free_dma",
+                cast[uint64](&_snd_free_dma))
+    _add_export("request_dma",
+                cast[uint64](&_snd_request_dma))
+    _add_export("stream_open",
+                cast[uint64](&_snd_stream_open))
+    _add_export("fasync_helper",
+                cast[uint64](&_snd_fasync_helper))
+    _add_export("kill_fasync",
+                cast[uint64](&_snd_kill_fasync_generic))
+    _add_export("single_open_size",
+                cast[uint64](&_snd_single_open_size))
+    _add_export("pid_vnr",
+                cast[uint64](&_snd_pid_vnr))
+    _add_export("release_resource",
+                cast[uint64](&_snd_release_resource))
+    _add_export("strlcat",
+                cast[uint64](&_snd_strlcat))
+    _add_export("vmemdup_user",
+                cast[uint64](&_snd_vmemdup_user))
+    _add_export("downgrade_write",
+                cast[uint64](&_snd_downgrade_write))
+    _add_export("memcpy_toio",
+                cast[uint64](&_snd_memcpy_toio))
+    _add_export("_raw_read_lock_irqsave",
+                cast[uint64](&_snd_raw_read_lock_irqsave))
+    _add_export("_raw_read_unlock_irqrestore",
+                cast[uint64](&_snd_raw_read_unlock_irqrestore))
+    _add_export("_raw_write_lock_irqsave",
+                cast[uint64](&_snd_raw_write_lock_irqsave))
+    _add_export("_raw_write_unlock_irqrestore",
+                cast[uint64](&_snd_raw_write_unlock_irqrestore))
+    _add_export("__list_del_entry_valid",
+                cast[uint64](&_snd_list_del_entry_valid))
+    _add_export("kvmalloc_node",
+                cast[uint64](&_snd_kvmalloc_node))
+    _add_export("xa_destroy",
+                cast[uint64](&_snd_xa_destroy))
+    _add_export("xa_erase",
+                cast[uint64](&_snd_xa_erase))
+    _add_export("__xa_insert",
+                cast[uint64](&_snd_xa_insert))
+    _add_export("xa_load",
+                cast[uint64](&_snd_xa_load))
+    _add_export("xa_store_range",
+                cast[uint64](&_snd_xa_store_range))
+    _add_export("dma_spin_lock",
+                cast[uint64](&snd_dma_spin_lock_buf[0]))
+
+    # ---- DATA exports ----
+    _add_export("snd_major",
+                cast[uint64](&snd_major_var))
+    _add_export("sound_class",
+                cast[uint64](&snd_sound_class_var))
+    _add_export("snd_hda_bus_type",
+                cast[uint64](&snd_hda_bus_type_buf[0]))

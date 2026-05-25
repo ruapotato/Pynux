@@ -84,6 +84,9 @@ from linux_abi.api_nvme import linux_abi_register_nvme
 from linux_abi.api_usbcore import linux_abi_register_usbcore
 from linux_abi.api_xhci import linux_abi_register_xhci
 from linux_abi.api_ehci import linux_abi_register_ehci
+from linux_abi.api_snd_core import linux_abi_register_snd_core
+from linux_abi.api_snd_pcm import linux_abi_register_snd_pcm
+from linux_abi.api_snd_hda import linux_abi_register_snd_hda
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -850,6 +853,7 @@ def linux_abi_exports_init():
     # `-device igb` line is the matching fixture when QEMU supports it.
     linux_abi_register_igb()
 
+<<<<<<< HEAD
     # Storage pivot (Agent D): the 53 new exports the stock Debian
     # ahci.ko (Linux 6.1.0-32 build) needs beyond what L<=68 + e1000e
     # already exports. ahci.ko is the SATA AHCI controller driver
@@ -933,6 +937,14 @@ def linux_abi_exports_init():
     linux_abi_register_usbcore()
     linux_abi_register_xhci()
     linux_abi_register_ehci()
+
+    # Audio scale-out: Intel HD Audio family — snd_hda_intel.ko +
+    # snd.ko + snd_pcm.ko + snd_hda_core.ko + snd_hda_codec.ko. Same
+    # V0 strategy as the NIC family — shim every cross-.ko reference
+    # on the Hamnix side so modules.dep ordering isn't required.
+    linux_abi_register_snd_core()
+    linux_abi_register_snd_pcm()
+    linux_abi_register_snd_hda()
 
 
 def linux_abi_lookup(name: Ptr[char]) -> uint64:
