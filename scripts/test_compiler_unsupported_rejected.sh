@@ -80,6 +80,79 @@ CASES=(
     n: int32 = cast[int32](sizeof(int64))
     return 0
 "
+"for_loop|def main() -> int32:
+    s: int32 = 0
+    for i in range(10):
+        s = s + i
+    return s
+"
+"range_builtin|def main() -> int32:
+    n: int32 = cast[int32](range(5))
+    return n
+"
+"tuple_unpack|def main() -> int32:
+    a: int32 = 1
+    b: int32 = 2
+    a, b = b, a
+    return a
+"
+"compound_assign|def main() -> int32:
+    x: int32 = 0
+    x += 1
+    return x
+"
+"global_stmt|counter: int64 = 0
+def main() -> int32:
+    global counter
+    counter = counter + 1
+    return 0
+"
+"is_op|def main() -> int32:
+    x: int32 = 5
+    if x is 5:
+        return 1
+    return 0
+"
+"defer_stmt|def main() -> int32:
+    defer cleanup()
+    return 0
+"
+"assert_stmt|def main() -> int32:
+    x: int32 = 1
+    assert x > 0
+    return 0
+"
+"union_decl|union UFoo:
+    a: int32
+    b: uint64
+def main() -> int32:
+    return 0
+"
+"class_method_call|class Foo:
+    x: int32
+    def m(self) -> int32:
+        return self.x
+def main() -> int32:
+    f: Foo
+    return f.m()
+"
+"class_inherit_field|class Animal:
+    legs: int32
+class Dog(Animal):
+    bark: int32
+def main() -> int32:
+    d: Dog
+    d.legs = 4
+    return d.legs
+"
+"print_builtin|def main() -> int32:
+    print(\"hi\")
+    return 0
+"
+"len_builtin|def main() -> int32:
+    n: int32 = cast[int32](len(\"hi\"))
+    return n
+"
 )
 
 fail=0

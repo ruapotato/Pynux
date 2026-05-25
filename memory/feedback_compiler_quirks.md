@@ -221,6 +221,50 @@ the answer is to (a) write the equivalent explicit code, or (b) bring
 a real proposal to extend the compiler — not to silently work around
 the parser/codegen mismatch.
 
+### 2026-05-25 follow-up audit
+
+A second sweep against the actual codegen surfaced three NEW fictions
+that the 2026-05-23 audit missed, plus several borderline cases. All
+were corrected in `LANGUAGE.md`:
+
+| Fiction | Reality |
+|---|---|
+| `for i in range(...)` (was documented with multiple full examples) | `ForStmt` is rejected by codegen; `range` is not a builtin. Zero production users. Use `while` with an explicit counter. |
+| `a, b = b, a` tuple-swap (was documented as "uses TupleUnpackAssign codegen") | `TupleUnpackAssign` has NO codegen path. Codegen rejects with `x86: statement TupleUnpackAssign not yet supported`. Use a temporary. |
+| Compound assignment (`+=`, `\|=`, ...) (undocumented; agents reach for it) | Codegen rejects with `x86: compound assignment '+=' not yet supported`. Spell out `x = x + 1`. |
+
+Borderline cases now spelled out in `LANGUAGE.md`'s "Features
+deliberately not in Adder" table:
+- `global x` / `nonlocal x` statements — codegen rejects `GlobalStmt`.
+- `is` / `is not` operators — codegen rejects `BinOp.IS`.
+- `from M import X as Y` rename — parsed; alias silently lost; only `X`
+  is callable.
+- Decorators on top-level def/class — silently ignored by codegen
+  (not the same as silently dropped — the def itself still emits).
+- Class methods (`def m(self):` inside a class body) — silently
+  DROPPED by codegen (no machine code for the body); a `f.m()` call
+  then fails with `MethodCallExpr not yet supported`.
+- Class inheritance `class Dog(Animal)` — parsed but inherited fields
+  are NOT copied; `d.legs` fails with `struct 'Dog' has no field 'legs'`.
+- `union Foo:` — codegen rejects with `top-level UnionDef not yet
+  supported`.
+- `List[T]` / `Dict[K,V]` / `Tuple[A,B]` / `Optional[T]` as type
+  annotations — parsed and silently treated as a generic 8-byte slot
+  (no real container behind the type).
+
+Reserved-identifier list expanded in the `Lexical Grammar → Reserved
+identifiers` section to cover the full lexer KEYWORDS table (incl.
+the type-name reservations like `int`, `float`, `str`, `bytes`, and
+the Python-noise ones like `field`, `property`, `self`, `auto`,
+`isinstance`, `dataclass`, `staticmethod`, `classmethod`).
+
+`scripts/test_compiler_unsupported_rejected.sh` extended with 14 new
+cases (`for_loop`, `tuple_unpack`, `compound_assign`, `global_stmt`,
+`is_op`, `defer_stmt`, `assert_stmt`, `union_decl`, `class_method_call`,
+`class_inherit_field`, `print_builtin`, `len_builtin`, `range_builtin`)
+so any of these silently re-acquiring codegen support fails the
+regression suite and forces an update of LANGUAGE.md.
+
 ## ~~`cast[uint64](arr[i])` for `Array[N, uint32]` doesn't zero-extend cleanly~~ NOT REAL (verified 2026-05-18)
 
 Was claimed during M16.97 debug. Verified against
