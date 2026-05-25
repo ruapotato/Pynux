@@ -1,0 +1,102 @@
+# linux_abi/api_hwmon.ad
+#
+# Shared hwmon (hardware monitoring) shim owner.
+#
+# Hoisted from api_igb.ad, api_atlantic.ad, and api_tg3.ad during the
+# "phylib + mdio + pci_vpd + hwmon" cleanup. Each NIC file had grown
+# its own stub return buffer (or, in igb's case, a per-call 4-KiB
+# kzalloc); merge them into a single owner with one shared static
+# stub buffer that's returned by every register flavour.
+#
+# We have no hwmon subsystem; the goal is just to hand back a benign
+# non-NULL, non-IS_ERR pointer so:
+#   * IS_ERR_OR_NULL() checks pass
+#   * the driver stashes the cookie for later devm_hwmon_device_
+#     unregister / hwmon_device_unregister (both no-op below)
+#
+# Variants we ship:
+#   * hwmon_device_register_with_groups       (tg3 — non-devm)
+#   * devm_hwmon_device_register_with_groups  (igb)
+#   * devm_hwmon_device_register_with_info    (atlantic — modern API)
+#   * hwmon_device_unregister                 (tg3)
+#
+# Naming: the "_hwm_" prefix marks the Hamnix-side shim.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree, kzalloc
+
+
+# =====================================================================
+# DATA: single shared stub buffer (returned by every register variant)
+# =====================================================================
+#
+# Linux's IS_ERR check trips on the high 0xfff range — a normal data
+# pointer (kernel BSS) passes both IS_ERR and NULL checks. A 64-byte
+# buffer is enough for the driver's "is this a valid cookie?" probe.
+
+hwm_dev_stub: Array[64, uint8]
+
+
+# =====================================================================
+# Group 1: register variants
+# =====================================================================
+
+def _hwm_register_with_groups(dev: uint64, name: Ptr[char],
+                                drvdata: uint64, groups: uint64) -> uint64:
+    # struct device *hwmon_device_register_with_groups(struct device *,
+    #                                                    const char *name,
+    #                                                    void *drvdata,
+    #                                                    const struct
+    #                                                    attribute_group
+    #                                                    **groups);
+    return cast[uint64](&hwm_dev_stub[0])
+
+
+def _hwm_devm_register_with_groups(dev: uint64, name: Ptr[char],
+                                     drvdata: uint64, groups: uint64) -> uint64:
+    # struct device *devm_hwmon_device_register_with_groups(struct device *,
+    #                                                         const char *name,
+    #                                                         void *drvdata,
+    #                                                         const struct
+    #                                                         attribute_group
+    #                                                         **groups);
+    # devm variant; cleanup is implicit at driver detach (no-op here).
+    return cast[uint64](&hwm_dev_stub[0])
+
+
+def _hwm_devm_register_with_info(dev: uint64, name: Ptr[char],
+                                   drvdata: uint64, chip_info: uint64,
+                                   extra_groups: uint64) -> uint64:
+    # struct device *devm_hwmon_device_register_with_info(
+    #     struct device *, const char *name, void *drvdata,
+    #     const struct hwmon_chip_info *, const struct
+    #     attribute_group **);
+    # The modern API (chip_info descriptor instead of attribute groups).
+    return cast[uint64](&hwm_dev_stub[0])
+
+
+# =====================================================================
+# Group 2: unregister
+# =====================================================================
+
+def _hwm_unregister(dev: uint64):
+    # void hwmon_device_unregister(struct device *);
+    return
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_hwmon():
+    # 4 hwmon exports hoisted from api_igb + api_atlantic + api_tg3.
+
+    _add_export("hwmon_device_register_with_groups",
+                cast[uint64](&_hwm_register_with_groups))
+    _add_export("devm_hwmon_device_register_with_groups",
+                cast[uint64](&_hwm_devm_register_with_groups))
+    _add_export("devm_hwmon_device_register_with_info",
+                cast[uint64](&_hwm_devm_register_with_info))
+    _add_export("hwmon_device_unregister",
+                cast[uint64](&_hwm_unregister))

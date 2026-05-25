@@ -1,0 +1,141 @@
+# linux_abi/api_mdio.ad
+#
+# Shared MDIO bus shim owner.
+#
+# Hoisted from api_r8169.ad (devm flavours) and api_tg3.ad (non-devm
+# flavours) during the "phylib + mdio + pci_vpd + hwmon" cleanup.
+# The MDIO bus connects the MAC to the PHY chip; any NIC driver that
+# spins up its own per-device PHY scan crosses into this surface.
+#
+# Without a real PHY behind an MDIO bus, reads return 0xffff (the
+# all-ones default for an absent device) and writes are dropped. The
+# devm and non-devm flavours share the same backing implementation —
+# we kzalloc a 1 KiB + sizeof_priv buffer for mdiobus_alloc_size and
+# its devm variant, and the registration calls are stubbed to success
+# so the driver's PHY scan walks addr 0..31 finding nothing.
+#
+# Naming: the "_mdio_" prefix marks the Hamnix-side shim.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree, kzalloc
+
+
+# =====================================================================
+# Group 1: MDIO bus allocation (devm + non-devm)
+# =====================================================================
+
+def _mdio_devm_alloc_size(dev: uint64, sz: int32) -> uint64:
+    # struct mii_bus *devm_mdiobus_alloc_size(struct device *, int sizeof_priv);
+    # Allocates a struct mii_bus with `sz` trailing bytes for the
+    # driver's private state. Real struct mii_bus is ~512 bytes; we
+    # give it 1 KiB + sz.
+    total: uint64 = 1024
+    if sz > 0:
+        total = total + cast[uint64](sz)
+    return kzalloc(total)
+
+
+def _mdio_alloc_size(sz: uint64) -> uint64:
+    # struct mii_bus *mdiobus_alloc_size(size_t sizeof_priv);
+    # Non-devm flavour. Same backing alloc.
+    total: uint64 = 1024
+    total = total + sz
+    return kzalloc(total)
+
+
+def _mdio_free(bus: uint64):
+    # void mdiobus_free(struct mii_bus *);
+    if bus != 0:
+        kfree(bus)
+
+
+# =====================================================================
+# Group 2: MDIO bus registration (devm + non-devm)
+# =====================================================================
+
+def _mdio_devm_register(dev: uint64, bus: uint64,
+                          owner: uint64) -> int32:
+    # int __devm_mdiobus_register(struct device *, struct mii_bus *,
+    #                              struct module *);
+    # Registers the bus and triggers a PHY scan. No bus to attach to;
+    # success keeps the driver's probe on the happy path.
+    return 0
+
+
+def _mdio_register(bus: uint64, owner: uint64) -> int32:
+    # int __mdiobus_register(struct mii_bus *, struct module *);
+    # Non-devm flavour. Same contract.
+    return 0
+
+
+def _mdio_unregister(bus: uint64):
+    # void mdiobus_unregister(struct mii_bus *);
+    return
+
+
+# =====================================================================
+# Group 3: MDIO bus I/O (PHY register access)
+# =====================================================================
+
+def _mdio_get_phy(bus: uint64, addr: int32) -> uint64:
+    # struct phy_device *mdiobus_get_phy(struct mii_bus *, int addr);
+    # Returns the phy_device at the given MDIO address, or NULL. The
+    # driver walks addr 0..31 looking for a non-NULL phydev. We return
+    # NULL for every address; the driver falls back to "no PHY found"
+    # and uses its built-in default.
+    return 0
+
+
+def _mdio_read(bus: uint64, addr: int32, regnum: uint32) -> int32:
+    # int mdiobus_read(struct mii_bus *, int addr, u32 regnum);
+    # Returns the 16-bit register value or a negative errno. 0xffff is
+    # the "no device on this address" bus-floats-high reading, which
+    # the driver treats as "no PHY here" (the address scan short-
+    # circuits on that).
+    return 0xffff
+
+
+def _mdio_write(bus: uint64, addr: int32, regnum: uint32,
+                  val: uint16) -> int32:
+    return 0
+
+
+def _mdio___write(bus: uint64, addr: int32, regnum: uint32,
+                    val: uint16) -> int32:
+    # Lockless variant; same behaviour.
+    return 0
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_mdio():
+    # 10 mdiobus exports hoisted from api_r8169 + api_tg3.
+
+    # ---- alloc / free (devm + non-devm) ----
+    _add_export("devm_mdiobus_alloc_size",
+                cast[uint64](&_mdio_devm_alloc_size))
+    _add_export("mdiobus_alloc_size",
+                cast[uint64](&_mdio_alloc_size))
+    _add_export("mdiobus_free",
+                cast[uint64](&_mdio_free))
+
+    # ---- register / unregister (devm + non-devm) ----
+    _add_export("__devm_mdiobus_register",
+                cast[uint64](&_mdio_devm_register))
+    _add_export("__mdiobus_register",
+                cast[uint64](&_mdio_register))
+    _add_export("mdiobus_unregister",
+                cast[uint64](&_mdio_unregister))
+
+    # ---- I/O (PHY-register access through the bus) ----
+    _add_export("mdiobus_get_phy",
+                cast[uint64](&_mdio_get_phy))
+    _add_export("mdiobus_read",
+                cast[uint64](&_mdio_read))
+    _add_export("mdiobus_write",
+                cast[uint64](&_mdio_write))
+    _add_export("__mdiobus_write",
+                cast[uint64](&_mdio___write))

@@ -1,0 +1,105 @@
+# linux_abi/api_pci_vpd.ad
+#
+# Shared PCI Vital Product Data (VPD) shim owner.
+#
+# Hoisted from api_sky2.ad (raw byte read/write) and api_tg3.ad
+# (alloc + csum + find_ro_info_keyword) during the
+# "phylib + mdio + pci_vpd + hwmon" cleanup.
+#
+# VPD is a side-channel EEPROM in the PCI config space (capability
+# 0x03) that carries OEM-supplied strings (model, part number,
+# serial) plus optional MAC overrides. Multiple NIC drivers
+# (sky2, tg3, and future Broadcom/Marvell families) read VPD at
+# probe to populate ethtool strings + the per-port MAC override.
+# With no VPD region in our env, all entry points return "no VPD"
+# outcomes and the driver falls back to chip defaults.
+#
+# Naming: the "_vpd_" prefix marks the Hamnix-side shim.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree, kzalloc
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# Group 1: byte-level read / write
+# =====================================================================
+
+def _vpd_read_any(pdev: uint64, pos: int32, count: uint64,
+                    buf: uint64) -> int64:
+    # ssize_t pci_read_vpd_any(struct pci_dev *, loff_t pos,
+    #                            size_t count, void *buf);
+    # Returns bytes-read on success, or a negative errno. We have no
+    # VPD; zero-fill the destination buffer and report "read 0 bytes"
+    # (== EOF, which the driver treats as "no VPD field at this offset").
+    if buf != 0 and count != 0:
+        memset(cast[Ptr[uint8]](buf), 0, count)
+    return 0
+
+
+def _vpd_write_any(pdev: uint64, pos: int32, count: uint64,
+                     buf: uint64) -> int64:
+    # ssize_t pci_write_vpd_any(struct pci_dev *, loff_t pos,
+    #                             size_t count, const void *buf);
+    # No-op; pretend the entire range was written.
+    return cast[int64](count)
+
+
+# =====================================================================
+# Group 2: allocator / checksum / keyword finder
+# =====================================================================
+
+def _vpd_alloc(pdev: uint64, sizep: uint64) -> uint64:
+    # void *pci_vpd_alloc(struct pci_dev *, unsigned int *size);
+    # Allocates + reads the entire VPD region into a buffer. We have
+    # no VPD; return an ERR_PTR(-ENODEV) cookie (the predefined
+    # MAX_ERRNO value 0xfffffffffffffff5 == -ENODEV cast to ptr).
+    # The driver IS_ERR()-checks the result and falls back to no-VPD
+    # probe.
+    if sizep != 0:
+        sp: Ptr[uint32] = cast[Ptr[uint32]](sizep)
+        sp[0] = 0
+    return 0xffffffffffffffed                          # -ENODEV ERR_PTR
+
+
+def _vpd_check_csum(buf: uint64, size: uint64) -> int32:
+    # int pci_vpd_check_csum(const void *vpd, size_t size);
+    # Validates the VPD region's checksum byte. We never returned a
+    # valid VPD pointer; this won't be called on the success path,
+    # but the relocation must resolve. -EINVAL for "no valid VPD".
+    return -22                                         # -EINVAL
+
+
+def _vpd_find_ro_info_keyword(buf: uint64, len: uint64,
+                                kw: Ptr[char],
+                                size: uint64) -> int32:
+    # int pci_vpd_find_ro_info_keyword(const void *buf, unsigned int
+    #                                    len, const char *kw, unsigned
+    #                                    int *size);
+    # Locates the offset of a 2-byte VPD keyword (e.g. "MN", "PN") in
+    # the buffer's RO area. Returns -ENOENT == keyword not found.
+    return -2                                          # -ENOENT
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_pci_vpd():
+    # 5 pci_vpd_* / pci_*vpd_any exports hoisted from api_sky2 + api_tg3.
+
+    # ---- byte-level read / write ----
+    _add_export("pci_read_vpd_any",
+                cast[uint64](&_vpd_read_any))
+    _add_export("pci_write_vpd_any",
+                cast[uint64](&_vpd_write_any))
+
+    # ---- allocator / checksum / keyword finder ----
+    _add_export("pci_vpd_alloc",
+                cast[uint64](&_vpd_alloc))
+    _add_export("pci_vpd_check_csum",
+                cast[uint64](&_vpd_check_csum))
+    _add_export("pci_vpd_find_ro_info_keyword",
+                cast[uint64](&_vpd_find_ro_info_keyword))

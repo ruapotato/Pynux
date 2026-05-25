@@ -1,0 +1,337 @@
+# linux_abi/api_phylib.ad
+#
+# Shared libphy (Linux generic PHY library) shim owner.
+#
+# Hoisted from api_r8169.ad + api_tg3.ad during the
+# "phylib + mdio + pci_vpd + hwmon" cleanup. Realtek (r8169),
+# Broadcom (tg3), Aquantia (atlantic) — every Ethernet NIC that
+# wires a discrete PHY through Linux's drivers/net/phy/*.ko crosses
+# into this surface. Without a real PHY behind an MDIO bus, all
+# entry points return benign "no PHY here" outcomes so the driver's
+# probe + open path completes:
+#
+#   * phy_read / phy_read_paged / phy_read_mmd -> 0xffff
+#     (bus-floats-high == "no device on this address" — the address
+#     scan short-circuits on that reading)
+#   * phy_write* -> 0 (success / drop)
+#   * phy_modify* -> 0
+#   * phy_ethtool_* -> -ENOTSUPP (524)
+#   * phy_start / phy_stop / phy_attached_info / printers -> void
+#   * phy_connect / mdiobus_get_phy -> NULL (no phydev found;
+#     drivers fall back to their internal-PHY arm)
+#
+# Stub philosophy: every entry point is init-cold. The packet path
+# and ethtool ioctls don't fire at insmod time.
+#
+# Naming: the "_phy_" prefix marks the Hamnix-side shim.
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree, kzalloc
+
+
+# =====================================================================
+# Group 1: PHY library — generic surface (libphy)
+# =====================================================================
+
+def _phy_connect_direct(dev: uint64, phydev: uint64,
+                          handler: uint64, interface: int32) -> int32:
+    # int phy_connect_direct(struct net_device *, struct phy_device *,
+    #                          void (*handler)(struct net_device *),
+    #                          phy_interface_t);
+    # Binds the phydev to the netdev. Returns 0; the driver stashes
+    # phydev for later phy_* calls (which all land back here).
+    return 0
+
+
+def _phy_connect(dev: uint64, bus_id: Ptr[char], handler: uint64,
+                  interface: int32) -> uint64:
+    # struct phy_device *phy_connect(struct net_device *, const char
+    #                                  *bus_id, void (*handler)(struct
+    #                                  net_device *), phy_interface_t);
+    # Higher-level wrapper around phy_attach_direct + phy_connect_direct.
+    # We have no real PHY; return NULL so the caller's IS_ERR_OR_NULL
+    # check trips and the driver falls into its non-phylib internal-PHY
+    # arm.
+    return 0
+
+
+def _phy_disconnect(phydev: uint64):
+    return
+
+
+def _phy_start(phydev: uint64):
+    # Kicks the PHY's autoneg state machine. No machine to kick.
+    return
+
+
+def _phy_stop(phydev: uint64):
+    return
+
+
+def _phy_resume(phydev: uint64) -> int32:
+    return 0
+
+
+def _phy_suspend(phydev: uint64) -> int32:
+    return 0
+
+
+def _phy_init_hw(phydev: uint64) -> int32:
+    # int phy_init_hw(struct phy_device *);
+    # Re-applies the boot-time PHY config. No real PHY to talk to;
+    # returning 0 is the success contract.
+    return 0
+
+
+def _phy_attached_info(phydev: uint64):
+    # void phy_attached_info(struct phy_device *);
+    # printk banner "Attached PHY driver ...". Suppress the banner.
+    return
+
+
+def _phy_start_aneg(phydev: uint64) -> int32:
+    return 0
+
+
+def _phy_speed_up(phydev: uint64) -> int32:
+    return 0
+
+
+def _phy_speed_down(phydev: uint64, sync: int32) -> int32:
+    return 0
+
+
+def _phy_set_max_speed(phydev: uint64, max_speed: uint32) -> int32:
+    return 0
+
+
+def _phy_print_status(phydev: uint64):
+    return
+
+
+def _phy_mac_interrupt(phydev: uint64):
+    return
+
+
+def _phy_do_ioctl_running(dev: uint64, ifr: uint64, cmd: int32) -> int32:
+    # int phy_do_ioctl_running(struct net_device *, struct ifreq *, int cmd);
+    # Forwards an ethtool/mii ioctl to the PHY. No PHY; -ENOTSUPP.
+    return -524
+
+
+def _phy_get_pause(phydev: uint64, tx_pause: uint64, rx_pause: uint64):
+    # void phy_get_pause(struct phy_device *, bool *tx_pause, bool *rx_pause);
+    if tx_pause != 0:
+        p: Ptr[uint8] = cast[Ptr[uint8]](tx_pause)
+        p[0] = 0
+    if rx_pause != 0:
+        p2: Ptr[uint8] = cast[Ptr[uint8]](rx_pause)
+        p2[0] = 0
+
+
+def _phy_set_asym_pause(phydev: uint64, rx: int32, tx: int32):
+    return
+
+
+def _phy_support_asym_pause(phydev: uint64):
+    return
+
+
+def _phy_validate_pause(phydev: uint64, pp: uint64) -> int32:
+    # int phy_validate_pause(struct phy_device *,
+    #                          struct ethtool_pauseparam *);
+    # Sanity-checks pause parameters against the PHY's supported set.
+    # No PHY; pass-through success.
+    return 0
+
+
+# ---- ethtool-flavoured PHY entry points ----
+
+def _phy_ethtool_get_link_ksettings(dev: uint64, cmd: uint64) -> int32:
+    # Returns the PHY's current speed/duplex/pause/advertise mask.
+    # Init-cold; the only consumer is `ethtool eth0`. -ENOTSUPP.
+    return -524
+
+
+def _phy_ethtool_set_link_ksettings(dev: uint64, cmd: uint64) -> int32:
+    return -524
+
+
+def _phy_ethtool_ksettings_get(phydev: uint64, cmd: uint64) -> int32:
+    # int phy_ethtool_ksettings_get(struct phy_device *,
+    #                                 struct ethtool_link_ksettings *);
+    # The _ksettings_ infix variant — tg3 + newer drivers link against
+    # this, the older drivers (r8169) link the get_link_ksettings form.
+    return -524
+
+
+def _phy_ethtool_ksettings_set(phydev: uint64, cmd: uint64) -> int32:
+    return -524
+
+
+def _phy_ethtool_get_eee(phydev: uint64, data: uint64) -> int32:
+    # Energy-Efficient Ethernet — toggles via ethtool. Not supported.
+    return -524
+
+
+def _phy_ethtool_set_eee(phydev: uint64, data: uint64) -> int32:
+    return -524
+
+
+def _phy_ethtool_nway_reset(dev: uint64) -> int32:
+    # `ethtool -r`. Restarts autoneg. Init-cold; success.
+    return 0
+
+
+def _phy_mii_ioctl(phydev: uint64, mii_data: uint64, cmd: int32) -> int32:
+    # int phy_mii_ioctl(struct phy_device *, struct ifreq *, int cmd);
+    # Forwards a SIOC{G,S}MII* ioctl to the PHY. Init-cold.
+    return 0
+
+
+def _phy_genphy_soft_reset(phydev: uint64) -> int32:
+    # int genphy_soft_reset(struct phy_device *);
+    # Writes BMCR.RESET (0x8000) to PHY register 0 and polls. No PHY;
+    # success.
+    return 0
+
+
+# ---- paged / MMD PHY register access ----
+#
+# Realtek-class PHYs use Clause-45-style paged register access. With
+# no PHY behind the MDIO bus, reads return 0xffff (bus-floats-high
+# default for an absent device) and writes are dropped.
+
+def _phy_read_paged(phydev: uint64, page: int32, regnum: uint32) -> int32:
+    return 0xffff
+
+
+def _phy_write_paged(phydev: uint64, page: int32, regnum: uint32,
+                       val: uint16) -> int32:
+    return 0
+
+
+def _phy_read_mmd(phydev: uint64, devad: int32, regnum: uint32) -> int32:
+    return 0xffff
+
+
+def _phy_write_mmd(phydev: uint64, devad: int32, regnum: uint32,
+                     val: uint16) -> int32:
+    return 0
+
+
+def _phy_select_page(phydev: uint64, page: int32) -> int32:
+    return 0
+
+
+def _phy_restore_page(phydev: uint64, oldpage: int32, ret: int32) -> int32:
+    return ret
+
+
+def _phy_modify(phydev: uint64, regnum: uint32,
+                 mask: uint16, set_bits: uint16) -> int32:
+    # int phy_modify(struct phy_device *, u32 regnum, u16 mask, u16 set);
+    # Read-modify-write. No PHY; success.
+    return 0
+
+
+def _phy___modify(phydev: uint64, regnum: uint32,
+                   mask: uint16, set_bits: uint16) -> int32:
+    # Lockless variant; same behaviour.
+    return 0
+
+
+def _phy_modify_paged(phydev: uint64, page: int32, regnum: uint32,
+                        mask: uint16, set_bits: uint16) -> int32:
+    return 0
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_phylib():
+    # 38 phy_* / genphy_* exports hoisted from api_r8169 + api_tg3.
+
+    # ---- libphy lifecycle ----
+    _add_export("phy_connect_direct",
+                cast[uint64](&_phy_connect_direct))
+    _add_export("phy_connect",
+                cast[uint64](&_phy_connect))
+    _add_export("phy_disconnect",
+                cast[uint64](&_phy_disconnect))
+    _add_export("phy_start",
+                cast[uint64](&_phy_start))
+    _add_export("phy_stop",
+                cast[uint64](&_phy_stop))
+    _add_export("phy_resume",
+                cast[uint64](&_phy_resume))
+    _add_export("phy_suspend",
+                cast[uint64](&_phy_suspend))
+    _add_export("phy_init_hw",
+                cast[uint64](&_phy_init_hw))
+    _add_export("phy_attached_info",
+                cast[uint64](&_phy_attached_info))
+    _add_export("phy_start_aneg",
+                cast[uint64](&_phy_start_aneg))
+    _add_export("phy_speed_up",
+                cast[uint64](&_phy_speed_up))
+    _add_export("phy_speed_down",
+                cast[uint64](&_phy_speed_down))
+    _add_export("phy_set_max_speed",
+                cast[uint64](&_phy_set_max_speed))
+    _add_export("phy_print_status",
+                cast[uint64](&_phy_print_status))
+    _add_export("phy_mac_interrupt",
+                cast[uint64](&_phy_mac_interrupt))
+    _add_export("phy_do_ioctl_running",
+                cast[uint64](&_phy_do_ioctl_running))
+    _add_export("phy_get_pause",
+                cast[uint64](&_phy_get_pause))
+    _add_export("phy_set_asym_pause",
+                cast[uint64](&_phy_set_asym_pause))
+    _add_export("phy_support_asym_pause",
+                cast[uint64](&_phy_support_asym_pause))
+    _add_export("phy_validate_pause",
+                cast[uint64](&_phy_validate_pause))
+
+    # ---- ethtool / mii ----
+    _add_export("phy_ethtool_get_link_ksettings",
+                cast[uint64](&_phy_ethtool_get_link_ksettings))
+    _add_export("phy_ethtool_set_link_ksettings",
+                cast[uint64](&_phy_ethtool_set_link_ksettings))
+    _add_export("phy_ethtool_ksettings_get",
+                cast[uint64](&_phy_ethtool_ksettings_get))
+    _add_export("phy_ethtool_ksettings_set",
+                cast[uint64](&_phy_ethtool_ksettings_set))
+    _add_export("phy_ethtool_get_eee",
+                cast[uint64](&_phy_ethtool_get_eee))
+    _add_export("phy_ethtool_set_eee",
+                cast[uint64](&_phy_ethtool_set_eee))
+    _add_export("phy_ethtool_nway_reset",
+                cast[uint64](&_phy_ethtool_nway_reset))
+    _add_export("phy_mii_ioctl",
+                cast[uint64](&_phy_mii_ioctl))
+    _add_export("genphy_soft_reset",
+                cast[uint64](&_phy_genphy_soft_reset))
+
+    # ---- paged / MMD register access ----
+    _add_export("phy_read_paged",
+                cast[uint64](&_phy_read_paged))
+    _add_export("phy_write_paged",
+                cast[uint64](&_phy_write_paged))
+    _add_export("phy_read_mmd",
+                cast[uint64](&_phy_read_mmd))
+    _add_export("phy_write_mmd",
+                cast[uint64](&_phy_write_mmd))
+    _add_export("phy_select_page",
+                cast[uint64](&_phy_select_page))
+    _add_export("phy_restore_page",
+                cast[uint64](&_phy_restore_page))
+    _add_export("phy_modify",
+                cast[uint64](&_phy_modify))
+    _add_export("__phy_modify",
+                cast[uint64](&_phy___modify))
+    _add_export("phy_modify_paged",
+                cast[uint64](&_phy_modify_paged))

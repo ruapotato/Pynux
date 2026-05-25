@@ -7,20 +7,14 @@
 # api_sky2. This file closes the remaining 26-symbol gap.
 #
 # Categories:
-#   * 6 PHY library — phy_connect, phy_ethtool_ksettings_{get,set},
-#                      phy_mii_ioctl, phy_validate_pause,
-#                      phy_get_pause (handled by api_r8169 already)
-#   * 5 MDIO bus    — mdiobus_alloc_size, mdiobus_free,
-#                      __mdiobus_register, mdiobus_unregister,
-#                      (mdiobus_read/write already by api_r8169)
+#   * PHY library + MDIO bus — HOISTED to api_phylib.ad / api_mdio.ad
+#                              during the shared-shim cleanup.
 #   * 3 sk_buff     — build_skb, slab_build_skb, __napi_alloc_frag_align
-#   * 2 hwmon       — hwmon_device_register_with_groups,
-#                      hwmon_device_unregister
+#   * hwmon         — HOISTED to api_hwmon.ad.
 #   * 4 PCI         — pci_dev_present, pci_get_slot,
 #                      pcie_capability_clear_and_set_word_unlocked,
 #                      (pci_ioremap_bar already by api_alx)
-#   * 3 PCI VPD     — pci_vpd_alloc, pci_vpd_check_csum,
-#                      pci_vpd_find_ro_info_keyword
+#   * PCI VPD       — HOISTED to api_pci_vpd.ad.
 #   * 1 PTP         — ptp_schedule_worker
 #   * 1 bitmap      — __bitmap_equal
 #   * 1 netdev      — netif_get_num_default_rss_queues
@@ -44,97 +38,15 @@ extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 
 
 # =====================================================================
-# DATA buffers
-# =====================================================================
-
-# hwmon device stub — same shape as the atlantic hwmon shim.
-tg3_hwmon_dev_stub: Array[64, uint8]
-
-
-# =====================================================================
-# Group 1: PHY library extensions
+# Groups 1 + 2: PHY library + MDIO bus — HOISTED
 # =====================================================================
 #
-# tg3 wires its internal/external PHY through libphy. api_r8169 ships
-# most of the PHY surface already (phy_start/stop/init_hw/...) — this
-# batch adds the half-dozen tg3 references not covered there.
-
-def _tg3_phy_connect(dev: uint64, bus_id: Ptr[char], handler: uint64,
-                      interface: int32) -> uint64:
-    # struct phy_device *phy_connect(struct net_device *, const char
-    #                                  *bus_id, void (*handler)(struct
-    #                                  net_device *), phy_interface_t);
-    # Higher-level wrapper around phy_attach_direct + phy_connect_direct.
-    # We have no real PHY; return NULL so the caller's IS_ERR_OR_NULL
-    # check trips and tg3 falls into its non-phylib internal-PHY arm.
-    return 0
-
-
-def _tg3_phy_ethtool_ksettings_get(phydev: uint64, cmd: uint64) -> int32:
-    # int phy_ethtool_ksettings_get(struct phy_device *,
-    #                                 struct ethtool_link_ksettings *);
-    # ethtool `-s` getter. Init-cold. (Note: api_r8169 ships
-    # `phy_ethtool_get_link_ksettings` with a slightly different name —
-    # the _ksettings_ infix variant is what tg3 + many newer drivers
-    # link against.)
-    return -524                                       # -ENOTSUPP
-
-
-def _tg3_phy_ethtool_ksettings_set(phydev: uint64, cmd: uint64) -> int32:
-    # int phy_ethtool_ksettings_set(...);
-    return -524
-
-
-def _tg3_phy_mii_ioctl(phydev: uint64, mii_data: uint64, cmd: int32) -> int32:
-    # int phy_mii_ioctl(struct phy_device *, struct ifreq *, int cmd);
-    # Forwards a SIOC{G,S}MII* ioctl to the PHY. Init-cold.
-    return 0
-
-
-def _tg3_phy_validate_pause(phydev: uint64, pp: uint64) -> int32:
-    # int phy_validate_pause(struct phy_device *,
-    #                          struct ethtool_pauseparam *);
-    # Sanity-checks the pause parameters against the PHY's supported
-    # set. No PHY; pass-through success.
-    return 0
-
-
-# =====================================================================
-# Group 2: MDIO bus allocation / register
-# =====================================================================
-#
-# api_r8169 ships mdiobus_read/write + __devm_mdiobus_register +
-# devm_mdiobus_alloc_size. tg3 calls the non-devm flavour
-# (mdiobus_alloc_size + __mdiobus_register + mdiobus_unregister +
-# mdiobus_free) and the bare alloc_size. Same backing alloc as the
-# devm variant.
-
-def _tg3_mdiobus_alloc_size(sz: uint64) -> uint64:
-    # struct mii_bus *mdiobus_alloc_size(size_t sizeof_priv);
-    # Allocates struct mii_bus + `sz` trailing priv bytes. The real
-    # struct mii_bus is ~512 bytes; we hand back kzalloc(1 KiB + sz)
-    # mirroring the devm shim in api_r8169.
-    total: uint64 = 1024
-    total = total + sz
-    return kzalloc(total)
-
-
-def _tg3_mdiobus_free(bus: uint64):
-    # void mdiobus_free(struct mii_bus *);
-    if bus != 0:
-        kfree(bus)
-
-
-def _tg3___mdiobus_register(bus: uint64, owner: uint64) -> int32:
-    # int __mdiobus_register(struct mii_bus *, struct module *);
-    # Same contract as __devm_mdiobus_register in api_r8169 — registers
-    # the bus + triggers PHY scan. No bus to talk to; success.
-    return 0
-
-
-def _tg3_mdiobus_unregister(bus: uint64):
-    # void mdiobus_unregister(struct mii_bus *);
-    return
+# tg3's libphy entry points (phy_connect / phy_ethtool_ksettings_{get,
+# set} / phy_mii_ioctl / phy_validate_pause) and its non-devm MDIO
+# bus helpers (mdiobus_alloc_size / mdiobus_free / __mdiobus_register
+# / mdiobus_unregister) used to live here. They were hoisted to
+# linux_abi/api_phylib.ad and linux_abi/api_mdio.ad. Both files
+# register before api_tg3 in exports.ad.
 
 
 # =====================================================================
@@ -179,28 +91,8 @@ def _tg3_napi_alloc_frag_align(napi: uint64, fragsz: uint32,
 
 
 # =====================================================================
-# Group 4: hwmon (non-devm variants)
+# Group 4: hwmon — HOISTED to api_hwmon.ad
 # =====================================================================
-#
-# api_igb ships devm_hwmon_device_register_with_groups (the devm
-# variant); tg3 uses the plain non-devm form. Same backing stub.
-
-def _tg3_hwmon_device_register_with_groups(dev: uint64,
-                                             name: Ptr[char],
-                                             drvdata: uint64,
-                                             groups: uint64) -> uint64:
-    # struct device *hwmon_device_register_with_groups(struct device *,
-    #                                                    const char *name,
-    #                                                    void *drvdata,
-    #                                                    const struct
-    #                                                    attribute_group
-    #                                                    **groups);
-    return cast[uint64](&tg3_hwmon_dev_stub[0])
-
-
-def _tg3_hwmon_device_unregister(dev: uint64):
-    # void hwmon_device_unregister(struct device *);
-    return
 
 
 # =====================================================================
@@ -237,43 +129,8 @@ def _tg3_pcie_cap_clear_and_set_word_unlocked(pdev: uint64, pos: int32,
 
 
 # =====================================================================
-# Group 6: PCI VPD allocator family
+# Group 6: PCI VPD — HOISTED to api_pci_vpd.ad
 # =====================================================================
-#
-# api_sky2 ships pci_read_vpd_any / pci_write_vpd_any (the byte-level
-# accessors). tg3 uses the higher-level allocator + checksum + RO-info
-# helpers, which sit on top of the byte accessors. With no VPD region
-# in our env, all three return "no VPD" outcomes.
-
-def _tg3_pci_vpd_alloc(pdev: uint64, sizep: uint64) -> uint64:
-    # void *pci_vpd_alloc(struct pci_dev *, unsigned int *size);
-    # Allocates + reads the entire VPD region into a buffer. We have
-    # no VPD; return an ERR_PTR(-ENODEV) cookie (one of the predefined
-    # MAX_ERRNO values — 0xfffffffffffffff5 == -ENODEV cast to ptr).
-    # tg3 IS_ERR()-checks the result and falls back to no-VPD probe.
-    if sizep != 0:
-        sp: Ptr[uint32] = cast[Ptr[uint32]](sizep)
-        sp[0] = 0
-    return 0xffffffffffffffed                          # -ENODEV ERR_PTR
-
-
-def _tg3_pci_vpd_check_csum(buf: uint64, size: uint64) -> int32:
-    # int pci_vpd_check_csum(const void *vpd, size_t size);
-    # Validates the VPD region's checksum byte. We never returned a
-    # valid VPD pointer; this won't be called on the success path,
-    # but the relocation must resolve. -EINVAL for "no valid VPD".
-    return -22                                         # -EINVAL
-
-
-def _tg3_pci_vpd_find_ro_info_keyword(buf: uint64, len: uint64,
-                                        kw: Ptr[char],
-                                        size: uint64) -> int32:
-    # int pci_vpd_find_ro_info_keyword(const void *buf, unsigned int
-    #                                    len, const char *kw, unsigned
-    #                                    int *size);
-    # Locates the offset of a 2-byte VPD keyword (e.g. "MN", "PN") in
-    # the buffer's RO area. Returns -ENOENT == keyword not found.
-    return -2                                          # -ENOENT
 
 
 # =====================================================================
@@ -355,27 +212,8 @@ def linux_abi_register_tg3():
     # 26 new exports beyond api_e1000e + api_r8169 + api_igb + api_alx
     # + api_atlantic + api_sky2.
 
-    # ---- Group 1: PHY library extensions ----
-    _add_export("phy_connect",
-                cast[uint64](&_tg3_phy_connect))
-    _add_export("phy_ethtool_ksettings_get",
-                cast[uint64](&_tg3_phy_ethtool_ksettings_get))
-    _add_export("phy_ethtool_ksettings_set",
-                cast[uint64](&_tg3_phy_ethtool_ksettings_set))
-    _add_export("phy_mii_ioctl",
-                cast[uint64](&_tg3_phy_mii_ioctl))
-    _add_export("phy_validate_pause",
-                cast[uint64](&_tg3_phy_validate_pause))
-
-    # ---- Group 2: MDIO bus (non-devm) ----
-    _add_export("mdiobus_alloc_size",
-                cast[uint64](&_tg3_mdiobus_alloc_size))
-    _add_export("mdiobus_free",
-                cast[uint64](&_tg3_mdiobus_free))
-    _add_export("__mdiobus_register",
-                cast[uint64](&_tg3___mdiobus_register))
-    _add_export("mdiobus_unregister",
-                cast[uint64](&_tg3_mdiobus_unregister))
+    # ---- Groups 1 + 2: PHY library + MDIO bus ----
+    # Hoisted to linux_abi/api_phylib.ad + linux_abi/api_mdio.ad.
 
     # ---- Group 3: sk_buff ----
     _add_export("build_skb",
@@ -385,11 +223,8 @@ def linux_abi_register_tg3():
     _add_export("__napi_alloc_frag_align",
                 cast[uint64](&_tg3_napi_alloc_frag_align))
 
-    # ---- Group 4: hwmon (non-devm) ----
-    _add_export("hwmon_device_register_with_groups",
-                cast[uint64](&_tg3_hwmon_device_register_with_groups))
-    _add_export("hwmon_device_unregister",
-                cast[uint64](&_tg3_hwmon_device_unregister))
+    # ---- Group 4: hwmon ----
+    # Hoisted to linux_abi/api_hwmon.ad.
 
     # ---- Group 5: PCI extensions ----
     _add_export("pci_dev_present",
@@ -400,12 +235,7 @@ def linux_abi_register_tg3():
                 cast[uint64](&_tg3_pcie_cap_clear_and_set_word_unlocked))
 
     # ---- Group 6: PCI VPD ----
-    _add_export("pci_vpd_alloc",
-                cast[uint64](&_tg3_pci_vpd_alloc))
-    _add_export("pci_vpd_check_csum",
-                cast[uint64](&_tg3_pci_vpd_check_csum))
-    _add_export("pci_vpd_find_ro_info_keyword",
-                cast[uint64](&_tg3_pci_vpd_find_ro_info_keyword))
+    # Hoisted to linux_abi/api_pci_vpd.ad.
 
     # ---- Group 7: PTP ----
     _add_export("ptp_schedule_worker",

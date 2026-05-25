@@ -21,7 +21,7 @@
 #   * 1 napi_alloc_skb              — skb alloc from NAPI context
 #   * 1 skb_add_rx_frag_netmem      — frag-add into RX skb (page or
 #                                      device-memory backed)
-#   * 1 hwmon                       — devm_hwmon_device_register_with_info
+#   * hwmon                         — HOISTED to api_hwmon.ad
 #   * 1 dev_open                    — kernel-side ifup
 #   * 1 __dma_sync_single_for_cpu   — the leading-underscore raw
 #                                      form (no inline wrapper)
@@ -39,13 +39,6 @@
 from linux_abi.exports import _add_export
 from kernel.printk.printk import printk0
 from mm.slab import kmalloc, kfree, kzalloc
-
-
-# =====================================================================
-# DATA buffer for hwmon stub return
-# =====================================================================
-
-atl_hwmon_dev_stub: Array[64, uint8]
 
 
 # =====================================================================
@@ -185,24 +178,8 @@ def _atl_skb_add_rx_frag_netmem(skb: uint64, i: int32, netmem: uint64,
 
 
 # =====================================================================
-# Group 7: hwmon (hardware monitoring) — devm variant with info
+# Group 7: hwmon — HOISTED to api_hwmon.ad
 # =====================================================================
-
-def _atl_devm_hwmon_device_register_with_info(dev: uint64,
-                                                name: Ptr[char],
-                                                drvdata: uint64,
-                                                chip_info: uint64,
-                                                extra_groups: uint64) -> uint64:
-    # struct device *devm_hwmon_device_register_with_info(
-    #     struct device *, const char *name, void *drvdata,
-    #     const struct hwmon_chip_info *, const struct
-    #     attribute_group **);
-    # Registers a hwmon device with the "chip_info" descriptor (the
-    # modern API; older drivers use the _with_groups variant). We
-    # have no hwmon subsystem; return a benign non-NULL pointer to a
-    # static buffer so IS_ERR_OR_NULL checks pass and the driver
-    # stashes the cookie for later devm_hwmon_device_unregister.
-    return cast[uint64](&atl_hwmon_dev_stub[0])
 
 
 # =====================================================================
@@ -292,8 +269,7 @@ def linux_abi_register_atlantic():
                 cast[uint64](&_atl_skb_add_rx_frag_netmem))
 
     # ---- Group 7: hwmon ----
-    _add_export("devm_hwmon_device_register_with_info",
-                cast[uint64](&_atl_devm_hwmon_device_register_with_info))
+    # Hoisted to linux_abi/api_hwmon.ad.
 
     # ---- Group 8: dev_open ----
     _add_export("dev_open",

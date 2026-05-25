@@ -57,8 +57,9 @@
 #   * ~6 ptp + ksize + percpu + mem + sched_clock + memcpy_fromio
 #     + page_frag_cache_drain + __num_online_cpus + cpu_number +
 #     __alloc_pages + driver_for_each_device + devm_kmalloc +
-#     devm_hwmon_device_register_with_groups + set_normalized_timespec64
-#     + ptp_clock_event + ptp_find_pin + csum_partial + numa_node.
+#     set_normalized_timespec64 + ptp_clock_event + ptp_find_pin
+#     + csum_partial + numa_node. (devm_hwmon_device_register_with_
+#     groups hoisted to api_hwmon.ad.)
 #
 # Stub philosophy mirrors api_e1000e and api_r8169: every shim here
 # is init-cold. The test fixture would use `qemu -device igb` if
@@ -560,21 +561,6 @@ def _igb_devm_kmalloc(dev: uint64, size: uint64, gfp: uint32) -> uint64:
     return kmalloc(size)
 
 
-def _igb_devm_hwmon_device_register_with_groups(dev: uint64, name: Ptr[char],
-                                                  drvdata: uint64,
-                                                  groups: uint64) -> uint64:
-    # struct device *devm_hwmon_device_register_with_groups(struct device *,
-    #                                                         const char *name,
-    #                                                         void *drvdata,
-    #                                                         const struct
-    #                                                         attribute_group **);
-    # Returns a struct device * (the new hwmon device) or an ERR_PTR.
-    # We have no hwmon subsystem; return a 1-page stub allocation so
-    # the driver's pointer is non-NULL and non-IS_ERR (Linux's IS_ERR
-    # checks for the high 0xfff range; a normal heap pointer passes).
-    return kzalloc(4096)
-
-
 def _igb_page_frag_cache_drain(nc: uint64, count: int32):
     # void __page_frag_cache_drain(struct page *, unsigned int count);
     # Drops `count` refs on a page-frag-cache page. No page-frag
@@ -761,8 +747,7 @@ def linux_abi_register_igb():
                 cast[uint64](&_igb_driver_for_each_device))
     _add_export("devm_kmalloc",
                 cast[uint64](&_igb_devm_kmalloc))
-    _add_export("devm_hwmon_device_register_with_groups",
-                cast[uint64](&_igb_devm_hwmon_device_register_with_groups))
+    # devm_hwmon_device_register_with_groups hoisted to api_hwmon.ad.
     _add_export("__page_frag_cache_drain",
                 cast[uint64](&_igb_page_frag_cache_drain))
     _add_export("__alloc_pages",

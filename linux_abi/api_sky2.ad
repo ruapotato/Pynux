@@ -12,8 +12,7 @@
 #                          matching _for_cpu)
 #   * 2 TX lock helpers  — netif_tx_lock, netif_tx_unlock
 #   * 1 PCI PM           — pci_pme_capable
-#   * 2 PCI VPD          — pci_read_vpd_any, pci_write_vpd_any
-#                          (Vital Product Data — EEPROM access)
+#   * PCI VPD            — HOISTED to api_pci_vpd.ad
 #
 # Stub philosophy: every shim is init-cold. sky2's probe reads the
 # chip's VPD region to harvest the OEM serial / MAC overrides; with
@@ -25,8 +24,6 @@
 from linux_abi.exports import _add_export
 from kernel.printk.printk import printk0
 from mm.slab import kmalloc, kfree, kzalloc
-
-extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 
 
 # =====================================================================
@@ -75,33 +72,8 @@ def _sky_pci_pme_capable(pdev: uint64, state: int32) -> int32:
 
 
 # =====================================================================
-# Group 4: PCI Vital Product Data (VPD)
+# Group 4: PCI VPD — HOISTED to api_pci_vpd.ad
 # =====================================================================
-#
-# VPD is a side-channel EEPROM in the PCI config space (capability
-# 0x03) that carries OEM-supplied strings + MAC overrides. sky2 reads
-# the "MN" / "PN" / serial keywords at probe to populate ethtool
-# strings + the per-port MAC override. With no VPD, both reads
-# short-return 0 bytes and the driver falls back to chip defaults.
-
-def _sky_pci_read_vpd_any(pdev: uint64, pos: int32, count: uint64,
-                            buf: uint64) -> int64:
-    # ssize_t pci_read_vpd_any(struct pci_dev *, loff_t pos,
-    #                            size_t count, void *buf);
-    # Returns bytes-read on success, or a negative errno. We have no
-    # VPD; zero-fill the destination buffer and report "read 0 bytes"
-    # (== EOF, which the driver treats as "no VPD field at this offset").
-    if buf != 0 and count != 0:
-        memset(cast[Ptr[uint8]](buf), 0, count)
-    return 0
-
-
-def _sky_pci_write_vpd_any(pdev: uint64, pos: int32, count: uint64,
-                             buf: uint64) -> int64:
-    # ssize_t pci_write_vpd_any(struct pci_dev *, loff_t pos,
-    #                             size_t count, const void *buf);
-    # No-op; pretend the entire range was written.
-    return cast[int64](count)
 
 
 # =====================================================================
@@ -109,8 +81,9 @@ def _sky_pci_write_vpd_any(pdev: uint64, pos: int32, count: uint64,
 # =====================================================================
 
 def linux_abi_register_sky2():
-    # 6 new exports beyond api_e1000e + api_r8169 + api_igb + api_alx
-    # + api_atlantic.
+    # 4 new exports beyond api_e1000e + api_r8169 + api_igb + api_alx
+    # + api_atlantic (down from 6 after PCI VPD was hoisted into
+    # api_pci_vpd.ad).
 
     # ---- Group 1: DMA ----
     _add_export("__dma_sync_single_for_device",
@@ -127,7 +100,4 @@ def linux_abi_register_sky2():
                 cast[uint64](&_sky_pci_pme_capable))
 
     # ---- Group 4: PCI VPD ----
-    _add_export("pci_read_vpd_any",
-                cast[uint64](&_sky_pci_read_vpd_any))
-    _add_export("pci_write_vpd_any",
-                cast[uint64](&_sky_pci_write_vpd_any))
+    # Hoisted to linux_abi/api_pci_vpd.ad.

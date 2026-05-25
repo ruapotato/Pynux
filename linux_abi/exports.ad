@@ -76,6 +76,10 @@ from linux_abi.api_l65 import linux_abi_register_l65
 from linux_abi.api_l66 import linux_abi_register_l66
 from linux_abi.api_l67 import linux_abi_register_l67
 from linux_abi.api_l68 import linux_abi_register_l68
+from linux_abi.api_phylib import linux_abi_register_phylib
+from linux_abi.api_mdio import linux_abi_register_mdio
+from linux_abi.api_pci_vpd import linux_abi_register_pci_vpd
+from linux_abi.api_hwmon import linux_abi_register_hwmon
 from linux_abi.api_e1000e import linux_abi_register_e1000e
 from linux_abi.api_r8169 import linux_abi_register_r8169
 from linux_abi.api_igb import linux_abi_register_igb
@@ -845,6 +849,25 @@ def linux_abi_exports_init():
     # Total exports after this milestone: 1333 + 80 = 1413
     # (under MAX_EXPORTS=2048).
     linux_abi_register_e1000e()
+
+    # Shared generic-shim owners hoisted out of per-NIC api_*.ad files
+    # so any new driver that pulls libphy / MDIO / PCI-VPD / hwmon
+    # symbols just resolves against these centralised owners (no
+    # per-agent duplication). Registered AFTER api_e1000e — order
+    # within the table doesn't change lookup semantics (linear scan,
+    # first-match-wins), but keeping the NIC-specific shims earlier
+    # preserves the historical layout. Counts:
+    #   * phylib  : 38 phy_* / genphy_* (was: r8169 33 + tg3 5)
+    #   * mdio    : 10 mdiobus_* (was: r8169 6 + tg3 4)
+    #   * pci_vpd : 5 pci_vpd_* / pci_*_vpd_any (was: sky2 2 + tg3 3)
+    #   * hwmon   : 4 hwmon_* / devm_hwmon_* (was: igb 1 + atlantic 1
+    #                                            + tg3 2; merged into
+    #                                            one stub buffer)
+    # Total: 57 exports moved into shared owners.
+    linux_abi_register_phylib()
+    linux_abi_register_mdio()
+    linux_abi_register_pci_vpd()
+    linux_abi_register_hwmon()
 
     # Multi-NIC scale-out: r8169 (Realtek consumer GbE) — 70 new
     # exports beyond api_e1000e. Closes the PHY library + MDIO bus +
