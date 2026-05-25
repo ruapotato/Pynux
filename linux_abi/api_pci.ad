@@ -74,6 +74,7 @@ from drivers.pci.pci import pci_config_read_dword, pci_config_write_dword
 from drivers.pci.pci import pci_read_bar, pci_pack_bdf
 from kernel.printk.printk import printk0, printk1, printk2
 from mm.slab import kzalloc, kfree
+from linux_abi.api_netdev import dev_open_registered
 
 
 # --- struct pci_dev field offsets (Linux 6.12 ballpark) -------------
@@ -526,6 +527,22 @@ def _l_pci_walk_and_match(drv: uint64):
                         if rc != 0:
                             # Probe rejected; free the shim pci_dev.
                             kfree(pdev)
+                        else:
+                            # M16-pivot.c: probe succeeded. The driver
+                            # has registered a netdev with netdev_ops
+                            # pointing at its ndo_open/ndo_start_xmit
+                            # table. Linux's userspace normally fires
+                            # `ifconfig <iface> up` here — we don't
+                            # have that path wired, so call dev_open
+                            # directly to walk the registered netdev
+                            # table and invoke each ndo_open. For
+                            # e1000e that drives the chip's real
+                            # bring-up (rings, request_irq, napi_enable,
+                            # netif_start_queue, RCTL/TCTL.EN writes).
+                            printk0("[pci_register_driver] probe OK; triggering dev_open\n")
+                            n_opened: int32 = dev_open_registered()
+                            printk1("[pci_register_driver] dev_open: %d netdev(s) opened\n",
+                                    cast[uint64](n_opened))
         dev = dev + 1
 
 

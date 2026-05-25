@@ -63,6 +63,7 @@
 
 from linux_abi.exports import _add_export
 from mm.slab import kmalloc, kfree, kzalloc
+from kernel.printk.printk import printk0, printk1, printk2
 
 
 # --- Sizing constants -----------------------------------------------
@@ -106,6 +107,32 @@ SKB_TAILROOM:    uint64 = 128
 NETDEV_DEV_ADDR_PTR_OFF:  uint64 = 0x330
 NETDEV_DEV_ADDR_BUF_OFF:  uint64 = 0x340
 NETDEV_DEV_ADDR_BUF_LEN:  uint64 = 32
+
+# struct net_device netdev_ops pointer (Linux 6.1) sits at offset 0xd0.
+# Verified by disassembling e1000_probe in the Debian e1000e.ko: the
+# instruction `movq $0x0,0xd0(%r15)` at +0x2e4 of e1000_probe carries
+# an R_X86_64_32S relocation against `.rodata+0x4080` — and that rodata
+# offset is exactly the address of the `e1000e_netdev_ops` global (from
+# the symbol table). So the probe writes `dev->netdev_ops = &e1000e_netdev_ops`
+# via `0xd0(%r15)` where %r15 holds the netdev pointer.
+NETDEV_NETDEV_OPS_OFF:    uint64 = 0xd0
+
+# struct net_device_ops layout (Linux 6.1, include/linux/netdevice.h):
+#   offset 0x00: ndo_init
+#   offset 0x08: ndo_uninit
+#   offset 0x10: ndo_open
+#   offset 0x18: ndo_stop
+#   offset 0x20: ndo_start_xmit
+# Verified against the e1000e.ko's e1000e_netdev_ops table at
+# .rodata+0x4080 — the rela.rodata entries place e1000e_open at
+# +0x10 (ndo_open) and e1000e_close at +0x18 (ndo_stop), and a .text
+# relocation pointing into e1000_xmit_frame lands at +0x20
+# (ndo_start_xmit).
+NDO_INIT_OFF:        uint64 = 0x00
+NDO_UNINIT_OFF:      uint64 = 0x08
+NDO_OPEN_OFF:        uint64 = 0x10
+NDO_STOP_OFF:        uint64 = 0x18
+NDO_START_XMIT_OFF:  uint64 = 0x20
 
 
 # --- 16-slot static net_device table --------------------------------
@@ -343,6 +370,106 @@ def _l_eth_type_trans(skb: uint64, dev: uint64) -> uint32:
     hi: uint32 = cast[uint32](data[12])
     lo: uint32 = cast[uint32](data[13])
     return (hi << 8) | lo
+
+
+# --- M16-pivot.c: dev_open / netdev_ops dispatch --------------------
+#
+# Linux's userspace fires `dev_open` via `ifconfig <iface> up`, which
+# walks down to netdev->netdev_ops->ndo_open(dev) — and for e1000e that
+# kicks off the chip's real bring-up: RX/TX ring allocation,
+# request_irq, napi_enable, netif_start_queue, RCTL.EN/TCTL.EN. We
+# don't have ifconfig wired through to the netlink path used by Linux,
+# so the dispatch is invoked directly from the __pci_register_driver
+# shim post-probe instead. dev_open_registered() finds every
+# registered netdev whose ndo_open hasn't been invoked yet and calls
+# it; ndo_open is at offset NDO_OPEN_OFF inside the
+# netdev_ops table living at netdev[NETDEV_NETDEV_OPS_OFF].
+#
+# Open state is tracked via the netdev_state slot: a successfully
+# opened netdev moves state from 2 (registered) to 3 (open). That
+# lets a future re-call of dev_open_registered idempotently skip
+# already-opened devices.
+
+NETDEV_STATE_FREE:       uint64 = 0
+NETDEV_STATE_ALLOCATED:  uint64 = 1
+NETDEV_STATE_REGISTERED: uint64 = 2
+NETDEV_STATE_OPEN:       uint64 = 3
+
+
+def netdev_get_ndo_open(dev: uint64) -> uint64:
+    # Returns the address of ndo_open for `dev`, or 0 if either
+    # dev or dev->netdev_ops is NULL. Pure accessor — does not
+    # invoke the callback.
+    if dev == 0:
+        return 0
+    ops_pp: Ptr[uint64] = cast[Ptr[uint64]](dev + NETDEV_NETDEV_OPS_OFF)
+    ops: uint64 = ops_pp[0]
+    if ops == 0:
+        return 0
+    open_pp: Ptr[uint64] = cast[Ptr[uint64]](ops + NDO_OPEN_OFF)
+    return open_pp[0]
+
+
+def netdev_get_ndo_start_xmit(dev: uint64) -> uint64:
+    # Returns the address of ndo_start_xmit for `dev`, or 0 if either
+    # dev or dev->netdev_ops is NULL. Used by the TX bridge.
+    if dev == 0:
+        return 0
+    ops_pp: Ptr[uint64] = cast[Ptr[uint64]](dev + NETDEV_NETDEV_OPS_OFF)
+    ops: uint64 = ops_pp[0]
+    if ops == 0:
+        return 0
+    xmit_pp: Ptr[uint64] = cast[Ptr[uint64]](ops + NDO_START_XMIT_OFF)
+    return xmit_pp[0]
+
+
+def netdev_first_registered() -> uint64:
+    # Returns the netdev handle of the first slot in state REGISTERED
+    # or OPEN. Used by the TX bridge to pick the (currently only)
+    # Linux-driver-owned netdev to forward eth_tx() frames to.
+    i: uint64 = 0
+    while i < MAX_NETDEV_SLOTS:
+        st: uint64 = netdev_state[i]
+        if st == NETDEV_STATE_REGISTERED or st == NETDEV_STATE_OPEN:
+            return netdev_handle[i]
+        i = i + 1
+    return 0
+
+
+def dev_open_registered() -> int32:
+    # Iterate every netdev slot in state REGISTERED and invoke its
+    # ndo_open callback. Returns the number of netdevs successfully
+    # opened (>= 0), or a negative errno if a callback rejected.
+    #
+    # Linux's dev_open() does more than just call ndo_open: it sets
+    # IFF_UP, calls netif_set_real_num_{tx,rx}_queues, raises
+    # NETDEV_UP notifications, etc. For our bring-up the load-bearing
+    # step is the ndo_open call itself — the driver's open routine
+    # allocates rings, calls request_irq, napi_enable, and writes
+    # RCTL.EN/TCTL.EN. The rest of dev_open's housekeeping isn't
+    # consumed by anyone in Hamnix yet.
+    opened: int32 = 0
+    i: uint64 = 0
+    while i < MAX_NETDEV_SLOTS:
+        if netdev_state[i] == NETDEV_STATE_REGISTERED:
+            dev: uint64 = netdev_handle[i]
+            open_fn_addr: uint64 = netdev_get_ndo_open(dev)
+            if open_fn_addr == 0:
+                printk1("[dev_open] netdev=%p has no ndo_open; skipping\n",
+                        dev)
+            else:
+                printk2("[dev_open] calling ndo_open(netdev=%p) fn=%p\n",
+                        dev, open_fn_addr)
+                open_fn: Fn[int32, uint64] = \
+                    cast[Fn[int32, uint64]](open_fn_addr)
+                rc: int32 = open_fn(dev)
+                printk1("[dev_open] ndo_open returned rc=%d\n",
+                        cast[uint64](rc))
+                if rc == 0:
+                    netdev_state[i] = NETDEV_STATE_OPEN
+                    opened = opened + 1
+        i = i + 1
+    return opened
 
 
 # --- Export-table registration --------------------------------------
