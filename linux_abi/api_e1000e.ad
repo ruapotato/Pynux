@@ -684,14 +684,47 @@ def _e1k_napi_schedule_prep(napi: uint64) -> int32:
 
 
 def _e1k_napi_schedule(napi: uint64):
-    # void __napi_schedule(struct napi_struct *) — pushes the napi
-    # onto the per-CPU run list and raises NET_RX_SOFTIRQ. With no
-    # softirq wired, just set the SCHED bit (same as schedule_prep
-    # would have done). The poll callback never runs in our env.
+    # void __napi_schedule(struct napi_struct *) — Linux's real impl
+    # pushes the napi onto the per-CPU run list and raises NET_RX_
+    # SOFTIRQ, which later wakes ksoftirqd to call napi->poll.
+    # M16-pivot.c V0: skip the softirq pipeline and call napi->poll
+    # synchronously in IRQ context. For the e1000e bring-up this is
+    # the load-bearing step — without it the driver's IRQ handler
+    # finishes by setting SCHED but nothing ever drains the RX ring,
+    # so DHCP OFFER never reaches eth_rx.
+    #
+    # Single-threaded sync polling is safe here because:
+    #   (a) Hamnix has no preemption inside an IRQ handler — the
+    #       trampoline is non-reentrant.
+    #   (b) The driver's IRQ handler has already ACK'd ICR before
+    #       calling __napi_schedule (read-to-clear), so further
+    #       MSIs are masked at the device level until IMS is
+    #       restored — and IMS is reset by napi_complete_done at
+    #       the bottom of e1000e_poll.
     if napi == 0:
         return
     sp: Ptr[uint64] = cast[Ptr[uint64]](napi + NAPI_STATE_OFF)
-    sp[0] = NAPI_STATE_DISABLE
+    sp[0] = NAPI_STATE_DISABLE                  # mark SCHED set
+
+    poll_pp: Ptr[uint64] = cast[Ptr[uint64]](napi + NAPI_POLL_OFF)
+    poll_addr: uint64 = poll_pp[0]
+    if poll_addr == 0:
+        # No poll callback registered (netif_napi_add_weight not
+        # called for this napi). Leave SCHED set; nothing else we
+        # can do.
+        return
+    wp: Ptr[int32] = cast[Ptr[int32]](napi + NAPI_WEIGHT_OFF)
+    weight: int32 = wp[0]
+    if weight <= 0:
+        weight = 64                              # Linux default
+    # Cast and invoke. Signature: int poll(struct napi_struct *, int).
+    pfn: Fn[int32, uint64, int32] = \
+        cast[Fn[int32, uint64, int32]](poll_addr)
+    pfn(napi, weight)
+    # Whatever pfn returned, the driver's poll handler is responsible
+    # for calling napi_complete_done(napi, work) when its work is
+    # below the budget — that's what clears SCHED. We don't second-
+    # guess here.
 
 
 def _e1k_napi_complete_done(napi: uint64, work_done: int32) -> int32:
