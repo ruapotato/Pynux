@@ -67,16 +67,45 @@ from mm.slab import kmalloc, kfree, kzalloc
 
 # --- Sizing constants -----------------------------------------------
 #
-# NET_DEVICE_SIZE is the blob we hand back from alloc_etherdev_mqs;
-# 2 KiB is comfortably larger than the real Linux 6.12 layout. The
-# headroom carveout for dev_alloc_skb is symmetric: 128 bytes before
-# the returned data pointer, 128 after, so a driver that does
-# skb_reserve(skb, 64) + skb_put(skb, frame_len) on a 1500-byte
-# allocation still fits inside the slab object.
-
-NET_DEVICE_SIZE: uint64 = 2048
+# NET_DEVICE_SIZE is the sizeof(struct net_device) part of the blob we
+# hand back from alloc_etherdev_mqs. The TOTAL alloc is NET_DEVICE_SIZE
+# + sizeof_priv — the e1000e probe walks netdev_priv() at offset 0x980
+# from netdev and reads/writes adapter fields up to ~0x3100 bytes past
+# that point. Linux 6.1's sizeof(struct net_device) is ~0x980 with
+# CONFIG_NET_RX_BUSY_POLL / CONFIG_NETFILTER all enabled (Debian
+# default); we pick 0x980 to match the offset stock-compiled drivers
+# use for netdev_priv(). Modules that use less priv space than they
+# requested just leave the tail zero (kzalloc).
+#
+# Before this change NET_DEVICE_SIZE was a flat 2 KiB regardless of
+# sizeof_priv. That worked for module-load smoke tests but corrupted
+# the heap as soon as a real driver wrote past 2 KiB into its priv
+# area — specifically e1000e's probe stores adapter->hw.hw_addr at
+# offset 0xf40 from netdev (priv offset 0x5c0), which is past the
+# 2 KiB cap. The corrupted write landed in the next slab object;
+# subsequent reads of adapter->hw.hw_addr returned garbage and
+# e1000_read_mac_addr_generic dereferenced that garbage to read the
+# MAC, getting all-zeroes (or whatever happened to live there) and
+# bailing with -EIO at is_valid_ether_addr.
+NET_DEVICE_SIZE: uint64 = 0x980
 SKB_HEADROOM:    uint64 = 128
 SKB_TAILROOM:    uint64 = 128
+
+# struct net_device field offsets (Linux 6.1, Debian config):
+#   0x330  const unsigned char *dev_addr — points at the in-struct
+#                                          dev_addr_shadow buffer.
+#   0x340  scratch buffer the dev_addr pointer aims at. Reserved 32
+#          bytes (= MAX_ADDR_LEN); the e1000e probe checks bytes 0..5.
+#
+# The e1000e probe path reads netdev->dev_addr at 0x330(%r15) and
+# dereferences (rdx) + 0x4(rdx) for the is_valid_ether_addr test.
+# If 0x330 is NULL the deref is into low identity memory and the
+# bytes there decide whether the MAC check passes or fails — usually
+# fails. Pointing it at the in-struct scratch buffer makes the test
+# observable to dev_addr_mod (which copies bytes into that buffer).
+NETDEV_DEV_ADDR_PTR_OFF:  uint64 = 0x330
+NETDEV_DEV_ADDR_BUF_OFF:  uint64 = 0x340
+NETDEV_DEV_ADDR_BUF_LEN:  uint64 = 32
 
 
 # --- 16-slot static net_device table --------------------------------
@@ -129,19 +158,35 @@ def _netdev_find_free_slot() -> int32:
 def _l_alloc_etherdev_mqs(sizeof_priv: int32, txqs: uint32,
                           rxqs: uint32) -> uint64:
     # txqs / rxqs are the requested TX/RX queue counts; sizeof_priv is
-    # the trailing bytes the driver wants past net_device for its own
-    # state (accessed via netdev_priv()). For L25 we ignore all three
-    # — the 2 KiB blob is bigger than the typical priv (a few hundred
-    # bytes) plus net_device itself, and netdev_priv() (not yet shimmed)
-    # would just return dev + sizeof(struct net_device). When that
-    # symbol gets exported we'll size the alloc as
-    # NET_DEVICE_SIZE + sizeof_priv.
+    # the trailing bytes past net_device the driver wants for its
+    # state (accessed via netdev_priv(), which Linux's stock-compiled
+    # modules unfold to `netdev + ALIGN(sizeof(struct net_device),
+    # NETDEV_ALIGN)` == netdev + 0x980 for Linux 6.1).
+    #
+    # e1000e calls alloc_etherdev_mqs(0x3100, 1, 1) — its priv area
+    # (struct e1000_adapter) is 0x3100 bytes. The total alloc has to
+    # honour the request or the driver writes past the end of the
+    # slab object, corrupting heap state and (for e1000e) silently
+    # zeroing adapter->hw.hw_addr by the time the MAC read fires.
+    total: uint64 = NET_DEVICE_SIZE
+    if sizeof_priv > 0:
+        total = total + cast[uint64](sizeof_priv)
     slot: int32 = _netdev_find_free_slot()
     if slot < 0:
         return 0
-    blob: uint64 = kzalloc(NET_DEVICE_SIZE)
+    blob: uint64 = kzalloc(total)
     if blob == 0:
         return 0
+
+    # Wire netdev->dev_addr (offset 0x330) to point at the in-struct
+    # scratch buffer at offset 0x340. Linux's alloc_etherdev does the
+    # equivalent (sets dev->dev_addr = dev->dev_addr_shadow) so
+    # subsequent dev_addr_mod / eth_hw_addr_set writes land in a
+    # well-known buffer the probe path's is_valid_ether_addr test
+    # then reads back.
+    ptr: Ptr[uint64] = cast[Ptr[uint64]](blob + NETDEV_DEV_ADDR_PTR_OFF)
+    ptr[0] = blob + NETDEV_DEV_ADDR_BUF_OFF
+
     s: uint64 = cast[uint64](slot)
     netdev_handle[s]  = blob
     netdev_state[s]   = 1                          # allocated, not registered
