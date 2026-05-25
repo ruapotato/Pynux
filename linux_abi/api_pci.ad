@@ -72,6 +72,8 @@
 from linux_abi.exports import _add_export
 from drivers.pci.pci import pci_config_read_dword, pci_config_write_dword
 from drivers.pci.pci import pci_read_bar, pci_pack_bdf
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.slab import kzalloc, kfree
 
 
 # --- struct pci_dev field offsets (Linux 6.12 ballpark) -------------
@@ -85,15 +87,24 @@ from drivers.pci.pci import pci_read_bar, pci_pack_bdf
 # one indirection away; the L21 stub avoids the indirection by reading
 # a synthetic cached copy that the future bus-walker will populate).
 
-PCI_DEV_DEVFN_OFFSET: uint64 = 16     # u32 devfn (Linux uses unsigned int)
-PCI_DEV_BUSNR_OFFSET: uint64 = 24     # u32 cached bus number (Hamnix extension)
+# M16-pivot.b: the shim pci_dev allocated by _l_pci_alloc_shim_dev
+# (further below in this file) uses Linux 6.1's REAL struct pci_dev
+# offsets — devfn at 56, vendor at 60, bus number at our Hamnix-
+# private cache offset 1500. Updated from L21's L21-test-fixture
+# offsets (devfn=16, busnr=24) which were appropriate when probe
+# wasn't being dispatched. With probe now invoked through a real-
+# layout pci_dev (see _l_pci_walk_and_match), the accessors below
+# must read at the same offsets the shim populates.
+PCI_DEV_DEVFN_OFFSET: uint64 = 56     # u32 devfn (Linux 6.1 layout)
+PCI_DEV_BUSNR_OFFSET: uint64 = 1500   # u32 cached bus number (Hamnix extension)
 
 
 def _pci_dev_bus(dev_ptr: uint64) -> uint32:
     # Pull the cached bus number out of the struct. NULL handles get
-    # bus 0 — Linux's accessors would BUG on NULL, but for L21 the
-    # caller of these shims is the not-yet-wired probe path, so we
-    # stay quiet.
+    # bus 0 — Linux's accessors would BUG on NULL, but for the
+    # shim-call paths the caller of these accessors is either probe
+    # itself (with our shim pci_dev pointer) or post-probe driver
+    # code (same shim still live); stay quiet on NULL either way.
     if dev_ptr == 0:
         return 0
     p: Ptr[uint32] = cast[Ptr[uint32]](dev_ptr + PCI_DEV_BUSNR_OFFSET)
@@ -131,6 +142,49 @@ MAX_PCI_DRIVERS: uint64 = 16
 pci_drv_ptrs:   Array[16, uint64]   # struct pci_driver *  (0 = free)
 pci_drv_owners: Array[16, uint64]   # struct module *
 pci_drv_names:  Array[16, uint64]   # Ptr[char] mod_name
+
+
+# --- Linux struct pci_driver layout (Debian 6.1.0-32, x86_64) -------
+#
+# Linux 6.1's struct pci_driver starts with a `struct list_head node`
+# (16 bytes) — dropped in 6.12 but present in the 6.1 build the Debian
+# e1000e.ko targets. Layout verified by reading e1000e.ko's .rela.data
+# (the first relocation lands at offset 16 of e1000_driver, populating
+# .name; subsequent 8-byte-stride relocations fill .id_table, .probe,
+# .remove). The fields we touch in the bus-walk path:
+#   offset  0: struct list_head node  (next, prev — initialized to 0)
+#   offset 16: const char *name
+#   offset 24: const struct pci_device_id *id_table
+#   offset 32: int (*probe)(struct pci_dev *, const struct pci_device_id *)
+#   offset 40: void (*remove)(struct pci_dev *)
+PCI_DRIVER_NAME_OFF:    uint64 = 16
+PCI_DRIVER_ID_TABLE_OFF: uint64 = 24
+PCI_DRIVER_PROBE_OFF:   uint64 = 32
+PCI_DRIVER_REMOVE_OFF:  uint64 = 40
+
+
+# --- Linux struct pci_device_id layout (40 bytes, x86_64) -----------
+#
+# A NULL-terminated array (terminated by all-zero entry; the
+# discriminator Linux uses is `vendor == 0`).
+#   offset  0: __u32 vendor
+#   offset  4: __u32 device
+#   offset  8: __u32 subvendor
+#   offset 12: __u32 subdevice
+#   offset 16: __u32 class
+#   offset 20: __u32 class_mask
+#   offset 24: kernel_ulong_t driver_data  (8 bytes on x86_64)
+#   offset 32: __u32 override_only
+#   total size with alignment: 40
+PCI_DEVICE_ID_SIZE:           uint64 = 40
+PCI_DEVICE_ID_VENDOR_OFF:     uint64 = 0
+PCI_DEVICE_ID_DEVICE_OFF:     uint64 = 4
+PCI_DEVICE_ID_SUBVENDOR_OFF:  uint64 = 8
+PCI_DEVICE_ID_SUBDEVICE_OFF:  uint64 = 12
+PCI_DEVICE_ID_CLASS_OFF:      uint64 = 16
+PCI_DEVICE_ID_CLASSMASK_OFF:  uint64 = 20
+
+PCI_ANY_ID:                   uint32 = 0xFFFFFFFF
 
 
 def _pci_drv_find_free() -> int32:
@@ -183,6 +237,209 @@ def _pci_rgn_find_by_dev(dev: uint64) -> int32:
     return -1
 
 
+# --- Bus walk + id_table match (driver_register dispatch path) ------
+#
+# When a stock Linux driver calls __pci_register_driver, the real
+# kernel walks the previously-enumerated PCI bus list and, for every
+# device whose (vendor, device) matches an entry in drv->id_table,
+# invokes drv->probe(pdev, matching_id). To make Hamnix's __pci_
+# register_driver shim drive probe, we replicate that walk: read the
+# id_table (a NULL-terminated array of struct pci_device_id) and
+# scan bus 0 for matching vendor/device tuples. Diagnostic prints
+# trace what we matched; the actual probe-invocation step is gated
+# by a follow-on Hamnix-side struct pci_dev allocation, which is
+# substantial work because the driver dereferences ~25 fields of
+# the real Linux 6.1 layout at probe time (vendor/device/devfn,
+# resource[] array, dev->name, &pdev->dev, etc.).
+#
+# V1: log every match found, do NOT invoke probe yet. This proves
+# the bus-walk + match logic is correct (the QEMU e1000e device
+# at 0000:00:03.0 with 8086:10D3 must be picked up by the loaded
+# e1000e.ko's id_table) without risking a kernel wedge from a
+# half-populated pci_dev passed to probe.
+
+
+def _l_pci_id_table_match(id_table: uint64, vendor: uint32,
+                          device: uint32) -> uint64:
+    # Walk id_table (NULL-terminated by an all-zero entry; the
+    # canonical terminator condition is `vendor == 0`) looking for
+    # the first entry whose vendor/device fields match. Returns the
+    # address of the matching struct pci_device_id, or 0 if none.
+    # We honour PCI_ANY_ID (0xFFFFFFFF) on either field.
+    if id_table == 0:
+        return 0
+    cursor: uint64 = id_table
+    # Bound the iteration at 256 entries; even the biggest stock
+    # drivers (intel-iommu, megaraid_sas) carry under 100 IDs.
+    steps: uint64 = 0
+    while steps < 256:
+        v_p: Ptr[uint32] = cast[Ptr[uint32]](cursor + PCI_DEVICE_ID_VENDOR_OFF)
+        d_p: Ptr[uint32] = cast[Ptr[uint32]](cursor + PCI_DEVICE_ID_DEVICE_OFF)
+        v: uint32 = v_p[0]
+        d: uint32 = d_p[0]
+        # NULL terminator: vendor==0 is the kbuild convention.
+        if v == 0:
+            return 0
+        v_match: int32 = 0
+        if v == PCI_ANY_ID or v == vendor:
+            v_match = 1
+        d_match: int32 = 0
+        if d == PCI_ANY_ID or d == device:
+            d_match = 1
+        if v_match == 1 and d_match == 1:
+            return cursor
+        cursor = cursor + PCI_DEVICE_ID_SIZE
+        steps = steps + 1
+    return 0
+
+
+# --- struct pci_dev shim layout (Linux 6.1, Debian config) ----------
+#
+# We allocate a 2 KiB blob and lay down just the fields a stock
+# driver's probe reads at the offsets Linux 6.1's struct pci_dev
+# expects. Anything past the end of what we write is zero (kzalloc),
+# which is the same default Linux gives a fresh pci_dev.
+#
+# Offsets confirmed against include/linux/pci.h (6.1 line) with
+# CONFIG_PCIEAER, CONFIG_PCIEPORTBUS, CONFIG_PCIEASPM all enabled
+# (Debian 6.1.0-32 amd64 default config).
+#
+# We DELIBERATELY use a different (smaller) set of offsets than
+# the L21 fixture's PCI_DEV_DEVFN_OFFSET=16 / PCI_DEV_BUSNR_OFFSET=24
+# stubs further up: those served the test where probe was never
+# invoked. Now we're producing a pci_dev that Linux's compiled-against-
+# real-headers e1000e.ko will dereference, so we must place fields
+# where real Linux puts them.
+SHIM_PCI_DEV_SIZE:        uint64 = 2048
+SHIM_PCI_DEV_DEVFN_OFF:   uint64 = 56
+SHIM_PCI_DEV_VENDOR_OFF:  uint64 = 60
+SHIM_PCI_DEV_DEVICE_OFF:  uint64 = 62
+SHIM_PCI_DEV_SUBV_OFF:    uint64 = 64
+SHIM_PCI_DEV_SUBD_OFF:    uint64 = 66
+SHIM_PCI_DEV_CLASS_OFF:   uint64 = 68
+SHIM_PCI_DEV_REVISION_OFF: uint64 = 72
+SHIM_PCI_DEV_HDRTYPE_OFF: uint64 = 73
+
+# Hamnix-private "cached bus number" we tuck into the high half of
+# the slot, since real Linux puts the bus number behind a pointer
+# (pdev->bus->number) we don't have a struct pci_bus to support.
+# The L21 config-space accessors (_l_pci_read_config_*) need a
+# bus, so we expose a Hamnix-extension cached copy at this offset.
+# 1500 is well past the real pci_dev fields so no overlap.
+SHIM_PCI_DEV_HAMNIX_BUS_OFF: uint64 = 1500
+
+
+def _l_pci_alloc_shim_dev(bus: uint32, devnr: uint32, fn: uint32,
+                          vendor: uint32, device: uint32) -> uint64:
+    # Build a 2 KiB pci_dev mirror with the Linux 6.1 offsets the
+    # compiled driver expects. kzalloc gives us zero-initialised
+    # storage; we only need to populate the few fields the probe
+    # path reads at registration time.
+    blob: uint64 = kzalloc(SHIM_PCI_DEV_SIZE)
+    if blob == 0:
+        return 0
+
+    # devfn: device in bits 7..3, function in bits 2..0. This is
+    # Linux's encoding (different from Hamnix's pci_pack_bdf which
+    # uses bits 15..11 for device).
+    devfn: uint32 = ((devnr & 0x1F) << 3) | (fn & 0x7)
+    dfn_p: Ptr[uint32] = cast[Ptr[uint32]](blob + SHIM_PCI_DEV_DEVFN_OFF)
+    dfn_p[0] = devfn
+
+    v_p: Ptr[uint16] = cast[Ptr[uint16]](blob + SHIM_PCI_DEV_VENDOR_OFF)
+    v_p[0] = cast[uint16](vendor & 0xFFFF)
+    d_p: Ptr[uint16] = cast[Ptr[uint16]](blob + SHIM_PCI_DEV_DEVICE_OFF)
+    d_p[0] = cast[uint16](device & 0xFFFF)
+
+    # subsystem_vendor / subsystem_device from config space.
+    sv_raw: uint32 = pci_config_read_dword(bus, devnr, fn, 0x2C)
+    sv_p: Ptr[uint16] = cast[Ptr[uint16]](blob + SHIM_PCI_DEV_SUBV_OFF)
+    sv_p[0] = cast[uint16](sv_raw & 0xFFFF)
+    sd_p: Ptr[uint16] = cast[Ptr[uint16]](blob + SHIM_PCI_DEV_SUBD_OFF)
+    sd_p[0] = cast[uint16]((sv_raw >> 16) & 0xFFFF)
+
+    # class / revision / hdr_type from config dword 0x08.
+    class_dword: uint32 = pci_config_read_dword(bus, devnr, fn, 0x08)
+    # Linux stores `class` as the top 24 bits left-shifted to fit a
+    # u32: (base_class<<16)|(subclass<<8)|prog_if — same as the raw
+    # config word with the low 8 bits (revision) stripped.
+    class_field: uint32 = class_dword >> 8
+    c_p: Ptr[uint32] = cast[Ptr[uint32]](blob + SHIM_PCI_DEV_CLASS_OFF)
+    c_p[0] = class_field
+    rev_p: Ptr[uint8] = cast[Ptr[uint8]](blob + SHIM_PCI_DEV_REVISION_OFF)
+    rev_p[0] = cast[uint8](class_dword & 0xFF)
+    hdr_raw: uint32 = pci_config_read_dword(bus, devnr, fn, 0x0C)
+    hdr_p: Ptr[uint8] = cast[Ptr[uint8]](blob + SHIM_PCI_DEV_HDRTYPE_OFF)
+    hdr_p[0] = cast[uint8]((hdr_raw >> 16) & 0x7F)            # strip multifn bit
+
+    # Hamnix-private bus number cache (the config-space accessors
+    # need it; real Linux reads pdev->bus->number).
+    hbus_p: Ptr[uint32] = cast[Ptr[uint32]](blob + SHIM_PCI_DEV_HAMNIX_BUS_OFF)
+    hbus_p[0] = bus
+
+    return blob
+
+
+def _l_pci_walk_and_match(drv: uint64):
+    # Walk PCI bus 0 (Hamnix's pci_scan only enumerates bus 0; multi-
+    # bus support needs bridge-secondary-bus reads we don't have).
+    # For each non-empty slot, read vendor/device, run it against
+    # drv->id_table, and log any match. V1 stops short of invoking
+    # drv->probe: the compiled-against-Linux probe code reads many
+    # struct pci_dev fields beyond the few we populate here, and
+    # mistakes wedge the kernel. Once the shim layout matches the
+    # driver's expectations end-to-end, this function gains a probe-
+    # invocation step; for now it's a tracer.
+    id_table: uint64 = _rd_u64_ptr(drv + PCI_DRIVER_ID_TABLE_OFF)
+    name_ptr: uint64 = _rd_u64_ptr(drv + PCI_DRIVER_NAME_OFF)
+    probe_fn: uint64 = _rd_u64_ptr(drv + PCI_DRIVER_PROBE_OFF)
+    if id_table == 0:
+        printk0("[pci_register_driver] drv->id_table=NULL; no matching\n")
+        return
+    printk2("[pci_register_driver] walking bus, id_table=%p probe=%p\n",
+            id_table, probe_fn)
+
+    bus: uint32 = 0
+    dev: uint32 = 0
+    while dev < 32:
+        ident: uint32 = pci_config_read_dword(bus, dev, 0, 0)
+        vendor: uint32 = ident & 0xFFFF
+        if vendor != 0xFFFF:
+            device: uint32 = (ident >> 16) & 0xFFFF
+            mid: uint64 = _l_pci_id_table_match(id_table, vendor, device)
+            if mid != 0:
+                printk2("[pci_register_driver] MATCH %x:%x", vendor, device)
+                printk2(" at %x:%x", bus, dev)
+                printk1(" (id_entry @ %p)\n", mid)
+                # Allocate a pci_dev mirror and call probe through it.
+                # This is the V2 step the previous agent punted on.
+                pdev: uint64 = _l_pci_alloc_shim_dev(bus, dev, 0,
+                                                     vendor, device)
+                if pdev == 0:
+                    printk0("[pci_register_driver] kzalloc(pci_dev) failed\n")
+                else:
+                    if probe_fn == 0:
+                        printk0("[pci_register_driver] drv->probe=NULL; skipping\n")
+                        kfree(pdev)
+                    else:
+                        printk2("[pci_register_driver] calling probe(pdev=%p, id=%p)\n",
+                                pdev, mid)
+                        # int (*probe)(struct pci_dev *, const struct pci_device_id *)
+                        pfn: Fn[int32, uint64, uint64] = cast[Fn[int32, uint64, uint64]](probe_fn)
+                        rc: int32 = pfn(pdev, mid)
+                        printk1("[pci_register_driver] probe returned rc=%d\n",
+                                cast[uint64](rc))
+                        if rc != 0:
+                            # Probe rejected; free the shim pci_dev.
+                            kfree(pdev)
+        dev = dev + 1
+
+
+def _rd_u64_ptr(addr: uint64) -> uint64:
+    p: Ptr[uint64] = cast[Ptr[uint64]](addr)
+    return p[0]
+
+
 # --- Driver registration shims --------------------------------------
 
 def _l_pci_register_driver(drv: uint64, owner: uint64,
@@ -190,7 +447,9 @@ def _l_pci_register_driver(drv: uint64, owner: uint64,
     # Linux: int __pci_register_driver(drv, owner, name). Returns 0
     # on success, negative errno on failure. The real implementation
     # walks the bus and calls drv->probe(pdev) for every device whose
-    # id_table entry matches; at L21 we just claim the slot.
+    # id_table entry matches. Hamnix v2 (M16-pivot.b): we now do that
+    # walk for real — match drv->id_table against bus 0, alloc a
+    # shim pci_dev, and call drv->probe(pdev, id).
     if drv == 0:
         return -22                              # -EINVAL
     if _pci_drv_find_by_ptr(drv) >= 0:
@@ -203,6 +462,11 @@ def _l_pci_register_driver(drv: uint64, owner: uint64,
     pci_drv_ptrs[s]   = drv
     pci_drv_owners[s] = owner
     pci_drv_names[s]  = mod_name
+
+    # Walk the bus and dispatch matched devices into drv->probe. We
+    # do this AFTER recording the slot so probe-invoked unregister
+    # paths still see a consistent table.
+    _l_pci_walk_and_match(drv)
     return 0
 
 

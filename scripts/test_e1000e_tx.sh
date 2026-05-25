@@ -56,24 +56,34 @@ timeout 25s qemu-system-x86_64 \
 rc=$?
 set -e
 
-echo "[test_e1000e_tx] --- captured (kmod / e1000e / eth) ---"
-grep -E 'kmod_linux|\[e1000e\.ko\]|\[e1000e\]|\[eth\]|\[netdev|\[boot:35' "$LOG" || true
+echo "[test_e1000e_tx] --- captured (kmod / e1000e / eth / pci_register_driver) ---"
+grep -E 'kmod_linux|\[e1000e\.ko\]|\[e1000e\]|\[eth\]|\[netdev|\[boot:35|\[pci_register_driver\]' "$LOG" || true
 echo "[test_e1000e_tx] --- end ---"
 
 fail=0
 # Assertions: the .ko was found in cpio, the L-series loader walked
 # the ET_REL header successfully, applied every relocation without
 # leaving any unresolved-external skipped, called init_module and
-# init_module returned 0. The module is now bound and ready for the
-# QEMU e1000e device. Real TX/RX/DHCP wiring is a follow-on commit
-# (the driver's probe registers a struct pci_driver but our
-# __pci_register_driver shim doesn't yet walk our PCI device table
-# to invoke driver->probe(pdev) — that's the next milestone).
+# init_module returned 0. M16-pivot.b: __pci_register_driver now
+# walks the live bus, matches against drv->id_table, and INVOKES
+# drv->probe(pdev, id) — observable as "[pci_register_driver]
+# MATCH 8086:10d3 at 0:3" + "calling probe(...)" + "probe returned
+# rc=...". The QEMU e1000e device responds to vendor 0x8086 device
+# 0x10d3 (82574-class) at bus 0 device 3 function 0, which is what
+# the assertion below pins. DHCP / real TX-RX through the Linux
+# driver is the next milestone — probe returns -EIO at the
+# ioremap step (pci_resource_start needs the struct pci_dev
+# resource[] array populated, which is itself non-trivial: the
+# field lives past struct device dev which has CONFIG-dependent
+# size).
 for needle in \
     "[e1000e.ko] loading" \
     "kmod_linux: relocations applied=" \
     "kmod_linux: init_module @" \
-    "[e1000e.ko] kmod_linux_load OK"
+    "[e1000e.ko] kmod_linux_load OK" \
+    "[pci_register_driver] MATCH 8086:10d3" \
+    "[pci_register_driver] calling probe(" \
+    "[pci_register_driver] probe returned rc="
 do
     if grep -F -q "$needle" "$LOG"; then
         echo "[test_e1000e_tx] OK: '$needle'"
@@ -98,4 +108,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "[test_e1000e_tx] PASS (.ko loaded; init_module returned 0)"
+echo "[test_e1000e_tx] PASS (.ko loaded; init_module returned 0; probe invoked)"
