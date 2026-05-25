@@ -1,0 +1,568 @@
+# kernel/modprobe.ad
+#
+# Linux-shape modprobe auto-loader. At boot, walk Hamnix's PCI bus and
+# match each device's (vendor, device, subvendor, subdevice, class,
+# subclass, prog-if) tuple against the lines in the baked-in
+# /lib/modules/modules.alias table; for every match, kmod_linux_load
+# the matching .ko from /lib/modules/auto/<name>.ko. This is the
+# moral equivalent of Linux's modprobe + modules.alias + udev coldplug.
+#
+# The modules.alias table is generated at build time by
+# scripts/build_modules_alias.py from `modinfo -F alias` against every
+# kernel-modules/<name>/<name>.ko. Each line is:
+#
+#     alias pci:v<VVVV>d<DDDD>sv<SSSS>sd<SSSS>bc<BB>sc<SS>i<II> <module>
+#
+# where each placeholder is uppercase hex of the indicated PCI field,
+# or `*` if the module's MODULE_DEVICE_TABLE entry was wildcarded at
+# that position (the common case for vendor:device-only matches like
+# Intel NICs that don't care about which OEM rebranded the silicon).
+#
+# Module dependencies (modules.dep, equivalent of `depmod -a`) are
+# NOT yet handled. Every kernel-modules/<X>/<X>.ko is assumed to be
+# either standalone (the e1000e.ko case — pulls only L-shim symbols
+# Hamnix already exports) OR to have its dependencies satisfied by an
+# earlier static link into the kernel image. The follow-up that
+# implements modules.dep replaces the "load this .ko" line below with
+# a topo-sort + transitive insmod walk. See docs/MODULES.md (future).
+
+from kernel.printk.printk import printk0, printk1, printk2
+from fs.cpio import (
+    cpio_init,
+    initramfs_entry_count, initramfs_entry_name,
+    initramfs_entry_data, initramfs_entry_size,
+)
+from linux_abi.loader import kmod_linux_load
+from drivers.pci.pci import (
+    pci_config_read_dword,
+    PCI_VENDOR_ID_OFFSET, PCI_CLASSREV_OFFSET, PCI_INVALID_VENDOR,
+)
+
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# --- low-level helpers --------------------------------------------------
+#
+# Adder has no general-purpose string library — only the printk
+# formatters know how to render an integer to ASCII. We need a 4-char
+# uppercase-hex render (vendor / device / subvendor / subdevice) and a
+# 2-char render (base class / subclass / prog-if) for the alias key
+# we glob against. Both are tiny; inline them here.
+
+def _hex_nibble(v: uint32) -> uint8:
+    # 0..9 -> '0'..'9', 10..15 -> 'A'..'F'. Match modinfo's output
+    # case (uppercase). The matcher below is case-INsensitive against
+    # the alias-table side, so this only matters cosmetically for the
+    # printk traces.
+    if v < 10:
+        return cast[uint8](48 + v)                  # '0'+v
+    return cast[uint8](65 + (v - 10))                # 'A'+v-10
+
+
+def _u16_to_hex8(v: uint32, out: Ptr[uint8]):
+    # Big-endian 8-char hex render of a u16 value zero-padded to 32 bits.
+    # Linux's PCI MODULE_DEVICE_TABLE alias encoding pads every
+    # vendor/device/subvendor/subdevice field to 8 hex digits even though
+    # the underlying value is 16 bits — modinfo emits exactly:
+    #     pci:v00008086d000010D3sv*sd*bc*sc*i*
+    # so we must match that width to glob-match against modinfo's
+    # alias lines. `out` MUST have room for 8 bytes; no NUL is written.
+    out[0] = _hex_nibble((v >> 28) & 0xF)
+    out[1] = _hex_nibble((v >> 24) & 0xF)
+    out[2] = _hex_nibble((v >> 20) & 0xF)
+    out[3] = _hex_nibble((v >> 16) & 0xF)
+    out[4] = _hex_nibble((v >> 12) & 0xF)
+    out[5] = _hex_nibble((v >>  8) & 0xF)
+    out[6] = _hex_nibble((v >>  4) & 0xF)
+    out[7] = _hex_nibble( v        & 0xF)
+
+
+def _u8_to_hex2(v: uint32, out: Ptr[uint8]):
+    # Big-endian 2-char hex render. `out` MUST have room for 2 bytes.
+    out[0] = _hex_nibble((v >> 4) & 0xF)
+    out[1] = _hex_nibble( v       & 0xF)
+
+
+def _ascii_upper(c: uint8) -> uint8:
+    # Case-fold to upper. Lowercase a..f -> uppercase A..F; everything
+    # else passes through.
+    if c >= 97 and c <= 102:                         # 'a'..'f'
+        return cast[uint8](c - 32)
+    return c
+
+
+def _eq_uchar(a: uint8, b: uint8) -> int32:
+    if _ascii_upper(a) == _ascii_upper(b):
+        return 1
+    return 0
+
+
+# --- modules.alias line iteration --------------------------------------
+#
+# The alias-table blob is a flat text region: comment lines start with
+# '#' (skipped), blank lines (zero or one '\n') are skipped, every
+# other line is `alias <pattern> <module-name>\n`. We don't allocate
+# any per-line structure — the matcher streams the buffer once per
+# PCI device, in O(table_size * devices) time. Both are small (105
+# aliases per e1000e, ~30 devices on a real bus → ~3000 compares).
+
+
+def _line_end(blob: Ptr[uint8], start: uint64, size: uint64) -> uint64:
+    # Return the offset of the next '\n' (or `size` if EOF first).
+    i: uint64 = start
+    while i < size:
+        if blob[i] == 10:                            # '\n'
+            return i
+        i = i + 1
+    return size
+
+
+def _skip_spaces(blob: Ptr[uint8], pos: uint64, end: uint64) -> uint64:
+    while pos < end and (blob[pos] == 32 or blob[pos] == 9):
+        pos = pos + 1
+    return pos
+
+
+def _word_end(blob: Ptr[uint8], pos: uint64, end: uint64) -> uint64:
+    # Advance until whitespace or end-of-line.
+    while pos < end and blob[pos] != 32 and blob[pos] != 9 \
+            and blob[pos] != 10:
+        pos = pos + 1
+    return pos
+
+
+# --- alias-pattern matcher ---------------------------------------------
+#
+# The pattern is a literal-bytes-or-'*' string. Each '*' matches any
+# run of bytes (including zero) up to the next literal in the pattern
+# or end of query. In practice every modinfo-emitted PCI alias has
+# '*' only at fixed positions:
+#
+#     pci:v00008086d000010D3sv*sd*bc*sc*i*
+#
+# i.e. v/d are always literal, sv/sd/bc/sc/i are EITHER 2/4-char hex
+# literals OR a single '*'. So a full glob engine is overkill; we walk
+# the pattern segment by segment, matching either a literal hex field
+# or a wildcard. This is fast AND robust against the slight encoding
+# variations modinfo emits across kernel versions.
+
+
+def _pat_consume_literal(pat: Ptr[uint8], qry: Ptr[uint8],
+                         p_off: uint64, q_off: uint64,
+                         p_end: uint64, q_end: uint64) -> uint64:
+    # Match literal bytes from `pat[p_off..]` against `qry[q_off..]`
+    # until we hit a '*' in the pattern, end of pattern, or end of
+    # query. Returns the new (p_off << 32) | q_off — caller decodes.
+    # On mismatch, returns 0xFFFFFFFFFFFFFFFF as a sentinel.
+    while p_off < p_end and q_off < q_end:
+        pc: uint8 = pat[p_off]
+        if pc == 42:                                 # '*'
+            return (p_off << 32) | q_off
+        qc: uint8 = qry[q_off]
+        if _eq_uchar(pc, qc) == 0:
+            return 0xFFFFFFFFFFFFFFFF
+        p_off = p_off + 1
+        q_off = q_off + 1
+    return (p_off << 32) | q_off
+
+
+def _alias_glob_match(pat: Ptr[uint8], p_len: uint64,
+                      qry: Ptr[uint8], q_len: uint64) -> int32:
+    # Returns 1 if `pat` (literals + '*') matches all of `qry`.
+    # Implementation is the classic iterative wildcard match used by
+    # busybox's match.c and CPython's fnmatch — O(p*q) worst case but
+    # the patterns we see have at most 5 '*' segments, so it's near
+    # linear in practice.
+    p: uint64 = 0
+    q: uint64 = 0
+    star_p: int64 = -1
+    star_q: uint64 = 0
+    while q < q_len:
+        if p < p_len and pat[p] == 42:               # '*'
+            star_p = cast[int64](p)
+            star_q = q
+            p = p + 1
+            # Fast-forward over consecutive stars (collapse '**' to '*').
+            while p < p_len and pat[p] == 42:
+                p = p + 1
+            if p == p_len:
+                return 1                              # trailing '*' matches rest
+        else:
+            if p < p_len and _eq_uchar(pat[p], qry[q]) == 1:
+                p = p + 1
+                q = q + 1
+            else:
+                if star_p < 0:
+                    return 0
+                p = cast[uint64](star_p) + 1
+                # Skip any extra stars after the backtrack point.
+                while p < p_len and pat[p] == 42:
+                    p = p + 1
+                if p == p_len:
+                    return 1
+                star_q = star_q + 1
+                q = star_q
+    while p < p_len and pat[p] == 42:
+        p = p + 1
+    if p == p_len:
+        return 1
+    return 0
+
+
+# --- per-device query construction -------------------------------------
+
+def _build_pci_query(qbuf: Ptr[uint8], vendor: uint32, device: uint32,
+                     subv: uint32, subd: uint32,
+                     bc: uint32, sc: uint32, pi: uint32) -> uint64:
+    # Format "pci:v<V>d<D>sv<SV>sd<SD>bc<BC>sc<SC>i<PI>" into qbuf,
+    # where V/D/SV/SD are 8-hex-digit fields (Linux's modinfo width)
+    # and BC/SC/PI are 2-hex-digit fields. Returns the length written.
+    # Total: "pci:" (4) + "v"+8 + "d"+8 + "sv"+8 + "sd"+8 + "bc"+2 +
+    # "sc"+2 + "i"+2 = 4 + 9 + 9 + 10 + 10 + 4 + 4 + 3 = 53 bytes.
+    # qbuf MUST have room for >= 53 bytes. No NUL appended.
+    p: uint64 = 0
+    qbuf[p + 0] = 112                                # 'p'
+    qbuf[p + 1] = 99                                 # 'c'
+    qbuf[p + 2] = 105                                # 'i'
+    qbuf[p + 3] = 58                                 # ':'
+    p = p + 4
+    qbuf[p] = 118                                    # 'v'
+    p = p + 1
+    _u16_to_hex8(vendor, cast[Ptr[uint8]](
+        cast[uint64](qbuf) + p))
+    p = p + 8
+    qbuf[p] = 100                                    # 'd'
+    p = p + 1
+    _u16_to_hex8(device, cast[Ptr[uint8]](
+        cast[uint64](qbuf) + p))
+    p = p + 8
+    qbuf[p + 0] = 115                                # 's'
+    qbuf[p + 1] = 118                                # 'v'
+    p = p + 2
+    _u16_to_hex8(subv, cast[Ptr[uint8]](
+        cast[uint64](qbuf) + p))
+    p = p + 8
+    qbuf[p + 0] = 115                                # 's'
+    qbuf[p + 1] = 100                                # 'd'
+    p = p + 2
+    _u16_to_hex8(subd, cast[Ptr[uint8]](
+        cast[uint64](qbuf) + p))
+    p = p + 8
+    qbuf[p + 0] = 98                                 # 'b'
+    qbuf[p + 1] = 99                                 # 'c'
+    p = p + 2
+    _u8_to_hex2(bc, cast[Ptr[uint8]](
+        cast[uint64](qbuf) + p))
+    p = p + 2
+    qbuf[p + 0] = 115                                # 's'
+    qbuf[p + 1] = 99                                 # 'c'
+    p = p + 2
+    _u8_to_hex2(sc, cast[Ptr[uint8]](
+        cast[uint64](qbuf) + p))
+    p = p + 2
+    qbuf[p] = 105                                    # 'i'
+    p = p + 1
+    _u8_to_hex2(pi, cast[Ptr[uint8]](
+        cast[uint64](qbuf) + p))
+    p = p + 2
+    return p
+
+
+# Modinfo-emitted modern PCI aliases always include the subsystem and
+# class fields with '*' wildcards even when the C source's PCI_DEVICE()
+# macro didn't set them. Modules.alias lines therefore look like:
+#     pci:v00008086d000010D3sv*sd*bc*sc*i*
+# Some older kmod versions emit a shorter form ending at the device
+# id (no `sv...` tail). The glob matcher handles both shapes because
+# any unmatched tail in the query side fails — so we always include
+# the full query, and short patterns simply won't match without their
+# own '*' suffix. modinfo on every kmod >= 16 emits the full form;
+# older host distros would need depmod -a to migrate.
+
+
+# --- entry-table lookup ------------------------------------------------
+
+def _find_initramfs_entry(target: Ptr[uint8],
+                          target_len: uint64) -> int64:
+    # Linear scan over the cpio table looking for a name byte-for-byte
+    # equal to `target` (including the trailing NUL — cpio entry names
+    # are NUL-terminated in the blob). Returns the index on hit, -1 on
+    # miss. We can't call _lookup_name from fs/vfs.ad here because it
+    # also rewrites paths through the per-process Pgrp namespace which
+    # isn't pinned at the boot call site. Auto-modules are
+    # namespace-INDEPENDENT artifacts (initramfs bytes), so a literal
+    # cpio match is correct.
+    count: uint64 = initramfs_entry_count()
+    i: uint64 = 0
+    while i < count:
+        nm: Ptr[char] = initramfs_entry_name(i)
+        np: Ptr[uint8] = cast[Ptr[uint8]](nm)
+        # First quick check: target_len bytes match + the byte at
+        # target_len is NUL (cpio names are NUL-terminated).
+        ok: int32 = 1
+        j: uint64 = 0
+        while j < target_len:
+            if np[j] != target[j]:
+                ok = 0
+                j = target_len                       # break
+            else:
+                j = j + 1
+        if ok == 1 and np[target_len] == 0:
+            return cast[int64](i)
+        i = i + 1
+    return -1
+
+
+# --- core loop: PCI walk × alias-table glob match ----------------------
+
+# Bounded buffer reused for the per-device query string (max ~37 bytes
+# from _build_pci_query). Lives in the function-local stack frame, but
+# Adder doesn't permit Array[...] inside a def, so it's a top-level
+# BSS scratch. Single-threaded boot path — no locking needed.
+_QBUF_LEN: uint64 = 64
+_query_buf: Array[64, uint8]
+
+# Same idea for the per-match .ko path construction:
+#   "/lib/modules/auto/" + <module-name> + ".ko"
+# We cap the module name at 56 bytes (Linux's MODULE_NAME_LEN is 60
+# but the .ko stem we store is shorter). Total: 18 + 56 + 3 = 77 < 96.
+_KO_PATH_LEN: uint64 = 96
+_ko_path: Array[96, uint8]
+
+
+def _emit_ko_path(module: Ptr[uint8], mod_len: uint64) -> uint64:
+    # Build "/lib/modules/auto/<module>.ko" into _ko_path. Returns the
+    # path's length (excluding the trailing NUL we append for
+    # _find_initramfs_entry).
+    prefix: Ptr[uint8] = "/lib/modules/auto/"
+    pl: uint64 = 18
+    i: uint64 = 0
+    while i < pl:
+        _ko_path[i] = prefix[i]
+        i = i + 1
+    j: uint64 = 0
+    while j < mod_len and (pl + j) < (_KO_PATH_LEN - 4):
+        _ko_path[pl + j] = module[j]
+        j = j + 1
+    pos: uint64 = pl + j
+    _ko_path[pos + 0] = 46                           # '.'
+    _ko_path[pos + 1] = 107                          # 'k'
+    _ko_path[pos + 2] = 111                          # 'o'
+    _ko_path[pos + 3] = 0                            # NUL
+    return pos + 3
+
+
+# Track which modules have been loaded already so a device that
+# matches a second alias line for the same .ko doesn't trigger a
+# duplicate insmod. Indexed by a stamp of the first N chars of the
+# module name (cheap fingerprint — collisions just cause a redundant
+# load attempt, which kmod_linux_load itself short-circuits via its
+# duplicate-name check). Pure boot-time table; lives in BSS.
+_MAX_LOADED: uint64 = 32
+_loaded_fingerprint: Array[32, uint64]
+_n_loaded: uint64 = 0
+
+
+def _fingerprint(s: Ptr[uint8], n: uint64) -> uint64:
+    # Rolling FNV-1a-ish 64-bit hash. Cheap, no dependencies.
+    h: uint64 = 0xcbf29ce484222325
+    i: uint64 = 0
+    while i < n:
+        h = h ^ cast[uint64](s[i])
+        h = h * 0x100000001b3
+        i = i + 1
+    return h
+
+
+def _already_loaded(module: Ptr[uint8], mod_len: uint64) -> int32:
+    fp: uint64 = _fingerprint(module, mod_len)
+    i: uint64 = 0
+    while i < _n_loaded:
+        if _loaded_fingerprint[i] == fp:
+            return 1
+        i = i + 1
+    return 0
+
+
+def _mark_loaded(module: Ptr[uint8], mod_len: uint64):
+    if _n_loaded >= _MAX_LOADED:
+        return
+    _loaded_fingerprint[_n_loaded] = _fingerprint(module, mod_len)
+    _n_loaded = _n_loaded + 1
+
+
+# --- printk helper: print first N bytes of a buffer + newline ----------
+
+def _printk_bytes(prefix: Ptr[uint8], buf: Ptr[uint8], n: uint64):
+    # printk has no %.*s; we render a single-shot trace by NUL-
+    # terminating into a small scratch and using %s. Bounded at 96 to
+    # match _ko_path's footprint.
+    scratch: Array[160, uint8]
+    p: uint64 = 0
+    while p < 160 and prefix[p] != 0:
+        scratch[p] = prefix[p]
+        p = p + 1
+    i: uint64 = 0
+    while i < n and (p + i) < 158:
+        scratch[p + i] = buf[i]
+        i = i + 1
+    scratch[p + i] = 0
+    printk1("%s\n", cast[uint64](&scratch[0]))
+
+
+# --- public API --------------------------------------------------------
+
+def modprobe_auto_load() -> uint64:
+    # The Linux modprobe equivalent for Hamnix. Walks bus 0 (the only
+    # bus pci_scan inspects today) and for each non-empty function 0
+    # looks up the device's alias key in the baked-in modules.alias
+    # table. On a match, kmod_linux_load /lib/modules/auto/<X>.ko.
+    # Returns the count of modules successfully loaded (0 means no
+    # device matched any alias, NOT an error).
+    printk0("[modprobe] auto-load: reading /lib/modules/modules.alias\n")
+
+    cpio_init()                                      # idempotent
+
+    alias_marker: Ptr[uint8] = "/lib/modules/modules.alias"
+    alias_idx: int64 = _find_initramfs_entry(alias_marker, 26)
+    if alias_idx < 0:
+        printk0("[modprobe] /lib/modules/modules.alias not in initramfs\n")
+        return 0
+    alias_blob: Ptr[uint8] = initramfs_entry_data(cast[uint64](alias_idx))
+    alias_size: uint64 = initramfs_entry_size(cast[uint64](alias_idx))
+    printk1("[modprobe] alias table: %d bytes\n", alias_size)
+
+    _n_loaded = 0
+    n_loaded_ok: uint64 = 0
+    n_match_attempts: uint64 = 0
+
+    bus: uint32 = 0
+    dev: uint32 = 0
+    while dev < 32:
+        ident: uint32 = pci_config_read_dword(bus, dev, 0,
+                                              PCI_VENDOR_ID_OFFSET)
+        vendor: uint32 = ident & 0xFFFF
+        if vendor == PCI_INVALID_VENDOR:
+            dev = dev + 1
+            continue
+        device: uint32 = (ident >> 16) & 0xFFFF
+        # subsystem vendor + device live at config offset 0x2C.
+        sv_raw: uint32 = pci_config_read_dword(bus, dev, 0, 0x2C)
+        subv: uint32 = sv_raw & 0xFFFF
+        subd: uint32 = (sv_raw >> 16) & 0xFFFF
+        # class / subclass / prog-if at config offset 0x08 (revision in
+        # the low byte; we skip the revision since alias patterns
+        # don't carry it).
+        class_dword: uint32 = pci_config_read_dword(bus, dev, 0,
+                                                    PCI_CLASSREV_OFFSET)
+        base_class: uint32 = (class_dword >> 24) & 0xFF
+        sub_class:  uint32 = (class_dword >> 16) & 0xFF
+        prog_if:    uint32 = (class_dword >>  8) & 0xFF
+
+        qlen: uint64 = _build_pci_query(
+            cast[Ptr[uint8]](&_query_buf[0]),
+            vendor, device, subv, subd,
+            base_class, sub_class, prog_if)
+        # Trace the query string so the test harness can verify the
+        # right key was formatted for the device under test.
+        _printk_bytes("[modprobe] querying ",
+                      cast[Ptr[uint8]](&_query_buf[0]), qlen)
+
+        # Walk every alias line in the table; on first match, kmod_load.
+        pos: uint64 = 0
+        while pos < alias_size:
+            le: uint64 = _line_end(alias_blob, pos, alias_size)
+            # Skip blank lines and comments.
+            if le == pos:
+                pos = le + 1
+                continue
+            if alias_blob[pos] == 35:                # '#'
+                pos = le + 1
+                continue
+            # Parse "alias <pattern> <module-name>".
+            # Word 1: must be "alias" (5 chars + space). If anything
+            # else, skip the line.
+            if le - pos < 7:
+                pos = le + 1
+                continue
+            if alias_blob[pos + 0] != 97  \
+                    or alias_blob[pos + 1] != 108 \
+                    or alias_blob[pos + 2] != 105 \
+                    or alias_blob[pos + 3] != 97  \
+                    or alias_blob[pos + 4] != 115:
+                pos = le + 1
+                continue
+            ws1: uint64 = _skip_spaces(alias_blob, pos + 5, le)
+            pat_start: uint64 = ws1
+            pat_end:   uint64 = _word_end(alias_blob, pat_start, le)
+            ws2: uint64 = _skip_spaces(alias_blob, pat_end, le)
+            mod_start: uint64 = ws2
+            mod_end:   uint64 = _word_end(alias_blob, mod_start, le)
+            if pat_end == pat_start or mod_end == mod_start:
+                pos = le + 1
+                continue
+
+            # Match the pattern against the query.
+            if _alias_glob_match(
+                    cast[Ptr[uint8]](
+                        cast[uint64](alias_blob) + pat_start),
+                    pat_end - pat_start,
+                    cast[Ptr[uint8]](&_query_buf[0]),
+                    qlen) == 1:
+                n_match_attempts = n_match_attempts + 1
+                mod_ptr: Ptr[uint8] = cast[Ptr[uint8]](
+                    cast[uint64](alias_blob) + mod_start)
+                mod_len: uint64 = mod_end - mod_start
+                _printk_bytes("[modprobe] MATCH -> module=",
+                              mod_ptr, mod_len)
+                if _already_loaded(mod_ptr, mod_len) == 1:
+                    printk0("[modprobe] (already loaded; skipping)\n")
+                else:
+                    path_len: uint64 = _emit_ko_path(mod_ptr, mod_len)
+                    _printk_bytes("[modprobe] loading ",
+                                  cast[Ptr[uint8]](&_ko_path[0]),
+                                  path_len)
+                    ko_idx: int64 = _find_initramfs_entry(
+                        cast[Ptr[uint8]](&_ko_path[0]), path_len)
+                    if ko_idx < 0:
+                        printk0("[modprobe] .ko not found in initramfs; skipping\n")
+                    else:
+                        ko_blob: Ptr[uint8] = initramfs_entry_data(
+                            cast[uint64](ko_idx))
+                        ko_size: uint64 = initramfs_entry_size(
+                            cast[uint64](ko_idx))
+                        rc: int32 = kmod_linux_load(ko_blob, ko_size)
+                        if rc < 0:
+                            printk1("[modprobe] kmod_linux_load failed: rc=%d\n",
+                                    cast[uint64](rc))
+                        else:
+                            printk1("[modprobe] kmod_linux_load OK (slot=%d)\n",
+                                    cast[uint64](rc))
+                            _mark_loaded(mod_ptr, mod_len)
+                            n_loaded_ok = n_loaded_ok + 1
+                # First-match-wins for this device — even if more lines
+                # would match, loading the first .ko captures the
+                # device. Skip the rest of the table for this PCI dev.
+                pos = alias_size                     # break outer
+            else:
+                pos = le + 1
+
+        dev = dev + 1
+
+    printk2("[modprobe] auto-load complete: %d modules loaded (%d match attempts)\n",
+            n_loaded_ok, n_match_attempts)
+    return n_loaded_ok
+
+
+def auto_modules_marker_found() -> int32:
+    # Returns 1 if /etc/auto-modules is in the cpio archive (planted
+    # by scripts/build_initramfs.py when ENABLE_AUTO_MODULES=1). Used
+    # by init/main.ad to gate the modprobe_auto_load() call so the
+    # default CI boot stays single-purpose.
+    cpio_init()
+    target: Ptr[uint8] = "/etc/auto-modules"
+    target_len: uint64 = 17                          # strlen
+    idx: int64 = _find_initramfs_entry(target, target_len)
+    if idx < 0:
+        return 0
+    return 1

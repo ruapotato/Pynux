@@ -99,6 +99,7 @@ from arch.x86.kernel.module import module_api_init, module_load
 from linux_abi.exports import linux_abi_exports_init
 from linux_abi.loader import kmod_linux_load
 from drivers.pci.pci import e1000e_ko_marker_found
+from kernel.modprobe import modprobe_auto_load, auto_modules_marker_found
 from kernel.stack_protect import __stack_chk_init
 from drivers.pci.pci import pci_scan
 from drivers.rtc.cmos import rtc_init
@@ -2791,6 +2792,19 @@ def start_kernel():
     # stock .ko loader (linux_abi/loader.ad). Idempotent.
     printk0("[boot:35] linux_abi_exports_init\n")
     linux_abi_exports_init()
+
+    # Linux-shape modprobe auto-loader. When /etc/auto-modules is
+    # present in the initramfs (planted by build_initramfs.py when
+    # ENABLE_AUTO_MODULES=1 — the framework-superset of the legacy
+    # ENABLE_E1000E_KO marker below), walk the PCI bus and load any
+    # .ko in /lib/modules/auto/ that matches a baked
+    # /lib/modules/modules.alias entry. Default boots skip the marker
+    # so existing hand-rolled-driver tests stay deterministic.
+    if auto_modules_marker_found() == 1:
+        printk0("[boot:35.M] modprobe auto-load\n")
+        n_auto: uint64 = modprobe_auto_load()
+        printk1("[boot:35.M] modprobe auto-load: %d modules loaded\n",
+                n_auto)
 
     # Strategic-pivot: load Linux's stock e1000e.ko via the L-series
     # loader when /etc/e1000e-ko marker is present. Replaces the
