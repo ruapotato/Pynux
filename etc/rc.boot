@@ -15,7 +15,11 @@
 #     single-quoted so the lexer does not eat them as a comment.
 #   - '[' ']' are list-literal syntax and ':' is its own token, so
 #     marker text that contains them is single-quoted into one word.
-#   - `bind NEW OLD` grafts device/dir OLD onto the name NEW.
+#   - `bind SRC DST` grafts the source SRC onto the lookup name DST.
+#     Source-first matches BOTH Linux's `mount source target` AND
+#     Plan 9's `bind new old` (which is itself source→target). Old
+#     `bind /srv '#s'` snippets in this tree were a wrapper bug —
+#     not a "Plan 9 style" choice.
 
 echo 'rc.boot: hamnix boot rc starting'
 
@@ -25,39 +29,41 @@ echo 'rc.boot: hamnix boot rc starting'
 # Plan 9 path names in the ambient namespace. Every command hamsh
 # later spawns inherits this table via its COW Pgrp clone.
 #
-#   bind /srv  '#s'   — name-server directory
-#   bind /proc '#p'   — per-task introspection (status / ns / ...)
-#   bind /n    '#/'   — conventional mount-point parent
+#   bind '#s' /srv    — name-server directory (source-first)
+#   bind '#p' /proc   — per-task introspection (status / ns / ...)
+#   bind '#/' /n      — conventional mount-point parent
 #
 # '#c' (console) is deliberately NOT bound onto /dev: vfs.ad already
 # ships /dev/cons as a direct cdev, and grafting the single-file
 # console device over the /dev directory would shadow /dev/null,
 # /dev/cpuinfo, etc. /dev is the Layer-1 byte-source pile; the
 # '#'-namespace is Layer 2 — they coexist without binding together.
-bind /srv '#s'
-bind /proc '#p'
-bind /n '#/'
+bind '#s' /srv
+bind '#p' /proc
+bind '#/' /n
 
 # Rootfs partition (Plan 9 shape, docs/rootfs_partition.md). The
-# kernel auto-discovered an ext4 partition at boot via
-# mount_rootfs_partition() and exposed it through the `/ext` path-
-# prefix dispatch (see fs/vfs.ad's is_ext_path). Plan 9 convention:
-# mount file servers at conventional names under /n. We `bind` (not
-# `mount` — `/ext` is a kernel-side dispatch hook, not a 9P srvfd
-# yet) it at /n/distros so the SHELL has read/write access to the
-# rootfs partition's free space. The shell sees:
+# kernel auto-discovered the ext4 partition at boot via
+# mount_rootfs_partition() and (Phases 3-6) registered it under the
+# sentinel-declared name '#distro' in the per-name file-server stack.
+# Plan 9 convention: mount file servers at conventional names under
+# /n. The bind here is source-first: SRC='#distro' (the partition's
+# file server), DST=/n/distros (the lookup name in the shell view).
 #
+# This `bind` snapshots the Chan at bind time per plain Plan 9
+# chan.c — already-bound paths cannot be yanked by hot-plug, even
+# if another partition later pushes a duplicate '#distro' onto the
+# named stack. Only fresh binds re-consult the stack.
+#
+# The shell sees:
 #   /n/distros/usr/bin/dpkg       — read the real Debian dpkg
 #   /n/distros/home/me/myfile     — write user files to the partition
 #
 # Anything `apt install` writes from inside `enter linux { ... }`
 # lands at /n/distros/usr/bin/<X> (because the linux ns rebinds
-# / -> /n/distros) — which means the writes ARE visible to the
-# shell, but at /n/distros/usr/bin/<X> rather than /usr/bin/<X>.
-# The shell's own /usr/bin/ stays Hamnix-native (cpio-served);
-# apt cannot shadow Hamnix paths. This is the "different mounts
-# for the linux ns vs the init system" guarantee the user wants.
-bind /n/distros /ext
+# '#distro' at /). The shell's own /usr/bin/ stays Hamnix-native
+# (cpio-served); apt cannot shadow Hamnix paths.
+bind '#distro' /n/distros
 echo 'rc.boot: namespace recipe applied (rootfs at /n/distros)'
 
 # --- boot services --------------------------------------------------
@@ -133,21 +139,22 @@ echo 'rc.boot:STEP-1 past ifconfig dump'
 #
 # Plan 9 shape (2026-05-26 pivot, docs/rootfs_partition.md): the
 # distro tree lives on a SEPARATE ext4 partition the kernel auto-
-# discovers at boot and exposes via the existing `/ext` device-letter
-# alias. `bind / /ext` reaches the rootfs partition WITHOUT mounting
-# it in the init namespace (the shell's normal view) — only this
-# linux ns recipe sees the distro tree. Anything `apt install` writes
-# lands on the rootfs partition's ext4 filesystem, but is reachable
-# only from inside the linux ns. The init namespace stays Hamnix-
-# native; the shell's /, /etc, /bin, ... are NEVER shadowed by the
-# Debian tree.
+# discovers at boot. The sentinel file `.hamnix-roots` at the
+# partition root names it `distro`, so it lands in the named
+# file-server stack as `#distro`. `bind '#distro' /` reaches the
+# rootfs partition WITHOUT mounting it in the init namespace (the
+# shell's normal view) — only this linux ns recipe sees the distro
+# tree at /. Anything `apt install` writes lands on the rootfs
+# partition's ext4 filesystem, but is reachable only from inside the
+# linux ns. The init namespace stays Hamnix-native; the shell's /,
+# /etc, /bin, ... are NEVER shadowed by the Debian tree.
 #
 # Fallback: if the kernel didn't find an ext4 rootfs (e.g. `-kernel
-# ELF` boot with no rootfs.img attached), `/ext` resolves to nothing
-# and `enter linux { ... }` calls fail with -ENOENT. The legacy in-
-# cpio /var/lib/distros/default path is also still bound below for
-# backward compat with the rich-cpio test fixtures that bake the
-# distro tree into the kernel ELF (set HAMNIX_CPIO_LEAN=0).
+# ELF` boot with no rootfs.img attached), `#distro` resolves to
+# nothing and `enter linux { ... }` calls fail with -ENOENT. The
+# legacy in-cpio /var/lib/distros/default path is also still bound
+# below for backward compat with the rich-cpio test fixtures that
+# bake the distro tree into the kernel ELF (set HAMNIX_CPIO_LEAN=0).
 #
 # The share list below is deliberately minimal — only paths that are
 # safe to expose to a foreign-distro binary, where "safe" means
@@ -182,22 +189,22 @@ echo 'rc.boot:STEP-1 past ifconfig dump'
 # naturally when the distro IS Debian: `enter debian { apt update }`.
 echo 'rc.boot:STEP-2 about to capture linux ns template'
 linux = ns clean {
-    bind / /ext
+    bind '#distro' /
     bind /home /home
-    bind /dev '#c'
-    bind /proc '#p'
-    bind /srv '#s'
-    bind /n '#/'
+    bind '#c' /dev
+    bind '#p' /proc
+    bind '#s' /srv
+    bind '#/' /n
     bind /tmp /tmp
 }
 echo 'rc.boot:STEP-3 captured linux ns; capturing debian ns'
 debian = ns clean {
-    bind / /ext
+    bind '#distro' /
     bind /home /home
-    bind /dev '#c'
-    bind /proc '#p'
-    bind /srv '#s'
-    bind /n '#/'
+    bind '#c' /dev
+    bind '#p' /proc
+    bind '#s' /srv
+    bind '#/' /n
     bind /tmp /tmp
 }
 echo 'rc.boot:STEP-4 captured debian ns'
