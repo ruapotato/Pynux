@@ -36,20 +36,31 @@ from scratch. Hamnix picks both, layered:
 | **1** | Native syscalls | **Plan 9-shape** — ~25 calls including `rfork`, `bind`, `mount`, `errstr`. See [`docs/native-api.md`](docs/native-api.md) |
 | **0** | Kernel internals | Linux-shape — task_struct, scheduler, allocators. Reading kernel/sched/core.c → porting to `kernel/sched/core.ad` is the unit of work. |
 
-The clearest demonstration: the **cdev family**. Native code reads system
-state via Plan 9-shape paths like `/dev/cpuinfo`, `/dev/meminfo`,
-`/dev/uptime`, `/dev/loadavg`, `/dev/version`, `/dev/hostname` (twelve
-files; see M16.131–M16.133). Linux binaries open `/proc/cpuinfo`,
-`/proc/meminfo`, etc. and the **Layer-2 translation** (M16.134) silently
-rewrites the path before `vfs_open` — Linux ELFs see byte-identical
-output to native code.
+The clearest demonstration: the **cdev family**. Native code reads
+system state via Plan 9-shape paths like `/dev/cpuinfo`,
+`/dev/meminfo`, `/dev/uptime`, `/dev/loadavg`, `/dev/version`,
+`/dev/hostname` (twelve files; see M16.131–M16.133). For Linux
+binaries the trick is NOT path translation — it's that **`enter
+linux { ... }` constructs a Linux-shape namespace** by binding the
+same kernel device file servers at the paths Debian expects:
+`linux = ns clean { bind '#c' /dev; bind '#p' /proc; bind '#s' /srv;
+... }` in `etc/rc.boot`. Inside the namespace, `cat /proc/cpuinfo`
+opens Hamnix's proc cdev directly (no path-string rewriting in the
+syscall path); the same kernel file server answers both worlds via
+different namespace bindings.
 
-This pattern generalises: the kernel knows letters (`#s`, `#p`, `#c`,
-`#/` — Plan 9 device aliases); userspace `init` reads a recipe and
-binds them at conventional paths (`bind '#s' /srv`, `bind '#p' /proc`,
-…). Per-process namespaces via `rfork(RFNAMEG)`, real `Pgrp` struct
-with refcount, end-to-end 9P loop closes through userspace-posted
-srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
+This pattern generalises: the kernel knows device letters (`#s`,
+`#p`, `#c`, `#/` — Plan 9 aliases) plus multi-char names registered
+from on-disk sentinels (`#distro`, `#home`, `#by-id/<partuuid>`).
+Userspace `init` reads a recipe and binds them at conventional paths
+(`bind '#s' /srv`, `bind '#p' /proc`, …). Per-process namespaces via
+`rfork(RFNAMEG)`, real `Pgrp` struct with refcount, bind freeze
+(`#<word>` source resolves to `#by-id/<partuuid>` at bind time so
+hot-plug can't yank running namespaces), end-to-end 9P loop closes
+through userspace-posted srvfds. See M16.135 + 9P V0..V4.1 in
+[STATUS.md](STATUS.md) and the full design in
+[`docs/architecture.md`](docs/architecture.md) §"Filesystem layout
+and discovery".
 
 ---
 
@@ -110,12 +121,20 @@ srvfds. See M16.135 + 9P V0..V4.1 in [STATUS.md](STATUS.md).
   (commits `0de1c63`..`3ff5bfc`) because that's the wrong architecture:
   apt/dpkg are Debian userland; they should run as the real Debian
   binaries inside the Linux namespace, not be re-shimmed in Adder.
-  The boot ISO now stages a curated apt/dpkg closure + busybox into a
-  separate ext4 partition (`scripts/build_rootfs_img.py`), the kernel
-  auto-discovers the partition via a `.hamnix-roots` sentinel, and
-  `etc/rc.boot`'s `linux = ns clean { bind '#distro' / ; ... }`
-  exposes it inside the linux namespace. `enter linux { /usr/bin/apt
-  install hello }` runs real Debian apt against real Debian dpkg. See
+  The boot ISO carries a separate ext4 partition
+  (`scripts/build_rootfs_img.py`); the kernel auto-discovers it and
+  reads its `.hamnix-roots` sentinel to register each declared name
+  (`<word> <relpath>` lines) as its own file server in the kernel's
+  per-name file-server table. Today the partition serves a single
+  `#distro` file server holding the Debian closure + busybox; the
+  same mechanism scales to splitting one ext4 partition into N file
+  servers (e.g. `#distro` + `#home` + `#apt-cache`), each
+  independently bindable into different namespaces. `etc/rc.boot`'s
+  `linux = ns clean { bind '#distro' / ; bind '#c' /dev; bind '#p'
+  /proc; ... }` composes the Linux-namespace view by binding the
+  distro file server AND the Hamnix cdev/proc/srv file servers at
+  Debian-expected paths. `enter linux { /usr/bin/apt install hello }`
+  runs real Debian apt against real Debian dpkg. See
   `docs/rootfs_partition.md` for the FS-discovery design (named
   file-server stacks, `#by-id/<partuuid>` stable aliases,
   `/proc/fs/by-name/<word>` inspection).
