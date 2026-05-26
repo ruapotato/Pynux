@@ -1,0 +1,529 @@
+# linux_abi/api_hid.ad
+#
+# HID-class shim layer — closes the UND surface of hid.ko (the Linux
+# HID core library, ~480 KiB) and exposes the cross-.ko hid_* family
+# of EXPORT_SYMBOL functions that usbhid.ko / hid-generic.ko consume.
+#
+# UND analysis (`nm -u` of the Debian 6.1.0-32 hid.ko):
+#   hid.ko total UND          133
+#   covered by L<=68 + family 116 (input_event family already shipped
+#                                  by api_snd_core; memcpy/memset/
+#                                  kmalloc/kfree/_printk shipped by
+#                                  L1..L5; the workqueue + mutex /
+#                                  spinlock surface shipped by L7..L9)
+#   gap to close              17 (this file)
+#
+# Categorized gap:
+#   1. Legacy semaphore primitives (4): down, down_interruptible,
+#      down_trylock, up. Linux's `struct semaphore` (kernel/locking/
+#      semaphore.c) — hid.ko's hiddev minor table uses these for the
+#      cdev<->minor mapping. The struct is a small (24-byte) embedded
+#      counter. Hamnix has no preemption-aware semaphore primitive
+#      yet; these stubs assume the semaphore is always available.
+#      The body shape mirrors api_l57's down_read / up_read shim.
+#
+#   2. Input absinfo + abs-params + force-feedback event hooks (4):
+#      input_alloc_absinfo, input_set_abs_params, input_ff_event,
+#      input_scancode_to_scalar. Touch/joystick-class HID devices
+#      register an absolute-axis range and call input_event with
+#      EV_ABS through these helpers; keyboards never reach them.
+#      Stubs return 0 / NULL.
+#
+#   3. Power-supply class (5): power_supply_register / _unregister /
+#      _changed / _get_drvdata / _powers. HID battery-aware peripherals
+#      (wireless mice, drawing tablets) publish a /sys/class/power_supply
+#      entry showing the battery level. Keyboards never use this. Stubs
+#      return success / NULL.
+#
+#   4. Tail-of-the-pack (4): bus_rescan_devices (re-probe trigger when
+#      a new HID device is added — cold), ktime_get_coarse_ts64 (coarse
+#      timestamp for hiddev event timing — we expose a monotonically-
+#      increasing counter), mutex_lock_killable (mutex_lock with SIGKILL
+#      sensitivity — stubs as plain mutex_lock), __kfifo_to_user
+#      (hiddev event buffer drain into userspace — never reached
+#      without a /dev/hiddev fd, and our chrdev surface returns
+#      -ENODEV for hiddev opens).
+#
+# DATA path:
+#   Hamnix's keyboard event flow is:
+#     QEMU/HW xhci → drivers/usb/xhci.ad::xhci_poll → hid_kbd_report
+#                                                 → kbd_rx_push
+#   The .ko-side hid.ko / usbhid.ko load is a Linux-ABI COVERAGE PROBE,
+#   not the live data path. Loading proves the dep chain (usbcore +
+#   xhci_hcd + xhci_pci + hid + usbhid) is reachable through the
+#   L-shim without symbol gaps. Real keystrokes still flow through
+#   the hand-rolled xhci.ad above. When the URB framework gets real
+#   I/O (next milestone — see api_usbhid.ad), this comment updates
+#   to point at usb_submit_urb → hid_input_report → kbd_rx_push.
+#
+# Cross-module EXPORT_SYMBOL surface:
+#   hid.ko ships ~70 EXPORT_SYMBOL_GPL functions (hid_register_driver,
+#   hid_hw_open, hid_hw_close, hid_input_report, hid_parse_report,
+#   hid_set_field, hid_alloc_report_buf, hid_check_keys_pressed,
+#   hidinput_count_leds, hid_lookup_quirk, hid_output_report,
+#   hid_quirks_init, hid_quirks_exit, hid_add_device, hid_allocate_device,
+#   hid_destroy_device, hid_driver_{suspend,resume,reset_resume},
+#   hid_hw_request, hid_set_field). usbhid.ko UND-references all of
+#   these. Without modules.dep load ordering they MUST be resolvable
+#   from the Hamnix shim table before usbhid.ko's init_module fires.
+#   This file exports each one as a stub that returns sane defaults.
+#
+# The "_hd_" prefix marks the Hamnix-side shim for hid.ko-defined
+# symbols (distinct from "_uc_" / "_uh_" / "_xc_" elsewhere).
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.slab import kmalloc, kfree, kzalloc
+from drivers.usb.hid import hid_kbd_report
+
+
+# =====================================================================
+# DATA buffers
+# =====================================================================
+#
+# hid.ko exports no DATA symbols its consumers depend on at load
+# time, but we expose a single coarse-timestamp counter for
+# ktime_get_coarse_ts64 below. struct timespec64 is 16 bytes
+# (tv_sec: int64, tv_nsec: int64). Hamnix has no real wall clock
+# in this path; we just bump nsec on every call.
+_hd_coarse_ts_counter:     uint64 = 0
+
+
+# =====================================================================
+# Group 1: legacy semaphore primitives
+# =====================================================================
+#
+# Linux:
+#   void down(struct semaphore *sem);
+#   int  down_interruptible(struct semaphore *sem);
+#   int  down_trylock(struct semaphore *sem);
+#   void up(struct semaphore *sem);
+#
+# Hamnix has no preemption-aware semaphore yet (the kernel runs
+# cooperatively). The legacy semaphore is a counted-mutex; our
+# stub treats every down as immediately succeeding (sem always
+# available) and every up as a no-op.
+
+def _hd_down(sem: uint64):
+    # Counted down. Cooperative kernel — never sleep. Real Linux
+    # would block; we just return.
+    return
+
+
+def _hd_down_interruptible(sem: uint64) -> int32:
+    # 0 on success; -EINTR if a signal arrived. We never sleep so
+    # success is the only outcome.
+    return 0
+
+
+def _hd_down_trylock(sem: uint64) -> int32:
+    # 0 on success; 1 if the semaphore was contended. Always succeed.
+    return 0
+
+
+def _hd_up(sem: uint64):
+    return
+
+
+# =====================================================================
+# Group 2: input absinfo / abs-params / force-feedback
+# =====================================================================
+#
+# Linux:
+#   struct input_absinfo *input_alloc_absinfo(struct input_dev *);
+#   void input_set_abs_params(struct input_dev *, unsigned int axis,
+#                              int min, int max, int fuzz, int flat);
+#   int  input_ff_event(struct input_dev *, unsigned int code,
+#                        int value);
+#   void input_scancode_to_scalar(const struct input_keymap_entry *,
+#                                  unsigned int *scancode);
+#
+# Touch/joystick HID devices use these for absolute-axis registration
+# and rumble events. Keyboards never reach them. Stubs return
+# 0 / NULL so the alloc-failure arm doesn't fire on a legitimate
+# kbd-only run.
+
+_hd_absinfo_buf:           Array[256, uint8]
+
+
+def _hd_input_alloc_absinfo(dev: uint64) -> uint64:
+    # Return a stable non-NULL pointer; the caller stashes it on the
+    # input_dev. The buffer is reused across all input devices since
+    # Hamnix never reads from the absinfo (no /dev/input fd).
+    return cast[uint64](&_hd_absinfo_buf[0])
+
+
+def _hd_input_set_abs_params(dev: uint64, axis: uint32,
+                             vmin: int32, vmax: int32,
+                             fuzz: int32, flat: int32):
+    return
+
+
+def _hd_input_ff_event(dev: uint64, code: uint32, value: int32) -> int32:
+    # 0 on success. Force-feedback rumble — nothing to do on Hamnix.
+    return 0
+
+
+def _hd_input_scancode_to_scalar(ke: uint64, scancode: Ptr[uint32]):
+    # Pre-Linux 5.x took the scancode as a 4-byte field; current
+    # versions support variable-length scancodes. With ke->{len,index}
+    # both zero (we never populate input_keymap_entry), the upstream
+    # impl does nothing useful — we mirror that.
+    if cast[uint64](scancode) != 0:
+        scancode[0] = 0
+
+
+# =====================================================================
+# Group 3: power_supply (battery class)
+# =====================================================================
+#
+# Linux:
+#   struct power_supply *power_supply_register(struct device *parent,
+#       const struct power_supply_desc *desc,
+#       const struct power_supply_config *cfg);
+#   void power_supply_unregister(struct power_supply *psy);
+#   void power_supply_changed(struct power_supply *psy);
+#   void *power_supply_get_drvdata(struct power_supply *psy);
+#   int  power_supply_powers(struct power_supply *psy, struct device *);
+#
+# HID battery monitor (wireless peripherals). Stubs return a stable
+# non-NULL slot for register, NULL for get_drvdata (caller branches
+# IS_ERR_OR_NULL and the NULL path is benign), 0 for powers, and
+# no-ops for changed / unregister.
+
+_hd_power_supply_buf:      Array[256, uint8]
+
+
+def _hd_power_supply_register(parent: uint64, desc: uint64,
+                              cfg: uint64) -> uint64:
+    # Stable non-NULL pointer; caller stores it on hid_device. The
+    # buffer is reused across multiple registers — Hamnix doesn't
+    # segregate. Returning IS_ERR(-ENOMEM) would be more accurate
+    # but the caller treats !IS_ERR as a success contract.
+    return cast[uint64](&_hd_power_supply_buf[0])
+
+
+def _hd_power_supply_unregister(psy: uint64):
+    return
+
+
+def _hd_power_supply_changed(psy: uint64):
+    return
+
+
+def _hd_power_supply_get_drvdata(psy: uint64) -> uint64:
+    return 0
+
+
+def _hd_power_supply_powers(psy: uint64, dev: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 4: tail-of-the-pack
+# =====================================================================
+#
+# Linux:
+#   int bus_rescan_devices(struct bus_type *bus);
+#   void ktime_get_coarse_ts64(struct timespec64 *ts);
+#   int mutex_lock_killable(struct mutex *lock);
+#   unsigned int __kfifo_to_user(struct __kfifo *fifo, void __user *to,
+#                                  unsigned long len, unsigned int *copied);
+
+def _hd_bus_rescan_devices(bus: uint64) -> int32:
+    # Re-walk the bus' device list and re-probe each. Hamnix doesn't
+    # support late hotplug — the original probe at module-load is the
+    # only chance. Return 0 (success).
+    return 0
+
+
+def _hd_ktime_get_coarse_ts64(ts: Ptr[uint64]):
+    # struct timespec64 { int64 tv_sec; int64 tv_nsec; }. We bump a
+    # nanosecond counter so consecutive calls produce monotonically
+    # increasing values. hid.ko's hiddev event timestamp consumer
+    # only diffs successive samples, so the wall-clock origin doesn't
+    # matter.
+    _hd_coarse_ts_counter = _hd_coarse_ts_counter + 1000
+    if cast[uint64](ts) != 0:
+        ts[0] = 0                                    # tv_sec
+        ts[1] = _hd_coarse_ts_counter                # tv_nsec
+
+
+def _hd_mutex_lock_killable(lock: uint64) -> int32:
+    # Like mutex_lock but returns -EINTR if a SIGKILL arrives during
+    # the wait. Hamnix has no preemption inside kernel paths so
+    # there's never a sleep — return 0 (got the lock).
+    return 0
+
+
+def _hd_kfifo_to_user(fifo: uint64, to: uint64, n: uint64,
+                      copied: Ptr[uint32]) -> uint32:
+    # int __kfifo_to_user(struct __kfifo *fifo, void __user *to,
+    #                       unsigned long len, unsigned int *copied);
+    # /dev/hiddev event drain. Hamnix doesn't surface /dev/hiddev,
+    # so the drain runs against an empty fifo — *copied = 0.
+    if cast[uint64](copied) != 0:
+        copied[0] = 0
+    return 0
+
+
+# =====================================================================
+# Cross-module hid_* EXPORT_SYMBOL surface
+# =====================================================================
+#
+# These are DEFINED in hid.ko, but usbhid.ko / hid-generic.ko /
+# hid-input.ko UND-reference them. Without modules.dep ordering
+# guarantees (which the loader doesn't yet enforce), we shim each
+# of these in Hamnix's address space so the dependent module's
+# init_module relocation pass resolves them regardless of which
+# .ko loads first.
+#
+# Each stub prints once per invocation (printk1 with the address as
+# diagnostic) and returns the success-shape default for its prototype.
+# A future agent wiring the real URB pipeline replaces these one by
+# one with hand-bridged implementations.
+
+# struct hid_device-shaped backing buffer. Linux's struct hid_device
+# is large (~2 KiB with input + driver + report-descriptor + ...);
+# we use 4 KiB for headroom. hid_allocate_device returns a pointer
+# into this buffer, indexed by a free-slot counter so distinct USB
+# HID interfaces don't collide on the same slot.
+MAX_HID_DEVICES:           uint64 = 4
+_hd_device_slots:          Array[16384, uint8]
+_hd_device_next_slot:      uint64 = 0
+
+
+def _hd_hid_allocate_device() -> uint64:
+    # struct hid_device *hid_allocate_device(void);
+    # Allocates a zero-initialised hid_device. We hand out 4 KiB
+    # slots from the static pool (max 4 active devices — covers
+    # any reasonable test rig). Out of slots: return 0 (caller
+    # branches IS_ERR_OR_NULL).
+    if _hd_device_next_slot >= MAX_HID_DEVICES:
+        printk0("[shim] hid:hid_allocate_device — out of slots, returning NULL\n")
+        return 0
+    off: uint64 = _hd_device_next_slot * 4096
+    _hd_device_next_slot = _hd_device_next_slot + 1
+    addr: uint64 = cast[uint64](&_hd_device_slots[0]) + off
+    printk1("[shim] hid:hid_allocate_device -> %p\n", addr)
+    return addr
+
+
+def _hd_hid_destroy_device(hdev: uint64):
+    printk1("[shim] hid:hid_destroy_device(%p) — no-op\n", hdev)
+
+
+def _hd_hid_add_device(hdev: uint64) -> int32:
+    # int hid_add_device(struct hid_device *);
+    # Real Linux: registers the device on the hid bus and triggers a
+    # driver probe walk. With no hid_bus_type backing in our env,
+    # we log and return 0 (success). The keystroke data path still
+    # flows through xhci.ad's hand-rolled hid_kbd_report below.
+    printk1("[shim] hid:hid_add_device(%p) -> 0\n", hdev)
+    return 0
+
+
+def _hd_hid_parse_report(hdev: uint64, start: uint64, size: uint32) -> int32:
+    # int hid_parse_report(struct hid_device *hid, __u8 *start,
+    #                       unsigned size);
+    # Parses the HID report descriptor blob into hid_device->collection.
+    # usbhid.ko calls this after GET_DESCRIPTOR(HID_REPORT). With no
+    # real input layer, we just log + succeed.
+    printk2("[shim] hid:hid_parse_report(hdev=%p size=%d) -> 0\n",
+            hdev, cast[uint64](size))
+    return 0
+
+
+def _hd_hid_input_report(hdev: uint64, rtype: uint32,
+                        data: Ptr[uint8], size: int32,
+                        is_intr: int32) -> int32:
+    # int hid_input_report(struct hid_device *hid, enum hid_report_type,
+    #                       u8 *data, u32 size, int interrupt);
+    # The DATA-PATH function: usbhid's URB callback calls this with
+    # the freshly-arrived 8-byte boot report.
+    #
+    # If/when usbhid's URB pipeline starts firing for real, this is
+    # the bridge point — call hid_kbd_report() with the buffer and
+    # the keystroke flows to kbd_rx_push exactly like the hand-rolled
+    # xhci path. For V0 the URB pipeline is stubbed so this never
+    # fires in practice; we still bridge it for free in case a
+    # follow-up agent wires it.
+    if cast[uint64](data) != 0 and size >= 8:
+        printk1("[shim] hid:hid_input_report bridging to hid_kbd_report (size=%d)\n",
+                cast[uint64](size))
+        hid_kbd_report(data)
+    return 0
+
+
+def _hd_hid_output_report(hdev: uint64, data: Ptr[uint8],
+                          size: int32) -> int32:
+    # int hid_output_report(struct hid_device *hid, __u8 *data,
+    #                        size_t size);
+    # Builds an output report blob (keyboard LED state, etc.). With
+    # no LED wiring on Hamnix's HID path we just return the size.
+    return size
+
+
+def _hd_hid_set_field(report: uint64, field_idx: uint32,
+                      value: int32) -> int32:
+    # int hid_set_field(struct hid_field *, unsigned offset, __s32 value);
+    return 0
+
+
+def _hd_hid_alloc_report_buf(report: uint64, gfp_flags: uint32) -> uint64:
+    # u8 *hid_alloc_report_buf(struct hid_report *report, gfp_t flags);
+    # Allocates a buffer sized for the report. We default to 64 bytes
+    # (covers boot-protocol keyboard at 8 bytes + headroom for full-
+    # protocol mode). Returns NULL on alloc failure.
+    return kzalloc(64)
+
+
+def _hd_hid_check_keys_pressed(hdev: uint64) -> int32:
+    # bool hid_check_keys_pressed(struct hid_device *);
+    # Used by suspend logic — "is anything down?". We have no key
+    # state visible from this shim; return 0 (no keys pressed) so
+    # suspend doesn't false-positive abort.
+    return 0
+
+
+def _hd_hidinput_count_leds(hdev: uint64) -> uint32:
+    # Number of LEDs (Caps/Num/Scroll) on the device. Boot keyboard
+    # has 3; we report 0 because we don't wire SET_REPORT for LED
+    # state back to the device.
+    return 0
+
+
+def _hd_hid_lookup_quirk(hdev: uint64) -> uint32:
+    # u32 hid_lookup_quirk(struct hid_device *);
+    # Returns a quirks-table bitmask for known-broken devices. With
+    # no quirks table populated, return 0 (no quirks apply).
+    return 0
+
+
+def _hd_hid_quirks_init(quirks_param: uint64, bus: uint32,
+                       count: int32) -> int32:
+    # Module-init time table builder. Stub returns 0.
+    return 0
+
+
+def _hd_hid_quirks_exit():
+    return
+
+
+def _hd_hid_hw_open(hdev: uint64) -> int32:
+    # int hid_hw_open(struct hid_device *);
+    # Real Linux: opens the underlying transport (USB interrupt-IN
+    # endpoint via usbhid). Hamnix's URB pipeline is stubbed; return
+    # 0 so the open-tracking refcount stays consistent.
+    printk1("[shim] hid:hid_hw_open(%p) -> 0\n", hdev)
+    return 0
+
+
+def _hd_hid_hw_close(hdev: uint64):
+    printk1("[shim] hid:hid_hw_close(%p) — no-op\n", hdev)
+
+
+def _hd_hid_hw_request(hdev: uint64, report: uint64,
+                      rtype: uint32) -> int32:
+    # int hid_hw_request(struct hid_device *, struct hid_report *,
+    #                     enum hid_class_request);
+    # Send a class request (GET_REPORT / SET_REPORT) via the LL
+    # driver. Stubbed.
+    return 0
+
+
+def _hd_hid_driver_suspend(hdev: uint64, state: uint32) -> int32:
+    return 0
+
+
+def _hd_hid_driver_resume(hdev: uint64) -> int32:
+    return 0
+
+
+def _hd_hid_driver_reset_resume(hdev: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_hid():
+    # ---- Group 1: legacy semaphore primitives ----
+    _add_export("down",                cast[uint64](&_hd_down))
+    _add_export("down_interruptible",  cast[uint64](&_hd_down_interruptible))
+    _add_export("down_trylock",        cast[uint64](&_hd_down_trylock))
+    _add_export("up",                  cast[uint64](&_hd_up))
+
+    # ---- Group 2: input absinfo / abs-params / force-feedback ----
+    _add_export("input_alloc_absinfo",
+                cast[uint64](&_hd_input_alloc_absinfo))
+    _add_export("input_set_abs_params",
+                cast[uint64](&_hd_input_set_abs_params))
+    _add_export("input_ff_event",
+                cast[uint64](&_hd_input_ff_event))
+    _add_export("input_scancode_to_scalar",
+                cast[uint64](&_hd_input_scancode_to_scalar))
+
+    # ---- Group 3: power_supply ----
+    _add_export("power_supply_register",
+                cast[uint64](&_hd_power_supply_register))
+    _add_export("power_supply_unregister",
+                cast[uint64](&_hd_power_supply_unregister))
+    _add_export("power_supply_changed",
+                cast[uint64](&_hd_power_supply_changed))
+    _add_export("power_supply_get_drvdata",
+                cast[uint64](&_hd_power_supply_get_drvdata))
+    _add_export("power_supply_powers",
+                cast[uint64](&_hd_power_supply_powers))
+
+    # ---- Group 4: tail-of-the-pack ----
+    _add_export("bus_rescan_devices",
+                cast[uint64](&_hd_bus_rescan_devices))
+    _add_export("ktime_get_coarse_ts64",
+                cast[uint64](&_hd_ktime_get_coarse_ts64))
+    _add_export("mutex_lock_killable",
+                cast[uint64](&_hd_mutex_lock_killable))
+    _add_export("__kfifo_to_user",
+                cast[uint64](&_hd_kfifo_to_user))
+
+    # ---- Cross-module hid_* EXPORT_SYMBOL surface (consumed by
+    #      usbhid.ko / hid-generic.ko / hid-input.ko) ----
+    _add_export("hid_allocate_device",
+                cast[uint64](&_hd_hid_allocate_device))
+    _add_export("hid_destroy_device",
+                cast[uint64](&_hd_hid_destroy_device))
+    _add_export("hid_add_device",
+                cast[uint64](&_hd_hid_add_device))
+    _add_export("hid_parse_report",
+                cast[uint64](&_hd_hid_parse_report))
+    _add_export("hid_input_report",
+                cast[uint64](&_hd_hid_input_report))
+    _add_export("hid_output_report",
+                cast[uint64](&_hd_hid_output_report))
+    _add_export("hid_set_field",
+                cast[uint64](&_hd_hid_set_field))
+    _add_export("hid_alloc_report_buf",
+                cast[uint64](&_hd_hid_alloc_report_buf))
+    _add_export("hid_check_keys_pressed",
+                cast[uint64](&_hd_hid_check_keys_pressed))
+    _add_export("hidinput_count_leds",
+                cast[uint64](&_hd_hidinput_count_leds))
+    _add_export("hid_lookup_quirk",
+                cast[uint64](&_hd_hid_lookup_quirk))
+    _add_export("hid_quirks_init",
+                cast[uint64](&_hd_hid_quirks_init))
+    _add_export("hid_quirks_exit",
+                cast[uint64](&_hd_hid_quirks_exit))
+    _add_export("hid_hw_open",
+                cast[uint64](&_hd_hid_hw_open))
+    _add_export("hid_hw_close",
+                cast[uint64](&_hd_hid_hw_close))
+    _add_export("hid_hw_request",
+                cast[uint64](&_hd_hid_hw_request))
+    _add_export("hid_driver_suspend",
+                cast[uint64](&_hd_hid_driver_suspend))
+    _add_export("hid_driver_resume",
+                cast[uint64](&_hd_hid_driver_resume))
+    _add_export("hid_driver_reset_resume",
+                cast[uint64](&_hd_hid_driver_reset_resume))

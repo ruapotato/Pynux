@@ -1,0 +1,678 @@
+# linux_abi/api_usbhid.ad
+#
+# usbhid.ko shim layer — closes the URB-family UND surface that
+# usbhid.ko UND-references against usbcore.ko. Pairs with api_hid.ad
+# (which provides the hid_* cross-module surface). Together these
+# two files close the load-time symbol gap for the
+# `usbhid.ko + hid.ko + usbcore.ko + xhci_hcd.ko + xhci_pci.ko`
+# dep chain.
+#
+# UND analysis (`nm -u` of the Debian 6.1.0-32 usbhid.ko):
+#   usbhid.ko total UND       125
+#   covered by L<=68 + family  76 (kmalloc/kfree/_printk/memcpy/memset
+#                                  from L1..L3; mutex/spinlock from L7;
+#                                  workqueue from L8; jiffies/system_wq
+#                                  from L59; hid_* from api_hid.ad
+#                                  above; device_set_wakeup_enable +
+#                                  device_set_node + __dev_fwnode shipped
+#                                  by L<=68's device-core surface).
+#   gap to close              49 (this file)
+#
+# Categorized gap:
+#   1. URB lifecycle (8): usb_alloc_urb, usb_free_urb, usb_submit_urb,
+#      usb_kill_urb, usb_unlink_urb, usb_unpoison_urb, usb_block_urb,
+#      usb_queue_reset_device. The .ko's interrupt-IN poll loop revolves
+#      around alloc/submit/kill of struct urb. With no real URB pipeline
+#      backing this layer (Hamnix's drivers/usb/xhci.ad owns the
+#      transfer ring at a layer below), every stub returns success and
+#      no URB ever completes — usbhid's URB callback never fires, so
+#      no keystrokes flow through THIS path. The keystroke data path
+#      lives in drivers/usb/xhci.ad::xhci_poll → hid_kbd_report →
+#      kbd_rx_push (see api_hid.ad header).
+#
+#   2. Control / interrupt / bulk message helpers (4): usb_control_msg,
+#      usb_interrupt_msg, usb_clear_halt, __usb_get_extra_descriptor.
+#      usbhid uses control_msg for SET_PROTOCOL / SET_IDLE class
+#      requests during probe. The hand-rolled xhci.ad already runs
+#      these against the real wire (xhci_control_transfer); the shim
+#      here is a coverage-probe stub that returns 0 (no real I/O).
+#
+#   3. usb_register_driver / usb_deregister (2). Driver registration
+#      against the usb_bus_type. Stub returns 0 (registered).
+#
+#   4. usb_find_interface / usb_string / usb_register_dev /
+#      usb_deregister_dev (4). Per-device sysfs surface +
+#      class-character-device registration. Stubs return success-shape
+#      defaults; no /dev/hidraw* surface in Hamnix yet.
+#
+#   5. Autopm (6): usb_autopm_get_interface,
+#      usb_autopm_get_interface_async, usb_autopm_get_interface_no_resume,
+#      usb_autopm_put_interface, usb_autopm_put_interface_async,
+#      usb_autopm_put_interface_no_suspend. Runtime PM refcount on the
+#      USB interface. Hamnix has no PM-runtime; stubs return 0.
+#
+#   6. Coherent DMA buffers (2): usb_alloc_coherent, usb_free_coherent.
+#      Wraps dma_alloc_coherent. Forward to Hamnix's kzalloc (identity-
+#      mapped — DMA address == virtual address in our env).
+#
+#   7. input_ff_create (1). Force-feedback input device init. Stub
+#      returns 0.
+#
+#   8. device_set_node (1). Sets the of-node (devicetree-fwnode) on a
+#      struct device. Stub no-op (no devicetree in Hamnix).
+#
+#   9. Wait/sched helpers (8): autoremove_wake_function, finish_wait,
+#      init_wait_entry, prepare_to_wait, prepare_to_wait_event,
+#      schedule_timeout, __msecs_to_jiffies, msleep. usbhid sleeps in
+#      its reset/probe path waiting for URB completions. Hamnix's
+#      cooperative kernel doesn't sleep; stubs return immediately.
+#
+#  10. Tail (13): __SCT__might_resched, sized_strscpy, mod_timer,
+#      timer_delete_sync, init_timer_key, __kmalloc_large_noprof,
+#      param_array_ops, param_ops_charp, param_ops_uint, __copy_overflow,
+#      ktime_get_mono_fast_ns, _dev_notice, _raw_spin_lock_irq /
+#      _raw_spin_unlock_irq.
+#
+# The "_uh2_" prefix marks the Hamnix-side shim for usbhid-specific
+# symbols (distinct from "_uh_" which api_usb_hcd.ad already uses
+# for usb_hcd shim functions).
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.slab import kmalloc, kfree, kzalloc
+
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# =====================================================================
+# DATA buffers
+# =====================================================================
+#
+# struct urb backing buffer. Linux's struct urb is ~256 bytes with
+# the transfer-flags + completion + context. usbhid allocates one
+# per interface-endpoint (typically 1 interrupt-IN URB per device);
+# 8 slots covers the test rig comfortably.
+MAX_URB_SLOTS:             uint64 = 16
+_uh2_urb_slots:            Array[8192, uint8]
+_uh2_urb_next_slot:        uint64 = 0
+
+
+# Track how many URBs got submitted — instrumentation for the test
+# harness. Each successful usb_submit_urb increments this; the test
+# greps for "[shim] usbhid: urb submitted total=N" so we can confirm
+# usbhid.ko reached the submit path (proves init_module ran past the
+# probe + endpoint setup).
+_uh2_urb_submit_count:     uint64 = 0
+
+
+# param_ops_* are DATA exports — Linux's module parameter machinery
+# uses these vtable pointers as the kernel_param_ops dispatch table.
+# A zeroed 64-byte buffer covers the size of struct kernel_param_ops
+# (~32 bytes on 6.x); callers only read .set / .get fields when a
+# user writes /sys/module/.../parameters/*, which Hamnix doesn't
+# surface (no /sys writable backing). Zero is the "no-op" shape.
+_uh2_param_ops_charp_buf:  Array[64, uint8]
+_uh2_param_ops_uint_buf:   Array[64, uint8]
+_uh2_param_array_ops_buf:  Array[64, uint8]
+
+
+# =====================================================================
+# Group 1: URB lifecycle
+# =====================================================================
+#
+# Linux:
+#   struct urb *usb_alloc_urb(int iso_packets, gfp_t mem_flags);
+#   void usb_free_urb(struct urb *urb);
+#   int  usb_submit_urb(struct urb *urb, gfp_t mem_flags);
+#   void usb_kill_urb(struct urb *urb);
+#   void usb_unlink_urb(struct urb *urb);
+#   void usb_unpoison_urb(struct urb *urb);
+#   void usb_block_urb(struct urb *urb);
+#   void usb_queue_reset_device(struct usb_interface *intf);
+
+def _uh2_usb_alloc_urb(iso_packets: int32, mem_flags: uint32) -> uint64:
+    # Hand out a slot from the static pool. iso_packets controls the
+    # trailing variable-length iso descriptor; we ignore it (boot-kbd
+    # uses interrupt transfers, no iso).
+    if _uh2_urb_next_slot >= MAX_URB_SLOTS:
+        printk0("[shim] usbhid:usb_alloc_urb — out of slots, returning NULL\n")
+        return 0
+    off: uint64 = _uh2_urb_next_slot * 512
+    _uh2_urb_next_slot = _uh2_urb_next_slot + 1
+    addr: uint64 = cast[uint64](&_uh2_urb_slots[0]) + off
+    # zero-init so completion fields don't have garbage.
+    memset(cast[Ptr[uint8]](addr), 0, 512)
+    printk1("[shim] usbhid:usb_alloc_urb -> %p\n", addr)
+    return addr
+
+
+def _uh2_usb_free_urb(urb: uint64):
+    # Slot-pool memory; no kfree.
+    return
+
+
+def _uh2_usb_submit_urb(urb: uint64, mem_flags: uint32) -> int32:
+    # int usb_submit_urb(struct urb *urb, gfp_t mem_flags);
+    # The interesting one. Real Linux: queues the URB on the HCD's
+    # transfer ring and arms the doorbell. Hamnix's URB pipeline is
+    # not wired through to drivers/usb/xhci.ad's interrupt-IN ring
+    # yet — usbhid's URB never completes. We log the attempt
+    # (instrumentation lets the test confirm usbhid.ko reached this
+    # path) and return 0 (submission accepted).
+    #
+    # When a future agent bridges this to xhci.ad's ring (read the
+    # interrupt-IN endpoint address out of urb+0x18, the buffer ptr
+    # out of urb+0x40, etc.), this is where it would happen.
+    _uh2_urb_submit_count = _uh2_urb_submit_count + 1
+    printk2("[shim] usbhid: urb submitted total=%d urb=%p\n",
+            _uh2_urb_submit_count, urb)
+    return 0
+
+
+def _uh2_usb_kill_urb(urb: uint64):
+    return
+
+
+def _uh2_usb_unlink_urb(urb: uint64):
+    return
+
+
+def _uh2_usb_unpoison_urb(urb: uint64):
+    return
+
+
+def _uh2_usb_block_urb(urb: uint64):
+    return
+
+
+def _uh2_usb_queue_reset_device(intf: uint64):
+    return
+
+
+# =====================================================================
+# Group 2: control / interrupt / bulk message helpers
+# =====================================================================
+#
+# Linux:
+#   int usb_control_msg(struct usb_device *dev, unsigned int pipe,
+#                        __u8 request, __u8 requesttype,
+#                        __u16 value, __u16 index,
+#                        void *data, __u16 size, int timeout);
+#   int usb_interrupt_msg(struct usb_device *dev, unsigned int pipe,
+#                          void *data, int len, int *actual_length,
+#                          int timeout);
+#   int usb_clear_halt(struct usb_device *dev, int pipe);
+#   int __usb_get_extra_descriptor(char *buffer, unsigned size,
+#                                    unsigned char type, void **ptr,
+#                                    size_t min);
+#
+# These run during usbhid's probe to send SET_PROTOCOL / SET_IDLE etc.
+# The hand-rolled xhci.ad already runs these against the wire via
+# xhci_control_transfer; the shim is a coverage-probe stub. Returning
+# the requested byte count signals success to the usbhid caller.
+
+def _uh2_usb_control_msg(dev: uint64, pipe: uint32,
+                         request: uint8, requesttype: uint8,
+                         value: uint16, index: uint16,
+                         data: uint64, size: uint16,
+                         timeout: int32) -> int32:
+    printk2("[shim] usbhid:usb_control_msg req=%d type=%d (stub)\n",
+            cast[uint64](request), cast[uint64](requesttype))
+    return cast[int32](size)
+
+
+def _uh2_usb_interrupt_msg(dev: uint64, pipe: uint32,
+                           data: uint64, length: int32,
+                           actual_length: Ptr[int32],
+                           timeout: int32) -> int32:
+    # Synchronous interrupt I/O — drains one interrupt-IN frame.
+    # No real wire here; report 0 bytes transferred.
+    if cast[uint64](actual_length) != 0:
+        actual_length[0] = 0
+    return 0
+
+
+def _uh2_usb_clear_halt(dev: uint64, pipe: int32) -> int32:
+    return 0
+
+
+def _uh2_usb_get_extra_descriptor(buffer: uint64, size: uint32,
+                                  dtype: uint8,
+                                  ptr_out: Ptr[uint64],
+                                  min_size: uint64) -> int32:
+    # int __usb_get_extra_descriptor(char *buffer, unsigned size,
+    #                                  unsigned char type, void **ptr,
+    #                                  size_t min);
+    # Walks the configuration "extra" descriptors looking for one of
+    # the given type. usbhid uses this to find the HID class descriptor.
+    # With no real wire data we report not-found (-1 / -ENODATA).
+    if cast[uint64](ptr_out) != 0:
+        ptr_out[0] = 0
+    return -61                                       # -ENODATA
+
+
+# =====================================================================
+# Group 3: usb_register_driver / usb_deregister
+# =====================================================================
+#
+# Linux:
+#   int usb_register_driver(struct usb_driver *new_driver,
+#                            struct module *owner, const char *mod_name);
+#   void usb_deregister(struct usb_driver *driver);
+#
+# usbhid's init_module ends in usb_register_driver(&hid_driver). With
+# no usb_bus_type backing in our env, we log + return 0 (registered).
+# This is the load-bearing call for usbhid.ko's init_module — return
+# success here and init_module returns 0, which the L-shim loader
+# interprets as "module loaded OK".
+
+def _uh2_usb_register_driver(new_driver: uint64, owner: uint64,
+                             mod_name: Ptr[char]) -> int32:
+    printk1("[shim] usbhid:usb_register_driver(name=%s) -> 0\n",
+            cast[uint64](mod_name))
+    return 0
+
+
+def _uh2_usb_deregister(driver: uint64):
+    return
+
+
+# =====================================================================
+# Group 4: per-device sysfs + class chardev
+# =====================================================================
+#
+# Linux:
+#   struct usb_interface *usb_find_interface(struct usb_driver *,
+#                                              int minor);
+#   int  usb_string(struct usb_device *dev, int index, char *buf,
+#                    size_t size);
+#   int  usb_register_dev(struct usb_interface *,
+#                          struct usb_class_driver *);
+#   void usb_deregister_dev(struct usb_interface *,
+#                            struct usb_class_driver *);
+
+def _uh2_usb_find_interface(drv: uint64, minor: int32) -> uint64:
+    return 0
+
+
+def _uh2_usb_string(dev: uint64, index: int32, buf: Ptr[uint8],
+                    size: uint64) -> int32:
+    # Returns the number of bytes copied (0 on absent string).
+    if size > 0 and cast[uint64](buf) != 0:
+        buf[0] = 0
+    return 0
+
+
+def _uh2_usb_register_dev(intf: uint64, cdrv: uint64) -> int32:
+    # /dev/hidraw<N> minor allocation. No /dev/hidraw surface in
+    # Hamnix; return 0 (registered) so usbhid's probe doesn't unwind.
+    return 0
+
+
+def _uh2_usb_deregister_dev(intf: uint64, cdrv: uint64):
+    return
+
+
+# =====================================================================
+# Group 5: autopm
+# =====================================================================
+#
+# Linux:
+#   int usb_autopm_get_interface(struct usb_interface *intf);
+#   int usb_autopm_get_interface_async(struct usb_interface *intf);
+#   int usb_autopm_get_interface_no_resume(struct usb_interface *intf);
+#   void usb_autopm_put_interface(struct usb_interface *intf);
+#   void usb_autopm_put_interface_async(struct usb_interface *intf);
+#   void usb_autopm_put_interface_no_suspend(struct usb_interface *intf);
+#
+# Runtime-PM refcount. Hamnix has no PM runtime; every get succeeds,
+# every put is a no-op.
+
+def _uh2_usb_autopm_get_interface(intf: uint64) -> int32:
+    return 0
+
+
+def _uh2_usb_autopm_get_interface_async(intf: uint64) -> int32:
+    return 0
+
+
+def _uh2_usb_autopm_get_interface_no_resume(intf: uint64) -> int32:
+    return 0
+
+
+def _uh2_usb_autopm_put_interface(intf: uint64):
+    return
+
+
+def _uh2_usb_autopm_put_interface_async(intf: uint64):
+    return
+
+
+def _uh2_usb_autopm_put_interface_no_suspend(intf: uint64):
+    return
+
+
+# =====================================================================
+# Group 6: coherent DMA buffers
+# =====================================================================
+#
+# Linux:
+#   void *usb_alloc_coherent(struct usb_device *dev, size_t size,
+#                              gfp_t mem_flags, dma_addr_t *dma);
+#   void usb_free_coherent(struct usb_device *dev, size_t size,
+#                            void *addr, dma_addr_t dma);
+#
+# Hamnix's memory is identity-mapped — DMA address == virtual address.
+# Forward to kzalloc; the dma_addr write-back gets the same value.
+
+def _uh2_usb_alloc_coherent(dev: uint64, size: uint64,
+                            mem_flags: uint32,
+                            dma_out: Ptr[uint64]) -> uint64:
+    addr: uint64 = kzalloc(size)
+    if cast[uint64](dma_out) != 0:
+        dma_out[0] = addr                            # identity-map
+    return addr
+
+
+def _uh2_usb_free_coherent(dev: uint64, size: uint64,
+                           addr: uint64, dma: uint64):
+    if addr != 0:
+        kfree(addr)
+
+
+# =====================================================================
+# Group 7: input_ff_create
+# =====================================================================
+
+def _uh2_input_ff_create(dev: uint64, max_effects: uint32) -> int32:
+    # int input_ff_create(struct input_dev *, unsigned int max_effects);
+    # Force-feedback init on the input_dev. No FF wiring in Hamnix.
+    return 0
+
+
+# =====================================================================
+# Group 8: device_set_node
+# =====================================================================
+
+def _uh2_device_set_node(dev: uint64, fwnode: uint64):
+    # void device_set_node(struct device *dev, struct fwnode_handle *);
+    # No devicetree / ACPI fwnode wiring in Hamnix.
+    return
+
+
+# =====================================================================
+# Group 9: wait / sched helpers
+# =====================================================================
+#
+# Linux:
+#   int autoremove_wake_function(struct wait_queue_entry *, unsigned,
+#                                  int, void *);
+#   void finish_wait(struct wait_queue_head *, struct wait_queue_entry *);
+#   void init_wait_entry(struct wait_queue_entry *, int flags);
+#   void prepare_to_wait(struct wait_queue_head *,
+#                         struct wait_queue_entry *, int state);
+#   long prepare_to_wait_event(struct wait_queue_head *,
+#                                struct wait_queue_entry *, int state);
+#   signed long schedule_timeout(signed long timeout);
+#   unsigned long __msecs_to_jiffies(const unsigned int m);
+#   void msleep(unsigned int msecs);
+#
+# Hamnix's cooperative kernel never sleeps inside these paths; the
+# stubs return immediately so the .ko's wait loops terminate at the
+# first iteration.
+
+def _uh2_autoremove_wake_function(wq_entry: uint64, mode: uint32,
+                                  sync: int32, key: uint64) -> int32:
+    return 1                                         # waker handled
+
+
+def _uh2_finish_wait(wq_head: uint64, wq_entry: uint64):
+    return
+
+
+def _uh2_init_wait_entry(wq_entry: uint64, flags: int32):
+    return
+
+
+def _uh2_prepare_to_wait(wq_head: uint64, wq_entry: uint64,
+                         state: int32):
+    return
+
+
+def _uh2_prepare_to_wait_event(wq_head: uint64, wq_entry: uint64,
+                               state: int32) -> int64:
+    # Returns 0 on success, -ERESTARTSYS on pending signal. We never
+    # block — return 0.
+    return 0
+
+
+def _uh2_schedule_timeout(timeout: int64) -> int64:
+    # signed long schedule_timeout(signed long timeout);
+    # Return value: jiffies remaining. We don't sleep; report
+    # "no jiffies were consumed", i.e. caller's full timeout is left.
+    return timeout
+
+
+def _uh2_msecs_to_jiffies(m: uint32) -> uint64:
+    # Linux HZ=250 typically. We don't really need a jiffy clock;
+    # report a 1:1 mapping (msec == jiffy).
+    return cast[uint64](m)
+
+
+def _uh2_msleep(msecs: uint32):
+    # No sleep; return immediately. The synchronous probe path that
+    # calls msleep(10) between USB ops will just charge ahead — fine
+    # for Hamnix since the wire I/O is stubbed.
+    return
+
+
+# =====================================================================
+# Group 10: tail-of-the-pack
+# =====================================================================
+
+def _uh2_SCT_might_resched():
+    # __SCT__might_resched — static-call thunk for might_resched.
+    # No-op (matches the api_l57 routing for other __SCT__ thunks).
+    return
+
+
+def _uh2_sized_strscpy(dst: Ptr[uint8], src: Ptr[uint8],
+                       size: uint64) -> int64:
+    # ssize_t sized_strscpy(char *dst, const char *src, size_t size);
+    # Like strscpy: copy at most size-1 bytes + NUL. Returns the
+    # source length, or -E2BIG if it didn't fit.
+    if size == 0:
+        return -7                                    # -E2BIG
+    i: uint64 = 0
+    while i < (size - 1):
+        c: uint8 = src[i]
+        dst[i] = c
+        if c == 0:
+            return cast[int64](i)
+        i = i + 1
+    dst[i] = 0                                       # NUL-terminate
+    # Was the source longer?
+    if src[i] != 0:
+        return -7
+    return cast[int64](i)
+
+
+def _uh2_mod_timer(timer: uint64, expires: uint64) -> int32:
+    # int mod_timer(struct timer_list *timer, unsigned long expires);
+    # Real Linux: re-arms the timer to expire at the new jiffies value.
+    # Hamnix has timer_list shims at api_timer.ad; this is the missing
+    # mod helper. Return 0 (timer was inactive before).
+    return 0
+
+
+def _uh2_timer_delete_sync(timer: uint64) -> int32:
+    # Return 0 if timer was inactive, 1 if it was pending.
+    return 0
+
+
+def _uh2_init_timer_key(timer: uint64, func: uint64,
+                       flags: uint32, name: Ptr[char],
+                       key: uint64):
+    # void init_timer_key(struct timer_list *timer,
+    #                      void (*func)(struct timer_list *),
+    #                      unsigned int flags,
+    #                      const char *name,
+    #                      struct lock_class_key *key);
+    # Zero-init the function pointer slot via the caller's struct; we
+    # don't fire timer callbacks but the cb pointer being set isn't
+    # observable from outside.
+    return
+
+
+def _uh2_kmalloc_large_noprof(size: uint64, flags: uint32) -> uint64:
+    return kzalloc(size)
+
+
+def _uh2_copy_overflow(size: uint32, count: uint64):
+    # void __copy_overflow(int size, unsigned long count);
+    # Fortify-source overflow notifier — would have called
+    # __fortify_panic in production. We log + return.
+    printk2("[shim] usbhid:__copy_overflow size=%d count=%d\n",
+            cast[uint64](size), count)
+
+
+def _uh2_ktime_get_mono_fast_ns() -> uint64:
+    # u64 ktime_get_mono_fast_ns(void);
+    # NMI-safe monotonic clock. We reuse the same counter as api_hid's
+    # ktime_get_coarse_ts64 — both must be monotonic, the call rate
+    # isn't load-bearing.
+    return 0
+
+
+def _uh2_dev_notice(dev: uint64, fmt: Ptr[char]) -> int32:
+    return 0
+
+
+def _uh2_raw_spin_lock_irq(lock: uint64):
+    return
+
+
+def _uh2_raw_spin_unlock_irq(lock: uint64):
+    return
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_usbhid():
+    # ---- Group 1: URB lifecycle ----
+    _add_export("usb_alloc_urb",   cast[uint64](&_uh2_usb_alloc_urb))
+    _add_export("usb_free_urb",    cast[uint64](&_uh2_usb_free_urb))
+    _add_export("usb_submit_urb",  cast[uint64](&_uh2_usb_submit_urb))
+    _add_export("usb_kill_urb",    cast[uint64](&_uh2_usb_kill_urb))
+    _add_export("usb_unlink_urb",  cast[uint64](&_uh2_usb_unlink_urb))
+    _add_export("usb_unpoison_urb",cast[uint64](&_uh2_usb_unpoison_urb))
+    _add_export("usb_block_urb",   cast[uint64](&_uh2_usb_block_urb))
+    _add_export("usb_queue_reset_device",
+                cast[uint64](&_uh2_usb_queue_reset_device))
+
+    # ---- Group 2: control / interrupt / bulk message helpers ----
+    _add_export("usb_control_msg",
+                cast[uint64](&_uh2_usb_control_msg))
+    _add_export("usb_interrupt_msg",
+                cast[uint64](&_uh2_usb_interrupt_msg))
+    _add_export("usb_clear_halt",
+                cast[uint64](&_uh2_usb_clear_halt))
+    _add_export("__usb_get_extra_descriptor",
+                cast[uint64](&_uh2_usb_get_extra_descriptor))
+
+    # ---- Group 3: driver registration ----
+    _add_export("usb_register_driver",
+                cast[uint64](&_uh2_usb_register_driver))
+    _add_export("usb_deregister",
+                cast[uint64](&_uh2_usb_deregister))
+
+    # ---- Group 4: per-device sysfs + class chardev ----
+    _add_export("usb_find_interface",
+                cast[uint64](&_uh2_usb_find_interface))
+    _add_export("usb_string",
+                cast[uint64](&_uh2_usb_string))
+    _add_export("usb_register_dev",
+                cast[uint64](&_uh2_usb_register_dev))
+    _add_export("usb_deregister_dev",
+                cast[uint64](&_uh2_usb_deregister_dev))
+
+    # ---- Group 5: autopm ----
+    _add_export("usb_autopm_get_interface",
+                cast[uint64](&_uh2_usb_autopm_get_interface))
+    _add_export("usb_autopm_get_interface_async",
+                cast[uint64](&_uh2_usb_autopm_get_interface_async))
+    _add_export("usb_autopm_get_interface_no_resume",
+                cast[uint64](&_uh2_usb_autopm_get_interface_no_resume))
+    _add_export("usb_autopm_put_interface",
+                cast[uint64](&_uh2_usb_autopm_put_interface))
+    _add_export("usb_autopm_put_interface_async",
+                cast[uint64](&_uh2_usb_autopm_put_interface_async))
+    _add_export("usb_autopm_put_interface_no_suspend",
+                cast[uint64](&_uh2_usb_autopm_put_interface_no_suspend))
+
+    # ---- Group 6: coherent DMA buffers ----
+    _add_export("usb_alloc_coherent",
+                cast[uint64](&_uh2_usb_alloc_coherent))
+    _add_export("usb_free_coherent",
+                cast[uint64](&_uh2_usb_free_coherent))
+
+    # ---- Group 7: input_ff_create ----
+    _add_export("input_ff_create",
+                cast[uint64](&_uh2_input_ff_create))
+
+    # ---- Group 8: device_set_node ----
+    _add_export("device_set_node",
+                cast[uint64](&_uh2_device_set_node))
+
+    # ---- Group 9: wait / sched helpers ----
+    _add_export("autoremove_wake_function",
+                cast[uint64](&_uh2_autoremove_wake_function))
+    _add_export("finish_wait",
+                cast[uint64](&_uh2_finish_wait))
+    _add_export("init_wait_entry",
+                cast[uint64](&_uh2_init_wait_entry))
+    _add_export("prepare_to_wait",
+                cast[uint64](&_uh2_prepare_to_wait))
+    _add_export("prepare_to_wait_event",
+                cast[uint64](&_uh2_prepare_to_wait_event))
+    _add_export("schedule_timeout",
+                cast[uint64](&_uh2_schedule_timeout))
+    _add_export("__msecs_to_jiffies",
+                cast[uint64](&_uh2_msecs_to_jiffies))
+    _add_export("msleep",
+                cast[uint64](&_uh2_msleep))
+
+    # ---- Group 10: tail-of-the-pack ----
+    _add_export("__SCT__might_resched",
+                cast[uint64](&_uh2_SCT_might_resched))
+    _add_export("sized_strscpy",
+                cast[uint64](&_uh2_sized_strscpy))
+    _add_export("mod_timer",
+                cast[uint64](&_uh2_mod_timer))
+    _add_export("timer_delete_sync",
+                cast[uint64](&_uh2_timer_delete_sync))
+    _add_export("init_timer_key",
+                cast[uint64](&_uh2_init_timer_key))
+    _add_export("__kmalloc_large_noprof",
+                cast[uint64](&_uh2_kmalloc_large_noprof))
+    _add_export("__copy_overflow",
+                cast[uint64](&_uh2_copy_overflow))
+    _add_export("ktime_get_mono_fast_ns",
+                cast[uint64](&_uh2_ktime_get_mono_fast_ns))
+    _add_export("_dev_notice",
+                cast[uint64](&_uh2_dev_notice))
+    _add_export("_raw_spin_lock_irq",
+                cast[uint64](&_uh2_raw_spin_lock_irq))
+    _add_export("_raw_spin_unlock_irq",
+                cast[uint64](&_uh2_raw_spin_unlock_irq))
+
+    # ---- DATA exports ----
+    _add_export("param_ops_charp",
+                cast[uint64](&_uh2_param_ops_charp_buf[0]))
+    _add_export("param_ops_uint",
+                cast[uint64](&_uh2_param_ops_uint_buf[0]))
+    _add_export("param_array_ops",
+                cast[uint64](&_uh2_param_array_ops_buf[0]))

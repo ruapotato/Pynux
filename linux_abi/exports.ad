@@ -92,6 +92,8 @@ from linux_abi.api_usbcore import linux_abi_register_usbcore
 from linux_abi.api_xhci import linux_abi_register_xhci
 from linux_abi.api_ehci import linux_abi_register_ehci
 from linux_abi.api_usb_hcd import linux_abi_register_usb_hcd
+from linux_abi.api_hid import linux_abi_register_hid
+from linux_abi.api_usbhid import linux_abi_register_usbhid
 from linux_abi.api_snd_core import linux_abi_register_snd_core
 from linux_abi.api_snd_pcm import linux_abi_register_snd_pcm
 from linux_abi.api_snd_hda import linux_abi_register_snd_hda
@@ -1053,6 +1055,22 @@ def linux_abi_exports_init():
     # the L-shim bridges into drivers/usb/xhci.ad::xhci_init() for
     # the real MMIO controller bring-up.
     linux_abi_register_usb_hcd()
+
+    # HID-class L-shim: hid.ko (HID core library, ~480 KiB) +
+    # usbhid.ko (USB HID transport, ~180 KiB). Together they close
+    # the load-time symbol gap for the
+    # `usbhid + hid + usbcore + xhci_hcd + xhci_pci` dep chain.
+    # api_hid.ad ships 17 new UND shims for hid.ko's gap and exports
+    # the cross-module hid_* surface usbhid.ko UND-references;
+    # api_usbhid.ad ships 49 new UND shims for usbhid.ko's gap
+    # (URB lifecycle + control_msg + autopm + driver-registration).
+    # The actual keystroke data path is unchanged from the previous
+    # milestone — drivers/usb/xhci.ad::xhci_poll → hid_kbd_report
+    # → kbd_rx_push delivers real keyboard events. The .ko loads
+    # are a Linux-ABI coverage probe that proves the dep chain
+    # resolves without symbol gaps.
+    linux_abi_register_hid()
+    linux_abi_register_usbhid()
 
     # Audio scale-out: Intel HD Audio family — snd_hda_intel.ko +
     # snd.ko + snd_pcm.ko + snd_hda_core.ko + snd_hda_codec.ko. Same
