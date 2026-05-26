@@ -35,7 +35,7 @@
 from kernel.printk.printk import printk0, printk1, printk2
 from mm.page_alloc import alloc_pages, free_pages, PAGE_SIZE
 from linux_abi.exports import linux_abi_lookup
-from arch.x86.mm.pgtable import phys_to_virt
+from arch.x86.mm.module_map import module_map_alloc, module_map_free
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
@@ -81,7 +81,9 @@ MAX_LINUX_MODULES: uint64 = 8
 # Parallel arrays (same struct-globals-with-Ptr-fields pitfall as
 # exports.ad). Slot 0 of each array is reserved as "unused"; valid
 # slot ids start at 1.
-mod_base_addr:   Array[8, uint64]      # base of the contiguous load region
+mod_base_addr:   Array[8, uint64]      # base of the contiguous load region (phys)
+mod_base_virt:   Array[8, uint64]      # high-half virt the .ko was mapped at
+mod_base_span:   Array[8, uint64]      # span in bytes (rounded up to 2 MiB)
 mod_base_pages:  Array[8, uint64]      # how many pages we allocated (free on unload)
 mod_base_order:  Array[8, uint64]      # alloc_pages order used (for free_pages)
 mod_exit_fn:     Array[8, uint64]      # cleanup_module address (0 if none)
@@ -889,28 +891,52 @@ def kmod_linux_load(image: Ptr[uint8], size: uint64) -> int32:
     if span == 0:
         printk0("kmod_linux: no SHF_ALLOC sections (empty module?)\n")
         return -8
-    # Round up to PAGE_SIZE so we can use alloc_pages.
-    span = (span + cast[uint64](PAGE_SIZE - 1)) & ~cast[uint64](PAGE_SIZE - 1)
+    # Round up to 2 MiB. The .ko is mapped into the kernel's high-half
+    # module window through a 2-MiB-granular page directory (see
+    # arch/x86/mm/module_map.ad), and module_map_alloc expects both
+    # phys and span to be 2 MiB-aligned. alloc_pages naturally returns
+    # 2^order-aligned runs; rounding up to a 2 MiB multiple AND asking
+    # for an order whose run size is at least 2 MiB guarantees the
+    # returned phys is 2-MiB-aligned too. The largest .ko in the tree
+    # (mac80211 ~2.5 MiB → rounded to 4 MiB) still fits comfortably in
+    # MAX_ORDER (= 4 MiB).
+    MODULE_ALIGN: uint64 = 0x200000              # 2 MiB
+    span = (span + MODULE_ALIGN - 1) & ~(MODULE_ALIGN - 1)
     order: int32 = _order_for(span)
     if order < 0:
         printk1("kmod_linux: module image too large: %d bytes\n", span)
         return -12                              # -ENOMEM
+    # 2 MiB = PAGE_SIZE << 9, so order MUST be at least 9 for the run
+    # alloc_pages produces to be 2-MiB-aligned. _order_for picks the
+    # smallest order with size >= span, so for span >= 2 MiB it already
+    # returns >= 9; clamp anyway for defence.
+    if order < 9:
+        order = 9
     base_phys: uint64 = alloc_pages(order)
     if base_phys == 0:
         printk0("kmod_linux: alloc_pages failed\n")
         return -12
-    # Use the high-half virtual alias of the allocated physical page
-    # range. The kernel maps phys 0 → virt 0xffffffff80000000+, so
-    # phys_to_virt() just adds PGT_KERNEL_VBASE. Loading the module
-    # at a high-half address brings it within ±2 GiB of every kernel
-    # symbol the .ko's R_X86_64_32S relocations need to reach — Linux
-    # modules are linked under the assumption that "module addresses
-    # and kernel addresses sign-extend the same way", which is true
-    # in the high-half and FALSE if the module sits at low-half phys
-    # (the previous bug: low-half-loaded module saw kernel exports
-    # truncated to 32 bits, executing at garbage low-half addresses
-    # like 0x8013ae41 instead of 0xffffffff8013ae41).
-    base: uint64 = phys_to_virt(base_phys)
+    # Map the .ko's physical pages into the kernel's high-half MODULE
+    # MAPPING window (an unused portion of pdpt_high's 2 GiB virt range
+    # at 0xffffffff80000000+kernel_image_size onwards). This guarantees
+    # the runtime virt address is BOTH (a) sign-extension-equivalent to
+    # its low-32-bit representation (required by R_X86_64_32S) AND (b)
+    # within ±2 GiB of every kernel export (required by R_X86_64_PC32 /
+    # R_X86_64_PLT32). The previous design called phys_to_virt(pa) =
+    # pa + 0xffffffff80000000, which only worked when pa < 2 GiB —
+    # i.e. only in QEMU's small-memory boots. On a real laptop with
+    # > 4 GiB of physical RAM, memblock_set_region picks a base_phys
+    # well above 4 GiB; phys_to_virt then wraps uint64 and produces a
+    # garbage low-half address that's outside the high-half mapping —
+    # the NUC's "TRAP: vector 0x06 #UD" symptom. module_map_alloc()
+    # decouples virt placement from physical placement: phys can live
+    # anywhere alloc_pages hands us; virt is always materialised inside
+    # the 2-MiB-granular fragment of pdpt_high that we own.
+    base: uint64 = module_map_alloc(base_phys, span)
+    if base == 0:
+        printk0("kmod_linux: module_map_alloc failed (virt space exhausted?)\n")
+        free_pages(base_phys, order)
+        return -12
     # Zero the entire region: .bss / NOBITS comes for free, and any
     # gap left by 8-byte alignment is implicitly zero.
     memset(cast[Ptr[uint8]](base), 0, span)
@@ -986,6 +1012,7 @@ def kmod_linux_load(image: Ptr[uint8], size: uint64) -> int32:
         # No init_module symbol AND no struct module to fall back on —
         # this isn't a recognizable kbuild module at all.
         printk0("kmod_linux: no init_module symbol or struct module.init\n")
+        module_map_free(base, span)
         free_pages(base_phys, order)
         return -8
 
@@ -997,12 +1024,15 @@ def kmod_linux_load(image: Ptr[uint8], size: uint64) -> int32:
         slot = slot + 1
     if slot >= MAX_LINUX_MODULES:
         printk0("kmod_linux: module table full\n")
+        module_map_free(base, span)
         free_pages(base_phys, order)
         return -12
     # Slot stores the PHYSICAL base so free_pages can return it to
-    # the buddy allocator. The high-half VA was used only for the
-    # init_module call.
+    # the buddy allocator AND the high-half VIRTUAL base + span so the
+    # corresponding module_map_free() on unload knows what to unmap.
     mod_base_addr[slot]  = base_phys
+    mod_base_virt[slot]  = base
+    mod_base_span[slot]  = span
     mod_base_order[slot] = cast[uint64](order)
     mod_exit_fn[slot]    = exit_addr
     mod_in_use[slot]     = 1
@@ -1036,6 +1066,7 @@ def kmod_linux_load(image: Ptr[uint8], size: uint64) -> int32:
     if rc_init != 0:
         # Module rejected itself — roll back the slot and free.
         mod_in_use[slot] = 0
+        module_map_free(base, span)
         free_pages(base_phys, order)
         return rc_init
 
@@ -1058,8 +1089,11 @@ def kmod_linux_unload(slot: int32) -> int32:
         exit_fn: Fn[None] = cast[Fn[None]](exit_addr)
         exit_fn()
 
+    module_map_free(mod_base_virt[s], mod_base_span[s])
     free_pages(mod_base_addr[s], cast[int32](mod_base_order[s]))
     mod_base_addr[s]  = 0
+    mod_base_virt[s]  = 0
+    mod_base_span[s]  = 0
     mod_base_order[s] = 0
     mod_exit_fn[s]    = 0
     mod_in_use[s]     = 0

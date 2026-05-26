@@ -1,0 +1,422 @@
+# arch/x86/mm/module_map.ad
+#
+# High-half virtual-address allocator for .ko module loads.
+#
+# WHY THIS EXISTS
+# ----------------
+# Stock Linux .kos are compiled as ET_REL with x86_64 SMALL code model.
+# Their relocations split into two categories that the loader at
+# linux_abi/loader.ad has to satisfy:
+#
+#   1. R_X86_64_PC32 / R_X86_64_PLT32 — PC-relative 32-bit calls and
+#      jumps. The target (kernel symbol) must be within ±2 GiB of the
+#      call site (the module's text). Out of range → wraparound silently
+#      patches a garbage int32.
+#
+#   2. R_X86_64_32S — absolute 32-bit signed. The target's full 64-bit
+#      address must EQUAL sign_extend(low_32_bits(target)). Targets
+#      outside the canonical range [0x0..0x7fffffff] ∪ [0xffffffff80000000..
+#      0xffffffffffffffff] cannot be encoded.
+#
+# Linux's solution is a dedicated MODULES_VADDR region (kernel/module.c:
+# `module_alloc`), carved out of high-half virt space just below the
+# kernel image so every load is automatically reachable for both
+# relocation flavors.
+#
+# Hamnix had a stop-gap previously: just call phys_to_virt(alloc_pages())
+# and trust that alloc_pages returned a physical address < 2 GiB so the
+# high-half alias was in PDPT[510..511]. That works on QEMU's small
+# -m 256M boots but FAILS on real hardware:
+#
+#   - A NUC / Skull Canyon with 32 GiB RAM has its largest available
+#     e820 region above 4 GiB. memblock picks that region as the
+#     bump pool; alloc_pages hands the loader a physical address in
+#     the 4..36 GiB range.
+#   - phys_to_virt(pa) = pa + 0xffffffff80000000 overflows uint64. For
+#     pa = 0x101526000 (just above 4 GiB) the result is 0x0000000081526000:
+#     a NON-CANONICAL low-half address, NOT in the kernel's high-half
+#     mapping. The module bytes land in low-identity-mapped memory at
+#     phys 0x81526000 (NOT the phys alloc_pages handed us!); the
+#     relocator then patches PC32 targets assuming high-half placement
+#     and the resulting RIP-relative offsets point at garbage.
+#   - First call into init_module on the NUC: #UD trap. (Observed
+#     2026-05-25 on Skull Canyon.)
+#
+# THE FIX
+# --------
+# Decouple module VIRTUAL placement from PHYSICAL placement. The .ko's
+# pages can live ANYWHERE in physical RAM (so we keep supporting boxes
+# with > 2 GiB), but the runtime virt address we hand the loader is
+# ALWAYS in the high-half MODULE_MAPPING window — by construction inside
+# PDPT[510..511], which is the 2 GiB range every kernel export's
+# R_X86_64_32S-encodable address also lives in.
+#
+# Mechanism: the first time anyone needs to map a module, we split
+# PDPT[510] (and PDPT[511]) from their boot-stamped 1 GiB huge pages
+# into 512-entry page directories (PDs) of 2 MiB pages each. The PD
+# entries covering the kernel image keep their original identity
+# mapping (phys = virt - KERNEL_VBASE) verbatim so kernel .text /
+# .rodata / .data / .bss stay reachable at the exact addresses they
+# were linked to. The PD entries past the kernel image are the
+# "module mapping pool": we re-stamp them on demand to point at
+# whatever phys alloc_pages handed the .ko loader.
+#
+# A coarse 2 MiB granularity matches the largest .ko in the tree
+# (mac80211.ko ~2.5 MiB, comfortably fits in 2 MiB-aligned 4 MiB).
+# Page alignment for .ko text/data is preserved because the loader
+# rounds its size up to 2 MiB and asks alloc_pages for a 2 MiB-aligned
+# physically-contiguous run.
+#
+# Address-space accounting:
+#   - PDPT[510] virt = 0xffffffff80000000 .. 0xffffffffbfffffff (1 GiB)
+#     PD slot 0   = 0xffffffff80000000 .. 0xffffffff801fffff (kernel)
+#     PD slot N   = 0xffffffff80000000 + N * 2 MiB
+#   - PDPT[511] virt = 0xffffffffc0000000 .. 0xffffffffffffffff (1 GiB)
+#     PD slot 0   = 0xffffffffc0000000 .. 0xffffffffc01fffff
+#     PD slot N   = 0xffffffffc0000000 + N * 2 MiB
+#
+# Both 1 GiB chunks together = 2 GiB; minus ~32 MiB kernel image, that's
+# ~2032 MiB of module-mapping capacity. Plenty for the dozen+ .kos
+# (cfg80211 + mac80211 + e1000e + ...) the dep walker pulls in on a
+# wifi-enabled boot.
+#
+# Up to 512 GiB+ physical RAM is supported transparently: we never
+# touch the PHYSICAL memory pool, only the VIRTUAL slot allocator.
+#
+# This module is parallel to pgtable.ad's existing
+# pgtable_mark_phys_uc_2m / pgt_pd_storage_pdpt0 path which splits
+# PDPT[0] (the LOW identity map) for MMIO UC-marking. Same recipe,
+# different PDPT slot and different use case.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from arch.x86.mm.pgtable import virt_to_phys
+
+extern def kernel_image_end() -> uint64
+extern def get_bsp_cr3() -> uint64
+extern def load_cr3(value: uint64)
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+# --- constants -------------------------------------------------------
+
+KMOD_KERNEL_VBASE:  uint64 = 0xffffffff80000000
+KMOD_PDPT510_VBASE: uint64 = 0xffffffff80000000  # PDPT[510] start
+KMOD_PDPT511_VBASE: uint64 = 0xffffffffc0000000  # PDPT[511] start
+KMOD_1GB:           uint64 = 0x40000000           # 1 GiB
+KMOD_2M:            uint64 = 0x200000             # 2 MiB
+KMOD_2M_SHIFT:      uint64 = 21
+KMOD_1GB_SHIFT:     uint64 = 30
+KMOD_PD_ENTRIES:    uint64 = 512
+
+# PDPT entry/PD entry flags (mirrors pgtable.ad).
+KMOD_FLAG_P:       uint64 = 0x1
+KMOD_FLAG_RW:      uint64 = 0x2
+KMOD_FLAG_US:      uint64 = 0x4
+KMOD_FLAG_PS:      uint64 = 0x80
+KMOD_HUGE_FLAGS:   uint64 = 0x87       # P|RW|US|PS for 2 MiB huge pages
+KMOD_PD_PTR_FLAGS: uint64 = 0x07       # P|RW|US for PDPT entry pointing at a PD (no PS)
+KMOD_ADDR_MASK:    uint64 = 0x000FFFFFFFFFF000
+
+
+# --- PD storage --------------------------------------------------
+#
+# Two PDs: one for PDPT[510], one for PDPT[511]. Each PD is 512 × 8 B =
+# 4096 B. We over-allocate to 8 KiB so a phys-aligned 4 KiB sub-buffer
+# is guaranteed inside without requiring a separate aligned-alloc.
+# .bss is zero-initialised which is convenient: any slot whose contents
+# we don't explicitly stamp reads as "not present".
+#
+# (Hamnix's BSS lives inside the kernel image at high-half virt; the
+# corresponding PHYSICAL address is in low RAM. We get the phys via
+# virt_to_phys at runtime so the CPU page walker, which dereferences
+# PHYSICAL addresses, can reach the PD bytes.)
+
+kmod_pd_pdpt510:  Array[8192, uint8]
+kmod_pd_pdpt511:  Array[8192, uint8]
+
+# Per-PD "in-use bitmap" of 2 MiB slots. 0 = free, 1 = mapped to a
+# module. Slots that the kernel image occupies are marked in-use
+# during init so they're never handed out for module mapping.
+kmod_pd_used_510: Array[512, uint8]
+kmod_pd_used_511: Array[512, uint8]
+
+# One-time-init guards. Once the split is done the new PD layout is
+# the live one; subsequent allocs just stamp 2 MiB slots.
+kmod_initialized: int32 = 0
+
+
+# --- internals -------------------------------------------------------
+
+def _kmod_pd_phys(buf: Ptr[uint8]) -> uint64:
+    # Take the high-half virt address of a BSS array and return its
+    # 4 KiB-aligned PHYSICAL address, suitable for stamping into a
+    # PDPT entry. virt_to_phys turns the kernel-image high-half VA
+    # into the corresponding low phys.
+    va: uint64 = cast[uint64](buf)
+    phys: uint64 = virt_to_phys(va)
+    return (phys + 4095) & ~cast[uint64](4095)
+
+
+def _kmod_pdpt_base() -> uint64:
+    # Walk CR3 -> PML4 -> PML4[511] -> pdpt_high to find the live
+    # PDPT page the CPU is using for the high-half. Doing this every
+    # call (rather than caching once) is cheap and means we follow
+    # the live PML4[511] in case a task-switch later cloned things;
+    # in practice the boot stub's pdpt_high stays live throughout.
+    cr3:    uint64 = get_bsp_cr3()
+    pml4:   uint64 = cr3 & KMOD_ADDR_MASK
+    # PML4[511] is at byte offset 511 * 8 = 0xFF8.
+    pml4e:  uint64 = cast[Ptr[uint64]](pml4 + 511 * 8)[0]
+    return pml4e & KMOD_ADDR_MASK
+
+
+def _kmod_split_pdpt_entry(pdpt_base: uint64,
+                           pdpt_idx: uint64,
+                           pd_phys: uint64,
+                           used_bitmap: Ptr[uint8],
+                           virt_start: uint64,
+                           phys_floor: uint64,
+                           label: Ptr[char]):
+    # Stamp a 512-entry PD that covers the same 1 GiB virt range as the
+    # current 1 GiB huge-page entry, then swap PDPT[pdpt_idx] from the
+    # 1 GiB huge-page entry to a pointer at our PD.
+    #
+    # `virt_start` is the high-half virt address PDPT[pdpt_idx] covers
+    # (0xffffffff80000000 for PDPT[510], 0xffffffffc0000000 for
+    # PDPT[511]).
+    #
+    # `phys_floor` is the smallest virt offset within the PDPT slot
+    # that we KNOW belongs to the kernel image (everything below it is
+    # kernel) — we mark used_bitmap[i] = 1 for those slots so the
+    # module-mapping allocator never hands them out. For PDPT[510]
+    # this is `kernel_image_end() rounded up to 2 MiB`; for PDPT[511]
+    # the kernel image doesn't reach there so it's 0.
+    #
+    # PD content per slot i: a 2 MiB huge-page entry mapping virt
+    #   (virt_start + i * 2 MiB)
+    # to phys
+    #   (virt_start + i * 2 MiB - KMOD_KERNEL_VBASE)
+    # which is the original identity-map the 1 GiB huge page provided.
+    # Preserving this is what keeps the kernel image's runtime
+    # references valid after the split.
+    pd_va: uint64 = cast[uint64](pdpt_base + pdpt_idx * 8)
+    old_entry: uint64 = cast[Ptr[uint64]](pd_va)[0]
+    # Zero the PD storage first (BSS is already zero on boot, but a
+    # second call to module_map_init() — should never happen, but
+    # defensive — would otherwise inherit stale content).
+    i: uint64 = 0
+    while i < KMOD_PD_ENTRIES:
+        # phys covered by virt (virt_start + i * 2 MiB) =
+        # (virt_start + i * 2 MiB) - KMOD_KERNEL_VBASE
+        ent_virt: uint64 = virt_start + i * KMOD_2M
+        ent_phys: uint64 = ent_virt - KMOD_KERNEL_VBASE
+        entry:    uint64 = ent_phys | KMOD_HUGE_FLAGS
+        cast[Ptr[uint64]](pd_phys + i * 8)[0] = entry
+        # Reserve slots whose virt falls below phys_floor — those are
+        # kernel image + headroom, not module mapping pool.
+        if (i * KMOD_2M) < phys_floor:
+            used_bitmap[i] = 1
+        else:
+            used_bitmap[i] = 0
+        i = i + 1
+    # Swap the PDPT entry: from a 1 GiB huge page to a pointer-to-PD.
+    new_entry: uint64 = pd_phys | KMOD_PD_PTR_FLAGS
+    cast[Ptr[uint64]](pd_va)[0] = new_entry
+    printk1("[module_map] %s split\n", cast[uint64](label))
+    printk2("[module_map]   pd_phys=%p new_pdpt=%p\n", pd_phys, new_entry)
+    printk1("[module_map]   was=%p\n", old_entry)
+    printk1("[module_map]   reserved-below-virt-offset=%p (kernel image)\n",
+            phys_floor)
+
+
+def _kmod_init():
+    # One-time split of PDPT[510] and PDPT[511] from boot-stub 1 GiB
+    # huge pages into 2-MiB-granular PDs. After this returns, the
+    # module-mapping allocator's per-slot bitmaps reflect "kernel
+    # image reserved, everything else free".
+    if kmod_initialized != 0:
+        return
+    pdpt_base: uint64 = _kmod_pdpt_base()
+    if pdpt_base == 0:
+        printk0("[module_map] _kmod_init: pdpt_high not present?\n")
+        return
+    printk1("[module_map] _kmod_init: pdpt_base=%p\n", pdpt_base)
+    # Kernel image phys end → 2 MiB-aligned-up. PD slots whose virt
+    # offset is below this are "kernel image"; everything at/above is
+    # the module pool.
+    kern_end_phys: uint64 = kernel_image_end()
+    kern_end_2m:   uint64 = (kern_end_phys + KMOD_2M - 1) & ~(KMOD_2M - 1)
+    printk2("[module_map] kernel_image_end phys=%p, 2 MiB-rounded=%p\n",
+            kern_end_phys, kern_end_2m)
+    # PDPT[510] covers virt 0xffffffff80000000 .. 0xffffffffbfffffff
+    # which corresponds to phys 0 .. 0x3fffffff via the old 1 GiB huge
+    # page. The kernel image lives in this range; reserve slots below
+    # kern_end_2m. (Convert phys floor into virt-offset-within-PDPT[510]
+    # — it's the same number since virt_start = KMOD_KERNEL_VBASE so
+    # virt_offset = ent_virt - virt_start = ent_phys - 0 = ent_phys.)
+    pd510_phys: uint64 = _kmod_pd_phys(cast[Ptr[uint8]](&kmod_pd_pdpt510[0]))
+    _kmod_split_pdpt_entry(pdpt_base, 510, pd510_phys,
+                           cast[Ptr[uint8]](&kmod_pd_used_510[0]),
+                           KMOD_PDPT510_VBASE,
+                           kern_end_2m,
+                           "PDPT[510]")
+    # PDPT[511] covers virt 0xffffffffc0000000 .. 0xffffffffffffffff
+    # which corresponds to phys 0x40000000 .. 0x7fffffff via the old
+    # 1 GiB huge page. The kernel image does NOT reach there, so
+    # phys_floor = 0: all 512 slots are free for module mapping.
+    pd511_phys: uint64 = _kmod_pd_phys(cast[Ptr[uint8]](&kmod_pd_pdpt511[0]))
+    _kmod_split_pdpt_entry(pdpt_base, 511, pd511_phys,
+                           cast[Ptr[uint8]](&kmod_pd_used_511[0]),
+                           KMOD_PDPT511_VBASE,
+                           0,
+                           "PDPT[511]")
+    # TLB flush: load_cr3 with the current value evicts any cached
+    # 1 GiB-huge-page entry that the CPU has for PDPT[510] / [511] so
+    # the next access goes through the new PD.
+    load_cr3(get_bsp_cr3())
+    kmod_initialized = 1
+    printk0("[module_map] init OK: PDPT[510..511] now 2-MiB-granular\n")
+
+
+def _kmod_find_free_run(used_bitmap: Ptr[uint8], n_slots: uint64) -> int32:
+    # Linear-scan a 512-slot bitmap for a contiguous run of `n_slots`
+    # free entries. Returns the start index, or -1 if no such run.
+    # First-fit; fine while the module count is low (< 100). A bigger
+    # workload would want a length-indexed free list, but that's
+    # premature optimisation here.
+    i: uint64 = 0
+    while (i + n_slots) <= KMOD_PD_ENTRIES:
+        ok: int32 = 1
+        j: uint64 = 0
+        while j < n_slots:
+            if used_bitmap[i + j] != 0:
+                ok = 0
+                j = n_slots
+            else:
+                j = j + 1
+        if ok == 1:
+            return cast[int32](i)
+        i = i + 1
+    return -1
+
+
+# --- public API ------------------------------------------------------
+
+def module_map_alloc(phys: uint64, span: uint64) -> uint64:
+    # Map `span` bytes of contiguous physical memory starting at
+    # `phys` into a fresh 2-MiB-aligned slot in the kernel's high-half
+    # module mapping window. Returns the high-half virt the caller
+    # should treat as the module's base, or 0 on failure (no virt
+    # space).
+    #
+    # PRECONDITIONS the caller (linux_abi/loader.ad) must already meet:
+    #   - `phys` is 2-MiB-aligned (it comes from alloc_pages with the
+    #     loader's span padded up to a multiple of 2 MiB; alloc_pages
+    #     returns naturally aligned runs at MAX_ORDER granularity).
+    #   - `span` is a 2-MiB multiple (loader rounds up before calling).
+    #
+    # We map first into PDPT[510] (kernel-adjacent slots), then
+    # PDPT[511] as overflow. Allocations never cross the 1 GiB
+    # boundary between [510] and [511]; if the requested span doesn't
+    # fit in either PDPT slot alone the alloc fails. .kos large enough
+    # to cross 1 GiB don't exist in the universe; this is a sanity
+    # rather than a real constraint.
+    if kmod_initialized == 0:
+        _kmod_init()
+    if span == 0:
+        return 0
+    # Phys must be 2-MiB-aligned for huge-page mapping. Refuse rather
+    # than silently miscount; alerts on a bad caller upgrade.
+    if (phys & (KMOD_2M - 1)) != 0:
+        printk2("[module_map] alloc: phys=%p not 2 MiB-aligned (span=%p)\n",
+                phys, span)
+        return 0
+    # Round span UP to a 2 MiB multiple (defence-in-depth — the loader
+    # already does this, but a stray caller shouldn't tear the bitmap).
+    span_rounded: uint64 = (span + KMOD_2M - 1) & ~(KMOD_2M - 1)
+    n_slots: uint64 = span_rounded >> KMOD_2M_SHIFT
+    # Try PDPT[510] first (kernel-adjacent, slots above the kernel
+    # image), then PDPT[511] as overflow.
+    pdpt_idx: uint64 = 510
+    pd_phys: uint64 = _kmod_pd_phys(cast[Ptr[uint8]](&kmod_pd_pdpt510[0]))
+    used: Ptr[uint8] = cast[Ptr[uint8]](&kmod_pd_used_510[0])
+    virt_base: uint64 = KMOD_PDPT510_VBASE
+    start: int32 = _kmod_find_free_run(used, n_slots)
+    if start < 0:
+        pdpt_idx = 511
+        pd_phys = _kmod_pd_phys(cast[Ptr[uint8]](&kmod_pd_pdpt511[0]))
+        used = cast[Ptr[uint8]](&kmod_pd_used_511[0])
+        virt_base = KMOD_PDPT511_VBASE
+        start = _kmod_find_free_run(used, n_slots)
+        if start < 0:
+            printk2("[module_map] alloc: out of virt slots for span=%p (n=%d)\n",
+                    span_rounded, n_slots)
+            return 0
+    # Stamp each 2 MiB PD entry: virt slot k -> phys (phys + k * 2 MiB).
+    k: uint64 = 0
+    start_u: uint64 = cast[uint64](start)
+    while k < n_slots:
+        slot_idx: uint64 = start_u + k
+        target_phys: uint64 = phys + k * KMOD_2M
+        entry: uint64 = (target_phys & ~(KMOD_2M - 1)) | KMOD_HUGE_FLAGS
+        cast[Ptr[uint64]](pd_phys + slot_idx * 8)[0] = entry
+        used[slot_idx] = 1
+        k = k + 1
+    # TLB flush so subsequent reads/writes through the new virt range
+    # don't see a stale not-present cache from the BSS-zeroed PD entry.
+    load_cr3(get_bsp_cr3())
+    virt: uint64 = virt_base + start_u * KMOD_2M
+    printk2("[module_map] alloc: phys=%p span=%p\n", phys, span_rounded)
+    printk2("[module_map]        -> virt=%p (PDPT[%d])\n", virt, pdpt_idx)
+    printk1("[module_map]           slot=%d\n", start_u)
+    return virt
+
+
+def module_map_free(virt: uint64, span: uint64):
+    # Unmap a previously-allocated module range. Restores each PD slot
+    # to its boot-time identity mapping (phys = virt - KERNEL_VBASE)
+    # so a subsequent kernel-image-reaching access through that virt
+    # would still find a valid mapping (matching the pre-split 1 GiB
+    # huge-page semantics). Marks the bitmap slots free.
+    if span == 0:
+        return
+    span_rounded: uint64 = (span + KMOD_2M - 1) & ~(KMOD_2M - 1)
+    n_slots: uint64 = span_rounded >> KMOD_2M_SHIFT
+    # Identify which PDPT slot (510 or 511) the virt falls in, then
+    # locate the matching PD + bitmap. Variables hoisted to function
+    # scope so the cross-branch assignment style works under Adder's
+    # single-declaration-per-name rule.
+    virt_base: uint64 = 0
+    pd_phys:   uint64 = 0
+    used:      Ptr[uint8] = cast[Ptr[uint8]](&kmod_pd_used_510[0])
+    in_range:  int32 = 0
+    if virt >= KMOD_PDPT511_VBASE:
+        if virt < (KMOD_PDPT511_VBASE + KMOD_1GB):
+            virt_base = KMOD_PDPT511_VBASE
+            pd_phys = _kmod_pd_phys(cast[Ptr[uint8]](&kmod_pd_pdpt511[0]))
+            used = cast[Ptr[uint8]](&kmod_pd_used_511[0])
+            in_range = 1
+    elif virt >= KMOD_PDPT510_VBASE:
+        virt_base = KMOD_PDPT510_VBASE
+        pd_phys = _kmod_pd_phys(cast[Ptr[uint8]](&kmod_pd_pdpt510[0]))
+        used = cast[Ptr[uint8]](&kmod_pd_used_510[0])
+        in_range = 1
+    if in_range == 0:
+        printk1("[module_map] free: virt=%p out of range\n", virt)
+        return
+    start_slot: uint64 = (virt - virt_base) >> KMOD_2M_SHIFT
+    if (start_slot + n_slots) > KMOD_PD_ENTRIES:
+        printk2("[module_map] free: virt=%p span=%p crosses PDPT boundary\n",
+                virt, span_rounded)
+        return
+    k: uint64 = 0
+    while k < n_slots:
+        slot_idx: uint64 = start_slot + k
+        # Restore identity-style entry: virt -> virt - KERNEL_VBASE.
+        ent_virt: uint64 = virt_base + slot_idx * KMOD_2M
+        ent_phys: uint64 = ent_virt - KMOD_KERNEL_VBASE
+        entry:    uint64 = ent_phys | KMOD_HUGE_FLAGS
+        cast[Ptr[uint64]](pd_phys + slot_idx * 8)[0] = entry
+        used[slot_idx] = 0
+        k = k + 1
+    load_cr3(get_bsp_cr3())
