@@ -107,6 +107,7 @@ from linux_abi.loader import kmod_linux_load
 from linux_abi.api_e1000e import e1000e_ko_chip_dump, e1000e_ko_force_tx_enable
 from linux_abi.api_netdev import netdev_first_registered
 from linux_abi.api_ahci import linux_abi_finish_ahci_add_disk
+from linux_abi.api_nvme_core import linux_abi_finish_nvme_add_disk
 from kernel.modprobe import (
     modprobe_auto_load,
     auto_modules_marker_found,
@@ -3941,6 +3942,19 @@ def start_kernel():
         else:
             printk1("[boot:35.N] modules_dep_load_with_deps(nvme) OK (rc=%d)\n",
                     cast[uint64](nvme_md_rc))
+        # Option X L-shim add_disk completion. The nvme.ko + nvme-core.ko
+        # stack is loaded and nvme.ko's probe ran — but probe returns
+        # -EINVAL early (well before reset_work queues), and even if
+        # probe DID succeed, nvme_reset_work is queued on nvme_wq which
+        # has no kthread servicing it (flush_work is a no-op stub). So
+        # nvme-core's reset -> identify -> scan -> add_disk chain never
+        # reaches add_disk. Bridge through the L-shim's finish path:
+        # the same hand-rolled drivers/nvme/nvme.ad helpers that the
+        # default boot path uses drive CC.EN + IDENTIFY + create I/O
+        # queues + register_blockdev("nvme0n1", ...) here, AFTER the
+        # .ko stack has been given its chance. Mirror of the AHCI
+        # linux_abi_finish_ahci_add_disk() invocation above.
+        linux_abi_finish_nvme_add_disk()
         # Run the exercise regardless of load rc — same rationale as
         # ahci_io_exercise: a partial-success shim path may still have
         # registered a blockdev before its init bailed.

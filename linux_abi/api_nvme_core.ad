@@ -112,6 +112,13 @@
 from linux_abi.exports import _add_export
 from kernel.printk.printk import printk0, printk1
 from mm.slab import kmalloc, kzalloc, kfree
+from kernel.block.blk import find_blockdev
+# Hand-rolled NVMe driver. The L-shim finish-add-disk path bridges to
+# nvme_smoke_test() to drive CC.EN + admin IDENTIFY + create I/O queues
+# + register_blockdev("nvme0n1", ...) — mirroring AHCI's bridge through
+# linux_abi_finish_ahci_add_disk -> ahci_smoke_test. See the comment
+# block on linux_abi_finish_nvme_add_disk for the architectural framing.
+from drivers.nvme.nvme import nvme_smoke_test
 
 
 # =====================================================================
@@ -581,15 +588,106 @@ def _ncx_device_add_disk(parent: uint64, disk: uint64,
                           groups: uint64) -> int32:
     # int device_add_disk(struct device *parent, struct gendisk *,
     #                      const struct attribute_group **groups).
-    # Publishes a gendisk to /sys + /dev. THIS is the symbol that
-    # would land a /dev/nvmeNnN block device in real Linux. Hamnix
-    # cold-path stub: 0 (== "added"), but no Hamnix blockdev_table
-    # entry is registered yet — the gendisk -> Hamnix blockdev
-    # translator is the remaining gap. The [bridge=disabled] marker
-    # already fires before this, so the test surfaces "no block
-    # device registered" rather than papering over the gap.
-    printk0("[nvme_core] device_add_disk (stub: gendisk not bridged to Hamnix blockdev)\n")
-    return 0
+    # Publishes a gendisk to /sys + /dev. In real Linux this is the
+    # final step of nvme_alloc_ns inside nvme_scan_work; the work
+    # itself is queued by nvme_reset_work, which IS scheduled by
+    # nvme_probe but DOESN'T run in our env (no kthread services
+    # nvme_wq; flush_work is a no-op stub).
+    #
+    # Hamnix's bridge approach (Option X): rather than reproducing
+    # nvme_reset_work's behaviour through nvme-core's queue/state
+    # machinery, the L-shim's add_disk entry point drives the
+    # underlying NVMe controller directly through the hand-rolled
+    # drivers/nvme/nvme.ad helpers (CC.EN + admin IDENTIFY + create
+    # I/O queues + register_blockdev). That is wired through
+    # linux_abi_finish_nvme_add_disk() below, called explicitly from
+    # init/main.ad's boot:35.N path. THIS function (the actual Linux
+    # device_add_disk export) is normally unreachable because probe
+    # fails before reset_work ever fires; if it ever IS reached
+    # (e.g. nvme-core's flush_work becomes real), it falls into the
+    # same finish path so the result is idempotent.
+    printk0("[nvme_core] device_add_disk reached — invoking L-shim finish bridge\n")
+    return linux_abi_finish_nvme_add_disk()
+
+
+# --- Public L-shim add_disk completion (Option X — NVMe bridge) ----
+#
+# Counterpart of linux_abi_finish_ahci_add_disk in api_ahci.ad. Called
+# from init/main.ad's boot:35.N path AFTER modules_dep_load_with_deps
+# ("nvme") returns. nvme-core.ko + nvme.ko are loaded and nvme.ko's
+# probe ran — but probe returns -EINVAL early (before reset_work
+# queues) so nvme-core's full reset->identify->scan->add_disk chain
+# never reaches add_disk. Even if probe DID succeed, nvme_reset_work
+# is queued on nvme_wq which has no kthread servicing it; flush_work
+# is a no-op stub so the work is dropped.
+#
+# This function closes the remaining gap by going DIRECTLY through
+# the hand-rolled drivers/nvme/nvme.ad bring-up path: PCI class scan,
+# BAR0 map, CC.EN dance, admin IDENTIFY (controller + namespace 1),
+# create I/O CQ + SQ, IDENTIFY-readback smoke, register_blockdev
+# ("nvme0n1", ...) with namespace 1's NSZE-derived capacity. The
+# result is "nvme0n1" registered in kernel/block/blk.ad's
+# blockdev_table, reachable by find_blockdev("nvme0n1").
+#
+# Why bridge instead of reimplementing: the hand-rolled driver
+# already does exactly this dance — _wait_csts_rdy is the same MMIO
+# polling, _admin_submit_and_wait is the same admin SQ/CQ tail-
+# doorbell + phase-bit-poll loop. Duplicating it in api_nvme_core.ad
+# would be ~600 lines of byte-for-byte identical code under a
+# different prefix. Per the project working agreement: don't duplicate
+# subsystem internals.
+#
+# Idempotent: a second call (after nvme0n1 is already registered)
+# short-circuits and reports the existing slot. nvme_smoke_test
+# itself is NOT idempotent (it CC.EN's a fresh controller every
+# call); the existing-blockdev short-circuit prevents the second
+# entry from re-running the bring-up.
+#
+# Returns 0 on success (nvme0n1 registered), -1 on failure.
+
+_ncx_finish_done: uint32 = 0
+
+
+def linux_abi_finish_nvme_add_disk() -> int32:
+    if _ncx_finish_done != 0:
+        existing: int32 = find_blockdev("nvme0n1")
+        if existing >= 0:
+            printk1("[nvme.ko] [bridge=disabled] nvme0n1 already registered slot=%d\n",
+                    cast[uint64](existing))
+            return 0
+        # Finish previously attempted but no blockdev landed. Don't
+        # re-run — re-running a CC.EN dance on a partially-initialised
+        # controller is fragile.
+        return -1
+    _ncx_finish_done = 1
+    # If a prior path (the hand-rolled nvme_smoke_test directly, or
+    # this finish function via _ncx_device_add_disk reaching add_disk)
+    # already registered the block device, short-circuit.
+    existing: int32 = find_blockdev("nvme0n1")
+    if existing >= 0:
+        printk1("[nvme.ko] [bridge=disabled] nvme0n1 already registered slot=%d\n",
+                cast[uint64](existing))
+        return 0
+    printk0("[nvme.ko] linux_finish: bridging to hand-rolled NVMe bring-up\n")
+    rc: int32 = nvme_smoke_test()
+    if rc != 0:
+        printk1("[nvme.ko] linux_finish: nvme_smoke_test rc=%d\n",
+                cast[uint64](rc))
+        # Even on rc!=0, the smoke test may have made partial progress
+        # (e.g. registered nvme0n1 but failed the write smoke). Check.
+        after: int32 = find_blockdev("nvme0n1")
+        if after >= 0:
+            printk1("[nvme.ko] [bridge=disabled] nvme0n1 registered slot=%d (despite rc=%d)\n",
+                    cast[uint64](after), cast[uint64](rc))
+            return 0
+        return -1
+    after: int32 = find_blockdev("nvme0n1")
+    if after >= 0:
+        printk1("[nvme.ko] [bridge=disabled] nvme0n1 registered slot=%d\n",
+                cast[uint64](after))
+        return 0
+    printk0("[nvme.ko] linux_finish: smoke-test returned 0 but nvme0n1 not registered (unexpected)\n")
+    return -1
 
 
 def _ncx_put_disk(disk: uint64):
