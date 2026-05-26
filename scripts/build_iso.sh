@@ -327,17 +327,22 @@ WIDE_ESP_IMG="$PATCH_TMP/efi_wide.img"
 #   Verified empirically: a 4 MB FAT16 ESP fails with "Not Found"; a
 #   4 MB FAT12 ESP with the same contents succeeds and "[hamnix] EFI
 #   entry reached" appears on the serial console.
-# WHY -c 32 (16 KB clusters): FAT12 has only 4084 usable clusters, so
-#   at 24 MB the cluster size must be large enough to stay under that
-#   ceiling — 24 MB / 16 KB = 1536 clusters, comfortably FAT12. Without
-#   an explicit -c, mformat would pick small clusters and silently
-#   produce a FAT16 volume that OVMF rejects.
-WIDE_ESP_SIZE_MB=24
+# WHY -c 64 (32 KB clusters): FAT12 has only 4084 usable clusters, so
+#   at 64 MB the cluster size must be large enough to stay under that
+#   ceiling — 64 MB / 32 KB = 2048 clusters, comfortably FAT12. (At the
+#   earlier -c 32 / 16 KB cluster size, 64 MB / 16 KB = 4096 clusters
+#   would slip JUST over the 4084 limit and mformat would silently
+#   produce a FAT16 volume that OVMF rejects.) Without an explicit -c,
+#   mformat would also pick small clusters and produce FAT16.
+# WHY 64 MB (was 24): the kernel grew past 24 MB (elf64-x86-64,
+#   higher-half, ko-loader, network/USB/block drivers folded in) and
+#   mcopy started reporting "Disk full" when staging it into the ESP.
+WIDE_ESP_SIZE_MB=64
 WIDE_ESP_SECTORS=$(( WIDE_ESP_SIZE_MB * 1024 * 1024 / 512 ))
 dd if=/dev/zero of="$WIDE_ESP_IMG" bs=1M count="$WIDE_ESP_SIZE_MB" status=none
 # Geometry: -h 64 -s 32 -t <tracks>. Each track = 32*512 = 16 KB.
-# For 24 MB total: 24*1024*1024 / 16384 = 1536 tracks.
-mformat -i "$WIDE_ESP_IMG" -h 64 -s 32 -c 32 \
+# For 64 MB total: 64*1024*1024 / 16384 = 4096 tracks.
+mformat -i "$WIDE_ESP_IMG" -h 64 -s 32 -c 64 \
         -t $(( WIDE_ESP_SIZE_MB * 64 )) -v HAMNIX ::
 mmd -i "$WIDE_ESP_IMG" "::/EFI"
 mmd -i "$WIDE_ESP_IMG" "::/EFI/BOOT"
