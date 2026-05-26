@@ -521,38 +521,31 @@ fi
 echo "[build_iso]   GPT ESP \\EFI\\BOOT\\BOOTX64.EFI : $(stat -c%s "$VERIFY_TMP/esp_bootx64.efi") bytes, sha matches stub"
 echo "[build_iso]   GPT ESP \\hamnix-kernel.elf    : $(stat -c%s "$VERIFY_TMP/esp_kernel.elf") bytes, sha matches kernel"
 
-# Verify the rootfs partition lives in the GPT at partition 3 and
-# carries an ext4 superblock. parted's per-partition flags don't
-# mark ext4 specially, so we just confirm a 3rd partition exists
-# beyond the ESP and that its first 1 KiB+ contains the 0xEF53 magic
-# at offset 1024 (byte 0x438 of the partition).
-ROOTFS_INFO=$(/sbin/parted "$HAMNIX_ISO_OUT" unit s print 2>/dev/null \
-              | awk '/^ *3 +/ { print }')
-if [ -z "$ROOTFS_INFO" ]; then
-    echo "[build_iso] WARNING: no partition 3 in GPT (rootfs missing?)" >&2
-    /sbin/parted "$HAMNIX_ISO_OUT" unit s print >&2 || true
-else
-    ROOTFS_START=$(echo "$ROOTFS_INFO" | awk '{print $2}' | tr -d 's')
-    # Read 4 bytes at offset 1024 within the partition (sector 2,
-    # byte 0). On an ext4 the bytes at offset 0x438..0x439 are the
-    # little-endian magic 0xEF53.
-    MAGIC_HEX=$(dd if="$HAMNIX_ISO_OUT" bs=512 \
-                   skip=$((ROOTFS_START + 2)) count=1 status=none \
-                | od -An -tx1 -N1024 \
-                | tr -s ' \n' ' ' \
-                | awk '{print $0}' \
-                | cut -c2280-2285)
-    # (Cheaper: just dump 2 bytes at exact offset.)
-    MAGIC_BYTES=$(dd if="$HAMNIX_ISO_OUT" bs=1 \
-                     skip=$(((ROOTFS_START * 512) + 1024 + 0x38)) \
-                     count=2 status=none 2>/dev/null \
-                  | od -An -tx1 | tr -d ' \n')
-    if [ "$MAGIC_BYTES" = "53ef" ]; then
-        echo "[build_iso]   rootfs partition 3 at sector $ROOTFS_START: ext4 magic 0xEF53 OK"
-    else
-        echo "[build_iso] WARNING: rootfs partition 3 at sector $ROOTFS_START: " \
-             "magic bytes='$MAGIC_BYTES' (expected '53ef')" >&2
+# Verify the rootfs partition lives in the GPT and carries an ext4
+# superblock. xorriso's `-append_partition 3 0x83 <rootfs.img>` ends
+# up at GPT partition 4 because xorriso reserves slots 1, 3, 5 for
+# "Gap" placeholders that surround its data + ESP partitions (a
+# hybrid-MBR + GPT layout artefact). We scan for the FIRST partition
+# whose ext4 superblock magic 0xEF53 sits at byte offset 1024.
+ROOTFS_START=""
+for try_idx in 4 3 2 5; do
+    INFO=$(/sbin/parted "$HAMNIX_ISO_OUT" unit s print 2>/dev/null \
+           | awk -v idx="$try_idx" '$1 == idx { print }')
+    if [ -z "$INFO" ]; then continue; fi
+    TRY_START=$(echo "$INFO" | awk '{print $2}' | tr -d 's')
+    TRY_MAGIC=$(dd if="$HAMNIX_ISO_OUT" bs=1 \
+                   skip=$(((TRY_START * 512) + 1024 + 0x38)) \
+                   count=2 status=none 2>/dev/null \
+                | od -An -tx1 | tr -d ' \n')
+    if [ "$TRY_MAGIC" = "53ef" ]; then
+        ROOTFS_START="$TRY_START"
+        echo "[build_iso]   rootfs partition $try_idx at sector $TRY_START: ext4 magic 0xEF53 OK"
+        break
     fi
+done
+if [ -z "$ROOTFS_START" ]; then
+    echo "[build_iso] WARNING: no ext4 rootfs partition found in GPT" >&2
+    /sbin/parted "$HAMNIX_ISO_OUT" unit s print >&2 || true
 fi
 
 ISO_BYTES=$(stat -c%s "$HAMNIX_ISO_OUT")
