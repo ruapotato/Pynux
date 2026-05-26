@@ -1,0 +1,72 @@
+# user/mkfs_ext4.ad
+#
+# Thin userland wrapper around fs/ext4.ad::ext4_mkfs() — invoked via
+# the /dev/blk/<dev>/ctl command channel. Sample uses:
+#
+#   /bin/mkfs_ext4 /dev/blk/vdb        # format the whole disk
+#   /bin/mkfs_ext4 /dev/blk/vdbp2      # format partition 2
+#
+# The kernel's ext4_mkfs requires the device's capacity (in 512-byte
+# sectors) — devblk.ad's CTL handler queries that itself, so this
+# wrapper passes none. The wrapper's exit code is 0 on a successful
+# command write, 1 on any failure (open / write).
+#
+# See sys/src/9/port/devblk.ad for the CTL grammar and
+# fs/ext4.ad::ext4_mkfs for the on-disk layout produced.
+
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def strcpy(dst: Ptr[uint8], src: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while src[i] != 0:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+    return i
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2, "usage: mkfs_ext4 /dev/blk/<dev>\n")
+        return 1
+    dev: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    # Build "<dev>/ctl" — bound at 64 chars; /dev/blk/<name> is at most
+    # 9 + 16 = 25 bytes, plus "/ctl" = 29, well under the cap.
+    ctl_path: Array[64, uint8]
+    n: uint64 = strcpy(&ctl_path[0], dev)
+    suffix: Ptr[uint8] = "/ctl"
+    j: uint64 = 0
+    while suffix[j] != 0 and n + j < 63:
+        ctl_path[n + j] = suffix[j]
+        j = j + 1
+    ctl_path[n + j] = 0
+    fd: int32 = sys_open_write(cast[Ptr[char]](&ctl_path[0]))
+    if fd < 0:
+        write_str(2, "mkfs_ext4: cannot open ")
+        write_str(2, &ctl_path[0])
+        write_str(2, "\n")
+        return 1
+    cmd: Ptr[uint8] = "mkfs_ext4\n"
+    rc: int64 = sys_write(fd, cmd, 10)
+    sys_close(fd)
+    if rc < 0:
+        write_str(2, "mkfs_ext4: kernel formatter failed\n")
+        return 1
+    write_str(1, "mkfs_ext4: ")
+    write_str(1, dev)
+    write_str(1, " OK\n")
+    return 0

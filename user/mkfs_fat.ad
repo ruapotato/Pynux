@@ -1,0 +1,123 @@
+# user/mkfs_fat.ad
+#
+# Thin userland wrapper around fs/fat_mkfs.ad::fat_mkfs() — invoked
+# via the /dev/blk/<dev>/ctl command channel.
+#
+#   /bin/mkfs_fat /dev/blk/vdbp1            # format whole device as FAT
+#   /bin/mkfs_fat /dev/blk/vdbp1 32         # cap at 32 MiB
+#
+# CAVEAT: as of this commit fs/fat_mkfs.ad is a stub that returns
+# -1 with a diagnostic — the installer uses raw-sector copies of the
+# ISO's ESP partition instead of re-emitting FAT12 from scratch.
+# See fs/fat_mkfs.ad's header. The wrapper is still provided so the
+# CTL surface is symmetric with mkfs_ext4 + future drop-in upgrade
+# of the kernel-side writer.
+
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def strcpy(dst: Ptr[uint8], src: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while src[i] != 0:
+        dst[i] = src[i]
+        i = i + 1
+    dst[i] = 0
+    return i
+
+
+def render_u64(v: uint64, out: Ptr[uint8]) -> uint64:
+    if v == 0:
+        out[0] = 48
+        out[1] = 0
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    out[i] = 0
+    return written
+
+
+def parse_u64(s: Ptr[uint8]) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[uint64](c - 48)
+        i = i + 1
+    return v
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2, "usage: mkfs_fat /dev/blk/<dev> [size_mb]\n")
+        return 1
+    dev: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    size_mb: uint64 = 0
+    if argc > 2:
+        size_mb = parse_u64(cast[Ptr[uint8]](argv[2]))
+    ctl_path: Array[64, uint8]
+    n: uint64 = strcpy(&ctl_path[0], dev)
+    suffix: Ptr[uint8] = "/ctl"
+    j: uint64 = 0
+    while suffix[j] != 0 and n + j < 63:
+        ctl_path[n + j] = suffix[j]
+        j = j + 1
+    ctl_path[n + j] = 0
+    fd: int32 = sys_open_write(cast[Ptr[char]](&ctl_path[0]))
+    if fd < 0:
+        write_str(2, "mkfs_fat: cannot open ")
+        write_str(2, &ctl_path[0])
+        write_str(2, "\n")
+        return 1
+    cmd: Array[64, uint8]
+    p: Ptr[uint8] = "mkfs_fat"
+    k: uint64 = 0
+    while p[k] != 0:
+        cmd[k] = p[k]
+        k = k + 1
+    if size_mb > 0:
+        cmd[k] = 32
+        k = k + 1
+        # decimal render in place
+        scratch: Array[24, uint8]
+        m: uint64 = render_u64(size_mb, &scratch[0])
+        s: uint64 = 0
+        while s < m:
+            cmd[k + s] = scratch[s]
+            s = s + 1
+        k = k + m
+    cmd[k] = 10
+    k = k + 1
+    rc: int64 = sys_write(fd, &cmd[0], k)
+    sys_close(fd)
+    if rc < 0:
+        write_str(2, "mkfs_fat: kernel formatter failed (stub)\n")
+        return 1
+    write_str(1, "mkfs_fat: ")
+    write_str(1, dev)
+    write_str(1, " OK\n")
+    return 0
