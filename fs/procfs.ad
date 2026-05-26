@@ -26,6 +26,16 @@ from kernel.sched.core import (
 from arch.x86.kernel.time import get_jiffies
 from mm.page_alloc import page_alloc_total, page_alloc_free_count
 from kernel.printk.printk_log import printk_log_snapshot, PRINTK_LOG_SIZE
+# Phase 8 (docs/rootfs_partition.md "Inspection: /proc/fs"): the
+# named-stack + by-id tables drive the /proc/fs/{by-name,by-id,
+# anonymous} readout. Stays static-text — one fresh snapshot per open.
+from sys.src.port9.port.chan import (
+    name_table_slot_count, name_table_slot_word, name_table_slot_in_use,
+    name_stack_depth, name_lookup_partuuid, name_lookup_dir,
+    byid_table_size, byid_table_entry_in_use,
+    byid_table_entry_partuuid, byid_table_entry_sentinel,
+    byid_table_entry_dir,
+)
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -244,6 +254,17 @@ def proc_render(path: Ptr[char], buf: Ptr[uint8]) -> int64:
         # below — PRINTK_LOG_SIZE bytes — so the snapshot tails the
         # whole ring rather than only the last page.
         return cast[int64](render_kmsg(buf, PRINTK_LOG_SIZE))
+    # Phase 8: /proc/fs/{by-name,by-id,anonymous} introspection. The
+    # by-name/<word> and by-id/<uuid> arms parse the trailing slug
+    # out of the path before dispatching.
+    if _path_eq(path, "/proc/fs/anonymous") != 0:
+        return cast[int64](render_fs_anonymous(buf))
+    if _path_starts_with(path, "/proc/fs/by-name/") != 0:
+        word_p: Ptr[char] = cast[Ptr[char]](cast[uint64](path) + 17)
+        return cast[int64](render_fs_by_name(word_p, buf))
+    if _path_starts_with(path, "/proc/fs/by-id/") != 0:
+        uuid_p: Ptr[char] = cast[Ptr[char]](cast[uint64](path) + 15)
+        return cast[int64](render_fs_by_id(uuid_p, buf))
     return -1
 
 
@@ -270,6 +291,177 @@ def _path_eq(a: Ptr[char], b: Ptr[char]) -> int32:
         if ca == 0:
             return 1
         i = i + 1
+
+
+def _path_starts_with(a: Ptr[char], prefix: Ptr[char]) -> int32:
+    # 1 iff `a` starts with `prefix` (NUL-terminated comparison up to
+    # the length of `prefix`). Returns 0 on mismatch.
+    i: int32 = 0
+    while True:
+        pc: int32 = prefix[i]
+        if pc == 0:
+            return 1
+        if a[i] != pc:
+            return 0
+        i = i + 1
+
+
+def render_fs_anonymous(buf: Ptr[uint8]) -> uint64:
+    # `/proc/fs/anonymous` — list of partitions registered as
+    # `#part<N>` (no sentinel). The by-id table carries an empty
+    # sentinel string for anonymous registrations; we walk it and
+    # pick the empties. Lines:
+    #
+    #   partuuid=<uuid>   anonymous=true
+    #
+    # The doc spec calls for `#partN -> partuuid` mappings; with the
+    # current named-stack we'd need a reverse lookup. The pragmatic
+    # render walks by-id and prints any entry whose sentinel field
+    # is empty.
+    pos: uint64 = 0
+    pos = _buf_put_str(buf, pos, "# /proc/fs/anonymous: partitions without sentinel\n")
+    n: uint64 = byid_table_size()
+    s: uint64 = 0
+    found_any: int32 = 0
+    while s < 32:
+        if byid_table_entry_in_use(s) != 0:
+            sent: Ptr[uint8] = byid_table_entry_sentinel(s)
+            if sent[0] == 0:
+                # anonymous record
+                pu: Ptr[uint8] = byid_table_entry_partuuid(s)
+                pos = _buf_put_str(buf, pos, "partuuid=")
+                pos = _buf_put_str(buf, pos, pu)
+                pos = _buf_put_str(buf, pos, "  anonymous=true\n")
+                found_any = 1
+        s = s + 1
+    if found_any == 0:
+        pos = _buf_put_str(buf, pos, "(no anonymous partitions registered)\n")
+    return pos
+
+
+def _word_eq_cstr(a: Ptr[uint8], b: Ptr[char]) -> int32:
+    # NUL-terminated equality of two C-string views.
+    i: uint64 = 0
+    while True:
+        ca: uint8 = a[i]
+        cb: int32 = b[i]
+        if ca != cast[uint8](cb & 0xFF):
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+
+
+def render_fs_by_name(word: Ptr[char], buf: Ptr[uint8]) -> uint64:
+    # `/proc/fs/by-name/<word>` — render the LIFO stack for a single
+    # name as in the doc example:
+    #
+    #   1 (#home):   partuuid=ABCD-EFGH  sentinel=`home`  dir=`home/`
+    #   2 (#home2):  partuuid=1234-5678  sentinel=`home`  dir=`home/`
+    pos: uint64 = 0
+    # Find the slot whose word matches the request. Linear over
+    # name_table; word strings are at most 32 bytes.
+    n_slots: uint64 = 32                          # NAME_TABLE_MAX (chan.ad)
+    target_slot: int64 = -1
+    s: uint64 = 0
+    while s < n_slots:
+        if name_table_slot_in_use(s) != 0:
+            sw: Ptr[uint8] = name_table_slot_word(s)
+            if _word_eq_cstr(sw, word) != 0:
+                target_slot = cast[int64](s)
+                s = n_slots
+            else:
+                s = s + 1
+        else:
+            s = s + 1
+    pos = _buf_put_str(buf, pos, "# /proc/fs/by-name/")
+    pos = _buf_put_cstr(buf, pos, word)
+    pos = _buf_put_str(buf, pos, "\n")
+    if target_slot < 0:
+        pos = _buf_put_str(buf, pos, "(no stack for this word)\n")
+        return pos
+    # Render top→bottom. name_stack_depth gives total entries; we
+    # iterate positions 1..depth.
+    word_buf: Array[40, uint8]
+    j: int32 = 0
+    while j < 40 and word[j] != 0:
+        word_buf[j] = cast[uint8](word[j] & 0xFF)
+        j = j + 1
+    word_buf[j] = 0
+    depth: int32 = name_stack_depth(&word_buf[0])
+    pp: int32 = 1
+    while pp <= depth:
+        pu_buf: Array[40, uint8]
+        dir_buf: Array[256, uint8]
+        if name_lookup_partuuid(&word_buf[0], pp, &pu_buf[0], 40) != 0:
+            pu_buf[0] = cast[uint8](63)           # '?'
+            pu_buf[1] = 0
+        if name_lookup_dir(&word_buf[0], pp, &dir_buf[0], 256) != 0:
+            dir_buf[0] = cast[uint8](63)
+            dir_buf[1] = 0
+        # `pp (#wordN):  partuuid=...  sentinel=`word`  dir=`...`\n`
+        pos = _buf_put_dec(buf, pos, cast[uint64](pp))
+        pos = _buf_put_str(buf, pos, " (#")
+        pos = _buf_put_str(buf, pos, &word_buf[0])
+        if pp > 1:
+            pos = _buf_put_dec(buf, pos, cast[uint64](pp))
+        pos = _buf_put_str(buf, pos, "):  partuuid=")
+        pos = _buf_put_str(buf, pos, &pu_buf[0])
+        pos = _buf_put_str(buf, pos, "  sentinel=`")
+        pos = _buf_put_str(buf, pos, &word_buf[0])
+        pos = _buf_put_str(buf, pos, "`  dir=`")
+        pos = _buf_put_str(buf, pos, &dir_buf[0])
+        pos = _buf_put_str(buf, pos, "`\n")
+        pp = pp + 1
+    return pos
+
+
+def render_fs_by_id(partuuid: Ptr[char], buf: Ptr[uint8]) -> uint64:
+    # `/proc/fs/by-id/<partuuid>` — render the partition identity
+    # record:
+    #
+    #   partition=<uuid>  sentinel=`<word>`  dir=`<path>`
+    #
+    # Plus a list of named slots this partition occupies (Phase 9
+    # extension; today the simple identity is enough).
+    pos: uint64 = 0
+    s: uint64 = 0
+    found: int64 = -1
+    while s < 32:
+        if byid_table_entry_in_use(s) != 0:
+            pu: Ptr[uint8] = byid_table_entry_partuuid(s)
+            if _word_eq_cstr(pu, partuuid) != 0:
+                found = cast[int64](s)
+                s = 32
+            else:
+                s = s + 1
+        else:
+            s = s + 1
+    pos = _buf_put_str(buf, pos, "# /proc/fs/by-id/")
+    pos = _buf_put_cstr(buf, pos, partuuid)
+    pos = _buf_put_str(buf, pos, "\n")
+    if found < 0:
+        pos = _buf_put_str(buf, pos, "(unknown partition uuid)\n")
+        return pos
+    fu: uint64 = cast[uint64](found)
+    pos = _buf_put_str(buf, pos, "partition=")
+    pos = _buf_put_str(buf, pos, byid_table_entry_partuuid(fu))
+    pos = _buf_put_str(buf, pos, "  sentinel=`")
+    pos = _buf_put_str(buf, pos, byid_table_entry_sentinel(fu))
+    pos = _buf_put_str(buf, pos, "`  dir=`")
+    pos = _buf_put_str(buf, pos, byid_table_entry_dir(fu))
+    pos = _buf_put_str(buf, pos, "`\n")
+    return pos
+
+
+def _buf_put_cstr(buf: Ptr[uint8], pos: uint64, s: Ptr[char]) -> uint64:
+    # Like _buf_put_str but for Ptr[char] inputs (procfs's path uses
+    # this type from the VFS surface).
+    i: uint64 = 0
+    while s[i] != 0:
+        buf[pos + i] = cast[uint8](s[i] & 0xFF)
+        i = i + 1
+    return pos + i
 
 
 def is_proc_path(name: Ptr[char]) -> int32:
