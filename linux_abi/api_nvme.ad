@@ -710,49 +710,72 @@ def _nvm_opal_unlock_from_suspend(dev: uint64) -> int32:
 # Group 6: misc helpers
 # =====================================================================
 
+def _nvm_dev_set_name(dev: uint64, fmt: uint64) -> int32:
+    # int dev_set_name(struct device *dev, const char *fmt, ...).
+    # api_devclass.ad's _l_dev_set_name treats `dev` as a 1-based slot
+    # index into its dev_in_use table and returns -EINVAL when the
+    # pointer isn't a slot. nvme-core's nvme_init_ctrl passes a heap
+    # pointer (`&ctrl->ctrl_device` allocated by nvme.ko's kzalloc_node)
+    # that the slot table doesn't know about — the unhandled -22 aborts
+    # nvme_probe with -EINVAL before reset_work ever queues.
+    #
+    # Override (last-match-wins via linux_abi_register_nvme below):
+    # treat dev_set_name as a synchronous success on every non-NULL
+    # device pointer. Device naming is purely a kernel-internal label
+    # (driven by sysfs / kobject which Hamnix doesn't expose); the
+    # .ko callers that error-check it just need a 0 return.
+    #
+    # Other .ko's that call dev_set_name with their own heap pointers
+    # already work around the -22 because their callers don't strictly
+    # check the return value, OR they hit pre-existing pre-this-commit
+    # traps elsewhere in their probe path (verified: test_ahci_io's
+    # libata internal #UD at 0xa369 fires with or without this
+    # override).
+    if dev == 0:
+        return -22
+    return 0
+
+
 def _nvm_async_schedule_node(func: uint64, data: uint64,
                                 node: int32) -> uint64:
     # async_cookie_t async_schedule_node(async_func_t func, void *data,
     #                                       int node).
     # Schedules `func(data, cookie)` on the async kthread pool. In a
     # real kernel the kthread services the queue and eventually runs
-    # func. We have no async-kthread worker for this queue, so the
-    # work would normally be DROPPED.
+    # func.
     #
-    # Pre-nvme-core-side-load: dropping was the only safe option —
-    # reset_work would deref nvme_ctrl_ops fn pointers that our shim
-    # left zero, triggering #UD inside reset_work's deep call chain.
+    # Hamnix has no async-kthread worker for this queue. We sync-
+    # dispatch the function inline: `func(data, cookie)` runs on the
+    # calling thread (the kmod_linux probe context). nvme.ko calls
+    # async_schedule(nvme_async_probe, dev) at the end of nvme_probe,
+    # right after nvme_reset_ctrl queues reset_work on nvme_reset_wq.
+    # nvme_async_probe does:
     #
-    # Post-nvme-core-side-load (this commit): nvme-core.ko owns the
-    # real nvme_ctrl_ops machinery; nvme.ko's nvme_pci_ctrl_ops vtable
-    # is populated by nvme.ko itself at probe time. Dispatching
-    # reset_work synchronously would now exercise the real controller
-    # MMIO bring-up — CC.EN cycling, AQA/ASQ/ACQ programming, IDENTIFY,
-    # CREATE I/O QUEUE — against QEMU's NVMe BAR. The wall is now the
-    # MSI-X IRQ delivery for completion (nvme uses MSI-X by default,
-    # one vector per queue, and our L-shim hard-codes a single MSI
-    # vector for e1000e bring-up — multi-vector MSI-X routing is the
-    # next milestone). Without MSI-X delivery, reset_work's
-    # `wait_for_completion_io_timeout` on the admin SQ doorbell write
-    # spins until the 30-second timeout fires, then returns -EIO and
-    # marks the controller DEAD.
+    #   flush_work(&ctrl->reset_work);
+    #   flush_work(&ctrl->scan_work);
+    #   nvme_put_ctrl(&ctrl);
     #
-    # Sync-dispatch REMAINS DROPPED post-side-load (2026-05-25):
-    # The agent that landed the nvme-core side-load discovered (via
-    # boot-log trace) that nvme_probe RETURNS -EINVAL early at the
-    # pdev->dev_id read path — well BEFORE reaching the
-    # async_schedule_node(nvme_reset_work) call. So sync-dispatching
-    # this entry point won't help reach the controller MMIO bring-up
-    # path. The next bottleneck is in nvme_probe itself: an early
-    # sanity check fails against our shim pci_dev. Diagnosing that
-    # is the next agent's lift; for now async_schedule_node stays
-    # a no-op so when the probe-path gap is closed, this stays
-    # benign.
+    # Pre-this-commit: this shim DROPPED the work, so nvme_probe
+    # completed without ever giving reset_work a chance to run. With
+    # nvme-core.ko side-loaded (cross-module ksymtab resolves
+    # nvme_reset_ctrl to nvme-core's real EXPORT_SYMBOL body), the
+    # work IS queued by nvme_reset_ctrl; sync-dispatching
+    # nvme_async_probe kicks the downstream flush_work calls.
     #
-    # if func != 0:
-    #     fn: Fn[None, uint64, uint64] = \
-    #         cast[Fn[None, uint64, uint64]](func)
-    #     fn(data, 1)
+    # libata.ko ALSO uses async_schedule_node (for SATA port bring-up).
+    # The AHCI .ko-load test (test_ahci_io.sh) was ALREADY failing
+    # before this change with a pre-existing libata-internal #UD at
+    # 0xa369, independently of the async-work shim — verified by
+    # running the test on a clean checkout. Sync-dispatching libata's
+    # async-work doesn't move the AHCI failure point.
+    #
+    # Cookie convention: pass 1 (matches a non-NULL async_cookie_t).
+    # The callee uses cookie only in the legacy async-domain API (we
+    # don't model domains).
+    if func != 0:
+        fn: Fn[None, uint64, uint64] = \
+            cast[Fn[None, uint64, uint64]](func)
+        fn(data, 1)
     return 1
 
 
@@ -1061,6 +1084,15 @@ def linux_abi_register_nvme():
     # ---- Group 6: misc helpers ----
     _add_export("async_schedule_node",
                 cast[uint64](&_nvm_async_schedule_node))
+    # dev_set_name override: api_devclass.ad's _l_dev_set_name returns
+    # -EINVAL when called on a heap-allocated device pointer (it
+    # expects a 1-based slot index). nvme-core's nvme_init_ctrl passes
+    # such a heap pointer; without this override probe bails -EINVAL
+    # before reset_work queues. linux_abi_lookup is last-match-wins
+    # (see exports.ad), so this registration (later in
+    # linux_abi_exports_init() than api_devclass.ad) wins.
+    _add_export("dev_set_name",
+                cast[uint64](&_nvm_dev_set_name))
     _add_export("wait_for_completion_io_timeout",
                 cast[uint64](&_nvm_wait_for_completion_io_timeout))
     _add_export("dma_map_sgtable",

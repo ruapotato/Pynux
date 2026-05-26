@@ -106,8 +106,11 @@ rc=$?
 set -e
 
 echo "[test_nvme_io] --- captured (nvme / nvme_io_test / ext4 / kmod / bridge / ksymtab) ---"
-grep -aE 'kmod_linux: name=|\[nvme\.ko\]|\[nvme_io_test\]|\[nvme\]|\[nvme_core\]|\[boot:35\.N\]|\[bridge=|\[ksymtab_hit\] nvme |ext4: mounted|ext4: bad magic|ext4: failed' "$LOG" | head -120 || true
+grep -aE 'kmod_linux: name=|\[nvme\.ko\]|\[nvme_io_test\]|\[nvme\]|\[nvme_core\]|\[boot:35\.N\]|\[bridge=|\[ksymtab_hit\] nvme |\[pci_register_driver\]|ext4: mounted|ext4: bad magic|ext4: failed' "$LOG" | head -120 || true
 echo "[test_nvme_io] --- end ---"
+
+# Stash the full raw log for post-mortem (mirrors test_nvme_ko.sh).
+cp "$LOG" /tmp/test_nvme_io.last.log || true
 
 # Panic / TRAP / BUG is unambiguously a regression.
 if grep -aE -q "PANIC|panic:|TRAP:|BUG:" "$LOG"; then

@@ -1161,8 +1161,18 @@ def build_archive() -> bytes:
     nvme_core_ko = here / "kernel-modules" / "nvme_core" / "nvme-core.ko"
     if nvme_core_ko.is_file():
         data = nvme_core_ko.read_bytes()
+        # nvme.ko's modules.dep entry says `depends: nvme-core` (with a
+        # dash). The in-kernel modules_dep walker (kernel/modules_dep.ad)
+        # normalizes '-' to '_' when composing the cpio lookup path, so
+        # it actually searches for `/lib/modules/nvme_core.ko` (underscore).
+        # Plant BOTH forms so a userspace `insmod /lib/modules/nvme-core.ko`
+        # (dash, what `modinfo -F name` prints) and the in-kernel dep
+        # walker's lookup (underscore-normalized) both resolve. Same
+        # dual-form trick used for xhci-hcd vs xhci_hcd.ko below.
         for name in ("/lib/modules/nvme-core.ko",
-                     "/lib/modules/6.12/nvme-core.ko"):
+                     "/lib/modules/6.12/nvme-core.ko",
+                     "/lib/modules/nvme_core.ko",
+                     "/lib/modules/6.12/nvme_core.ko"):
             blob += cpio_entry(name, data)
             print(f"  embedded {name} ({len(data)} bytes from "
                   f"kernel-modules/nvme_core/nvme-core.ko)")
