@@ -14,7 +14,7 @@
 #   access or host root needed.
 #
 # The boot rides hamsh-as-init (INIT_ELF=hamsh.elf, same pattern
-# scripts/test_apt_real_deb.sh uses) and feeds `/bin/ping -c 3
+# scripts/test_linux_apt_install.sh uses) and feeds `/bin/ping -c 3
 # 10.0.2.2` over the serial console. ENABLE_PING_SMOKE=1 is also
 # plumbed through — scripts/build_initramfs.py picks it up to plant
 # /etc/ping-smoke-test in the initramfs, so future kernel-side ping

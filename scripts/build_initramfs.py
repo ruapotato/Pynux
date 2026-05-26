@@ -304,20 +304,11 @@ if os.environ.get("ENABLE_HTTP_REDIRECT_SMOKE") == "1":
     # it so the kernel reaches the redirect smoke below.
     FILES.append(("/etc/skip-https-internet-smoke", b"1\n"))
 
-# apt-path V0: scripts/test_dpkg_deb_x.sh generates a tiny .deb
-# fixture on the host, points HAMNIX_DEB_FIXTURE at it, and this
-# block plants the bytes at /tests/sample.deb inside the cpio
-# initramfs so the userland `/bin/dpkg_deb` binary can extract it
-# under QEMU. Off-default: an unset env var leaves the initramfs
-# alone, exactly like every other gated marker above.
-_DEB_FIXTURE_PATH = os.environ.get("HAMNIX_DEB_FIXTURE", "")
-if _DEB_FIXTURE_PATH:
-    try:
-        with open(_DEB_FIXTURE_PATH, "rb") as _fdeb:
-            FILES.append(("/tests/sample.deb", _fdeb.read()))
-    except OSError as _e:
-        raise SystemExit(
-            f"HAMNIX_DEB_FIXTURE={_DEB_FIXTURE_PATH}: unreadable ({_e})")
+# HAMNIX_DEB_FIXTURE: RETIRED. Was used by the now-deleted
+# scripts/test_dpkg_*.sh battery (Adder dpkg_deb tests) to plant a host-
+# generated tiny .deb at /tests/sample.deb in the cpio. Real apt/dpkg
+# now run inside `enter linux { ... }` against debian-minbase/rootfs/;
+# no synthetic fixtures needed.
 
 # httpd docroot staging: scripts/test_httpd.sh sets HAMNIX_HTTPD_DOCROOT=1
 # to plant a tiny static-file tree at /var/www inside the cpio initramfs
@@ -387,41 +378,10 @@ if _TLS_CA_DER_PATH:
         raise SystemExit(
             f"TLS_CA_DER={_TLS_CA_DER_PATH}: unreadable ({_e})")
 
-# apt chain-of-trust anchor: the userland `apt` (user/apt.ad) verifies
-# the OpenPGP signature on a repository's `InRelease` against a baked
-# archive signing key at /etc/apt-trusted.gpg. The blob is the raw
-# bytes of `gpg --export <archive-key>` — one v4 RSA Public-Key packet,
-# parsed by lib/pgp/pgp.ad. scripts/test_apt_inrelease.sh generates a
-# throwaway test key, signs its fixture `Release`, and points
-# APT_TRUSTED_GPG at the exported public key so apt can authenticate
-# the fixture without trusting any real-world Debian key. Off-default:
-# an unset env var leaves the initramfs alone, exactly like the other
-# gated markers above.
-_APT_TRUSTED_GPG = os.environ.get("APT_TRUSTED_GPG", "")
-if _APT_TRUSTED_GPG:
-    try:
-        with open(_APT_TRUSTED_GPG, "rb") as _f:
-            FILES.append(("/etc/apt-trusted.gpg", _f.read()))
-    except OSError as _e:
-        raise SystemExit(
-            f"APT_TRUSTED_GPG={_APT_TRUSTED_GPG}: unreadable ({_e})")
-else:
-    # No test/override key supplied: bake the production Debian
-    # archive keyring if the host has the `debian-archive-keyring`
-    # package installed. apt then authenticates a real Debian mirror
-    # out of the box. Absent it, apt simply has no anchor and reports
-    # the repository as UNAUTHENTICATED (fail-loud, never fail-open).
-    for _dak in (
-        "/usr/share/keyrings/debian-archive-keyring.gpg",
-        "/etc/apt/trusted.gpg.d/debian-archive-keyring.gpg",
-    ):
-        if os.path.exists(_dak):
-            try:
-                with open(_dak, "rb") as _f:
-                    FILES.append(("/etc/apt-trusted.gpg", _f.read()))
-            except OSError:
-                pass
-            break
+# APT_TRUSTED_GPG: RETIRED with the Adder apt. The real Debian apt-get
+# (staged inside /var/lib/distros/default/ via HAMNIX_DEFAULT_REAL_DEBIAN)
+# reads /etc/apt/trusted.gpg.d/debian-archive-keyring.gpg from its own
+# tree — that file is part of the curated-real-debian stage list.
 
 # cpio capacity stress fixture: scripts/test_cpio_capacity.sh sets
 # HAMNIX_CPIO_STRESS_FILES=<N> to plant N tiny synthetic files at

@@ -14,8 +14,9 @@
 #   image holds tens of MB without bloating the kernel/initramfs),
 #   boots Hamnix with that disk attached (kernel auto-mounts ext4 at
 #   /ext), and runs this binary. We read /ext/Packages.gz in 64 KiB
-#   chunks — exactly how user/apt.ad drains a chunked HTTP body — and
-#   feed each chunk to inflate_feed. The inflater verifies the gzip
+#   chunks — a chunked-streaming exercise of lib/zlib/inflate's
+#   incremental API — and feed each chunk to inflate_feed. The inflater
+#   verifies the gzip
 #   trailer's CRC32 + ISIZE internally, so a final rc==1 is proof the
 #   entire ~50 MB stream inflated byte-correct.
 #

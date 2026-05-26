@@ -133,9 +133,11 @@ build_adder_user hamwd                # Phase D: Hamnix Window Daemon (Layer 3 /
 build_adder_user p9srv_demo           # Phase D / V4: minimum-viable userspace 9P server (test fixture)
 build_adder_user distrofs             # Plan 9 distro: userland 9P file-server daemon for the distro /var tree
 build_adder_user nsrun                 # Plan 9 shim launcher: runs a program in a private distrofs-backed namespace
-build_adder_user dpkg_deb             # apt-path V0: extract data.tar.gz from a .deb to a target dir
-build_adder_user dpkg                 # apt-path V1: parse control + record installed package in dpkg DB
-build_adder_user apt                  # apt-path V0: fetch + decompress + parse a Debian repo index over HTTP
+# apt/dpkg/dpkg_deb RETIRED — replaced by real Debian binaries run via
+# `enter linux { /usr/bin/apt-get ... }` against the debootstrap'd tree
+# staged at /var/lib/distros/default/ (HAMNIX_DEFAULT_REAL_DEBIAN=1).
+# Per the user's direction: "apt should be a Linux binary running in a
+# Linux namespace." See scripts/test_linux_apt_install.sh.
 build_adder_user u_server             # U-socket V1: native TCP server (bind/listen/accept smoke test)
 build_adder_user u_tlstest            # U-TLS: native HTTPS client (TLS over the /net file tree)
 build_adder_user httpd                # U-socket: static-file HTTP/1.0 server daemon (/bin/httpd)
