@@ -65,6 +65,15 @@ from drivers.net.virtio_net import virtio_net_poll
 from drivers.net.eth import eth_tx, eth_get_mac
 from drivers.net.arp import arp_lookup
 from arch.x86.kernel.time import get_jiffies, pit_monotonic_us
+# kernel_cond_resched: the wedge-class fix. Every `while get_jiffies()
+# < deadline:` loop in this file runs from userland-syscall context with
+# EFLAGS.IF cleared (IA32_FMASK = 0x0200); without an IRQ-window inside
+# the loop body, the LAPIC timer never fires, `jiffies` stays frozen,
+# and the deadline never elapses. kernel_cond_resched briefly enables
+# interrupts (sti + hlt + cli) so the LAPIC timer can tick and any
+# STATE_READY peer can be scheduled in. See kernel/sched/core.ad for the
+# full rationale.
+from kernel.sched.core import kernel_cond_resched
 
 
 # TCP control-block states (RFC 793). Numbered to match the order
@@ -360,6 +369,11 @@ def _tcp_prime_arp(b0: uint8, b1: uint8, b2: uint8, b3: uint8) -> int32:
         virtio_net_poll()
         if arp_lookup(addr_ptr) != cast[Ptr[uint8]](0):
             return 0
+        # Preempt-class wedge-fix: with IF=0 here, the LAPIC timer
+        # can't bump jiffies — without this the loop would never see
+        # `get_jiffies() >= deadline`. kernel_cond_resched briefly sti+
+        # hlt+cli so the timer fires (and any STATE_READY peer runs).
+        kernel_cond_resched()
     return -1
 
 
@@ -1148,6 +1162,8 @@ def tcp_connect(remote_b0: uint8, remote_b1: uint8,
             # ever came back, so this is a timeout, not a refusal.
             tcp_slot_state[slot] = TCP_CLOSED
             return TCP_ERR_TIMEOUT
+        # Preempt-class wedge-fix: see _tcp_prime_arp above.
+        kernel_cond_resched()
     printk1("[tcp] connect timeout on slot=%d\n", slot)
     tcp_slot_state[slot] = TCP_CLOSED
     return TCP_ERR_TIMEOUT
@@ -1197,6 +1213,8 @@ def tcp_send(slot_signed: int32, buf: Ptr[uint8],
         if rtx < 0:
             # Exceeded TCP_MAX_RETRIES — peer has gone dark.
             return -1
+        # Preempt-class wedge-fix: see _tcp_prime_arp above.
+        kernel_cond_resched()
     # Even with retransmit we couldn't get an ACK. Return -1 so the
     # caller can distinguish a lost segment from a clean send.
     printk1("[tcp] send ACK timeout slot=%d\n", slot)
@@ -1289,6 +1307,12 @@ def tcp_recv(slot_signed: int32, buf: Ptr[uint8],
         # Wall-clock deadline check off the free-running PIT counter.
         if pit_monotonic_us() - start_us >= budget_us:
             return 0                      # treat timeout-with-no-data as 0
+        # Preempt-class fairness: even though pit_monotonic_us advances
+        # under IF=0 (so we don't WEDGE here the way the get_jiffies
+        # loops do), this poll would still monopolise the CPU and
+        # starve any STATE_READY peer. kernel_cond_resched gives the
+        # peer a window to run.
+        kernel_cond_resched()
 
 
 def tcp_slot_at_eof(slot_signed: int32) -> int32:
@@ -1554,6 +1578,13 @@ def tcp_accept(listener_slot: int32, timeout_jiffies: uint64) -> int32:
                         printk1("[tcp] accept returning slot=%d\n", i)
                         return cast[int32](i)
             i = i + 1
+        # Preempt-class wedge-fix. This is THE site sshd's net_accept
+        # hits: without kernel_cond_resched a sshd `while served < 64`
+        # accept-loop pins the CPU forever — jiffies frozen under
+        # IF=0, hamsh (PID 1) never gets scheduled and the
+        # `[hamsh-alive]` heartbeat never appears. The sti+hlt+cli
+        # window in kernel_cond_resched is what unwedges it.
+        kernel_cond_resched()
     printk1("[tcp] accept timeout on listener slot=%d\n", lslot)
     return -1
 

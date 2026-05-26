@@ -77,6 +77,9 @@ from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.ip import ip_send, ip_csum16, IPPROTO_ICMP
 from arch.x86.kernel.time import get_jiffies, pit_monotonic_us
 from drivers.net.virtio_net import virtio_net_poll
+# kernel_cond_resched: cooperative preempt point inside kernel poll
+# loops. See drivers/net/tcp.ad and kernel/sched/core.ad.
+from kernel.sched.core import kernel_cond_resched
 
 
 # ICMP types we handle.
@@ -457,6 +460,9 @@ def icmp_conn_recv(slot: int32, buf: Ptr[uint8], max_len: uint64,
             return cast[int64](n)
         if pit_monotonic_us() - start_us >= budget_us:
             return -11
+        # Preempt-class fairness point inside the kernel poll loop.
+        # See drivers/net/tcp.ad::tcp_recv for the rationale.
+        kernel_cond_resched()
 
 
 # Accessors for the /net/icmp status / local / remote info files.

@@ -30,6 +30,9 @@ from kernel.printk.printk import printk0, printk1, printk2
 from drivers.net.ip import ip_send, IPPROTO_UDP
 from drivers.net.virtio_net import virtio_net_poll
 from arch.x86.kernel.time import pit_monotonic_us
+# kernel_cond_resched: cooperative preempt point inside kernel poll
+# loops. See drivers/net/tcp.ad and kernel/sched/core.ad.
+from kernel.sched.core import kernel_cond_resched
 
 
 # Reserved port numbers we care about. DHCP server speaks on 67,
@@ -418,6 +421,9 @@ def udp_socket_recvfrom(slot_signed: int32, buf: Ptr[uint8],
             return cast[int64](n)
         if pit_monotonic_us() - start_us >= budget_us:
             return -11                               # EAGAIN — no datagram
+        # Preempt-class fairness point inside the kernel poll loop.
+        # See drivers/net/tcp.ad::tcp_recv for the rationale.
+        kernel_cond_resched()
 
 
 def udp_socket_recv_pending(slot_signed: int32) -> int32:

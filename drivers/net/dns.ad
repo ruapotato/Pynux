@@ -92,6 +92,10 @@ from drivers.net.eth import eth_tx, eth_get_mac
 from drivers.net.arp import arp_lookup
 from drivers.net.tcp import tcp_connect, tcp_send, tcp_recv, tcp_close
 from arch.x86.kernel.time import get_jiffies
+# kernel_cond_resched: wedge-class fix for `while get_jiffies() <
+# deadline:` loops that run from userland-syscall context with IF=0.
+# See drivers/net/tcp.ad / kernel/sched/core.ad for the full story.
+from kernel.sched.core import kernel_cond_resched
 
 
 # UDP server-side port — DNS speaks on 53. The ephemeral client-side
@@ -650,6 +654,10 @@ def _dns_prime_arp() -> int32:
         if arp_lookup(addr_ptr) != cast[Ptr[uint8]](0):
             dns_server_arp_ok = 1
             return 0
+        # Preempt-class wedge-fix: under IF=0 the timer can't fire to
+        # bump jiffies, so the loop never reaches the deadline. See
+        # drivers/net/tcp.ad::_tcp_prime_arp for the canonical pattern.
+        kernel_cond_resched()
     return -1
 
 
@@ -1221,6 +1229,8 @@ def _dns_query(hostname: Ptr[uint8], qtype: uint16,
                     dns_slot_used[slot] = 0
                     return -1
             return cast[int32](slot)
+        # Preempt-class wedge-fix: see _dns_prime_arp above.
+        kernel_cond_resched()
     dns_slot_used[slot] = 0
     printk0("[dns] timeout\n")
     return -1

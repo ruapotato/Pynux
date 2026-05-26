@@ -1699,6 +1699,59 @@ def yield_to_others():
     signal_check_and_handle()
 
 
+def kernel_cond_resched():
+    # Kernel-side cooperative-reschedule point. The wedge-class fix.
+    #
+    # PROBLEM: SYSCALL entry clears EFLAGS.IF (IA32_FMASK=0x0200). For
+    # the whole duration of a syscall, CPU interrupts are masked: the
+    # LAPIC timer cannot fire, `jiffies` is frozen, and a kernel busy-
+    # poll of the shape `while get_jiffies() < deadline: poll_one()`
+    # degenerates into `while True`. One such loop in a kernel-side
+    # accept (e.g. drivers/net/tcp.ad::tcp_accept) pins the CPU
+    # forever — every other task is STATE_READY but can never run.
+    # The hamsh heartbeat regression is a symptom of exactly this.
+    #
+    # FIX: any kernel loop that polls in a syscall context calls
+    # kernel_cond_resched() inside its body. We briefly enable
+    # interrupts (sti), halt until the next interrupt (hlt — which
+    # the periodic LAPIC timer will satisfy within at most 10 ms at
+    # HZ=100), then disable interrupts again. During the IRQ-open
+    # window:
+    #   * the LAPIC timer fires → timer_interrupt() bumps `jiffies`
+    #     and ages the per-task quantum (preempt_tick — even though
+    #     it returns 0 for from_user=0 and does not switch from the
+    #     ISR, the quantum-tick still happens),
+    #   * the UART RX FIFO drains, virtio-net IRQs land in their
+    #     ring handlers, etc — i.e. EVERYTHING that needs IF=1 to
+    #     make progress, makes progress.
+    # After we cli again we OPTIONALLY rotate to a runnable peer via
+    # schedule() — Linux's cond_resched() semantics. This is the
+    # part that makes a kernel busy-spin preemptive: a syscall now
+    # cannot starve a STATE_READY peer indefinitely.
+    #
+    # Safety:
+    #   * MUST be called only when no kernel spinlock is held. Hamnix
+    #     is UP and has no kernel spinlocks today; if/when SMP lands
+    #     this contract becomes load-bearing.
+    #   * Caller MUST be prepared for IRQ side effects: jiffies has
+    #     advanced, signals may have been posted, virtio rings may
+    #     have moved. Most kernel pollers already cope with all three
+    #     (that's the whole point of the poll loop).
+    #   * Caller MUST be prepared for schedule() to return after any
+    #     length of wall-clock — the task may have been off-CPU for
+    #     other slices. Loop conditions that read get_jiffies() / the
+    #     PIT counter / TSC handle this naturally.
+    local_irq_enable()
+    asm_volatile("hlt")
+    local_irq_disable()
+    # Rotate if there's any STATE_READY peer. schedule() is a no-op
+    # when nobody else wants the CPU, so the cost in the single-task
+    # case is one branch + one _another_task_ready scan (NTASKS=16
+    # array probes — comfortably cheap).
+    if _another_task_ready() != 0:
+        schedule()
+
+
 # --- §3: signals -------------------------------------------------
 #
 # Bitmap-based signal subsystem. Every TaskStruct carries:

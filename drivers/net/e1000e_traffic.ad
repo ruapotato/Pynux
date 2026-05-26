@@ -63,6 +63,8 @@ from drivers.net.udp import (
 from drivers.net.dns import dns_lookup
 from drivers.net.arp import arp_lookup, arp_send_request
 from arch.x86.kernel.time import get_jiffies
+# kernel_cond_resched: wedge-class fix. See drivers/net/tcp.ad.
+from kernel.sched.core import kernel_cond_resched
 from fs.cpio import cpio_init, initramfs_entry_count, initramfs_entry_name
 
 extern def cpu_relax()
@@ -133,6 +135,11 @@ def _e1k_prime_arp_for_gateway() -> int32:
         if arp_lookup(gw_ptr) != cast[Ptr[uint8]](0):
             printk0("[traffic_test] ARP prime: 10.0.2.2 -> entry live\n")
             return 0
+        # Preempt-class wedge-fix: see drivers/net/tcp.ad::_tcp_prime_arp.
+        # This loop comment claims "IRQs enabled", but it's called from
+        # userland-syscall context where IF=0; cpu_relax just pauses
+        # without unmasking. kernel_cond_resched opens the IRQ window.
+        kernel_cond_resched()
     printk0("[traffic_test] ARP prime: 10.0.2.2 -> no reply within 200 ms\n")
     return -1
 

@@ -2064,7 +2064,12 @@ def main() -> int32:
     while served < 64:
         cfd: int32 = net_accept(lfd)
         if cfd < 0:
-            # accept timed out with no client — try again.
+            # accept timed out with no client — try again. Yield so the
+            # interactive shell (hamsh PID 1) and any other STATE_READY
+            # task get CPU time between retries; even with preemption
+            # working (M-series scheduler fix), this is correct hygiene
+            # and keeps sshd's CPU footprint near zero when idle.
+            sys_yield()
             continue
         conn_fd[0] = cfd
         _log("[sshd] accepted SSH connection\n")
