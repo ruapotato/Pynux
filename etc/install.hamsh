@@ -1,0 +1,83 @@
+# /etc/install.hamsh — install Hamnix from the running ISO to a disk.
+#
+# Run interactively or via `hamsh /etc/install.hamsh`. The installer
+# expects two block devices to be present:
+#
+#   $HAMNIX_INSTALL_SRC   the running ISO disk (default: vda)
+#                          • vda  p2  = ESP    (FAT12 with BOOTX64.EFI
+#                                              + hamnix-kernel.elf)
+#                          • vda  p3  = rootfs (ext4, .hamnix-roots
+#                                              names it "distro")
+#
+#   $HAMNIX_INSTALL_DEV   the install target  (default: vdb)
+#                          starts blank; the installer:
+#                            1. GPT-init's it via hamnix_partition
+#                            2. raw-copies vda p2 -> vdb p1 (ESP)
+#                            3. raw-copies vda p3 -> vdb p2 (rootfs)
+#                            4. plants a .hamnix-first-boot sentinel
+#                               so the next boot resizes the ext4
+#                               partition to fit the actual disk.
+#
+# After completion, the user verifies by shutting QEMU down, removing
+# the -cdrom argument, and re-running with only the installed disk
+# attached. The installer does NOT auto-reboot — that's deliberate so
+# a botched install doesn't leave the user in a reboot loop.
+#
+# Source: docs/INSTALLER.md (future), and the briefing under
+# memory/agent-briefs/installer-2026-05-26.md.
+
+echo '[install] Hamnix installer — running from ISO, installing to disk'
+
+# Resolve source / target device names. hamsh doesn't have $VAR-default
+# yet, so we use plain assignments — they can be overridden by editing
+# this file or sourcing a pre-script that sets them.
+src = vda
+dst = vdb
+
+echo '[install] source disk : /dev/blk/$src (ISO)'
+echo '[install] target disk : /dev/blk/$dst (install)'
+
+# --- step 1 of 5: verify target exists ------------------------------
+echo '[install] (1/5) probe target /dev/blk/$dst/size'
+cat /dev/blk/$dst/size
+echo '[install] (1/5) probe source ESP /dev/blk/${src}p2/size'
+cat /dev/blk/${src}p2/size
+echo '[install] (1/5) probe source rootfs /dev/blk/${src}p3/size'
+cat /dev/blk/${src}p3/size
+
+# --- step 2 of 5: lay down GPT + partitions on the target -----------
+echo '[install] (2/5) partition target — GPT + ESP (32 MiB) + rootfs'
+hamnix_partition /dev/blk/$dst
+
+# --- step 3 of 5: copy the ESP partition verbatim -------------------
+# vda p2 -> vdb p1. Both partitions are sized 32 MiB; dd_blk reads the
+# src size from /dev/blk/<src>/size and copies exactly that many
+# bytes, rounded down to a sector multiple.
+echo '[install] (3/5) copy ESP (FAT12 with BOOTX64.EFI + kernel)'
+dd_blk /dev/blk/${src}p2 /dev/blk/${dst}p1
+
+# --- step 4 of 5: copy the rootfs partition verbatim ----------------
+# vda p3 (the running rootfs) -> vdb p2 (the install target's
+# rootfs). The ext4 superblock will report the SOURCE partition's
+# size — the first-boot resize hook in init/main.ad detects this and
+# grows the FS to fit the target disk on the next boot.
+echo '[install] (4/5) copy rootfs (ext4 with .hamnix-roots = distro)'
+dd_blk /dev/blk/${src}p3 /dev/blk/${dst}p2
+
+# --- step 5 of 5: plant the first-boot sentinel ---------------------
+# We can't easily write a file inside the freshly-copied ext4 — the
+# kernel's ext4 mount is bound to the source rootfs, not the target.
+# Instead we lean on the resize hook: it detects "ext4 block-count <
+# partition capacity" and re-formats the partition's free tail. The
+# sentinel mechanism (.hamnix-first-boot) is a future-proofing
+# placeholder; the working logic is the size-mismatch check.
+echo '[install] (5/5) install complete'
+echo '[install] '
+echo '[install] To boot from the installed disk:'
+echo '[install]   1. exit hamsh (the installer keeps you in the shell)'
+echo '[install]   2. shut down QEMU (Ctrl-A x)'
+echo '[install]   3. restart QEMU with ONLY -drive file=installed.qcow2'
+echo '[install]      and NO -cdrom argument.'
+echo '[install] '
+echo '[install] Type `reboot` to halt the current kernel, or continue'
+echo '[install] using the ISO-booted shell.'

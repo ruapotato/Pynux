@@ -147,3 +147,4 @@ build_adder_user preempt_demo         # preemption test: spawns the hog, proves 
 build_adder_user mkfs_ext4            # installer: format a /dev/blk/<dev> as ext4 (via /ctl)
 build_adder_user mkfs_fat             # installer: format a /dev/blk/<dev> as FAT (via /ctl; stub)
 build_adder_user hamnix_partition     # installer: GPT init + ESP + rootfs mkpart on /dev/blk/<dev>
+build_adder_user dd_blk               # installer: sector-aligned /dev/blk/SRC -> /dev/blk/DST copy
