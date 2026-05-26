@@ -327,22 +327,31 @@ WIDE_ESP_IMG="$PATCH_TMP/efi_wide.img"
 #   Verified empirically: a 4 MB FAT16 ESP fails with "Not Found"; a
 #   4 MB FAT12 ESP with the same contents succeeds and "[hamnix] EFI
 #   entry reached" appears on the serial console.
-# WHY -c 64 (32 KB clusters): FAT12 has only 4084 usable clusters, so
-#   at 64 MB the cluster size must be large enough to stay under that
-#   ceiling — 64 MB / 32 KB = 2048 clusters, comfortably FAT12. (At the
-#   earlier -c 32 / 16 KB cluster size, 64 MB / 16 KB = 4096 clusters
-#   would slip JUST over the 4084 limit and mformat would silently
-#   produce a FAT16 volume that OVMF rejects.) Without an explicit -c,
-#   mformat would also pick small clusters and produce FAT16.
-# WHY 64 MB (was 24): the kernel grew past 24 MB (elf64-x86-64,
-#   higher-half, ko-loader, network/USB/block drivers folded in) and
-#   mcopy started reporting "Disk full" when staging it into the ESP.
-WIDE_ESP_SIZE_MB=64
+# WHY -c 128 (64 KB clusters, mtools' max): FAT12 has only 4084 usable
+#   clusters, so at our chosen size the cluster size must keep us
+#   under that ceiling — 128 MB / 64 KB = 2048 clusters, comfortably
+#   FAT12. We can't go larger than -c 128 (mformat rejects -c 256 as
+#   out-of-range; 128 sectors * 512 B = 64 KiB is the cluster ceiling).
+#   Therefore the true ESP ceiling under FAT12 is ~250 MB (4084 * 64 KB).
+#   OVMF rejects FAT16/FAT32 so we can't escape that bound — see the
+#   rootfs-on-separate-partition note below.
+# WHY 128 MB (was 64): the kernel grew to ~86 MB after real Debian
+#   apt/dpkg staging landed default-on (HAMNIX_DEFAULT_REAL_DEBIAN
+#   defaults to 1 per user direction 2026-05-26). 128 MB ESP holds
+#   the current kernel ELF (~86 MB) with ~40 MB headroom.
+# ROOTFS-ON-SEPARATE-PARTITION (future): the kernel ELF embedding the
+#   whole initramfs hits the FAT12 ~250 MB ceiling fast as we add more
+#   distro content. Linux live USBs solve this by laying a tiny EFI
+#   partition (kernel only) plus a large rootfs partition (ext4 or
+#   squashfs) on the same medium; the kernel mounts the rootfs at boot.
+#   When Hamnix wants 1 GB+ of Debian inside the namespace, that's the
+#   right next move — not bigger ESPs.
+WIDE_ESP_SIZE_MB=128
 WIDE_ESP_SECTORS=$(( WIDE_ESP_SIZE_MB * 1024 * 1024 / 512 ))
 dd if=/dev/zero of="$WIDE_ESP_IMG" bs=1M count="$WIDE_ESP_SIZE_MB" status=none
 # Geometry: -h 64 -s 32 -t <tracks>. Each track = 32*512 = 16 KB.
-# For 64 MB total: 64*1024*1024 / 16384 = 4096 tracks.
-mformat -i "$WIDE_ESP_IMG" -h 64 -s 32 -c 64 \
+# For 128 MB total: 128*1024*1024 / 16384 = 8192 tracks.
+mformat -i "$WIDE_ESP_IMG" -h 64 -s 32 -c 128 \
         -t $(( WIDE_ESP_SIZE_MB * 64 )) -v HAMNIX ::
 mmd -i "$WIDE_ESP_IMG" "::/EFI"
 mmd -i "$WIDE_ESP_IMG" "::/EFI/BOOT"

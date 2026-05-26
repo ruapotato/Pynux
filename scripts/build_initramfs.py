@@ -902,7 +902,11 @@ def build_archive() -> bytes:
     # `ldd /usr/bin/{apt-get,dpkg,dpkg-deb}` plus the /etc files apt
     # reads at startup, plus the ld.so + libc pair every dynamic
     # binary needs.
-    real_debian_raw = os.environ.get("HAMNIX_DEFAULT_REAL_DEBIAN", "0")
+    # HAMNIX_DEFAULT_REAL_DEBIAN defaults to "1" (real Debian apt/dpkg
+    # staged). Set "0"/"off"/"no" to fall back to the busybox-only fixture
+    # (smaller ISO, no real-apt). Per user direction 2026-05-26: Hamnix
+    # is meant to ship as a real distro — real Debian is the default.
+    real_debian_raw = os.environ.get("HAMNIX_DEFAULT_REAL_DEBIAN", "1")
     if real_debian_raw not in ("0", "", "off", "no"):
         minbase_rootfs = (here / "tests" / "distros" / "debian-minbase"
                           / "rootfs")
