@@ -82,7 +82,7 @@ need_tool sha256sum
 # a kernel built with the legacy asm /init.elf (which exec'd /hello)
 # would boot on real hardware then halt because /hello no longer
 # exists. The ISO is the user-facing artifact; treat it as fresh.
-echo "[build_iso] Rebuilding userland + initramfs + kernel ELF."
+echo "[build_iso] Rebuilding userland + initramfs + rootfs + kernel ELF."
 bash scripts/build_user.sh
 bash scripts/build_modules.sh
 # Use the DEFAULT /init (build/user/init.elf — the shim built by
@@ -93,6 +93,16 @@ bash scripts/build_modules.sh
 # real-hardware boot path. Test scripts that need a different first
 # task override /init with their own INIT_ELF fixture.
 python3 scripts/build_initramfs.py
+
+# Build the ext4 rootfs image that will become partition 3 of the
+# ISO (live-USB-style layout, see docs/rootfs_partition.md). The
+# bulk of distro content — real Debian apt/dpkg, busybox, userland
+# binaries — lives in the rootfs image; the cpio embedded above is
+# kept SMALL (init + hamsh + framework .kos + /etc/rc.boot only).
+# This is what lifts us past the FAT12 ~250 MB ESP ceiling and lets
+# Hamnix carry 1 GB+ of distro content in the namespace.
+HAMNIX_ROOTFS_IMG="${HAMNIX_ROOTFS_IMG:-build/hamnix-rootfs.img}"
+HAMNIX_ROOTFS_OUT="$HAMNIX_ROOTFS_IMG" python3 scripts/build_rootfs_img.py
 
 # Stale/partial-intermediate guard. Belt-and-braces for the
 # recurring "multiboot1 magic not found" false failure (the primary
@@ -423,8 +433,16 @@ cp "$HAMNIX_EFI_STUB" "$GRUB_TREE/efi/boot/bootx64.efi"
 # `-efi-boot-part --efi-boot-image` chain).
 cp "$WIDE_ESP_IMG" "$GRUB_TREE/efi.img"
 
-echo "[build_iso] Stage 2: xorriso direct build with wide ESP"
+echo "[build_iso] Stage 2: xorriso direct build with wide ESP + rootfs ext4"
 rm -f "$HAMNIX_ISO_OUT"
+# Why -append_partition 3 0x83 <rootfs.img>:
+#   * Partition 1: BIOS boot (existing, GPT-resident hybrid MBR)
+#   * Partition 2: ESP (kernel + EFI stub, FAT12 via --efi-boot above)
+#   * Partition 3: ext4 rootfs (NEW — Linux native, type 0x83)
+# OVMF's GPT walker exposes all three to the firmware, but the kernel
+# itself just needs the ext4 magic on partition 3 — the kernel scans
+# every registered block device's superblock area at boot and mounts
+# the first one carrying 0xEF53 at byte offset 1024.
 xorriso -as mkisofs \
         -graft-points \
         -b boot/grub/i386-pc/eltorito.img \
@@ -437,6 +455,7 @@ xorriso -as mkisofs \
         --efi-boot efi.img \
         -efi-boot-part --efi-boot-image \
         --protective-msdos-label \
+        -append_partition 3 0x83 "$HAMNIX_ROOTFS_IMG" \
         -o "$HAMNIX_ISO_OUT" \
         -r "$GRUB_TREE" \
         --sort-weight 0 / \
@@ -497,8 +516,43 @@ fi
 echo "[build_iso]   GPT ESP \\EFI\\BOOT\\BOOTX64.EFI : $(stat -c%s "$VERIFY_TMP/esp_bootx64.efi") bytes, sha matches stub"
 echo "[build_iso]   GPT ESP \\hamnix-kernel.elf    : $(stat -c%s "$VERIFY_TMP/esp_kernel.elf") bytes, sha matches kernel"
 
+# Verify the rootfs partition lives in the GPT at partition 3 and
+# carries an ext4 superblock. parted's per-partition flags don't
+# mark ext4 specially, so we just confirm a 3rd partition exists
+# beyond the ESP and that its first 1 KiB+ contains the 0xEF53 magic
+# at offset 1024 (byte 0x438 of the partition).
+ROOTFS_INFO=$(/sbin/parted "$HAMNIX_ISO_OUT" unit s print 2>/dev/null \
+              | awk '/^ *3 +/ { print }')
+if [ -z "$ROOTFS_INFO" ]; then
+    echo "[build_iso] WARNING: no partition 3 in GPT (rootfs missing?)" >&2
+    /sbin/parted "$HAMNIX_ISO_OUT" unit s print >&2 || true
+else
+    ROOTFS_START=$(echo "$ROOTFS_INFO" | awk '{print $2}' | tr -d 's')
+    # Read 4 bytes at offset 1024 within the partition (sector 2,
+    # byte 0). On an ext4 the bytes at offset 0x438..0x439 are the
+    # little-endian magic 0xEF53.
+    MAGIC_HEX=$(dd if="$HAMNIX_ISO_OUT" bs=512 \
+                   skip=$((ROOTFS_START + 2)) count=1 status=none \
+                | od -An -tx1 -N1024 \
+                | tr -s ' \n' ' ' \
+                | awk '{print $0}' \
+                | cut -c2280-2285)
+    # (Cheaper: just dump 2 bytes at exact offset.)
+    MAGIC_BYTES=$(dd if="$HAMNIX_ISO_OUT" bs=1 \
+                     skip=$(((ROOTFS_START * 512) + 1024 + 0x38)) \
+                     count=2 status=none 2>/dev/null \
+                  | od -An -tx1 | tr -d ' \n')
+    if [ "$MAGIC_BYTES" = "53ef" ]; then
+        echo "[build_iso]   rootfs partition 3 at sector $ROOTFS_START: ext4 magic 0xEF53 OK"
+    else
+        echo "[build_iso] WARNING: rootfs partition 3 at sector $ROOTFS_START: " \
+             "magic bytes='$MAGIC_BYTES' (expected '53ef')" >&2
+    fi
+fi
+
 ISO_BYTES=$(stat -c%s "$HAMNIX_ISO_OUT")
 echo "[build_iso] Done: $HAMNIX_ISO_OUT  ($ISO_BYTES bytes)"
 echo "[build_iso] BIOS path: GRUB + multiboot1 (unchanged)."
 echo "[build_iso] UEFI path: native PE/COFF stub (no GRUB-EFI in the boot path)."
+echo "[build_iso] Three partitions: BIOS boot + ESP (kernel) + ext4 rootfs."
 echo "[build_iso] Test with:  bash scripts/test_iso_qemu.sh"

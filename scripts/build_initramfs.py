@@ -560,6 +560,23 @@ def build_archive() -> bytes:
     blob = b""
     here = Path(__file__).resolve().parent.parent
 
+    # HAMNIX_CPIO_LEAN=1 — strip everything from the cpio that the
+    # rootfs partition (build/hamnix-rootfs.img, see
+    # scripts/build_rootfs_img.py + docs/rootfs_partition.md) carries
+    # instead. Used by scripts/build_iso.sh on the live-USB-style ISO
+    # path: the kernel ELF embeds only what's load-bearing BEFORE the
+    # block layer brings the rootfs partition online. Everything else
+    # (the real Debian apt/dpkg slice, the busybox runtime shell, the
+    # ~90 userland Adder binaries) lives on the ext4 partition.
+    #
+    # When unset (the default), every test that drives `-kernel ELF`
+    # directly without attaching the rootfs.img keeps working: the
+    # fat-cpio behaviour is preserved, including the in-cpio real
+    # Debian apt/dpkg closure that test_linux_apt_install.sh asserts
+    # against. Set HAMNIX_CPIO_LEAN=1 ONLY when the rootfs.img will
+    # be reachable through the block layer at boot.
+    cpio_lean = os.environ.get("HAMNIX_CPIO_LEAN", "0") == "1"
+
     # If INIT_ELF=<path> is set, embed that file as /init (overriding
     # whatever ELF in build/user/ would otherwise have grabbed the
     # /init slot). Lets us point /init at e.g. a Hamnix-compiled
@@ -624,8 +641,28 @@ def build_archive() -> bytes:
     # Exception: init.elf is the kernel's boot entrypoint and
     # always goes to /init (unless overridden via INIT_ELF above).
     # Everything else is found by hamsh's PATH walker.
+    #
+    # When HAMNIX_CPIO_LEAN is set, the cpio keeps ONLY the binaries
+    # the boot path needs before the rootfs partition mounts (init,
+    # hamsh, distrofs, and any binary the rc references early).
+    # Everything else is staged into the rootfs.img instead — see
+    # CPIO_USER_KEEP in scripts/build_rootfs_img.py for the symmetry.
+    CPIO_LEAN_USER_KEEP = {
+        "init.elf",
+        "hamsh.elf",
+        "distrofs.elf",
+        # Below: small binaries hamsh/rc spawns early — `motd` is
+        # spawned at top of rc.boot; `sshd` is a boot service; `ed`
+        # is the framework editor that should be available on the
+        # serial console even without rootfs mounted.
+        "motd.elf",
+        "sshd.elf",
+        "ed.elf",
+        "ifconfig.elf",
+    }
     user_dir = here / "build" / "user"
     if user_dir.is_dir():
+        skipped_lean = 0
         for elf in sorted(user_dir.glob("*.elf")):
             if init_override_real is not None:
                 if elf.resolve() == init_override_real:
@@ -640,10 +677,16 @@ def build_archive() -> bytes:
                 print(f"  embedded /init ({len(data)} bytes from "
                       f"build/user/{elf.name})")
                 continue
+            if cpio_lean and elf.name not in CPIO_LEAN_USER_KEEP:
+                skipped_lean += 1
+                continue
             bin_name = "/bin/" + elf.stem
             blob += cpio_entry(bin_name, data)
             print(f"  embedded {bin_name} ({len(data)} bytes from "
                   f"build/user/{elf.name})")
+        if cpio_lean and skipped_lean:
+            print(f"  [LEAN] skipped {skipped_lean} userland binaries "
+                  f"(staged into rootfs.img instead)")
 
     # HAMNIX_HAMSH_RC=<path>: when set, replace etc/hamsh.rc (or plant
     # one if absent) with the file at <path>. Used by tests that drive
@@ -726,7 +769,11 @@ def build_archive() -> bytes:
     # busybox bytes. One header per applet vs ~1 MB of duplicate
     # data per applet — ~15 KB total overhead instead of ~15 MB.
     bb_src = here / "tests" / "u-binary" / "u_busybox_musl"
-    if bb_src.is_file():
+    if cpio_lean:
+        print(f"  [LEAN] skipping in-cpio busybox staging — Linux "
+              f"runtime shell lives at /var/lib/distros/default/bin/"
+              f"busybox on rootfs.img")
+    elif bb_src.is_file():
         bb_bytes = bb_src.read_bytes()
         bb_target = "/var/lib/distros/default/bin/busybox"
         blob += cpio_entry(bb_target, bb_bytes, mode=0o100755)
@@ -907,7 +954,15 @@ def build_archive() -> bytes:
     # (smaller ISO, no real-apt). Per user direction 2026-05-26: Hamnix
     # is meant to ship as a real distro — real Debian is the default.
     real_debian_raw = os.environ.get("HAMNIX_DEFAULT_REAL_DEBIAN", "1")
-    if real_debian_raw not in ("0", "", "off", "no"):
+    if cpio_lean:
+        # LEAN mode: real Debian closure is staged into rootfs.img by
+        # scripts/build_rootfs_img.py (which honours
+        # HAMNIX_DEFAULT_REAL_DEBIAN with the same default-on semantics).
+        # Skip the in-cpio embed entirely to keep the kernel ELF small.
+        print(f"  [LEAN] real Debian apt/dpkg slice: skipped from cpio "
+              f"(staged into rootfs.img instead, "
+              f"HAMNIX_DEFAULT_REAL_DEBIAN={real_debian_raw})")
+    elif real_debian_raw not in ("0", "", "off", "no"):
         minbase_rootfs = (here / "tests" / "distros" / "debian-minbase"
                           / "rootfs")
         if not minbase_rootfs.is_dir():
