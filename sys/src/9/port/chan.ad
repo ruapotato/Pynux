@@ -447,6 +447,26 @@ def name_lookup_at(word: Ptr[uint8], pos: int32) -> uint64:
     return name_table[iu].stack[cast[uint64](j)].chan_ref
 
 
+def name_lookup_dir(word: Ptr[uint8], pos: int32,
+                    out_buf: Ptr[uint8], cap: uint64) -> int32:
+    # Copy the sentinel-declared relpath ('dir' field) for the entry
+    # at position `pos` (1 = top) into out_buf. Returns 0 on hit,
+    # -1 on miss. Used by Phase 6's chan_resolve_prefix / vfs_open
+    # `#<word>` arm to compute the on-disk subpath.
+    if pos < 1 or cap == 0:
+        return -1
+    idx: int32 = _name_find_slot(word)
+    if idx < 0:
+        return -1
+    iu: uint64 = cast[uint64](idx)
+    d: int32 = name_table[iu].depth
+    if pos > d:
+        return -1
+    j: int32 = d - pos
+    _name_str_copy(out_buf, &name_table[iu].stack[cast[uint64](j)].dir[0], cap)
+    return 0
+
+
 def name_lookup_partuuid(word: Ptr[uint8], pos: int32,
                           out_buf: Ptr[uint8], cap: uint64) -> int32:
     # Companion to name_lookup_at: copy the partuuid string for the

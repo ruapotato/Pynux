@@ -93,6 +93,10 @@ from sys.src.port9.port.devproc import (
 from sys.src.port9.port.chan import (
     chan_resolve_prefix, chan_find_srv_prefix,
     pgrp_current,
+    # Phase 6: long-form `#<word>` device names route through the
+    # named-stack and by-id alias tables.
+    name_lookup, name_lookup_at, name_lookup_dir,
+    byid_lookup,
 )
 # HAMSH §7: the `#d` fd device. /fd/N is a name in the calling
 # process's Pgrp namespace; an `#d/N` open installs an FD_DEVFD_MARK
@@ -843,6 +847,195 @@ def _open_srv_name(name: Ptr[char]) -> int32:
     return new_fd
 
 
+# Phase 6 — `#<word>` long-form name dispatch helpers.
+
+def _is_lower_letter(c: int32) -> int32:
+    if c >= 97 and c <= 122:
+        return 1
+    return 0
+
+
+def _is_digit_ch(c: int32) -> int32:
+    if c >= 48 and c <= 57:
+        return 1
+    return 0
+
+
+def _is_word_continuation(c: int32) -> int32:
+    # Char that can appear AFTER the first letter of a sentinel-shape
+    # name: [a-z0-9-]. Used to detect "this is a multi-char word" vs
+    # "this is one of the legacy single-char built-ins like #c/#p".
+    if _is_lower_letter(c) != 0:
+        return 1
+    if _is_digit_ch(c) != 0:
+        return 1
+    if c == 45:                                  # '-'
+        return 1
+    return 0
+
+
+def _hash_word_extract(name: Ptr[char], out: Ptr[uint8], cap: uint64,
+                       trailing_digits_out: Ptr[int32],
+                       word_end_out: Ptr[uint64]) -> int32:
+    # Given `name` pointing at `#<word>[<N>][/<rest>]`, copy the
+    # alphabetic prefix of word into `out` (NUL-terminated), and
+    # extract any trailing decimal-digit suffix into
+    # trailing_digits_out (0 if none — caller uses 1 for top, N for
+    # positional). `word_end_out` is set to the index in `name` just
+    # past the last word/digit char (where '/' or NUL is expected).
+    # Returns 0 on success, -1 on malformed (e.g., name[1] not a
+    # letter — which the caller should have filtered).
+    if name[1] == 0:
+        return -1
+    if _is_lower_letter(name[1]) == 0:
+        return -1
+    # Walk through the alpha part of the word.
+    i: uint64 = 1
+    o: uint64 = 0
+    while name[i] != 0 and _is_lower_letter(name[i]) != 0 and o + 1 < cap:
+        out[o] = cast[uint8](name[i])
+        o = o + 1
+        i = i + 1
+    # Hyphens belong to the word too — Plan 9 doesn't have them
+    # in built-ins, but our sentinel words allow `apt-cache` etc.
+    # Mid-word hyphens followed by another letter join the same word.
+    while name[i] == 45 and _is_lower_letter(name[i + 1]) != 0 and o + 1 < cap:
+        out[o] = 45
+        o = o + 1
+        i = i + 1
+        while name[i] != 0 and _is_lower_letter(name[i]) != 0 and o + 1 < cap:
+            out[o] = cast[uint8](name[i])
+            o = o + 1
+            i = i + 1
+    out[o] = 0
+    # Now any trailing decimal digits — those become the positional
+    # selector.
+    n: int32 = 0
+    while _is_digit_ch(name[i]) != 0:
+        n = n * 10 + (name[i] - 48)
+        i = i + 1
+    trailing_digits_out[0] = n
+    word_end_out[0] = i
+    return 0
+
+
+def _open_hash_long(name: Ptr[char]) -> int32:
+    # Resolve `#<word>[<N>][/<rest>]` through chan.ad's named-stack
+    # table. Special case: `#by-id/<partuuid>[/<rest>]` goes through
+    # the persistent by-id alias table instead.
+    word_buf: Array[40, uint8]
+    pos: int32 = 0
+    word_end: uint64 = 0
+    if _hash_word_extract(name, &word_buf[0], 40, &pos, &word_end) < 0:
+        return ENOENT
+    # `#by-id` short-circuit.
+    if _hash_is_by_id(&word_buf[0]) != 0:
+        # name[word_end] must be '/', followed by the partuuid.
+        if name[word_end] != 47:
+            return ENOENT
+        return _open_hash_by_id(name, word_end + 1)
+    # Position semantics: no digits → top (pos=1); `#home2` → pos=2.
+    sel: int32 = pos
+    if sel == 0:
+        sel = 1
+    chan_ref: uint64 = name_lookup_at(&word_buf[0], sel)
+    if chan_ref == 0:
+        return ENOENT
+    # Read the sentinel-declared dir for this entry, then route the
+    # open to the on-disk ext4 path `(dir)(rest)`.
+    dir_buf: Array[256, uint8]
+    if name_lookup_dir(&word_buf[0], sel, &dir_buf[0], 256) < 0:
+        return ENOENT
+    return _open_named_subpath(&dir_buf[0], name, word_end)
+
+
+def _hash_is_by_id(word: Ptr[uint8]) -> int32:
+    # NUL-terminated equality with "by-id".
+    lit: Ptr[uint8] = cast[Ptr[uint8]]("by-id")
+    i: uint64 = 0
+    while True:
+        a: uint8 = word[i]
+        b: uint8 = lit[i]
+        if a != b:
+            return 0
+        if a == 0:
+            return 1
+        i = i + 1
+
+
+def _open_hash_by_id(name: Ptr[char], partuuid_start: uint64) -> int32:
+    # Parse `name[partuuid_start..]` up to the next '/' (or NUL) as
+    # the partuuid; look it up in byid_table; route to ext4 with the
+    # remainder.
+    pu_buf: Array[40, uint8]
+    i: uint64 = partuuid_start
+    o: uint64 = 0
+    while name[i] != 0 and name[i] != 47 and o + 1 < 40:
+        pu_buf[o] = cast[uint8](name[i])
+        o = o + 1
+        i = i + 1
+    pu_buf[o] = 0
+    if o == 0:
+        return ENOENT
+    if byid_lookup(&pu_buf[0]) == 0:
+        return ENOENT
+    # The by-id table doesn't carry a sentinel-derived dir prefix
+    # (it's the WHOLE partition). The remainder starts at `i`.
+    empty: Array[2, uint8]
+    empty[0] = 0
+    return _open_named_subpath(&empty[0], name, i)
+
+
+def _open_named_subpath(dir_prefix: Ptr[uint8], name: Ptr[char],
+                        rest_start: uint64) -> int32:
+    # Compose a synthetic `/ext/<dir_prefix>/<rest>` path and call
+    # the existing ext4 reader. This is the simplest pragmatic
+    # Phase 6 implementation: with a single-mount ext4 state the
+    # path resolution already lands on the right partition. Multi-
+    # mount support is a future refactor.
+    scratch: Array[512, uint8]
+    p: uint64 = 0
+    # Plant "/ext".
+    scratch[0] = 47                              # '/'
+    scratch[1] = 101                             # 'e'
+    scratch[2] = 120                             # 'x'
+    scratch[3] = 116                             # 't'
+    p = 4
+    # Append "/<dir_prefix>" if non-empty AND not "." (which means
+    # whole-partition per the sentinel convention).
+    if dir_prefix[0] != 0 and dir_prefix[0] != 46:
+        scratch[p] = 47                          # '/'
+        p = p + 1
+        k: uint64 = 0
+        while dir_prefix[k] != 0 and p + 1 < 512:
+            scratch[p] = dir_prefix[k]
+            p = p + 1
+            k = k + 1
+        # Strip a trailing '/' the sentinel may include (`home/`).
+        if scratch[p - 1] == 47:
+            p = p - 1
+    # Append the remainder of name (after the `#word` segment).
+    if name[rest_start] == 47:
+        # The remainder already has a leading '/'.
+        pass
+    elif name[rest_start] != 0:
+        # Insert a '/' between dir_prefix and the remainder.
+        scratch[p] = 47
+        p = p + 1
+    j: uint64 = rest_start
+    while name[j] != 0 and p + 1 < 512:
+        scratch[p] = cast[uint8](name[j])
+        p = p + 1
+        j = j + 1
+    scratch[p] = 0
+    # For p == 4 (just "/ext" with no remainder, no dir), this is
+    # the partition root. is_ext_path / _open_ext4_read handle the
+    # bare "/ext" case via _open_dir_ext (not done here; we route
+    # to the normal _open_ext4_read which will return ENOENT for
+    # a bare directory in the current code path). Best-effort.
+    return _open_ext4_read(cast[Ptr[char]](&scratch[0]))
+
+
 def _open_hash_alias(name: Ptr[char]) -> int32:
     # V3.5: Plan 9 `#X` device-alias dispatch.
     #
@@ -861,11 +1054,25 @@ def _open_hash_alias(name: Ptr[char]) -> int32:
     #                  conventional mount-point parent; child Pgrps
     #                  populate via `bind '#/' /n` + `mount srv /n/<x>`).
     #
+    # Phase 6 (FS-discovery, docs/rootfs_partition.md): long-form
+    # device names land here too. `#<word>[<N>]/...` where word is a
+    # sentinel-declared name routes through chan.ad's named-stack
+    # (top = #word, position N = #wordN). `#by-id/<partuuid>/...`
+    # routes through the persistent by-id alias table.
+    #
     # Anything else is ENOENT — extending the alphabet is a V4-or-
     # later question (`#e` envdev, `#d` devdir, etc.).
     if name[1] == 0:
         # Bare '#'.
         return ENOENT
+    # Long-form name dispatch: if name[1] is a lowercase letter AND
+    # name[2] is also a [a-z0-9-] (i.e., we have a multi-char word
+    # rather than a single-char built-in), route through the named-
+    # stack. The single-char built-ins ('s', 'p', 'c', '/', 'd')
+    # remain reachable via the legacy arm below — their second char
+    # is either NUL or '/'.
+    if _is_lower_letter(name[1]) != 0 and _is_word_continuation(name[2]) != 0:
+        return _open_hash_long(name)
     letter: int32 = name[1]
     # '#s' family — devsrv.
     if letter == 115:                                  # 's'
