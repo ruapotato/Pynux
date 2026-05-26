@@ -270,7 +270,10 @@ in `%rax`. Functions emit `endbr64` at entry (IBT-ready), frame with
 
 There are no default-argument values, no keyword-only parameters, no
 `*args`/`**kwargs`, and no nested/closure-capturing function
-definitions. Every parameter and return type must be declared.
+definitions. Every parameter and return type must be declared. The
+parser also accepts keyword arguments AT CALL SITES (`foo(a=1, b=2)`)
+but the codegen rejects them with
+`x86: keyword arguments not supported (<fname>)` — call positionally.
 
 ---
 
@@ -485,20 +488,48 @@ Redeclaring an inherited field name in the child is a compile error.
 x: int32 = 42
 ptr: Ptr[int32] = &x         # Address of local x
 val: int32 = *ptr            # Dereference (returns int32)
-
-# Pointer arithmetic — scaled by sizeof(T), like in C
-next_ptr: Ptr[int32] = ptr + 1   # +4 bytes, not +1
 ```
+
+### Pointer arithmetic is UN-scaled — it's byte arithmetic
+
+Unlike C, `Ptr[T] + N` does **not** scale by `sizeof(T)`. The codegen
+emits a plain `addq` of the raw integer to the pointer value, so
+`ptr + 1` advances by **1 byte**, not by `sizeof(T)` bytes. To advance
+by elements, multiply manually OR use the index form below.
+
+```python
+ptr: Ptr[int32] = &x
+ptr_plus_1_byte: Ptr[int32] = ptr + 1         # +1 byte (NOT +4)
+ptr_next_elem:   Ptr[int32] = ptr + 4         # spell out the byte offset
+```
+
+The idiomatic production pattern is to compute the byte offset in
+`uint64` space and cast at the end (see `linux_abi/api_e1000e.ad`,
+`linux_abi/api_pci.ad`):
+
+```python
+head_p: Ptr[uint64] = cast[Ptr[uint64]](skb + 0xc8)
+ts_p:   Ptr[uint32] = cast[Ptr[uint32]](skb + 0xd8)
+```
+
+TODO(adder): the natural C semantics would be element-scaled
+arithmetic; the un-scaled behaviour above is an implementation
+limitation, not a deliberate design. A future codegen pass should
+scale `Ptr[T] + N` by `sizeof(T)` and update all production callers.
 
 ### Indexing through a pointer
 
-`ptr[i]` is sugar for `*(ptr + i)` — the index is scaled by the
-pointee size:
+`ptr[i]` IS scaled by the pointee size — `gen_index_address` multiplies
+the index by `element_size_of(obj)` before adding. So unlike `ptr + i`,
+`ptr[i]` behaves like C:
 
 ```python
 buf: Ptr[uint8] = cast[Ptr[uint8]](kmalloc(N))
-buf[0] = 0xAA                # writes one byte
-buf[1] = 0xBB
+buf[0] = 0xAA                # writes one byte at offset 0
+buf[1] = 0xBB                # writes one byte at offset 1
+
+words: Ptr[uint32] = cast[Ptr[uint32]](kmalloc(N))
+words[1] = 0xCAFEBABE        # writes 4 bytes at byte offset 4
 ```
 
 ### Pointer NULL / numeric pointer
@@ -592,6 +623,16 @@ or writing a `Percpu[T]` global from inside an Adder function emits
 the `%gs:`-prefixed `movq`/`movl`/etc. directly — no helper call,
 no relocation surprises.
 
+`T` must be a scalar (1/2/4/8 bytes). Scalar reads/writes use a
+sized `%gs:offset` `movb/movw/movl/movq`. Aggregate types
+(`Percpu[Array[N, T]]`, `Percpu[SomeStruct]`) have NO working
+accessor: a direct scalar load/store would error at codegen, but
+indexing through an aggregate Percpu global (`buf[0]`) silently
+decays to a plain `leaq buf(%rip)` and the per-CPU base is LOST.
+Keep `Percpu[T]` to scalar types until that path is wired up.
+TODO(adder): `Percpu[Array[N, T]]` / `Percpu[Struct]` aggregates
+should reject at codegen the same way the scalar accessor does.
+
 ---
 
 ## Hardware Intrinsics
@@ -655,8 +696,10 @@ pattern.
 
 ## Inline Assembly
 
-There is no `asm("...")` statement form on the x86_64 backend. Two
-mechanisms cover assembly-level code:
+There is no `asm("...")` expression form on the x86_64 backend: the
+parser accepts `asm("nop")` as an expression but the codegen rejects
+it with `x86: expression AsmExpr not yet supported`. Two mechanisms
+cover assembly-level code:
 
 ### 1. `asm_volatile` for a single instruction
 
@@ -727,8 +770,12 @@ Top-level visibility is by **convention on the symbol name**:
 
 - A top-level name **without** a leading underscore (`kmalloc`,
   `eth_register_tx_hook`, ...) is PUBLIC — it lives in the single
-  global symbol namespace. Two modules defining the same public name
-  is a linker error.
+  global symbol namespace. Two modules defining the same PUBLIC name
+  is a **hard error** at merge time: `compiler/adder.py`'s
+  `merge_programs` prints `Error: duplicate top-level definition '<name>'`
+  and exits with status 1. (The exception is `extern def` of the same
+  name in multiple modules — those are forward references, so silent
+  dedup is harmless.) Rename one of them.
 - A top-level name **with** a leading underscore (`_helper`,
   `_emit_str`, ...) is MODULE-PRIVATE — the merger mangles it to
   `<module_slug>__<name>` so each module's `_helper` is a distinct
@@ -738,13 +785,10 @@ Top-level visibility is by **convention on the symbol name**:
   `from M import _name`, then `_name` is promoted to PUBLIC and
   left un-mangled. Today's cross-module underscore symbols include
   `_add_export`, `__stack_chk_fail/guard/init`, and `_u_errstr`.
+  A name promoted to public this way is again subject to the
+  duplicate-definition rule above — only one module may define it.
 - `extern def` names are never mangled — they refer to real external
   symbols.
-
-Lookup is **linear scan, first match**: when a name is bound public
-in multiple places (e.g. an L-shim layer with multiple `_add_export`
-definitions), the first match wins. Order your declarations
-accordingly.
 
 Regression fixture: `scripts/test_compiler_module_private.sh`.
 
@@ -860,8 +904,8 @@ rejects it.
 | Tuple-unpacking assignment (`a, b = b, a`) | Codegen rejects `TupleUnpackAssign`. | Use a temporary: `tmp = a; a = b; b = tmp`. |
 | Compound assignment (`+=`, `-=`, `*=`, `\|=`, `&=`, `^=`, `<<=`, `>>=`) | Codegen rejects with `x86: compound assignment '+=' not yet supported`. | Spell out: `x = x + 1`. |
 | `global x` / `nonlocal x` statements | Codegen rejects `GlobalStmt`. Not needed anyway — bare names that aren't locals resolve to globals automatically. | Write `counter = counter + 1` without a `global` declaration. |
-| `is` / `is not` operators | Codegen rejects `BinOp.IS` / `BinOp.IS_NOT`. | `==` / `!=`. |
-| `in` operator (membership test) | Parser accepts inside `for ... in`; the binary-op form rejects. | Walk the container by index and compare. |
+| `is` / `is not` operators | Codegen rejects with `binary op BinOp.IS not yet supported` / `BinOp.IS_NOT not yet supported`. | `==` / `!=`. |
+| `in` / `not in` operators (membership test) | Parser accepts inside `for ... in`; the binary-op form rejects (codegen errors with `binary op BinOp.IN not yet supported` / `BinOp.NOT_IN not yet supported`). | Walk the container by index and compare. |
 | `List[T]`, `Dict[K, V]`, `Tuple[A, B]`, `Optional[T]` types | Imply hidden heap. Adder has no general-purpose dynamic container. Each is rejected explicitly at the source location citing the offending var/param/field (commit 25e6657). | `Array[N, T]` for fixed pools; `Ptr[T]` + `kmalloc` for growable storage. |
 | Dict literals `{1: 10}` and dict indexing | No `Dict` type. | A flat `Array[N, KV]` of `class KV { key, value }` plus a linear scan; or a slab-backed hash table built in `.ad`. |
 | List literals / list comprehensions (`[x*2 for x in r]`) | Codegen rejects `ListLiteral` / `ListComprehension`. | Write the `while` loop explicitly into an `Array[N, T]`. |
@@ -873,7 +917,7 @@ rejects it.
 | `match`/`case` statements | The parser accepts the syntax, but codegen does not implement it. No production site uses it. | A chained `if`/`elif`. For wide dispatch on enum/syscall numbers, an `Array[N, Fn[...]]` jump table indexed by the value. |
 | Class methods (`def m(self):`) | Methods imply vtables or per-method name-mangling. Rejected at class-def time with an actionable error (commit 25e6657: used to be silently dropped). | A free function that takes a `Ptr[T]` as its first argument: `def my_method(self: Ptr[T], ...) -> R`. |
 | Decorators on `def` / `class` (`@inline`, `@packed`, ...) | The codegen does not implement any decorator semantics. Rejected at codegen time with an actionable error (commit 25e6657: used to be silently dropped). | Define the class fields in the order and size you want; the codegen lays them out C-ABI style. For `@inline`-style hints there's no replacement — the compiler decides. |
-| `union` declarations | The parser accepts them but no production code defines a union; codegen support is partial. | Type-pun through a `Ptr[T]` cast: `cast[Ptr[uint32]](&u8_array[0])[0]`. |
+| `union` declarations | Parser accepts; codegen rejects at the source location with `x86: top-level UnionDef not yet supported`. Zero production usage. | Type-pun through a `Ptr[T]` cast: `cast[Ptr[uint32]](&u8_array[0])[0]`. |
 | Tuple literals / tuple types as values | `Tuple[A, B]` is not a real codegen type. | Return values by writing through caller-supplied `Ptr[T]` out-parameters, or pack into a struct. |
 | `print()`, `len()`, `input()`, `abs()`, `min()`, `max()`, `ord()`, `chr()`, `sizeof()` | None of these are wired up in codegen as builtins. | `printk0`/`printk1`/... family for printing. For lengths and sizes, hardcode the constant or compute it from the declaration; if a real `sizeof` is needed, expose it as a module-level `SIZEOF_FOO: uint64 = N`. |
 | Default-valued parameters `def f(x=0)` | Rejected at codegen time with an actionable error (commit 25e6657: parser used to accept the default but the call site emitted with %esi holding garbage). | Pass the default explicitly at each call site, or use overload-by-name (`alloc_default()` vs `alloc_sized(n)`). |
@@ -881,6 +925,10 @@ rejects it.
 | `volatile T` type modifier | Parsed but unused in codegen. | Read MMIO through `Ptr[T]` with barriers via `asm_volatile`. |
 | `from M import X as Y` (rename-on-import) | Parser accepts; alias silently lost and only `X` resolves. | Import under the real name: `from M import X`. |
 | `import lib.X as Y` and `lib.X.symbol` qualified access | Adder's import is a flat merge — see *Import System*. | `from lib.X import symbol`; rename on collision. |
+| Struct-init brace syntax `Point{x=10, y=20}` | Parser accepts; codegen rejects with `x86: expression StructInitExpr not yet supported`. | Allocate on stack/heap, then field-assign each member: `p: Point` then `p.x = 10; p.y = 20`. |
+| `asm("instr")` expression form | Parser accepts; codegen rejects with `x86: expression AsmExpr not yet supported`. | Use `asm_volatile("instr")` as a statement — see *Hardware Intrinsics*. |
+| `None` as an expression value | Parser produces `NoneLiteral`; codegen rejects with `x86: expression NoneLiteral not yet supported`. Note that `None` IS legal as the void return type in a `Fn[None, ...]` signature. | Use a typed null pointer: `cast[Ptr[T]](0)`. |
+| Keyword arguments at call sites `foo(a=1, b=2)` | Parser accepts; codegen rejects with `x86: keyword arguments not supported (<fname>)`. | Call positionally: `foo(1, 2)`. |
 
 If you find yourself reaching for any of these, the answer is almost
 always to (a) write the loop / cleanup / error-code path explicitly,
