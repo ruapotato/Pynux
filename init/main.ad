@@ -451,20 +451,17 @@ def mount_rootfs_partition() -> int32:
                         found_slot = si
         s = s + 1
     if found_slot < 0:
-        printk0("[rootfs] no ext4 partition found (init ns "
-                "stays cpio-only; linux ns will have no distrofs)\n")
+        printk0("[rootfs] no ext4 partition found (init ns stays cpio-only)\n")
         return -1
     # Mount via the existing ext4_init API. This populates fs/ext4.ad's
     # mount-state globals (ext4_blockdev_slot, block_size, ...) and
     # lights up the /ext/ path-prefix dispatch in fs/vfs.ad.
     if ext4_init(found_slot) != 0:
-        printk1("[rootfs] ext4_init(slot=%d) FAILED — partition "
-                "looked like ext4 but mount didn't take\n",
+        printk1("[rootfs] ext4_init(slot=%d) FAILED\n",
                 cast[uint64](found_slot))
         return -1
-    printk1("[rootfs] mounted ext4 rootfs at /ext (slot=%d, "
-            "exposed to namespaces as #/distrofs via etc/rc.boot's "
-            "linux ns recipe)\n", cast[uint64](found_slot))
+    printk1("[rootfs] mounted ext4 rootfs at /ext (slot=%d)\n",
+            cast[uint64](found_slot))
     return found_slot
 
 
