@@ -38,12 +38,12 @@ set +e
     sleep 3
     # An ambient bind at the prompt — it must survive into a default
     # `ns { }` overlay but be absent from a `ns clean { }` base.
-    printf 'bind /ambient_mark /tmp\n'
+    printf 'bind /tmp /ambient_mark\n'
     sleep 1
     # Inside a default ns {}: bind something, dump the namespace.
     printf 'echo NS_INSIDE\n'
     sleep 1
-    printf 'ns {\nbind /scoped_mark /tmp\ncat /proc/self/ns\n}\n'
+    printf 'ns {\nbind /tmp /scoped_mark\ncat /proc/self/ns\n}\n'
     sleep 3
     # After the brace: the scoped bind is gone; the ambient bind stays.
     printf 'echo NS_AFTER\n'

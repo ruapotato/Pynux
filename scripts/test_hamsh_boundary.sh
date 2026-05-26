@@ -35,7 +35,7 @@ trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs
 set +e
 (
     sleep 3
-    printf 'sandbox = ns {\nbind /sbx /tmp\n}\n'
+    printf 'sandbox = ns {\nbind /tmp /sbx\n}\n'
     sleep 2
     # DATA crosses: $x is copied into the enter child at fork.
     printf 'x = "hi_value"\n'

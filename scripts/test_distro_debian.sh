@@ -113,11 +113,11 @@ set +e
     #    paths. (Backing-subtree-absent binds record cleanly; only
     #    /etc is exercised here.)
     printf 'debianns = ns {\n'
-    printf 'bind /etc /var/lib/distros/debian-minbase/etc\n'
-    printf 'bind /usr /var/lib/distros/debian-minbase/usr\n'
-    printf 'bind /lib /var/lib/distros/debian-minbase/lib\n'
-    printf 'bind /lib64 /var/lib/distros/debian-minbase/lib64\n'
-    printf 'bind /var /var/lib/distros/debian-minbase/var\n'
+    printf 'bind /var/lib/distros/debian-minbase/etc /etc\n'
+    printf 'bind /var/lib/distros/debian-minbase/usr /usr\n'
+    printf 'bind /var/lib/distros/debian-minbase/lib /lib\n'
+    printf 'bind /var/lib/distros/debian-minbase/lib64 /lib64\n'
+    printf 'bind /var/lib/distros/debian-minbase/var /var\n'
     printf '}\n'
     sleep 2
     # 1) Read /etc/debian_version inside the debian-minbase namespace.

@@ -37,7 +37,7 @@ set +e
 (
     sleep 3
     # Capture a namespace template.
-    printf 'sandbox = ns {\nbind /sbx_mark /tmp\n}\n'
+    printf 'sandbox = ns {\nbind /tmp /sbx_mark\n}\n'
     sleep 2
     # enter — synchronous; the template's bind is applied inside.
     printf 'enter sandbox {\necho ENTER_RAN\ncat /proc/self/ns\n}\n'

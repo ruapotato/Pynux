@@ -123,7 +123,7 @@ set +e
     #     ns and `cat /sentinel_host/debian_version` would read "12.4"
     #     inside the entered child too; under clean isolation the
     #     ambient bind is dropped and the cat fails (no leak).
-    printf 'bind /sentinel_host /var/lib/distros/default/etc\n'
+    printf 'bind /var/lib/distros/default/etc /sentinel_host\n'
     sleep 1
     printf '/bin/echo BANNER-AMBIENT-SENTINEL\n'
     sleep 1

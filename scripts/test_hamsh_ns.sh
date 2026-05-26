@@ -36,7 +36,11 @@ set +e
 (
     sleep 3
     # A builtin bind at the prompt — mutates the AMBIENT namespace.
-    printf 'bind /nsbuiltin /tmp\n'
+    # bind SRC DST: src=/tmp (source data), dst=/nsbuiltin (where the
+    # shell can now find it). After the source-first flip the syscall
+    # gets (new=/nsbuiltin, old=/tmp) — same wire effect as the legacy
+    # `bind /nsbuiltin /tmp` order.
+    printf 'bind /tmp /nsbuiltin\n'
     sleep 1
     # The shell's own /proc/self/ns must now carry that binding.
     printf 'echo NS_AMBIENT_VIEW\n'

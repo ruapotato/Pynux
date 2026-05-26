@@ -164,8 +164,8 @@ set +e
     # then enter it to run the dynamic binary. This is the retired
     # distrorun's job expressed as plain namespace verbs (§0/§11).
     printf 'dyndistns = ns {\n'
-    printf 'bind /lib64 /var/lib/distros/dyndistro/lib64\n'
-    printf 'bind /lib /var/lib/distros/dyndistro/lib\n'
+    printf 'bind /var/lib/distros/dyndistro/lib64 /lib64\n'
+    printf 'bind /var/lib/distros/dyndistro/lib /lib\n'
     printf '}\n'
     sleep 2
     printf 'enter dyndistns {\n/bin/u_dynamic_ns_hello\n}\n'

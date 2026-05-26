@@ -64,20 +64,20 @@ RC_TMP=$(mktemp /tmp/hamsh-rc-linuxns.XXXXXX.rc)
 cat > "$RC_TMP" <<'EOF'
 echo TEST_RC_START
 linux = ns clean {
-    bind / /var/lib/distros/default
+    bind /var/lib/distros/default /
     bind /home /home
-    bind /dev '#c'
-    bind /proc '#p'
-    bind /srv '#s'
-    bind /n '#/'
+    bind '#c' /dev
+    bind '#p' /proc
+    bind '#s' /srv
+    bind '#/' /n
 }
 debian = ns clean {
-    bind / /var/lib/distros/default
+    bind /var/lib/distros/default /
     bind /home /home
-    bind /dev '#c'
-    bind /proc '#p'
-    bind /srv '#s'
-    bind /n '#/'
+    bind '#c' /dev
+    bind '#p' /proc
+    bind '#s' /srv
+    bind '#/' /n
 }
 echo TEST_RC_DONE_DEFINING_NS
 EOF

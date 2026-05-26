@@ -107,7 +107,7 @@ else
     echo "[test_hamsh_mount] MISS: SRV mount label not shown"
     fail=1
 fi
-if echo "$dump1" | grep -E -q 'bind /n/r2 /n/r -a'; then
+if echo "$dump1" | grep -E -q 'bind /n/r /n/r2 -a'; then
     echo "[test_hamsh_mount] OK: union -a flag rendered in /proc/self/ns"
 else
     echo "[test_hamsh_mount] MISS: union flag not rendered"
@@ -123,7 +123,7 @@ if echo "$dump2" | grep -F -q 'as remote'; then
 else
     echo "[test_hamsh_mount] OK: unmount by handle removed the labelled SRV mount"
 fi
-if echo "$dump2" | grep -E -q 'bind /n/r2 /n/r -a'; then
+if echo "$dump2" | grep -E -q 'bind /n/r /n/r2 -a'; then
     echo "[test_hamsh_mount] OK: union sibling survived the targeted unmount"
 else
     echo "[test_hamsh_mount] MISS: union sibling disturbed by unmount-by-handle"
