@@ -238,16 +238,25 @@ _md_path_buf: Array[128, uint8]
 
 def _md_build_path(prefix: Ptr[uint8], pfx_len: uint64,
                    name: Ptr[uint8], name_len: uint64) -> uint64:
-    # Compose "<prefix><name>.ko\0" into _md_path_buf. Returns the
-    # path length (excluding NUL). Caps mod_len so the trailing
+    # Compose "<prefix><normalized-name>.ko\0" into _md_path_buf. Returns
+    # the path length (excluding NUL). Caps mod_len so the trailing
     # ".ko\0" still fits.
+    #
+    # Name normalization mirrors Linux's modprobe: dash '-' in the
+    # dep-table token (modinfo -F depends prints `snd-pcm snd-hda-core`
+    # etc.) maps to underscore in the on-disk filename
+    # (kernel-modules/snd_pcm/snd_pcm.ko). Without normalization here
+    # the dep walker treats every hyphenated framework dep as
+    # shim-satisfied (`.ko not in initramfs (shim?)`), so the snd
+    # stack never loads snd_pcm.ko / snd_hda_core.ko / snd_hda_codec.ko
+    # as .ko's — they get resolved purely through the L-shim instead.
     i: uint64 = 0
     while i < pfx_len and i < (_MD_PATH_LEN - 4):
         _md_path_buf[i] = prefix[i]
         i = i + 1
     j: uint64 = 0
     while j < name_len and (i + j) < (_MD_PATH_LEN - 4):
-        _md_path_buf[i + j] = name[j]
+        _md_path_buf[i + j] = _md_norm(name[j])
         j = j + 1
     pos: uint64 = i + j
     _md_path_buf[pos + 0] = 46                   # '.'
