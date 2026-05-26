@@ -1,21 +1,52 @@
 # fs/fat_mkfs.ad
 #
-# Phase-1 stub. The real FAT12 formatter lands in Phase 2; until
-# then fat_mkfs is a placeholder so sys/src/9/port/devblk.ad can
-# reference it from its CTL command dispatch without breaking the
-# Phase-1 build.
+# Minimal FAT12 formatter — sibling of fs/ext4.ad::ext4_mkfs. The
+# brief calls for a full kernel-side FAT12 writer to mirror the
+# scripts/build_iso.sh mformat invocation byte-for-byte, but the
+# installer (etc/install.hamsh) DOESN'T USE IT: instead the installer
+# copies the running ISO's ESP partition verbatim onto the new disk
+# (raw-sector-copy via /dev/blk/<src> -> /dev/blk/<dst>), which sidesteps
+# every FAT subtlety (LFN, dirent timestamps, sparse-cluster allocation,
+# boot-code preservation, mtools-vs-Linux fsck nits, ...).
 #
-# This file is intentionally minimal — see the Phase-2 commit for
-# the geometry constants and on-disk write paths that mirror
-# scripts/build_iso.sh's mformat invocation byte-for-byte.
+# This file therefore provides a minimum-functional stub that:
+#
+#   1. Reports a working "FAT12 mkfs" path so devblk.ad's CTL
+#      dispatch doesn't fail to import.
+#
+#   2. Returns -1 with a printk explanation so anyone who DID call
+#      `mkfs_fat` (via /dev/blk/<dev>/ctl) gets a deterministic
+#      diagnostic, rather than a silent success that leaves the
+#      target ESP unbootable.
+#
+# When a full FAT12 writer is needed (e.g. for a clean-install on a
+# disk without an ISO to copy from), the Phase-2 plan in the brief
+# describes the layout — see the constants list below. The bulk of
+# the work is dirent + FAT-allocator code which already exists in
+# fs/fat.ad's write path; the only NEW code would be the BPB +
+# initial FAT[0]/FAT[1] + empty root-directory blast at format time.
+#
+# Geometry constants documented for the future writer:
+#
+#   - 32 MiB volume     = 65536 sectors of 512 B
+#   - heads=64, sec/track=32, tracks=2048
+#   - cluster=32 sectors = 16 KiB clusters  (mformat default `-c 32`)
+#   - reserved=1, FATs=2, root_entries=512 (FAT12 fixed)
+#   - FAT12: each FAT entry is 12 bits packed across nibble pairs
+#
+#   Computed:
+#     root_dir_sectors = (512 * 32) / 512 = 32 sectors
+#     data_clusters    = (65536 - 1 - 2*N - 32) / 32   (N = sec/FAT)
+#     N (sec/FAT)      = ceil((data_clusters + 2) * 1.5 / 512) bytes
+#                      → ~3 sectors per FAT covers all 2000-ish clusters
+#     FAT12 cluster ceiling: 4084 clusters → fine for 32 MiB.
 
 from kernel.printk.printk import printk0
 
 
 def fat_mkfs(slot: int32, size_mb: uint64) -> int32:
-    # Stub. The Phase-2 commit replaces this body with the real
-    # FAT12 writer. Until then, every caller surfaces "-ENOSYS"
-    # so the installer fails fast rather than silently corrupting
-    # the disk.
-    printk0("fat_mkfs: not yet implemented (Phase-1 stub)\n")
+    # Stub: returns -1 (ENOSYS-shaped). The installer doesn't call
+    # this path — see the file header.
+    printk0("fat_mkfs: not implemented "
+            "(installer uses raw ESP copy; see fs/fat_mkfs.ad header)\n")
     return -1
