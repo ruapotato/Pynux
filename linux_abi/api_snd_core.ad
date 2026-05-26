@@ -311,16 +311,35 @@ def __snd_ctl_add_follower(master: uint64, follower: uint64,
 
 def _snd_info_create_card_entry(card: uint64, name: Ptr[char],
                                   parent: uint64) -> uint64:
-    return 0
+    # struct snd_info_entry *snd_info_create_card_entry(
+    #     struct snd_card *, const char *name, struct snd_info_entry *parent);
+    #
+    # Returns a heap-backed snd_info_entry. The caller (snd-core's own
+    # snd_card_info_init and snd_minor_info_init) immediately writes
+    # entry->ops at offset 0x20 and registers it via snd_info_register;
+    # if we returned NULL the caller cascades up with -ENOMEM, which
+    # would fail snd.ko's init_module. A real Linux entry is ~152 bytes
+    # (kmalloc_trace($0xdc0, $0x98) per the inline kmalloc); 256 bytes
+    # of zeroed slab is plenty for every offset the callers touch.
+    return kzalloc(256)
 
 
 def _snd_info_create_module_entry(module: uint64, name: Ptr[char],
                                     parent: uint64) -> uint64:
-    return 0
+    # struct snd_info_entry *snd_info_create_module_entry(
+    #     struct module *, const char *name, struct snd_info_entry *parent);
+    #
+    # Same shape as snd_info_create_card_entry but module-scoped. snd.ko's
+    # init_module path calls this via snd_minor_info_init / snd_card_info_init
+    # and treats a NULL return as -ENOMEM, which used to cascade snd.ko's
+    # init to -ENOMEM. Hand back a zeroed 256-byte slab so the caller's
+    # entry->ops / entry->p writes land inside the buffer.
+    return kzalloc(256)
 
 
 def _snd_info_free_entry(entry: uint64):
-    return
+    if entry != 0:
+        kfree(entry)
 
 
 def _snd_info_register(entry: uint64) -> int32:
@@ -549,12 +568,30 @@ def _snd_unregister_sound_special(unit: int32) -> int32:
 
 def _snd_proc_create_data(name: Ptr[char], mode: int32, parent: uint64,
                             proc_fops: uint64, data: uint64) -> uint64:
-    return 0
+    # struct proc_dir_entry *proc_create_data(const char *name, umode_t,
+    #     struct proc_dir_entry *parent, const struct proc_ops *,
+    #     void *data);
+    #
+    # snd.ko's own snd_info_register tail-calls this from the leaf-file
+    # branch and treats a NULL return as -ENOMEM, which would cascade
+    # up to snd.ko's init_module. Hand back a non-zero opaque handle
+    # (a small zeroed slab; the caller stores the pointer but never
+    # dereferences it on the insmod path).
+    return kzalloc(64)
 
 
 def _snd_proc_mkdir_mode(name: Ptr[char], mode: int32,
                           parent: uint64) -> uint64:
-    return 0
+    # struct proc_dir_entry *proc_mkdir_mode(const char *name, umode_t,
+    #     struct proc_dir_entry *parent);
+    #
+    # snd.ko's own snd_info_register's S_IFDIR branch calls this for
+    # the /proc/asound/{oss,seq,card0,...} subdirs and treats NULL as
+    # -ENOMEM. That used to cascade to snd.ko's init returning -ENOMEM
+    # (which then re-triggered every retry through the dep walker). A
+    # zeroed 64-byte slab is enough: snd_info_register stashes the
+    # returned pointer in entry->p and only NULL-checks it.
+    return kzalloc(64)
 
 
 def _snd_proc_set_size(entry: uint64, size: uint64):
