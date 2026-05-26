@@ -3790,6 +3790,38 @@ def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
                          + EXT4_SB_OFF_FREE_INODES),
         cast[uint32](new_free_inodes & 0xFFFFFFFF))
 
+    # Disable the resize_inode feature + zero s_reserved_gdt_blocks.
+    # mkfs sets up inode #7 (EXT4_RESIZE_INO) to pre-reserve backup
+    # GDT blocks scattered across every sparse-super group. After our
+    # grow, the new groups' bitmaps + inode tables land at the start
+    # of each new group — which OVERLAPS the blocks inode #7 had
+    # reserved. Linux's ext4_setup_system_zone calls
+    # ext4_protect_reserved_inode iff RESIZE_INODE is set, and that
+    # validation refuses the mount with EFSCORRUPTED on overlap.
+    #
+    # Clearing the compat bit makes the kernel skip inode #7 entirely
+    # at mount; clearing s_reserved_gdt_blocks tells e2fsprogs the
+    # reservation is gone. The user trades online-resize capability
+    # for an offline-grown FS that mounts cleanly. (Online resize was
+    # never wired up anyway — Hamnix only resizes offline at first
+    # boot.) A future userland `resize2fs -f -p` could rebuild the
+    # resize_inode if needed.
+    cur_compat: uint32 = _ext4_resize_sb_u32(sb,
+                                             EXT4_SB_OFF_FEATURE_COMPAT)
+    new_compat: uint32 = cur_compat \
+                         & (~EXT4_FEATURE_COMPAT_RESIZE_INODE)
+    _ext4_write_u32(
+        cast[Ptr[uint8]](cast[uint64](sb)
+                         + EXT4_SB_OFF_FEATURE_COMPAT),
+        new_compat)
+    _ext4_write_u16(
+        cast[Ptr[uint8]](cast[uint64](sb)
+                         + EXT4_SB_OFF_RESERVED_GDT_BLKS),
+        cast[uint16](0))
+    if (cur_compat & EXT4_FEATURE_COMPAT_RESIZE_INODE) != 0:
+        printk0("[ext4_resize_grow] cleared COMPAT_RESIZE_INODE + s_reserved_gdt_blocks\n")
+        printk0("[ext4_resize_grow]   (inode #7 reservations are stale post-grow)\n")
+
     # Superblock lives at byte offset 1024 (= sectors 2..3). Our
     # scratch buffer holds the 1 KiB SB at offset 0; write_sectors
     # takes a 1024-byte chunk = 2 sectors.

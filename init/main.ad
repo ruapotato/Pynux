@@ -205,6 +205,7 @@ from fs.ext4 import (
     ext4_rename_smoke_test, ext4_truncate_smoke_test,
     ext4_fsync_smoke_test,
     ext4_resolve_file, ext4_read_file, ext4_read_root_file,
+    ext4_resize_check, ext4_resize_grow, ext4_create_file,
 )
 from sys.src.port9.port.dev import is_reserved_word
 
@@ -888,32 +889,26 @@ def mount_rootfs_partition() -> int32:
 
 def _first_boot_grow_check():
     # First-boot resize hook for installed disks. Walks every block
-    # device, finds the rootfs ext4 partition (the one whose
-    # superblock magic 0xEF53 sits at byte 1024), and compares the
-    # FS's recorded block count against the partition's capacity.
-    # When the partition is larger (i.e. the installer copied a
-    # smaller rootfs onto a bigger target), log a one-line warning
-    # so the user knows they have unused space at the partition tail.
+    # device, finds the rootfs ext4 partition (highest-numbered slot
+    # whose superblock magic 0xEF53 sits at byte 1024 — same "last
+    # wins" rule mount_rootfs_partition uses), and grows its ext4 to
+    # fill the containing partition.
     #
-    # DEFERRED: the actual block-group-append resize. Real ext4 grow
-    # requires extending the group descriptor table and minting
-    # bitmap + inode-table blocks for every new group — significant
-    # new ext4 surface area beyond the single-group ext4_mkfs path
-    # this kernel ships. The current rootfs.img is multi-group (built
-    # by mke2fs on the host), so an in-tree grow would need a full
-    # mini-resize2fs: parse the existing GDT, allocate new groups at
-    # 8 MiB (sparse_super2) or 128 MiB stride, write fresh bitmaps,
-    # update s_blocks_count_lo/hi + s_free_blocks_count + s_groups_count
-    # and re-stamp the GDT and SB checksums.
+    # Idempotent across boots: ext4_resize_check returns 0 once the
+    # FS fills the partition (slack < 4 MiB), so a second boot is a
+    # no-op. We also drop a `.hamnix-grown` sentinel into the
+    # partition root on success — purely advisory, but a useful
+    # marker for log readers and future tools.
     #
-    # The wasted-tail space is benign for the install flow: the
-    # ~95 MiB Debian closure fits in the source-sized ext4 and the
-    # tail is reachable only via online resize from userspace (e.g.
-    # `enter linux { resize2fs /dev/vda2 }`). Until the in-tree
-    # multi-group resize lands, this hook stays informational; the
-    # log line tells the user how much slack to recover.
+    # On grow failure, log the error and continue boot. The FS is
+    # left at the smaller size — userspace `resize2fs /dev/vda2`
+    # from the linux ns is still a recovery path.
     n_slots: uint64 = blk_max_slots()
     sb_buf: Array[1024, uint8]
+    rootfs_slot: int32 = -1
+    fs_block_size_pick: uint64 = 0
+    fs_bytes_pick: uint64 = 0
+    part_bytes_pick: uint64 = 0
     s: uint64 = 0
     while s < n_slots:
         si: int32 = cast[int32](s)
@@ -924,8 +919,6 @@ def _first_boot_grow_check():
                 m_hi: uint16 = cast[uint16](sb_buf[0x39])
                 magic: uint16 = m_lo | (m_hi << 8)
                 if magic == 0xEF53:
-                    # s_log_block_size at offset 0x18 (in superblock,
-                    # i.e. sb_buf[0x18..]). FS block size = 1024 << log.
                     log_bs: uint32 = \
                         cast[uint32](sb_buf[0x18]) \
                         | (cast[uint32](sb_buf[0x19]) << 8) \
@@ -933,7 +926,6 @@ def _first_boot_grow_check():
                         | (cast[uint32](sb_buf[0x1B]) << 24)
                     fs_block_size: uint64 = \
                         cast[uint64](1024) << cast[uint64](log_bs)
-                    # s_blocks_count_lo at offset 0x04.
                     bc: uint32 = \
                         cast[uint32](sb_buf[0x04]) \
                         | (cast[uint32](sb_buf[0x05]) << 8) \
@@ -943,18 +935,74 @@ def _first_boot_grow_check():
                         cast[uint64](bc) * fs_block_size
                     part_sectors: uint64 = blk_capacity_sectors(si)
                     part_bytes: uint64 = part_sectors * 512
-                    if part_bytes > fs_bytes + (4 * 1024 * 1024):
-                        # Partition is at least 4 MiB larger than the
-                        # FS — the install grew the partition but the
-                        # FS still thinks it's source-sized. Future
-                        # ext4-grow work would extend the FS here.
-                        printk2("[firstboot] slot=%d ext4 fs=%d bytes ",
-                                cast[uint64](si), fs_bytes)
-                        printk2(" < partition=%d (slack %d MiB)\n",
-                                part_bytes,
-                                (part_bytes - fs_bytes) / (1024 * 1024))
-                        printk0("[firstboot] resize-to-fit deferred (multi-group-append unsupported)\n")
+                    rootfs_slot = si
+                    fs_block_size_pick = fs_block_size
+                    fs_bytes_pick = fs_bytes
+                    part_bytes_pick = part_bytes
         s = s + 1
+
+    if rootfs_slot < 0:
+        printk0("[firstboot] no ext4 partition; resize-to-fit skipped\n")
+        return
+
+    printk2("[firstboot] slot=%d ext4 fs=%d bytes\n",
+            cast[uint64](rootfs_slot), fs_bytes_pick)
+    printk2("[firstboot]   partition=%d bytes  block_size=%d\n",
+            part_bytes_pick, fs_block_size_pick)
+
+    # Probe + decide. ext4_resize_check returns 0 on no-grow,
+    # 1 on grow-feasible, negative errno on refusal.
+    chk: int32 = ext4_resize_check(rootfs_slot, part_bytes_pick)
+    if chk == 0:
+        printk0("[firstboot] no grow needed (slack < 4 MiB)\n")
+        return
+    if chk < 0:
+        printk1("[firstboot] resize refused (rc=%d); leaving FS as-is\n",
+                cast[uint64](cast[int64](chk)))
+        return
+
+    # chk == 1: grow is feasible. Compute target blocks (floor of
+    # partition_bytes / block_size — the resize_grow path rounds
+    # again to whole groups internally).
+    new_blocks: uint64 = part_bytes_pick / fs_block_size_pick
+    printk2("[firstboot] growing ext4: target blocks=%d (%d bytes)\n",
+            new_blocks, part_bytes_pick)
+    gr: int32 = ext4_resize_grow(rootfs_slot, new_blocks)
+    if gr != 0:
+        printk1("[firstboot] resize_grow FAILED rc=%d; FS unchanged\n",
+                cast[uint64](cast[int64](gr)))
+        return
+
+    printk2("[firstboot] resize_grow OK: slot=%d now %d bytes\n",
+            cast[uint64](rootfs_slot),
+            new_blocks * fs_block_size_pick)
+
+    # Re-init the ext4 mount globals so subsequent reads/writes see
+    # the new geometry. mount_rootfs_partition ran before us with
+    # the OLD block count cached; without this re-init the global
+    # ext4_blocks_count would still be the pre-grow value and any
+    # cross-group allocation would refuse.
+    if ext4_init(rootfs_slot) != 0:
+        printk0("[firstboot] post-grow ext4_init FAILED (unexpected)\n")
+        return
+
+    # Drop the `.hamnix-grown` sentinel into the partition root.
+    # Best-effort: a failed sentinel write doesn't undo the grow,
+    # which is the durable state the user actually cares about.
+    # ext4_create_file writes to root dir (inum=2) and lands in
+    # group 0 — already initialized, so the existing alloc paths
+    # work without any post-grow surgery.
+    body: Ptr[uint8] = "hamnix first-boot grow OK\n"
+    blen: uint64 = 0
+    while body[blen] != 0:
+        blen = blen + 1
+    sent_inum: uint32 = ext4_create_file(
+        2, ".hamnix-grown", body, blen)
+    if sent_inum == 0:
+        printk0("[firstboot] sentinel .hamnix-grown create FAILED (advisory)\n")
+    else:
+        printk1("[firstboot] sentinel .hamnix-grown inum=%d\n",
+                cast[uint64](sent_inum))
 
 
 # Storage L-shim exercise. Runs after kmod_linux_load of ahci.ko when
