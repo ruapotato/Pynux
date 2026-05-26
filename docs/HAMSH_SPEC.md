@@ -99,10 +99,13 @@ args  = ["-la", "/dev"]  # list
   argument.** No re-splitting, ever. `ls $args` → `ls` `-la` `/dev`. This makes
   the entire bash word-splitting bug class structurally impossible.
 
-**Environment = the `/env` namespace (`#e` device).** Exported variables are
-files under `/env`; children inherit them through the namespace, not through a
-separate "environment" concept. `$PATH` reads `/env/PATH`. Exporting a shell
-value writes its string form into `/env/NAME`.
+**Environment = the `/env` namespace.** Exported variables are files
+under `/env`; children inherit them through the namespace, not
+through a separate "environment" concept. `$PATH` reads `/env/PATH`.
+Exporting a shell value writes its string form into `/env/NAME`.
+(The current implementation mirrors env in hamsh's own value table
+and pipes it into a child's argv/envp staging — a dedicated kernel
+`#e` env-device is the planned shape but is not in the tree yet.)
 
 > **Scoping across namespace boundaries** (`ns` / `enter` / `spawn`) follows one
 > rule: **values cross, resolution is namespace-local.** This is the part most
@@ -253,7 +256,7 @@ apply the body's binds/mounts → run the body → tear the scope down.
 ns {
     bind '#c' /dev
     mount $logsrv /var/log
-    deb /bin/true        # sees only this view
+    /bin/true            # sees only this view
 }                        # namespace dissolves here
 ```
 
