@@ -19,17 +19,17 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 ELF=build/hamnix-kernel.elf
-HAMSH_ELF=build/user/hamsh.elf
 ROOTFS_IMG=build/hamnix-rootfs.img
 
 bash scripts/build_user.sh >/dev/null
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
+# /init = the normal shim (no HAMSH_ELF override) so rc.boot runs.
+python3 scripts/build_initramfs.py >/dev/null
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null
 python3 scripts/build_rootfs_img.py >/dev/null
 
 LOG=$(mktemp /tmp/test-by-id.XXXXXX.log)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+trap 'rm -f "$LOG"' EXIT
 
 set +e
 (

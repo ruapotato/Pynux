@@ -18,15 +18,16 @@ PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_ROOT"
 
 ELF=build/hamnix-kernel.elf
-HAMSH_ELF=build/user/hamsh.elf
 
 bash scripts/build_user.sh >/dev/null
-INIT_ELF="$HAMSH_ELF" python3 scripts/build_initramfs.py >/dev/null
+# Keep the normal init shim path — hamsh sources /etc/rc.boot, and
+# we type our `bind` commands at the prompt after rc.boot finishes.
+python3 scripts/build_initramfs.py >/dev/null
 python3 -m compiler.adder compile \
     --target=x86_64-bare-metal init/main.ad -o "$ELF" >/dev/null
 
 LOG=$(mktemp /tmp/test-bind-warn.XXXXXX.log)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+trap 'rm -f "$LOG"' EXIT
 
 set +e
 (
