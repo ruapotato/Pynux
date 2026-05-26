@@ -83,15 +83,17 @@ motdsvc = spawn detached bootns {
     motd
 }
 
-# sshd — the in-tree SSH-2 server (user/sshd.ad → /bin/sshd). Long-
-# lived: it accepts up to a small bounded number of sessions and then
-# exits (the V1 server caps at 8 clients per process). Detached so it
-# survives this rc and the interactive prompt that comes after. With
-# this in place, a vanilla Hamnix ISO boots straight into "ready for
-# SSH on port 22" with no INIT_ELF override needed.
-sshdsvc = spawn detached bootns {
-    sshd
-}
+# sshd — the in-tree SSH-2 server (user/sshd.ad → /bin/sshd). Promoted
+# from `spawn detached` to a managed service supervised by hamsh-as-
+# init. The definition lives at /etc/svc/sshd.hamsh; `svc start sshd`
+# parses it, registers the entry, and forks /bin/sshd as a non-
+# detached child of PID 1 (so the supervisor can reap it). Restart
+# policy in the .hamsh file is on-failure with 1 s..30 s exponential
+# backoff — if sshd crashes after handling its bounded number of
+# sessions, the supervisor brings it back without operator action.
+# After this line a `svc status sshd` shows the service as running
+# with its current pid.
+svc start sshd
 
 echo 'rc.boot: boot services launched'
 

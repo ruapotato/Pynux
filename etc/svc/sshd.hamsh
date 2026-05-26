@@ -1,0 +1,18 @@
+# /etc/svc/sshd.hamsh — Hamnix-native SSH-2.0 server, managed service.
+#
+# Read by the init-side service supervisor (user/hamsh.ad's
+# builtin_svc). `svc start sshd` in /etc/rc.boot parses this file,
+# registers the entry in the service table, and forks /bin/sshd in
+# PID 1's default namespace. The supervisor reaps the child if it
+# exits and restarts it per the policy below.
+#
+# Format (data, not code): key:value lines, '#' to EOL is a comment.
+# Required: name, ns, exec. Required ns values: init | <captured-ns>.
+
+name: sshd
+ns: init
+exec: /bin/sshd
+restart: on-failure
+backoff_ms: 1000
+backoff_max_ms: 30000
+description: Hamnix SSH-2.0 server (curve25519-sha256 + chacha20-poly1305)
