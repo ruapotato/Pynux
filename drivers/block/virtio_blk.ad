@@ -100,12 +100,13 @@ class VirtioBlkReq:
     pad:            Array[7, uint8]   # 17..24
 
 
+# Array sizes are literals because Adder doesn't accept a const in
+# Array[N, T]; keep these in sync with VBLK_MAX (4) and the
+# per-device descriptor count (3 = outhdr + data + status).
 vblk_states: Array[4, VirtioBlk]
 vblk_reqs:   Array[4, VirtioBlkReq]
 vblk_ops:    BlockDeviceOps
-# Per-device buffer descriptors live in .bss so we don't re-init
-# per request. Three descriptors per disk (outhdr, data, status).
-vblk_bufs:   Array[12, VirtBuf]
+vblk_bufs:   Array[12, VirtBuf]            # VBLK_MAX * 3 descriptors
 vblk_count:  uint64 = 0
 
 
@@ -198,6 +199,21 @@ def virtio_blk_write_sectors(priv: uint64, lba: uint64,
                 cast[uint64](vblk_reqs[priv].status))
         return -1
     return 0
+
+
+def _vblk_name(idx: uint64) -> Ptr[char]:
+    # Map a 0..VBLK_MAX-1 disk index to its conventional Linux-style
+    # virtio name. Beyond VBLK_MAX returns "vd?" — never reached on a
+    # well-formed call (init loops bounded by VBLK_MAX) but defensive.
+    if idx == 0:
+        return "vda"
+    if idx == 1:
+        return "vdb"
+    if idx == 2:
+        return "vdc"
+    if idx == 3:
+        return "vdd"
+    return "vd?"
 
 
 def _virtio_blk_init_one(bdf: uint32, idx: uint64,
@@ -295,24 +311,15 @@ def virtio_blk_init() -> int32:
     register_irq_handler(cast[uint64](VBLK_IRQ_VECTOR),
                          cast[uint64](&virtio_blk_irq_handler))
 
+    # Per-disk names. VBLK_MAX (4) entries; lookup is just an index.
     vblk_count = 0
     start: uint32 = 0
-    nm_a: Ptr[char] = "vda"
-    nm_b: Ptr[char] = "vdb"
-    nm_c: Ptr[char] = "vdc"
-    nm_d: Ptr[char] = "vdd"
     while vblk_count < VBLK_MAX:
         bdf: uint32 = pci_find_from(VIRTIO_VENDOR,
                                     VIRTIO_BLK_LEGACY, start)
         if bdf == PCI_BDF_NONE:
             break
-        nm: Ptr[char] = nm_a
-        if vblk_count == 1:
-            nm = nm_b
-        elif vblk_count == 2:
-            nm = nm_c
-        elif vblk_count == 3:
-            nm = nm_d
+        nm: Ptr[char] = _vblk_name(vblk_count)
         if _virtio_blk_init_one(bdf, vblk_count, nm) == 0:
             # Route this disk's INTx pin to the shared vector. The
             # IOAPIC pin we computed is whatever firmware assigned;

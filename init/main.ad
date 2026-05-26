@@ -895,12 +895,23 @@ def _first_boot_grow_check():
     # smaller rootfs onto a bigger target), log a one-line warning
     # so the user knows they have unused space at the partition tail.
     #
-    # The actual block-group-append resize requires extending the
-    # group descriptor table and minting bitmap + inode-table blocks
-    # for each new group — significant new ext4 surface area beyond
-    # the single-group ext4_mkfs path. Until that lands, this hook
-    # is informational; the wasted-tail space is benign for any
-    # install that started from an auto-sized source rootfs.
+    # DEFERRED: the actual block-group-append resize. Real ext4 grow
+    # requires extending the group descriptor table and minting
+    # bitmap + inode-table blocks for every new group — significant
+    # new ext4 surface area beyond the single-group ext4_mkfs path
+    # this kernel ships. The current rootfs.img is multi-group (built
+    # by mke2fs on the host), so an in-tree grow would need a full
+    # mini-resize2fs: parse the existing GDT, allocate new groups at
+    # 8 MiB (sparse_super2) or 128 MiB stride, write fresh bitmaps,
+    # update s_blocks_count_lo/hi + s_free_blocks_count + s_groups_count
+    # and re-stamp the GDT and SB checksums.
+    #
+    # The wasted-tail space is benign for the install flow: the
+    # ~95 MiB Debian closure fits in the source-sized ext4 and the
+    # tail is reachable only via online resize from userspace (e.g.
+    # `enter linux { resize2fs /dev/vda2 }`). Until the in-tree
+    # multi-group resize lands, this hook stays informational; the
+    # log line tells the user how much slack to recover.
     n_slots: uint64 = blk_max_slots()
     sb_buf: Array[1024, uint8]
     s: uint64 = 0
