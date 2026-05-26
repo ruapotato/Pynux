@@ -6,8 +6,12 @@
 #   $HAMNIX_INSTALL_SRC   the running ISO disk (default: vda)
 #                          • vda  p2  = ESP    (FAT12 with BOOTX64.EFI
 #                                              + hamnix-kernel.elf)
-#                          • vda  p3  = rootfs (ext4, .hamnix-roots
-#                                              names it "distro")
+#                          • vda  p4  = rootfs (ext4, .hamnix-roots
+#                                              names it "distro").
+#                          Note: xorriso writes the rootfs that
+#                          build_iso.sh names "partition 3" as GPT
+#                          partition 4 because of the synthetic
+#                          "Gap0"/"Gap1" placeholders xorriso adds.
 #
 #   $HAMNIX_INSTALL_DEV   the install target  (default: vdb)
 #                          starts blank; the installer:
@@ -32,8 +36,8 @@ echo '[install] (1/5) probe target /dev/blk/vdb/size'
 cat /dev/blk/vdb/size
 echo '[install] (1/5) probe source ESP /dev/blk/vdap2/size'
 cat /dev/blk/vdap2/size
-echo '[install] (1/5) probe source rootfs /dev/blk/vdap3/size'
-cat /dev/blk/vdap3/size
+echo '[install] (1/5) probe source rootfs /dev/blk/vdap4/size'
+cat /dev/blk/vdap4/size
 
 # --- step 2 of 5: lay down GPT + partitions on the target -----------
 echo '[install] (2/5) partition target — GPT + ESP (32 MiB) + rootfs'
@@ -47,12 +51,12 @@ echo '[install] (3/5) copy ESP (FAT12 with BOOTX64.EFI + kernel)'
 dd_blk /dev/blk/vdap2 /dev/blk/vdbp1
 
 # --- step 4 of 5: copy the rootfs partition verbatim ----------------
-# vda p3 (the running rootfs) -> vdb p2 (the install target's
+# vda p4 (the running rootfs) -> vdb p2 (the install target's
 # rootfs). The ext4 superblock will report the SOURCE partition's
 # size — the first-boot grow check in init/main.ad detects this and
 # logs the slack on the next boot.
 echo '[install] (4/5) copy rootfs (ext4 with .hamnix-roots = distro)'
-dd_blk /dev/blk/vdap3 /dev/blk/vdbp2
+dd_blk /dev/blk/vdap4 /dev/blk/vdbp2
 
 # --- step 5 of 5: print done ----------------------------------------
 echo '[install] (5/5) install complete'

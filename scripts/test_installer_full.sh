@@ -128,7 +128,7 @@ set +e
     printf 'exit\n'
     sleep 1
 ) | timeout "${BOOT_TIMEOUT}s" qemu-system-x86_64 \
-    -drive "file=$TARGET_IMG,if=virtio,format=qcow2,boot=on" \
+    -drive "file=$TARGET_IMG,if=virtio,format=qcow2" \
     -bios /usr/share/ovmf/OVMF.fd \
     -smp 2 -m 512M -nographic -no-reboot -monitor none -serial stdio \
     > "$STAGE_C_LOG" 2>&1
