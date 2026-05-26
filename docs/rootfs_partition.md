@@ -321,12 +321,30 @@ log the refusal, do NOT evict the bottom. Eviction would orphan a
 name while the underlying Chan stays alive in any already-bound
 namespace — a silent-data-corruption category footgun.
 
-### Stable instance identity — `#by-id/<partuuid>`
+### Stable instance identity — `#by-id/<partuuid>` (also = raw root)
 
 Persistent references use a stable alias. Every discovered partition
 is also addressable as `#by-id/<GPT-partition-UUID>`, mirroring
 Linux's `/dev/disk/by-id/`. This name NEVER moves: it's bound to the
 on-disk identifier, not the discovery order or the sentinel word.
+
+**The `#by-id/<partuuid>` chan is ALWAYS the raw partition root**,
+regardless of what the partition's sentinel declares. This is a
+deliberate dual-view design (user direction 2026-05-26):
+
+- The sentinel describes *named overlays* on the partition
+  (`#distro` = `debian-bookworm/`, `#home` = `home/`, etc.). These
+  are the convenience views applications bind.
+- The by-id chan is the *underlying drive root* — the partition's
+  actual `/`. Mount it to see everything on the disk, including the
+  sentinel file itself.
+
+This is what makes the sentinel editable in place:
+
+    bind '#by-id/abc-def-123' /n/raw
+    cat /n/raw/.hamnix-roots                   # inspect current sentinel
+    echo "userdata home/me/" >> /n/raw/.hamnix-roots   # add an entry
+    # next boot, #userdata will appear as a new named server
 
 Persistent recipes (e.g. an installed system's `/etc/fstab`-shape
 config, a script that always wants a specific disk) SHOULD use the
@@ -336,7 +354,8 @@ by-id alias:
 
 Positional names (`#home`, `#part0`) are for INTERACTIVE / NEW
 mounts where the user means "whatever the current top is." Scripts
-and configs that need stability use by-id.
+and configs that need stability use by-id. Recovery / sentinel-edit
+workflows use by-id for the raw view.
 
 ### Inspection: `/proc/fs`
 
