@@ -92,6 +92,7 @@ ifconfig dns 10.250.10.1
 echo '----- network info (ssh in with the address below) -----'
 ifconfig
 echo '---------------------------------------------------------'
+echo 'rc.boot:STEP-1 past ifconfig dump'
 
 # --- the Linux runtime namespace ------------------------------------
 # HAMSH_SPEC §0 + §11: running a Linux binary is NOT a bespoke
@@ -148,6 +149,7 @@ echo '---------------------------------------------------------'
 # scope_set path goes through eval_expr-which-yields-a-fresh-cell,
 # so we duplicate the body under both names instead). This reads
 # naturally when the distro IS Debian: `enter debian { apt update }`.
+echo 'rc.boot:STEP-2 about to capture linux ns template'
 linux = ns clean {
     bind / /var/lib/distros/default
     bind /home /home
@@ -156,6 +158,7 @@ linux = ns clean {
     bind /srv '#s'
     bind /n '#/'
 }
+echo 'rc.boot:STEP-3 captured linux ns; capturing debian ns'
 debian = ns clean {
     bind / /var/lib/distros/default
     bind /home /home
@@ -164,6 +167,8 @@ debian = ns clean {
     bind /srv '#s'
     bind /n '#/'
 }
+echo 'rc.boot:STEP-4 captured debian ns'
 echo 'rc.boot: linux runtime namespace defined (enter linux { ... }, enter debian { ... })'
 
+echo 'rc.boot:STEP-5 about to hand off to interactive shell'
 echo 'rc.boot: init complete -- handing off to interactive shell'
