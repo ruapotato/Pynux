@@ -4609,14 +4609,17 @@ def _svc_spawn_into_ns(idx: int32) -> int32:
             if rs < 0:
                 # Should never happen — supervisor runs as hostowner
                 # (uid 1) so SYS_SETUID's "current==1" gate passes.
-                # Surface the failure as exit 127 so the .hamsh
-                # supervisor records it as a service start failure.
-                sys_exit(127)
+                # Surface the failure as exit 126 so the .hamsh
+                # supervisor records it as a setuid failure (distinct
+                # from exit 127 = "command not found / spawn failed").
+                write_str(2, "svc: setuid failed for uid-switched service\n")
+                sys_exit(126)
                 return EX_NORMAL
             cpid_i: int32 = sys_spawn(path, argv,
                                       SPAWN_STDIO_NS, SPAWN_STDIO_NS,
                                       envp)
             if cpid_i < 0:
+                write_str(2, "svc: sys_spawn failed in uid-switched wrapper\n")
                 sys_exit(127)
                 return EX_NORMAL
             code_i: int64 = sys_waitpid(cpid_i)

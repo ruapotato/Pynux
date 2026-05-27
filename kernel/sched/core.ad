@@ -951,13 +951,23 @@ def create_user_thread(entry: uint64, name0: uint64,
     # docs/security.md: Plan-9-shape uid/gid inheritance. Fork (no
     # user_r9) AND thread (CLONE_THREAD with user_r9 != 0) BOTH inherit
     # the parent's uid/gid — the spec is "child gets parent's identity",
-    # which holds for both flavours. The first user task ever created
-    # has no real parent (current_idx still points at slot 0 from
-    # sched_init), so the fallback is the kthread default uid 1
-    # (hostowner). /dev/auth's SYS_SETUID flips this for `newshell`.
+    # which holds for both flavours.
+    #
+    # Boot-time fallback: the FIRST user task ever created (init / PID 1)
+    # is built before any kthread_create runs, so current_idx still
+    # points at slot 0 in its all-zero .bss init state — uid == 0. uid 0
+    # doesn't exist in Hamnix (the "root" idiom is gone; uid 1 is the
+    # hostowner). Detect that case and default to hostowner (1). All
+    # subsequent tasks inherit from a real parent that's either uid 1
+    # or whichever uid `sys_setuid` flipped them to.
     cu_uid: uint64 = current_idx
-    task_table[s].uid = task_table[cu_uid].uid
-    task_table[s].gid = task_table[cu_uid].gid
+    parent_uid: uint32 = task_table[cu_uid].uid
+    parent_gid: uint32 = task_table[cu_uid].gid
+    if parent_uid == 0:
+        parent_uid = 1
+        parent_gid = 1
+    task_table[s].uid = parent_uid
+    task_table[s].gid = parent_gid
     _init_fd_table(s)
     _inherit_cwd_from_parent(s)
     next_pid = next_pid + 1
