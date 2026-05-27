@@ -11,6 +11,12 @@
 
 name: sshd
 ns: init
+# docs/security.md Phase 11: run sshd at system uid 2. Compromise of
+# sshd then doesn't grant hostowner authority (the post-auth code path
+# that hands a real shell still needs to elevate to the authenticated
+# user's identity — which happens via the same Plan-9 newshell path
+# eventually; for now the supervisor side simply downgrades from 1).
+uid: 2
 exec: /bin/sshd
 restart: on-failure
 backoff_ms: 1000

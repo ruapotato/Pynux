@@ -4334,6 +4334,12 @@ svc_state:         Array[32, int32]
 svc_restart_pol:   Array[32, int32]
 svc_pid:           Array[32, int32]        # 0 when not running
 svc_last_exit:     Array[32, int32]
+# docs/security.md Phase 11: per-service uid. Defaults to 1
+# (hostowner) when the .hamsh file doesn't declare a `uid:` field.
+# System services like sshd should set `uid: 2` so a sshd compromise
+# doesn't grant hostowner authority. The supervisor switches to this
+# uid via sys_setuid in the rfork'd child BEFORE sys_spawn.
+svc_uid:           Array[32, uint32]
 svc_restarts:      Array[32, int32]        # restarts in this session
 svc_backoff_ms:    Array[32, int64]        # current backoff (ms)
 svc_backoff_init:  Array[32, int64]        # configured initial
@@ -4392,7 +4398,8 @@ def _svc_alloc_slot() -> int32:
 
 def svc_register(name: Ptr[uint8], ns: Ptr[uint8], cmdline: Ptr[uint8],
                  restart_pol: int32, backoff_ms: int64,
-                 backoff_max_ms: int64, desc: Ptr[uint8]) -> int32:
+                 backoff_max_ms: int64, desc: Ptr[uint8],
+                 uid: uint32) -> int32:
     # Register a service (or refresh an existing entry's static fields).
     # Returns the slot index, or -1 on overflow. Does NOT start the
     # service — that's svc_start (Phase 3).
@@ -4421,6 +4428,11 @@ def svc_register(name: Ptr[uint8], ns: Ptr[uint8], cmdline: Ptr[uint8],
     svc_backoff_init[u] = backoff_ms
     svc_backoff_max[u]  = backoff_max_ms
     svc_backoff_ms[u]   = backoff_ms
+    # docs/security.md Phase 11: stash the parsed uid. The spawn-into-
+    # ns path reads it back and calls sys_setuid in the rfork'd child
+    # before exec — service compromise then doesn't grant hostowner
+    # authority.
+    svc_uid[u] = uid
     return idx
 
 
@@ -4561,9 +4573,17 @@ def _svc_spawn_into_ns(idx: int32) -> int32:
     #                 mirrors the real service's; the supervisor tracks
     #                 the wrapper as svc_pid. This is the same shape
     #                 exec_spawn uses for `spawn linux { /bin/nginx }`.
+    #
+    # docs/security.md Phase 11: if the .hamsh service definition
+    # declares `uid: N` (N != 1), the supervisor rforks a wrapper
+    # process, sys_setuid()s to N, then sys_spawns the service binary.
+    # Compromise of the service then runs at uid N — service-isolated.
+    # The init-namespace + uid:1 fast path skips the rfork wrapper
+    # entirely (no identity change needed).
     u: uint64 = cast[uint64](idx)
     ns_name: Ptr[uint8] = _svc_ns_at(u)
     cmd: Ptr[uint8] = _svc_cmd_at(u)
+    target_uid: uint32 = svc_uid[u]
     rc: int32 = _svc_argv_tokenize(cmd)
     if rc <= 0:
         errstr_set("svc: empty or invalid exec line")
@@ -4571,12 +4591,41 @@ def _svc_spawn_into_ns(idx: int32) -> int32:
     argv: Ptr[uint64] = cast[Ptr[uint64]](&svc_spawn_argv_ptr[0])
     path: Ptr[char] = cast[Ptr[char]](svc_spawn_argv_ptr[0])
     envp: Ptr[uint64] = _build_envp()
-    if cstr_eq(ns_name, "init") != 0:
-        # Plain spawn in PID 1's namespace. SPAWN_STDIO_NS so the
-        # child's /fd/0,1,2 default to the console (PID 1's view).
+    # Fast path: ns=init AND uid=1 (hostowner). No identity change, no
+    # ns template to apply — direct sys_spawn (the supervisor stays
+    # the visible parent in the process tree).
+    if cstr_eq(ns_name, "init") != 0 and target_uid == 1:
         pid: int32 = sys_spawn(path, argv,
                                SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
         return pid
+    # uid switching path (still ns=init): rfork a wrapper so we can
+    # call sys_setuid between fork and exec. The wrapper runs as the
+    # service's uid and lives just long enough to sys_spawn + wait.
+    if cstr_eq(ns_name, "init") != 0:
+        flags_i: int32 = RFPROC | RFNAMEG
+        pid_i: int32 = sys_rfork(flags_i)
+        if pid_i == 0:
+            rs: int32 = sys_setuid(target_uid)
+            if rs < 0:
+                # Should never happen — supervisor runs as hostowner
+                # (uid 1) so SYS_SETUID's "current==1" gate passes.
+                # Surface the failure as exit 127 so the .hamsh
+                # supervisor records it as a service start failure.
+                sys_exit(127)
+                return EX_NORMAL
+            cpid_i: int32 = sys_spawn(path, argv,
+                                      SPAWN_STDIO_NS, SPAWN_STDIO_NS,
+                                      envp)
+            if cpid_i < 0:
+                sys_exit(127)
+                return EX_NORMAL
+            code_i: int64 = sys_waitpid(cpid_i)
+            sys_exit(cast[uint64](code_i))
+            return EX_NORMAL
+        if pid_i < 0:
+            errstr_pull_kernel()
+            return -1
+        return pid_i
     # Non-init namespace: look up the captured `ns clean { … }` template
     # by name in the hamsh scope and apply it in a fresh child.
     nsval: int32 = eval_var_by_name(str_intern_cstr(ns_name))
@@ -4592,12 +4641,15 @@ def _svc_spawn_into_ns(idx: int32) -> int32:
     flags: int32 = RFPROC | base_flag
     pid: int32 = sys_rfork(flags)
     if pid == 0:
-        # Child: clean namespace shape, apply template, exec the binary
-        # via sys_spawn (which forks again then execs) and propagate the
-        # service's exit code. A failed spawn surfaces as exit 127 —
-        # the standard "command not found" code.
+        # Child: clean namespace shape, apply template, switch uid
+        # (Phase 11), exec the binary via sys_spawn, propagate exit.
         _ns_child_ensure_stdio(clean)
         apply_ns_template(nsval)
+        if target_uid != 1:
+            rs2: int32 = sys_setuid(target_uid)
+            if rs2 < 0:
+                sys_exit(127)
+                return EX_NORMAL
         cpid: int32 = sys_spawn(path, argv,
                                 SPAWN_STDIO_NS, SPAWN_STDIO_NS, envp)
         if cpid < 0:
@@ -4797,6 +4849,9 @@ svc_pf_desc:      Array[128, uint8]
 svc_pf_restart:   int32 = 0
 svc_pf_backoff:   int64 = 0
 svc_pf_backoff_x: int64 = 0
+# docs/security.md Phase 11: parsed `uid:` field from the service
+# definition. Default 1 (hostowner) when omitted.
+svc_pf_uid:       uint32 = 1
 
 
 def _svc_pf_reset():
@@ -4807,6 +4862,7 @@ def _svc_pf_reset():
     svc_pf_restart = SVC_RESTART_ON_FAIL
     svc_pf_backoff = 1000              # 1 s default initial
     svc_pf_backoff_x = 30000           # 30 s default ceiling
+    svc_pf_uid = 1                     # default hostowner
 
 
 def _svc_trim_copy(dst: Ptr[uint8], cap: uint64,
@@ -4923,6 +4979,10 @@ def _svc_parse_buf(n: uint64) -> int32:
                 svc_pf_backoff = _svc_parse_int(base, val_lo, val_hi)
             elif _svc_key_eq(base, key_lo, key_hi, "backoff_max_ms") != 0:
                 svc_pf_backoff_x = _svc_parse_int(base, val_lo, val_hi)
+            elif _svc_key_eq(base, key_lo, key_hi, "uid") != 0:
+                # docs/security.md Phase 11: per-service uid. The
+                # supervisor switches to this identity before exec.
+                svc_pf_uid = cast[uint32](_svc_parse_int(base, val_lo, val_hi) & 0xFFFFFFFF)
             # Unknown keys are silently ignored (forward-compat).
         p = e + 1
     # Validation.
@@ -4988,7 +5048,7 @@ def svc_def_load(name: Ptr[uint8]) -> int32:
     return svc_register(&svc_pf_name[0], &svc_pf_ns[0],
                         &svc_pf_exec[0], svc_pf_restart,
                         svc_pf_backoff, svc_pf_backoff_x,
-                        &svc_pf_desc[0])
+                        &svc_pf_desc[0], svc_pf_uid)
 
 
 # --- svc builtin ----------------------------------------------------
