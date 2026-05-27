@@ -29,7 +29,21 @@ maturity).
 > (incl. loopback shortcut), the hamsh clean-sheet rewrite with
 > init/rc + line editor + Tab completion, the clean linux/debian
 > namespace recipe (`bind '#distro' /`), the L-shim USB-HC bridge
-> (`f426aee`) that carries `xhci_pci_probe` end-to-end.
+> (`f426aee`) that carries `xhci_pci_probe` end-to-end,
+> **`hpm` v1** (binary-only package manager with BFS dep solver +
+> conflicts, 5 packages at `https://255.one/`, uid==1 gate),
+> **the `hpm install`-driven installer** (`etc/install.hamsh`;
+> `scripts/test_installer_full.sh` 4-stage PASS — build ISO →
+> install → reboot from disk → first-boot ext4 grow-to-fit),
+> the **Plan-9-shape security model** end-to-end (hostowner uid 1,
+> `/dev/auth` cdev, SHA-512-crypt, VFS perm check, `newshell` +
+> `read` hamsh builtins, no setuid bits — see `docs/security.md`),
+> the **in-init service supervisor + `/proc/svc` mirror**
+> (`svc start/status/restart`, `SYS_SVC_PUBLISH=291`), and the
+> Adder compiler **split out to its own
+> [HamnixOS/adder](https://github.com/HamnixOS/adder) repo**
+> consumed here as a submodule (pin at `8e0e420` — methods +
+> `Ptr[T]+N` scaling + `Percpu` aggregate fixes).
 
 **Project-direction docs:** [`docs/architecture.md`](docs/architecture.md)
 (layered model, boundary rules, migration phases),
