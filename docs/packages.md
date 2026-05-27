@@ -20,15 +20,16 @@
 `hpm` is the Hamnix-native package manager. It installs **Hamnix-side
 state**: kernel modules, native userland binaries, services, drivers,
 **distro-namespace populations** (e.g. `linux-debian-12`'s rootfs tree),
-firmware (from the non-free pool), and the OS itself.
+firmware (from the `non-free-firmware` channel), and the OS itself.
 
 It does **NOT** install Debian / Ubuntu / SUSE binaries. Those are the
 job of the distro's own package manager running inside the appropriate
 distro namespace:
 
 ```
-hpm install linux-debian-12         # populates the distro file server
-hpm install --pool=non-free iwlwifi # firmware blob
+hpm install linux-debian-12            # populates the distro file server
+hpm enable non-free-firmware           # subscribe to the firmware channel
+hpm install iwlwifi-firmware           # firmware blob (after refresh)
                                     # then:
 enter debian-12 { apt install nginx }   # real apt, real Debian binary
 ```
@@ -241,7 +242,8 @@ Schema version 1.
 {
   "schema": 1,
   "repo": "HamnixOS/packages",
-  "url": "https://255.one/",
+  "channel": "main",
+  "url": "https://255.one/main/",
   "updated": "YYYY-MM-DD",
   "description": "...",
   "packages": [
@@ -249,6 +251,7 @@ Schema version 1.
       "name": "<name>",
       "version": "<version>",
       "arch": "<arch>",
+      "channel": "main",
       "url": "packages/<name>-<version>.tar.gz",
       "sha256": "<lowercase hex>",
       "size": <bytes>,
@@ -265,8 +268,12 @@ Schema version 1.
 Multiple versions of a package = multiple entries with the same `name`
 and different `version`.
 
-Non-free pool: `https://255.one/nonfree/index.json` (same schema).
-`hpm --pool=non-free` adds it to the search path.
+Each channel has its own `index.json` at `<channel>/index.json`; the
+per-package `url` field is relative to the channel root (so
+`packages/hamnix-init-1.0.0.tar.gz` resolves to
+`<base>/<channel>/packages/hamnix-init-1.0.0.tar.gz`). The `channel`
+field on each entry is what `hpm install` uses to derive the
+per-channel base URL when fetching the tarball.
 
 ## Installed-package database
 
@@ -294,7 +301,7 @@ Non-free pool: `https://255.one/nonfree/index.json` (same schema).
 
 | Command | Action |
 |---------|--------|
-| `hpm refresh` | Re-fetch `index.json` (and non-free if enabled) |
+| `hpm refresh` | Re-fetch `<channel>/index.json` for every enabled channel; merge into one local DB |
 | `hpm list` | Show installed packages |
 | `hpm search <pat>` | Query repo for packages matching `<pat>` |
 | `hpm show <name>` | Print PKGINFO + repo metadata for a package |
@@ -304,7 +311,9 @@ Non-free pool: `https://255.one/nonfree/index.json` (same schema).
 | `hpm pin <name>[@<ver>]` | Pin to the installed (or specific) version |
 | `hpm unpin <name>` | Remove pin |
 | `hpm verify <name>` | Re-check installed files against PKGINFO |
-| `--pool=non-free` | Enable the non-free pool for this invocation |
+| `hpm channels` | List enabled channels (`/var/lib/hpm/channels` ∪ `/etc/hpm/channels` seed) |
+| `hpm enable <name>` | Subscribe to channel `<name>` (e.g. `non-free-firmware`) |
+| `hpm disable <name>` | Unsubscribe from channel `<name>` |
 
 ## Signing
 
@@ -338,15 +347,36 @@ components individually instead of `hamnix-base`:
 hpm install hamnix-init hamnix-hamsh hpm hamnix-drivers-net-e1000e
 ```
 
-## Non-free pool
+## Channels
 
-`https://255.one/nonfree/` — same format, separate index. Holds
-firmware blobs (iwlwifi, brcm, etc.) and anything else with a
-license that prevents redistribution-by-default.
+Top-level directories under the repo root are *channels*, mirroring
+Debian's `main` / `contrib` / `non-free` / `non-free-firmware` split:
 
-`hpm --pool=non-free install iwlwifi-firmware` opts in. The pool
-URL is recorded in `installed.json` so `hpm update` knows to check
-both indexes for installed-from-non-free packages.
+| Channel             | URL                                        | Default? | Holds |
+|---------------------|--------------------------------------------|----------|-------|
+| `main`              | `https://255.one/main/`                    | yes      | First-party / DFSG-free software. The `hamnix-base` metapackage + every component leaf (init/hamsh/coreutils/net/sshd/hpm/fs/drivers/installer/bootloader) + `linux-debian-12`. |
+| `non-free`          | `https://255.one/non-free/`                | no       | DFSG-non-free software. Empty placeholder today. |
+| `non-free-firmware` | `https://255.one/non-free-firmware/`       | no       | Binary firmware blobs (iwlwifi, ath11k, GPU microcode, …). Empty placeholder today. |
+| `contrib`           | reserved                                   | no       | Free software depending on non-free components. Not auto-created. |
+
+`/etc/hpm/channels` is the package-shipped seed; `/var/lib/hpm/channels`
+is the writable user state. `hpm enable <name>` adds an entry there,
+`hpm disable <name>` removes it. `hpm refresh` walks every enabled
+channel, fetches its `index.json`, and merges every package entry
+into one local database — each entry's `channel` field tells `hpm
+install` which subdirectory holds the tarball.
+
+Default install subscribes to `main` only.
+
+A future installer flow can opt the user into `non-free-firmware` at
+first boot if it detects hardware that needs blobs (iwlwifi, ath11k,
+nouveau-firmware). Until that lands, opt in manually:
+
+```
+hpm enable non-free-firmware
+hpm refresh
+hpm install iwlwifi-firmware
+```
 
 ## What this spec does NOT include
 
