@@ -954,7 +954,9 @@ def _first_boot_grow_check():
     # 1 on grow-feasible, negative errno on refusal.
     chk: int32 = ext4_resize_check(rootfs_slot, part_bytes_pick)
     if chk == 0:
-        printk0("[firstboot] no grow needed (slack < 4 MiB)\n")
+        # Either slack < 4 MiB or slack < one whole block group; in
+        # both cases the grow check declines and the FS is left as-is.
+        printk0("[firstboot] no grow needed\n")
         return
     if chk < 0:
         printk1("[firstboot] resize refused (rc=%d); leaving FS as-is\n",

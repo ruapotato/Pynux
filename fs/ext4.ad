@@ -3288,14 +3288,22 @@ def ext4_resize_check(slot: int32,
         printk0("[ext4_resize] refuse: EXTENTS not set (non-ext4 layout)\n")
         return EXT4_RESIZE_EINVAL
 
-    # Compute target geometry. New blocks_count is floor(partition_bytes
-    # / block_size); group count is ceil(new_blocks / bpg). We round
-    # DOWN to a whole-blocks count so partial-block tails aren't
-    # claimed. The last group may be partial — that's fine, ext4
-    # marks the unused bitmap bits as in-use.
-    new_blocks: uint64 = partition_size_bytes / blk_sz
+    # Compute target geometry. We add only WHOLE block groups (the
+    # tail-of-partition slack smaller than one group is intentionally
+    # discarded — at most blocks_per_group-1 blocks = 8 MiB for the
+    # default 1 KiB / 8192-bpg layout). Aligns with resize_grow's
+    # rounding so the check + the actual grow agree.
+    new_blocks_raw: uint64 = partition_size_bytes / blk_sz
+    if new_blocks_raw <= cast[uint64](_ext4_resize_sb_u32(sb,
+                                EXT4_SB_OFF_FIRST_DATA_BLOCK)):
+        printk0("[ext4_resize] target <= first_data_block; no grow\n")
+        return 0
+    fdb_local: uint64 = cast[uint64](_ext4_resize_sb_u32(sb,
+                                EXT4_SB_OFF_FIRST_DATA_BLOCK))
+    new_groups: uint64 = (new_blocks_raw - fdb_local) / cast[uint64](bpg)
+    new_blocks: uint64 = fdb_local + new_groups * cast[uint64](bpg)
     if new_blocks <= cur_blocks:
-        printk0("[ext4_resize] post-round new_blocks <= cur; no grow\n")
+        printk0("[ext4_resize] target rounds to <= current; no grow\n")
         return 0
     # 64bit overflow guard — refuse a >4 GiB jump when the FS doesn't
     # already have the 64bit feature, since bc_hi is 0 today.
@@ -3304,10 +3312,17 @@ def ext4_resize_check(slot: int32,
         printk0("[ext4_resize] refuse: new blocks_count > 32 bits, 64bit feat off\n")
         return EXT4_RESIZE_EINVAL
 
-    old_groups: uint64 = (cur_blocks + cast[uint64](bpg) - 1) \
+    # Old group count uses CEIL so a partial last group counts as one
+    # group. The grow loop only ADDS whole groups beyond old_groups.
+    old_groups: uint64 = (cur_blocks - fdb_local + cast[uint64](bpg) - 1) \
                          / cast[uint64](bpg)
-    new_groups: uint64 = (new_blocks + cast[uint64](bpg) - 1) \
-                         / cast[uint64](bpg)
+    if new_groups <= old_groups:
+        # The whole-group target doesn't add any group beyond what we
+        # already have — partition has slack but it's smaller than one
+        # block group. Refuse the grow to keep this idempotent.
+        printk2("[ext4_resize] target groups %d <= current %d; no grow\n",
+                new_groups, old_groups)
+        return 0
     add_groups: uint64 = new_groups - old_groups
     printk2("[ext4_resize]   target blocks=%d  groups: %d ->",
             new_blocks, old_groups)
@@ -3636,6 +3651,14 @@ def ext4_resize_grow(slot: int32, new_blocks_count: uint64) -> int32:
         printk0("[ext4_resize] post-round target <= current; nop\n")
         return EXT4_RESIZE_OK
     new_groups: uint64 = new_groups_raw
+    if new_groups <= old_groups:
+        # Target round-down lands at or before the current group
+        # count — partition slack is smaller than one block group.
+        # Same idempotency case the check arm already handles; bail
+        # without touching the SB so the FS metadata isn't churned.
+        printk2("[ext4_resize] grow no-op: new_groups=%d <= old=%d\n",
+                new_groups, old_groups)
+        return EXT4_RESIZE_OK
 
     # Sanity-check GDT capacity (mirror ext4_resize_check; cheap).
     primary_gdt_blocks_new: uint64 = \

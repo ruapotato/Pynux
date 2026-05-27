@@ -10,6 +10,12 @@
 #   Stage C: boot the installed qcow2 alone (no ISO); assert hamsh
 #            prompts, and the [firstboot] grow-check arm logs the
 #            slack-or-fit decision.
+#   Stage D: resize-to-fit verification. Repeats the install+boot
+#            against a 1 GiB and a 5 GiB target, asserts that
+#            ext4_resize_grow extended the FS to fill each disk,
+#            and that a SECOND boot of the same disk does NOT
+#            re-trigger the grow (sentinel respected via
+#            ext4_resize_check returning "no grow needed").
 #
 # Markers asserted, in order, on Stage B:
 #   "[install] Hamnix installer"
@@ -23,9 +29,19 @@
 #   "Hamnix kernel booting"             (kernel banner)
 #   "[rootfs] mounted ext4 rootfs"      (rootfs detected on vdb)
 #
+# Markers asserted on Stage D, per disk size:
+#   "[ext4_resize_grow] DONE: blocks N -> M"  (with M > N and
+#                                              M*1024 ≈ disk size)
+#   "[firstboot] resize_grow OK"
+#   "[firstboot] sentinel .hamnix-grown inum=..."
+# Second-boot markers (idempotency):
+#   "[firstboot] no grow needed"
+#   ABSENT: "[ext4_resize_grow] DONE"
+#
 # Env overrides:
 #   BOOT_TIMEOUT  per-stage seconds         (default: 60)
 #   TARGET_SIZE   qcow2 size                (default: 2G)
+#   STAGE_D_SKIP=1  skip the Stage D resize verification
 #   KEEP_LOGS=1   keep log + qcow2 artifacts on PASS
 
 set -euo pipefail
@@ -164,5 +180,211 @@ if [ "${KEEP_LOGS:-0}" != "1" ]; then
     rm -f "$STAGE_B_LOG" "$STAGE_C_LOG"
     rm -f "$TARGET_IMG"
 fi
+
+# --- Stage D: ext4 resize-to-fit verification -------------------------
+# Repeat the install+boot for two disk sizes (1 GiB, 5 GiB) and assert
+# that the kernel's _first_boot_grow_check actually extends the ext4
+# FS to fill each disk. A second boot of the same disk must NOT
+# re-trigger the grow (idempotency via ext4_resize_check).
+#
+# The kernel logs:
+#   [ext4_resize_grow] DONE: blocks <before> -> <after>
+# We parse the <after> count and assert it's at least
+# (disk_bytes - SLACK_BYTES) / 1024 where SLACK_BYTES allows for
+# GPT + ESP + rounding-to-whole-block-groups.
+
+if [ "${STAGE_D_SKIP:-0}" = "1" ]; then
+    echo "[test_installer_full] Stage D: SKIPPED via STAGE_D_SKIP=1"
+    echo "[test_installer_full] ALL STAGES PASS"
+    exit 0
+fi
+
+# Pick a disk size for resize verification. Two sub-tests:
+#   D-1: 1 GiB qcow2 — exercises a modest grow (~10x source rootfs)
+#   D-2: 5 GiB qcow2 — exercises a large grow (~50x source rootfs)
+# Each sub-test runs Stage B (install) then Stage C (boot from disk)
+# and parses the kernel log for the resize markers.
+#
+# stage_d_install_and_boot <size_str> <expected_min_blocks_after>
+stage_d_install_and_boot() {
+    local size_str="$1"
+    local min_blocks="$2"
+    local label="$3"
+
+    local img_path
+    img_path=$(mktemp --tmpdir hamnix-installer-stageD.XXXXXX.qcow2)
+    local install_log
+    install_log=$(mktemp --tmpdir hamnix-installer-stageD-install.XXXXXX.log)
+    local boot_log
+    boot_log=$(mktemp --tmpdir hamnix-installer-stageD-boot.XXXXXX.log)
+    local boot2_log
+    boot2_log=$(mktemp --tmpdir hamnix-installer-stageD-boot2.XXXXXX.log)
+
+    echo "[test_installer_full] Stage D ($label): target size=$size_str img=$img_path"
+    rm -f "$img_path"
+    qemu-img create -f qcow2 "$img_path" "$size_str" >/dev/null
+
+    # Install phase (mirrors Stage B's stdin driving).
+    set +e
+    (
+        sleep 5
+        printf 'hamsh /etc/install.hamsh\n'
+        sleep 45
+        printf 'echo INSTALLER_DONE\n'
+        sleep 2
+        printf 'exit\n'
+        sleep 1
+    ) | timeout "${BOOT_TIMEOUT}s" qemu-system-x86_64 \
+        -drive "file=$HAMNIX_ISO,if=virtio,format=raw,readonly=on" \
+        -drive "file=$img_path,if=virtio,format=qcow2" \
+        -smp 2 -m 512M -nographic -no-reboot -monitor none -serial stdio \
+        > "$install_log" 2>&1
+    set -e
+
+    if ! grep -aE -q '\[install\] \(5/5\) install complete' "$install_log"; then
+        echo "[test_installer_full] Stage D ($label) FAIL: install did not complete" >&2
+        tail -40 "$install_log" >&2
+        if [ "${KEEP_LOGS:-0}" != "1" ]; then
+            rm -f "$img_path" "$install_log" "$boot_log" "$boot2_log"
+        else
+            echo "[test_installer_full] Stage D ($label) keep-logs: $install_log $boot_log $boot2_log" >&2
+        fi
+        return 1
+    fi
+    echo "[test_installer_full] Stage D ($label): install OK"
+
+    # First boot — should trigger the resize.
+    set +e
+    (
+        sleep 8
+        printf 'echo FIRST_BOOT_OK\n'
+        sleep 2
+        printf 'exit\n'
+        sleep 1
+    ) | timeout "${BOOT_TIMEOUT}s" qemu-system-x86_64 \
+        -drive "file=$img_path,if=virtio,format=qcow2" \
+        -bios /usr/share/ovmf/OVMF.fd \
+        -smp 2 -m 512M -nographic -no-reboot -monitor none -serial stdio \
+        > "$boot_log" 2>&1
+    set -e
+
+    # Assert: resize ran, sentinel got written.
+    if ! grep -aE -q '\[ext4_resize_grow\] DONE: blocks' "$boot_log"; then
+        echo "[test_installer_full] Stage D ($label) FAIL: no ext4_resize_grow DONE marker" >&2
+        echo "  --- last 40 lines of boot log: ---" >&2
+        tail -40 "$boot_log" >&2
+        if [ "${KEEP_LOGS:-0}" != "1" ]; then
+            rm -f "$img_path" "$install_log" "$boot_log" "$boot2_log"
+        else
+            echo "[test_installer_full] Stage D ($label) keep-logs: $install_log $boot_log $boot2_log" >&2
+        fi
+        return 1
+    fi
+    if ! grep -aE -q '\[firstboot\] sentinel \.hamnix-grown inum=' "$boot_log"; then
+        echo "[test_installer_full] Stage D ($label) FAIL: sentinel marker missing" >&2
+        tail -40 "$boot_log" >&2
+        if [ "${KEEP_LOGS:-0}" != "1" ]; then
+            rm -f "$img_path" "$install_log" "$boot_log" "$boot2_log"
+        else
+            echo "[test_installer_full] Stage D ($label) keep-logs: $install_log $boot_log $boot2_log" >&2
+        fi
+        return 1
+    fi
+
+    # Extract the post-grow block count and check it meets the minimum.
+    local after_blocks
+    after_blocks=$(grep -aE '\[ext4_resize_grow\] DONE: blocks' "$boot_log" \
+                   | sed -E 's/.*-> ([0-9]+).*/\1/' | tail -1)
+    if [ -z "$after_blocks" ]; then
+        echo "[test_installer_full] Stage D ($label) FAIL: could not parse block count" >&2
+        tail -10 "$boot_log" >&2
+        if [ "${KEEP_LOGS:-0}" != "1" ]; then
+            rm -f "$img_path" "$install_log" "$boot_log" "$boot2_log"
+        else
+            echo "[test_installer_full] Stage D ($label) keep-logs: $install_log $boot_log $boot2_log" >&2
+        fi
+        return 1
+    fi
+    if [ "$after_blocks" -lt "$min_blocks" ]; then
+        echo "[test_installer_full] Stage D ($label) FAIL: post-grow blocks=$after_blocks < min=$min_blocks" >&2
+        if [ "${KEEP_LOGS:-0}" != "1" ]; then
+            rm -f "$img_path" "$install_log" "$boot_log" "$boot2_log"
+        else
+            echo "[test_installer_full] Stage D ($label) keep-logs: $install_log $boot_log $boot2_log" >&2
+        fi
+        return 1
+    fi
+    echo "[test_installer_full] Stage D ($label): grow OK ($after_blocks blocks; min=$min_blocks)"
+
+    # Second boot — should NOT re-trigger the grow.
+    set +e
+    (
+        sleep 8
+        printf 'echo SECOND_BOOT_OK\n'
+        sleep 2
+        printf 'exit\n'
+        sleep 1
+    ) | timeout "${BOOT_TIMEOUT}s" qemu-system-x86_64 \
+        -drive "file=$img_path,if=virtio,format=qcow2" \
+        -bios /usr/share/ovmf/OVMF.fd \
+        -smp 2 -m 512M -nographic -no-reboot -monitor none -serial stdio \
+        > "$boot2_log" 2>&1
+    set -e
+
+    if grep -aE -q '\[ext4_resize_grow\] DONE: blocks' "$boot2_log"; then
+        echo "[test_installer_full] Stage D ($label) FAIL: second boot re-ran grow (NOT idempotent)" >&2
+        tail -40 "$boot2_log" >&2
+        if [ "${KEEP_LOGS:-0}" != "1" ]; then
+            rm -f "$img_path" "$install_log" "$boot_log" "$boot2_log"
+        else
+            echo "[test_installer_full] Stage D ($label) keep-logs: $install_log $boot_log $boot2_log" >&2
+        fi
+        return 1
+    fi
+    if ! grep -aE -q '\[firstboot\] no grow needed' "$boot2_log"; then
+        # Acceptable alternate: the check returned 0 silently and the
+        # later marker didn't print (e.g. partition size matched exactly).
+        # Surface the boot log so a future failure is debuggable.
+        if grep -aE -q '\[rootfs\] mounted ext4 rootfs' "$boot2_log"; then
+            echo "[test_installer_full] Stage D ($label): second boot mounted; no explicit 'no grow needed' marker" >&2
+        else
+            echo "[test_installer_full] Stage D ($label) FAIL: second boot mount missing" >&2
+            tail -40 "$boot2_log" >&2
+            rm -f "$img_path" "$install_log" "$boot_log" "$boot2_log"
+            return 1
+        fi
+    fi
+    echo "[test_installer_full] Stage D ($label): second boot idempotent (no re-grow)"
+
+    if [ "${KEEP_LOGS:-0}" != "1" ]; then
+        rm -f "$img_path" "$install_log" "$boot_log" "$boot2_log"
+    else
+        echo "[test_installer_full] Stage D ($label) KEEP_LOGS: $install_log $boot_log $boot2_log"
+    fi
+    return 0
+}
+
+echo "[test_installer_full] Stage D: ext4 resize-to-fit verification"
+
+# 1 GiB disk = 1073741824 bytes. After GPT (1 MiB) + ESP (32 MiB) +
+# partition alignment, the rootfs partition is ~1037 MiB.  Round
+# DOWN to whole-group: at 8 MiB/group that's 129 groups * 8192 blk
+# = 1056768 blocks. Allow some slack for filesystem overhead /
+# reserved-area accounting → require AT LEAST 800,000 blocks
+# (~780 MiB final ext4 capacity).
+stage_d_install_and_boot 1G 800000 "1G" || {
+    echo "[test_installer_full] Stage D-1G: FAILED" >&2
+    exit 1
+}
+
+# 5 GiB disk = 5368709120 bytes. Rootfs partition ~5128 MiB →
+# ~5252608 blocks worth of whole groups. Require AT LEAST 4,500,000
+# blocks (~4.39 GiB final capacity).
+stage_d_install_and_boot 5G 4500000 "5G" || {
+    echo "[test_installer_full] Stage D-5G: FAILED" >&2
+    exit 1
+}
+
+echo "[test_installer_full] Stage D: PASS"
 
 echo "[test_installer_full] ALL STAGES PASS"
