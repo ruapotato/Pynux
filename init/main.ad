@@ -206,6 +206,7 @@ from fs.ext4 import (
     ext4_fsync_smoke_test,
     ext4_resolve_file, ext4_read_file, ext4_read_root_file,
     ext4_resize_check, ext4_resize_grow, ext4_create_file,
+    ext4_dir_lookup,
 )
 from sys.src.port9.port.dev import is_reserved_word
 
@@ -887,6 +888,44 @@ def mount_rootfs_partition() -> int32:
     return last_mounted
 
 
+def _try_plant_grown_sentinel(message: Ptr[uint8]):
+    # Plant the `.hamnix-grown` sentinel in the partition root if it
+    # isn't there yet. Best-effort: a failed write doesn't undo
+    # any grow that may have run — the durable bytes the user cares
+    # about are the FS block count, not this advisory file.
+    #
+    # The sentinel SEMANTICALLY means "_first_boot_grow_check ran on
+    # this rootfs", regardless of whether the resize actually moved
+    # any bytes. That keeps the marker meaningful on disks where the
+    # FS already fills its partition (e.g. a build that imaged the
+    # rootfs at exactly the target geometry, or a second boot of a
+    # disk that grew on the first boot).
+    #
+    # Caller is responsible for having ext4_init'd the slot first.
+    # ext4_dir_lookup walks the root dir from inum=2; ext4_create_file
+    # appends a fresh dirent. We pre-check existence to avoid stacking
+    # duplicate dirents (ext4_dir_insert does NOT dedupe).
+    root_inode: Array[256, uint8]
+    if ext4_read_inode(2, &root_inode[0]) != 0:
+        printk0("[firstboot] sentinel: cannot read root inode (advisory)\n")
+        return
+    existing: uint32 = ext4_dir_lookup(&root_inode[0], ".hamnix-grown")
+    if existing != 0:
+        printk1("[firstboot] sentinel .hamnix-grown present (inum=%d)\n",
+                cast[uint64](existing))
+        return
+    blen: uint64 = 0
+    while message[blen] != 0:
+        blen = blen + 1
+    sent_inum: uint32 = ext4_create_file(
+        2, ".hamnix-grown", message, blen)
+    if sent_inum == 0:
+        printk0("[firstboot] sentinel .hamnix-grown create FAILED (advisory)\n")
+    else:
+        printk1("[firstboot] sentinel .hamnix-grown inum=%d\n",
+                cast[uint64](sent_inum))
+
+
 def _first_boot_grow_check():
     # First-boot resize hook for installed disks. Walks every block
     # device, finds the rootfs ext4 partition (highest-numbered slot
@@ -894,11 +933,19 @@ def _first_boot_grow_check():
     # wins" rule mount_rootfs_partition uses), and grows its ext4 to
     # fill the containing partition.
     #
-    # Idempotent across boots: ext4_resize_check returns 0 once the
-    # FS fills the partition (slack < 4 MiB), so a second boot is a
-    # no-op. We also drop a `.hamnix-grown` sentinel into the
-    # partition root on success — purely advisory, but a useful
-    # marker for log readers and future tools.
+    # Idempotent across boots:
+    #   * ext4_resize_check returns 0 once the FS fills the partition
+    #     (slack < 4 MiB OR slack < one whole block group), so a
+    #     second boot is a no-op on the actual block-count.
+    #   * `.hamnix-grown` is planted ONCE — `_try_plant_grown_sentinel`
+    #     looks it up before creating, so a second boot does not
+    #     stack a duplicate dirent.
+    #
+    # The sentinel is the source of truth for "first-boot check ran";
+    # it is planted on EVERY code path that reaches the FS (no-op
+    # grow, successful grow, even refused-grow). Test harnesses key
+    # off this marker, so its presence is independent of whether the
+    # grow actually moved bytes.
     #
     # On grow failure, log the error and continue boot. The FS is
     # left at the smaller size — userspace `resize2fs /dev/vda2`
@@ -956,9 +1003,17 @@ def _first_boot_grow_check():
     if chk == 0:
         # Either slack < 4 MiB or slack < one whole block group; in
         # both cases the grow check declines and the FS is left as-is.
+        # Still plant the sentinel: the check RAN, that's what the
+        # marker advertises.
         printk0("[firstboot] no grow needed\n")
+        _try_plant_grown_sentinel(
+            "hamnix first-boot grow-check ran (no grow needed)\n")
         return
     if chk < 0:
+        # Refused (feature incompat, GDT-no-room, etc.). Don't plant
+        # the sentinel — the FS is in a state where future code might
+        # want to retry the grow, and an existing sentinel suggests
+        # "we already decided not to touch this disk".
         printk1("[firstboot] resize refused (rc=%d); leaving FS as-is\n",
                 cast[uint64](cast[int64](chk)))
         return
@@ -994,17 +1049,7 @@ def _first_boot_grow_check():
     # ext4_create_file writes to root dir (inum=2) and lands in
     # group 0 — already initialized, so the existing alloc paths
     # work without any post-grow surgery.
-    body: Ptr[uint8] = "hamnix first-boot grow OK\n"
-    blen: uint64 = 0
-    while body[blen] != 0:
-        blen = blen + 1
-    sent_inum: uint32 = ext4_create_file(
-        2, ".hamnix-grown", body, blen)
-    if sent_inum == 0:
-        printk0("[firstboot] sentinel .hamnix-grown create FAILED (advisory)\n")
-    else:
-        printk1("[firstboot] sentinel .hamnix-grown inum=%d\n",
-                cast[uint64](sent_inum))
+    _try_plant_grown_sentinel("hamnix first-boot grow OK\n")
 
 
 # Storage L-shim exercise. Runs after kmod_linux_load of ahci.ko when
