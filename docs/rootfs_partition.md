@@ -24,6 +24,16 @@ This is the "1 GB+ live USB" model the user asked for (2026-05-26):
 no FAT12 ceiling on the rootfs, the shell can write to the partition,
 and Linux-ns writes can't shadow Hamnix paths.
 
+> **Install loop status (2026-05-27).** The full install loop is
+> now exercised end-to-end by `scripts/test_installer_full.sh` —
+> build ISO → boot ISO → run `etc/install.hamsh` against `vdb` →
+> reboot from the installed disk → first-boot ext4 grow-to-fit
+> (`ext4_resize_grow`, `f12b33a`+`1c19819`+`780bdd4`) → second
+> boot idempotent. The installer is now `hpm install`-driven
+> against an ISO-local mini-repo (`etc/install.hamsh` step 4-5),
+> not raw `dd`. See [`packages.md`](packages.md) for the package
+> format and the 5 v1 packages live at `https://255.one/`.
+
 ## Why this exists (the FAT12 ceiling)
 
 Pre-2026-05-26, the kernel ELF embedded a `cpio` initramfs containing
