@@ -111,26 +111,20 @@ bash scripts/build_modules.sh
 # cpio entries, which don't matter on an installed system that
 # already has its packages on disk.
 #
-# On a clean build with no prior kernel ELF, we build one preemptively
-# so the package isn't empty.
-if [ ! -f "$HAMNIX_KERNEL" ]; then
-    echo "[build_iso] No prior kernel ELF — bootstrapping for the bootloader package"
-    python3 -m compiler.adder compile \
-        --target=x86_64-bare-metal \
-        init/main.ad \
-        -o "$HAMNIX_KERNEL"
-fi
-# Same for the EFI stub.
-EFI_STUB_SRC="arch/x86/boot/efi_stub.S"
-if [ ! -f "$HAMNIX_EFI_STUB" ] && [ -f "$EFI_STUB_SRC" ]; then
-    echo "[build_iso] No prior EFI stub — bootstrapping for the bootloader package"
-    _PRE_EFI_TMP=$(mktemp -d)
-    as --64 -o "$_PRE_EFI_TMP/efi_stub.o" "$EFI_STUB_SRC"
-    ld -m i386pep --subsystem 10 -e efi_main --image-base 0 \
-       --no-dynamic-linker -nostdlib \
-       -o "$HAMNIX_EFI_STUB" "$_PRE_EFI_TMP/efi_stub.o"
-    rm -rf "$_PRE_EFI_TMP"
-fi
+# NOTE: the original installer-rewrite attempted to "bootstrap" a
+# kernel ELF + EFI stub here so they could be packaged into
+# hamnix-bootloader before build_initramfs.py runs. That race-
+# conditions the cpio: a clean `rm -rf build/` left no
+# fs/initramfs_blob.S, so the bootstrap kernel link failed with
+# `undefined reference to initramfs_cpio_base`.
+#
+# The ISO build path ALWAYS produces a slim hamnix-bootloader
+# (HAMNIX_BOOTLOADER_SLIM=1 below) — the metadata stub doesn't
+# carry the kernel ELF, so the bootstrap was solving a non-problem
+# for the ISO mini-repo. The FULL-payload hamnix-bootloader on
+# `https://255.one/` is built separately (see scripts/build_packages.py
+# without HAMNIX_BOOTLOADER_SLIM); that step expects build outputs
+# already present from a prior successful build_iso.sh run.
 
 echo "[build_iso] Building v1 hpm packages (build/packages/) for installer mini-repo"
 # HAMNIX_BOOTLOADER_SLIM=1: emit a metadata-only hamnix-bootloader

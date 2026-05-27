@@ -282,14 +282,20 @@ def build_hamnix_bootloader() -> dict:
     total_bytes = 0
     n_files = 0
 
-    if not KERNEL_ELF.is_file():
-        raise SystemExit(
-            f"[build_packages] {KERNEL_ELF.relative_to(HERE)} missing — "
-            f"run scripts/build_iso.sh first to produce the kernel ELF")
-    if not EFI_STUB.is_file():
-        raise SystemExit(
-            f"[build_packages] {EFI_STUB.relative_to(HERE)} missing — "
-            f"run scripts/build_iso.sh first to produce the EFI stub")
+    # SLIM mode emits a metadata-only tarball (PKGINFO only) — the
+    # kernel ELF + EFI stub aren't needed in that path. Only enforce
+    # the requirement when building the full-payload (non-slim)
+    # tarball intended for the upstream HamnixOS/packages mirror.
+    slim_early = os.environ.get("HAMNIX_BOOTLOADER_SLIM") == "1"
+    if not slim_early:
+        if not KERNEL_ELF.is_file():
+            raise SystemExit(
+                f"[build_packages] {KERNEL_ELF.relative_to(HERE)} missing — "
+                f"run scripts/build_iso.sh first to produce the kernel ELF")
+        if not EFI_STUB.is_file():
+            raise SystemExit(
+                f"[build_packages] {EFI_STUB.relative_to(HERE)} missing — "
+                f"run scripts/build_iso.sh first to produce the EFI stub")
 
     # The full-fat bootloader payload (BOOTX64.EFI + the kernel ELF)
     # lives in upstream HamnixOS/packages so a fresh-install user can
