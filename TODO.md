@@ -402,6 +402,7 @@ Everything in §5 is Layer-2-only per the boundary law.
 - `/bin` tool audit for cwd-relative defaults.
 - [x] SSH follow-ups — publickey auth, generated+persisted host key,
   RFC 6979 deterministic ECDSA nonce — `5cd02bb`.
+
 - `enter linux { /bin/sh }` interactive stdin: opens but typing doesn't
   reach the Linux process. The clean linux ns doesn't currently wire
   stdin through to the entered process; sshd-driven sessions are not
@@ -439,3 +440,121 @@ Everything in §5 is Layer-2-only per the boundary law.
 - `/bin` tool audit for cwd-relative defaults.
 - [x] SSH follow-ups — publickey auth, generated+persisted host key,
   RFC 6979 deterministic ECDSA nonce — `5cd02bb`.
+## Userland polish queue — post-installer-loop (2026-05-27)
+
+Serial dispatch per user direction *"don't do it in parallel, too wide
+on each issue. Take them one at a time."*
+
+### Queued — order locked
+
+**A** (in flight) — hpm-from-network. `etc/rc.boot` sets a static IP
+`10.250.10.99` unconditionally, clobbering DHCP. In QEMU/GNOME Boxes
+user-mode networking the real DHCP is `10.0.2.15` / gw `10.0.2.2` —
+the static override misconfigures DNS and `hpm refresh` fails to
+resolve `255.one`. Fix: drop the unconditional static (gate on
+`HAMNIX_STATIC_IP=...`); let DHCP win. Also add `user/ping.ad` for
+net diagnosis.
+
+**B** (gated on A) — dd_blk → 9P userland mount. Installer byte-copies
+at steps 6+ because hpm extracts into the LIVE system then we dd onto
+the target. Double handling AND incompatible with multi-package
+installs (you'd dd-clobber). Real fix: userland `mount(2)`-equivalent
+mounting a freshly-formatted ext4 partition as a 9P file server
+mid-session; `hpm --target-prefix=/mnt/newroot install ...` extracts
+directly. Touches `sys/src/9/port/chan.ad`, `fs/ext4.ad`, plus a new
+mount/attach primitive.
+
+**C** (gated on B) — component-package split. `hamnix-base` is a
+30-file monolith; split into `hamnix-kernel`, `hamnix-init`,
+`hamnix-hamsh`, `hamnix-svc-sshd`, `hamnix-framework-modules`,
+`hamnix-cdev-base`, `hamnix-fs-ext4`, `hamnix-fs-fat`, `hamnix-net`,
+`hamnix-drivers-{usb-xhci, block-ahci, block-nvme, net-e1000e,
+snd-hda}`. `hamnix-base` becomes a metapackage that `depends:` all.
+
+### Small-commands batch (after C)
+
+Each a small focused agent:
+- `dmesg` (`/proc/kmsg`), `ps` (`/proc/<pid>/status`), `df`/`du`
+- Persistent svc logs at `/var/log/svc/<name>.log`
+- First-login MOTD + welcome guidance
+- `man` / `help` per-command markdown viewer
+- `ls`, `find`, `du`, `cp -r`, `tar` — hamsh native coreutils polish
+- Time / timezone / RTC (`date`; load-bearing for TLS validity)
+- Audio playback (`snd_hda_intel.ko` loads; needs userland tool)
+
+## `hamUI` window system — design locked 2026-05-27
+
+(Was rio.md; renamed to avoid Plan 9 name collision. Full spec at
+[`docs/hamUI.md`](docs/hamUI.md).) Same per-window-namespace invariant
+as Plan 9 rio; same file-server-per-window shape; departs in three
+areas.
+
+### AI-debuggable file tree per window (`/dev/wsys/<wid>/`)
+
+The killer feature. Every window's text content + namespace state +
+I/O are file-readable from outside. AI agents debug Hamnix the same
+way human SREs do — but more thoroughly, because state is exposed
+directly, not through pixels.
+
+| File | What |
+|------|------|
+| `text` | UTF-8 scrollback (no screenshot needed) |
+| `output` | Live tail of current command's stdout/stderr |
+| `kbdin` | Write-only keystroke injection |
+| `cmd` | Write a command line, runs in window's shell (one-shot) |
+| `ns` | Plain-text mtab dump |
+| `pid` | Root pid of window's shell |
+| `proc/` | Symlinked tree of `/proc/<pid>/*` |
+| `kind` | `text` / `x11` / `framebuffer` |
+| `uid` | Effective uid (changes after `newshell`) |
+| `geometry` | minx miny maxx maxy |
+| `framebuffer` | Mmap pixel buffer (kind=x11 / framebuffer) |
+
+### Per-window admin elevation
+
+- Inside an existing window: `newshell hostowner` swaps the shell to
+  hostowner namespace (window stays; contents elevate).
+- Direct admin window: `hamUI new -as hostowner` prompts for password,
+  spawns a fresh window already elevated.
+
+### X11 / Linux apps via Xvfb-in-linux-ns
+
+`hamUI new -kind x11 -cmd '/usr/bin/firefox'`:
+- Spawns Xvfb inside linux ns drawing to a memory-mapped file.
+- hamUI reads + composits to physical fb.
+- Plan-9-shape `/dev/mouse` ↔ X11 event translation.
+- Per-window `framebuffer` IS the Xvfb buffer.
+- Path to Firefox/Chromium without writing our own X11 server.
+
+### Drag-to-create-window
+
+Plan 9 rio's canonical gesture: left-click on root, drag a rectangle,
+release → that rectangle becomes a new window (default: hamsh). When a
+GUI command runs inside (e.g. `firefox`), the window's `kind` flips and
+it becomes that app. No right-click menus. The drag IS window creation.
+
+User: *"Ironically, this resembles directly a desktop environment I
+built in the past."*
+
+### Phasing — AI-debug FIRST
+
+1. Phase 1: hamUI skeleton — one window, ALL AI-debug files in text
+   mode. No framebuffer yet. Unlocks AI collaboration before graphics.
+2. Phase 2: multi-window via `/dev/wsys`.
+3. Phase 3: per-window elevation visible in `uid` / `ns` files.
+4. Phase 4: framebuffer-backed pixel windows + drag-to-create.
+5. Phase 5: X11 bridge (Xvfb + event translation).
+6. Phase 6: snarf, wctl, focus policies.
+
+### Retired open questions
+
+Daemon-mode (not PID 1); multiplexed keyboard; defer acme; strict Plan
+9 draw protocol.
+
+## Bigger lifts — no immediate plan
+
+- NUC network silent on real I219 (needs hardware time).
+- iwlwifi — non-free pool firmware policy decision.
+- Browser (Firefox/Chromium) in hamUI window — gated on X11 bridge.
+- Suspend / power management.
+

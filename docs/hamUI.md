@@ -1,12 +1,169 @@
-# rio — Hamnix's file-based window system
+# hamUI — Hamnix's file-based window system
 
-**Status:** design spec, deferred behind the server-OS goals. Hamnix
+**Status:** design spec. **Renamed from `rio` 2026-05-27** (Plan 9
+name collision). The bulk of this doc inherits its shape from Plan 9
+rio (the design lineage); citations to Plan 9's `rio(1)` / `rio(4)`
+etc. remain unchanged because they reference the canonical upstream.
+Our system is `hamUI`.
+
+Tagline: **"every window is a debug scope onto a namespace."** The
+killer feature is AI-debuggability — every window's text content,
+namespace state, and live I/O are file-readable from outside, so an
+AI agent debugging Hamnix has the same access surface as a human SRE
+(more thorough, actually, because state is exposed directly rather
+than through pixels).
+
+> **Hamnix-specific design overlays** (additions to the Plan 9 rio
+> spec below). See [`TODO.md`](../TODO.md) § "`hamUI` window system"
+> for the consolidated summary and phasing.
+
+## H-§A. AI-debuggable file tree per window
+
+In addition to the Plan 9 rio file tree documented in §2 below,
+hamUI exposes on every window (`/dev/wsys/<wid>/`):
+
+| File | Purpose |
+|------|---------|
+| `text` | UTF-8 scrollback (no screenshot OCR needed; AI reads directly) |
+| `output` | Live tail of current command's stdout/stderr |
+| `kbdin` | Write-only keystroke injection (rio already has this) |
+| `cmd` | Write a command line, runs in window's shell (one-shot) |
+| `ns` | Plain-text mtab dump (binds + mounts) |
+| `pid` | Root pid of window's shell |
+| `proc/` | Symlinked tree of `/proc/<pid>/*` for window's processes |
+| `kind` | `text` / `x11` / `framebuffer` |
+| `uid` | Current effective uid (changes after `newshell`) |
+| `geometry` | minx miny maxx maxy |
+| `framebuffer` | Mmap pixel buffer (kind=x11 / framebuffer only) |
+
+Workflow example:
+```
+$ cat /dev/wsys                       # list all windows
+$ cat /dev/wsys/3/text | tail -20     # see window 3's recent output
+$ cat /dev/wsys/3/ns                  # see window 3's namespace
+$ echo 'ls /etc' > /dev/wsys/3/cmd    # tell window 3 to run a command
+$ cat /dev/wsys/3/output              # read the result
+```
+
+Plan 9 rio's draw protocol exposes pixels; hamUI's `text`/`output`/
+`cmd`/`proc/` overlay exposes structured state. Both layers coexist —
+pixel apps still work via the draw protocol; debug-tools and AI
+agents prefer the text layer.
+
+## H-§B. Per-window admin elevation
+
+Default: every new window opens in the calling user's namespace
+(regular user → restricted per `/etc/users/<name>.ns`; hostowner →
+full). Two elevation idioms:
+
+- **Within an existing window**: `newshell hostowner` (the security-
+  model builtin landed `43d7499`) swaps the SHELL inside the window
+  to a hostowner shell with the hostowner namespace. The window
+  stays; contents elevate.
+- **Direct admin window**: `hamUI new -as hostowner` prompts for the
+  hostowner password upfront, spawns a fresh window already in
+  hostowner namespace.
+
+The window's `wctl` and the new `uid` file (see H-§A) record current
+effective uid + namespace label, so `cat /dev/wsys` shows which
+windows are elevated.
+
+## H-§C. X11 / Linux apps via Xvfb-in-linux-ns
+
+Firefox / Chromium / anything-X11 runs inside a kind=x11 hamUI window
+backed by Xvfb (the X virtual framebuffer; ~2 MB binary in Debian, no
+DRM, no Mesa).
+
+```
+hamUI new -kind x11 -cmd '/usr/bin/firefox'
+```
+
+The window child:
+1. `rfork`s into a fresh per-window namespace
+2. `enter linux { Xvfb :0 -screen 0 1024x768x24 -fbdir /tmp/hamui-fb-<wid>; firefox }`
+3. Xvfb draws into `/tmp/hamui-fb-<wid>/Xvfb_screen0` (memory-mapped)
+4. hamUI mmap's the same file from outside; on a refresh tick, blits
+   the pixels into the window's region of the physical framebuffer
+
+Mouse/keyboard translation: hamUI translates Plan-9-shape `/dev/mouse`
+records into X11 protocol events written to Xvfb's listening unix
+socket at `/tmp/.X11-unix/X0` inside the linux ns. ~300 lines of glue
+per direction.
+
+Plan-9-shape rationale:
+- The X11 server is just another process in a namespace.
+- The pixel buffer is a file.
+- The X11 wire protocol is bytes on a unix socket — Plan-9-shape.
+- All gnarly X11 logic is Xvfb's problem; hamUI just routes pixels +
+  events.
+
+Path to a real browser on Hamnix without writing our own X11 server
+(multi-year project).
+
+## H-§D. Drag-to-create-window (the gesture)
+
+Plan 9 rio's canonical gesture, kept: **left-click on the root, drag
+a rectangle, release**. On release, that rectangle becomes a new
+window — by default a hamsh prompt. When a GUI command runs inside
+(e.g. `firefox`), the window's `kind` field flips and it becomes
+that app's window.
+
+No right-click menus, no taskbar, no "new window" toolbar. The drag
+IS window creation. User direction 2026-05-27:
+
+> "left click and drag out a rectangle, that rectangle is the shell,
+> once you run a GUI command inside it, just like in plan 9, the
+> windows becomes that app. So instead of right click and open
+> window, it's just left click hold, drag out a window."
+
+Implementation: hamUI watches `#m` (mouse) events; a button-down on
+the root + drag + button-up paints a rubber-band rectangle and, on
+release, atomically: allocates a wid, `srv_post`s the per-window
+file server, rforks the child, binds the per-window `/dev` into the
+child's namespace, exec's hamsh. Same path as `/dev/wsys` write
+`new -dx W -dy H`; the drag just synthesises the geometry.
+
+## H-§E. Phasing — AI-debug FIRST
+
+Reorders the rio-era phase list (§8 below) so the AI-debug unlocks
+come BEFORE the graphical work:
+
+1. **hamUI skeleton** — one window, ALL the AI-debug files (`text` /
+   `output` / `kbdin` / `cmd` / `ns` / `pid`) working in text mode.
+   **No framebuffer yet.** Unlocks AI collaboration well before
+   graphical OS.
+2. Multi-window via `/dev/wsys` (proves per-window-namespace
+   invariant).
+3. Per-window namespace + elevation visible in `uid` / `ns` files.
+4. Framebuffer-backed pixel windows + drag-to-create gesture.
+5. X11 bridge (Xvfb + event translation).
+6. Snarf, wctl resize/move, focus policies.
+
+Phase 1 alone is strategically significant: Hamnix becomes the OS an
+AI can fully debug while you're still on a serial console.
+
+## H-§F. Retired open questions (from §9 below)
+
+- **Q1: daemon-mode (not PID 1).** Less invasive; matches Plan 9.
+- **Q2: multiplexed keyboard.** Symmetric with mouse; more code but
+  better composition with the `kbdin` AI-debug feature.
+- **Q3: defer acme.** Hamsh + ported Unix programs first.
+- **Q4: strict Plan 9 draw protocol.** Ecosystem compat over cleaner
+  encoding.
+
+---
+
+## Plan 9 rio lineage — design baseline (everything below)
+
+The rest of this document is the design lineage from Plan 9 rio. The
+sections above (H-§A through H-§F) are the Hamnix-specific overlay.
+The naming convention `rio` in the text below refers to the
+**upstream Plan 9 implementation** which we cite throughout; our
+system is `hamUI`, sharing rio's load-bearing invariants but adding
+the AI-debug + elevation + X11 + drag-create features above. Hamnix
 is currently console-only (VGA text + EFI GOP text-mode framebuffer)
-per the explicit end-game scope in [`STATUS.md`](../STATUS.md) — X11 /
-Wayland / GUI apps are out of scope. This doc captures the rio design
-for whenever the project picks up a graphical UI. The open design
-questions are tracked in `memory/project_rio_open_questions.md`; no
-implementation work is in flight.
+per the explicit end-game scope in [`STATUS.md`](../STATUS.md). No
+implementation work is in flight yet.
 
 ---
 
