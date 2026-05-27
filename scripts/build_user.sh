@@ -114,6 +114,7 @@ build_adder_user md5sum               # M16.86: fixed-hash stub (real MD5 deferr
 build_adder_user env_show             # M16.86: hint about hamsh's `env` builtin
 build_adder_user watch                # M16.86: -n N CMD, runs CMD twice w/ delay
 build_adder_user whatis               # M16.86: one-line description table
+build_adder_user man                  # discovery: read /usr/share/man/<topic>.<N>.md
 build_adder_user top                  # M16.87: one-shot /proc dashboard
 build_adder_user ifconfig             # M16.87: stub lo 127.0.0.1/8
 build_adder_user ping                 # native Adder ping: Plan-9-shaped /net/icmp client

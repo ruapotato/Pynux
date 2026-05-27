@@ -1,0 +1,128 @@
+# user/man.ad
+#
+# Hamnix `man`: the discovery half of the man+help pair. Reads
+# /usr/share/man/<topic>.<N>.md for N in (1, 4, 5, 8) and writes
+# the bytes to stdout. The first hit wins.
+#
+# Plan 9 shape: pages are plain markdown (no troff, no roff macros,
+# no compression). The renderer IS a file copy — `man <topic>` is
+# semantically `cat /usr/share/man/<topic>.<N>.md` for the right N,
+# with section-fallback and a friendlier missing-page diagnostic.
+#
+#   man man     # this binary's page (meta — always present)
+#   man hamsh   # the shell
+#   man ls      # listing directories
+#
+# Sections (mirror Unix loosely; see etc/man/ for the canonical
+# set of authored pages):
+#   1 — user commands
+#   4 — devices / cdevs
+#   5 — file formats
+#   8 — admin
+#
+# Compiler-quirk discipline (feedback_compiler_quirks.md U9): the
+# path buffer is a top-level BSS Array — never a frame local —
+# because the x86_64 backend prefers fixed-base globals for paths
+# the kernel sees by C-string. All string literals are inline at
+# the call site for the same reason.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+
+
+PREFIX_LEN: uint64 = 15            # len("/usr/share/man/")
+SUFFIX_LEN: uint64 = 5             # ".N.md"
+
+PATH_CAP: uint64 = 256
+CHUNK: uint64 = 256
+
+# BSS scratch — never a frame local (U9).
+path_buf: Array[256, uint8]
+io_buf:   Array[256, uint8]
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+# Compose /usr/share/man/<topic>.<section>.md into path_buf, NUL-
+# terminated. Returns 0 on success, -1 if the composed path would
+# exceed PATH_CAP.
+def compose_path(topic: Ptr[uint8], section: uint8) -> int32:
+    # Copy prefix. Inline-literal walked byte-by-byte; string-literal
+    # globals at Ptr[uint8] type are rejected by the x86_64 backend
+    # (feedback_compiler_quirks.md), so we keep the literal at the
+    # call site and step its bytes.
+    prefix: Ptr[uint8] = "/usr/share/man/"
+    i: uint64 = 0
+    while i < PREFIX_LEN:
+        path_buf[i] = prefix[i]
+        i = i + 1
+    # Append topic up to its NUL.
+    j: uint64 = 0
+    while topic[j] != 0:
+        if i + 1 >= PATH_CAP:
+            return -1
+        path_buf[i] = topic[j]
+        i = i + 1
+        j = j + 1
+    # Append ".<section>.md".
+    if i + SUFFIX_LEN >= PATH_CAP:
+        return -1
+    path_buf[i]     = 46                   # '.'
+    path_buf[i + 1] = section
+    path_buf[i + 2] = 46                   # '.'
+    path_buf[i + 3] = 109                  # 'm'
+    path_buf[i + 4] = 100                  # 'd'
+    path_buf[i + 5] = 0
+    return 0
+
+
+# Stream the file at the composed path to stdout. Returns the
+# section byte ('1','4','5','8') on success, 0 on miss.
+def try_section(topic: Ptr[uint8], section: uint8) -> uint8:
+    if compose_path(topic, section) != 0:
+        return 0
+    fd: int32 = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if fd < 0:
+        return 0
+    while True:
+        n: int64 = sys_read(fd, &io_buf[0], CHUNK)
+        if n <= 0:
+            break
+        sys_write(1, &io_buf[0], cast[uint64](n))
+    sys_close(fd)
+    return section
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2, "man: usage: man <topic>\n")
+        return 1
+    topic: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+
+    # Section search order. 1 first (user commands — the common case),
+    # then devices, file formats, admin. The list is short and the
+    # cost of an extra sys_open on miss is negligible.
+    if try_section(topic, 49) != 0:        # '1'
+        return 0
+    if try_section(topic, 52) != 0:        # '4'
+        return 0
+    if try_section(topic, 53) != 0:        # '5'
+        return 0
+    if try_section(topic, 56) != 0:        # '8'
+        return 0
+
+    write_str(2, "man: no entry for ")
+    write_str(2, topic)
+    write_str(2, "\n")
+    return 1
