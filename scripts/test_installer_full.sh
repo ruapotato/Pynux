@@ -17,13 +17,16 @@
 #            re-trigger the grow (sentinel respected via
 #            ext4_resize_check returning "no grow needed").
 #
-# Markers asserted, in order, on Stage B:
+# Markers asserted, in order, on Stage B (hpm-driven shape):
 #   "[install] Hamnix installer"
 #   "[gpt] init OK"                     (kernel-side gpt_init)
 #   "[gpt] mkpart idx=0"                (ESP partition)
 #   "[gpt] mkpart idx=1"                (rootfs partition)
-#   "dd_blk: OK"                        (×2 — ESP + rootfs copy)
-#   "[install] (5/5) install complete"
+#   "hpm: installed hamnix-base"        (Phase 5 hpm-driven install)
+#   "hpm: installed hamnix-installer-tools"
+#   "hpm: installed hamnix-bootloader"
+#   "hpm: installed linux-debian-12"
+#   "[install] (7/7) install complete"
 #
 # Markers asserted on Stage C (boot from disk alone):
 #   "Hamnix kernel booting"             (kernel banner)
@@ -112,15 +115,23 @@ check_marker '\[install\] Hamnix installer' "installer banner"
 check_marker '\[gpt\] init OK' "gpt_init"
 check_marker '\[gpt\] mkpart idx=0' "ESP mkpart"
 check_marker '\[gpt\] mkpart idx=1' "rootfs mkpart"
-# dd_blk OK should appear twice (ESP + rootfs)
+# hpm-driven install: each package emits its own marker.
+check_marker 'hpm: installed hamnix-base'             "hpm install hamnix-base"
+check_marker 'hpm: installed hamnix-installer-tools'  "hpm install hamnix-installer-tools"
+check_marker 'hpm: installed hamnix-bootloader'       "hpm install hamnix-bootloader"
+check_marker 'hpm: installed linux-debian-12'         "hpm install linux-debian-12"
+# Underlying byte transfer (dd_blk of pre-populated source partitions)
+# still happens until userland can mount a freshly-formatted ext4 — see
+# etc/install.hamsh's step 6 banner-comment. We keep the assertion lax:
+# at least one dd_blk has to succeed (ESP + rootfs are both copied).
 ddok=$(grep -aE -c 'dd_blk: OK' "$STAGE_B_LOG" || true)
 if [ "$ddok" -ge 2 ]; then
-    echo "[test_installer_full]   OK : dd_blk: OK ×$ddok"
+    echo "[test_installer_full]   OK : dd_blk: OK ×$ddok (ESP + rootfs byte-transfer)"
 else
     echo "[test_installer_full]   MISS: dd_blk: OK appeared $ddok times (need 2)" >&2
     stage_b_fail=1
 fi
-check_marker '\[install\] \(5/5\) install complete' "install complete"
+check_marker '\[install\] \(7/7\) install complete' "install complete"
 
 if [ "$stage_b_fail" -ne 0 ]; then
     echo "[test_installer_full] Stage B FAILED — last 80 lines of log:" >&2
@@ -241,7 +252,7 @@ stage_d_install_and_boot() {
         > "$install_log" 2>&1
     set -e
 
-    if ! grep -aE -q '\[install\] \(5/5\) install complete' "$install_log"; then
+    if ! grep -aE -q '\[install\] \(7/7\) install complete' "$install_log"; then
         echo "[test_installer_full] Stage D ($label) FAIL: install did not complete" >&2
         tail -40 "$install_log" >&2
         if [ "${KEEP_LOGS:-0}" != "1" ]; then
