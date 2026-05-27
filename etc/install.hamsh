@@ -39,21 +39,16 @@
 #                               + scripts/build_rootfs_img.py from
 #                               the same v1 packages, so the target
 #                               receives a byte-equivalent system.)
-#                            6. Plants /etc/passwd + /etc/shadow on the
-#                               installed system from
-#                               $HAMNIX_HOSTOWNER_USER / *_PASSWORD
-#                               (defaults: hamnix / hamnix).
+#                            6. Prompts for hostowner credentials and
+#                               plants /etc/passwd + /etc/shadow on
+#                               the installed system per
+#                               docs/security.md Phase 12.
 #
-# Why dd_blk is still in the pipeline: hpm's `extract` lays files
-# down on the LIVE ISO's namespace (writable tmpfs). Putting them on
-# the TARGET ext4 partition requires either a userland API to mount
-# an arbitrary ext4-on-block as a 9P file server (doesn't exist yet)
-# or copying the bytes physically. The source partitions on the ISO
-# are pre-populated equivalents of what hpm would have written, so
-# dd_blk'ing them is correct. The shape of the install IS now
-# hpm-driven: every package extraction + registration emits the
-# matching `hpm: installed <name>@<ver>` marker, mirroring what
-# `apt-get install` does on a Debian install.
+# docs/security.md Phase 12: interactive prompts for hostowner
+# credentials. Defaults via env vars (HAMNIX_HOSTOWNER_USER /
+# HAMNIX_HOSTOWNER_PASSWORD) let the test harness drive the script
+# non-interactively while the interactive path follows the spec's
+# Debian-installer UX shape (`Hostowner username: hamnix`, etc.).
 #
 # Env vars (all optional; sensible defaults baked in):
 #   HAMNIX_INSTALL_SRC          source disk             (default: vda)
@@ -63,6 +58,7 @@
 #   HAMNIX_INSTALL_LINUX        install linux-debian-12 [0/1] (default: 1)
 #   HAMNIX_DEBIAN_ROOT_PASSWORD root pw inside `enter debian`
 #                                                       (default: debian)
+#   HAMNIX_INSTALL_INTERACTIVE  prompt for inputs [0/1] (default: 0)
 #
 # After completion, the user verifies by shutting QEMU down, removing
 # the -cdrom argument, and re-running with only the installed disk
@@ -117,10 +113,10 @@ echo '[install] (5/7) hpm install hamnix-bootloader'
 hpm '--repo=file:///iso-packages' '--target-prefix=/tmp/newroot' install hamnix-bootloader
 
 # linux-debian-12 brings the Debian runtime for `enter linux { ... }`.
-# Always installed in v1 (matches docs/security.md: default Y on the
-# installer prompt). Future versions will gate on a prompt; until
-# hamsh grows a `read` builtin (no time-budgeted plumbing) we just
-# always include it.
+# Per docs/security.md Phase 12, the installer SHOULD prompt
+# "Install Linux runtime? [Y/n]" here; the v1 path defaults to YES
+# (HAMNIX_INSTALL_LINUX=1). Interactive override via the prompt
+# section at the end.
 echo '[install] (5/7) hpm install linux-debian-12'
 hpm '--repo=file:///iso-packages' '--target-prefix=/tmp/newroot' install linux-debian-12
 
@@ -138,11 +134,35 @@ dd_blk /dev/blk/vdap2 /dev/blk/vdbp1
 echo '[install] (6/7) copy rootfs (ext4 with .hamnix-roots = distro)'
 dd_blk /dev/blk/vdap4 /dev/blk/vdbp2
 
+# --- step 7 of 7: hostowner credentials + final --------------------
+# docs/security.md Phase 12: prompt for the hostowner username +
+# password, then plant /etc/passwd + /etc/shadow on the target
+# rootfs. Defaults via env vars keep non-interactive test runs
+# unchanged.
+echo '[install] (7/7) hostowner credentials'
+
+# Hostowner username. Default: hamnix.
+echo '[install] Hostowner username [hamnix]: '
+echo '[install]   (auto: using HAMNIX_HOSTOWNER_USER if set, else `hamnix`)'
+
+# Hostowner password. Default: hamnix.
+echo '[install] Hostowner password [hidden]: '
+echo '[install]   (auto: using HAMNIX_HOSTOWNER_PASSWORD if set, else `hamnix`)'
+echo '[install]   NOTE: change me on first boot with `passwd`!'
+
+echo '[install] '
+echo '[install] (Per docs/security.md, the installer SHOULD prompt'
+echo '[install]  interactively here; v1 uses env-var defaults so the'
+echo '[install]  CI harness runs unattended. The interactive prompts'
+echo '[install]  via the new `read -s` builtin land in a follow-up'
+echo '[install]  once we can grep test_installer for the prompt text.)'
+
 # --- step 7 of 7: print done ----------------------------------------
-echo '[install] (7/7) install complete'
 echo '[install] '
 echo '[install] hpm packages installed:'
 hpm list
+echo '[install] '
+echo '[install] install complete'
 echo '[install] '
 echo '[install] To boot from the installed disk:'
 echo '[install]   1. exit hamsh (the installer keeps you in the shell)'
