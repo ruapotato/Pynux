@@ -1,0 +1,217 @@
+# user/help.ad
+#
+# Hamnix `help`: the discovery half of the man+help pair.
+#
+#   help              — print a topical index. For every page under
+#                       /usr/share/man/, list "<topic> — <H1 text>".
+#                       This is the "what commands exist?" answer for
+#                       new users.
+#   help <topic>      — sugar for `man <topic>`; same path-walk
+#                       behaviour, same exit code on miss.
+#   help builtins     — list hamsh builtins (cd, bind, svc, ...)
+#                       that have no /usr/share/man/ page because they
+#                       live inside the shell process.
+#
+# Plan 9 shape: like `man`, help reads markdown files directly. The
+# index is a sys_listdir of /usr/share/man/ followed by a one-line
+# header probe of each .md file. The H1 line of every page is its
+# one-line summary (the man page authoring guide is just "make the
+# first line `# <name> - <summary>`").
+#
+# Compiler-quirk discipline (feedback_compiler_quirks.md U9):
+# all big buffers at module-scope, string literals kept at call sites.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_listdir(path: Ptr[char], buf: Ptr[uint8],
+                       count: uint64) -> int64
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_waitpid(pid: int32) -> int64
+
+
+PREFIX_LEN: uint64 = 15            # len("/usr/share/man/")
+PATH_CAP:   uint64 = 256
+LIST_CAP:   uint64 = 4096
+HDR_CAP:    uint64 = 256
+
+# Module-scope buffers — frame locals would be too large.
+path_buf: Array[256, uint8]
+list_buf: Array[4096, uint8]
+hdr_buf:  Array[256, uint8]
+argv_buf: Array[4, uint64]
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+# Compose "/usr/share/man/<entry-bytes>" into path_buf, NUL-term'd.
+# entry is the raw name from sys_listdir (no NUL — len bytes).
+def compose_full(entry: Ptr[uint8], elen: uint64) -> int32:
+    prefix: Ptr[uint8] = "/usr/share/man/"
+    if PREFIX_LEN + elen + 1 >= PATH_CAP:
+        return -1
+    i: uint64 = 0
+    while i < PREFIX_LEN:
+        path_buf[i] = prefix[i]
+        i = i + 1
+    k: uint64 = 0
+    while k < elen:
+        path_buf[i + k] = entry[k]
+        k = k + 1
+    path_buf[i + elen] = 0
+    return 0
+
+
+# Read the first HDR_CAP bytes of path_buf into hdr_buf. Returns
+# the count read (>=0) or -1 on open failure.
+def read_header(elen: uint64) -> int64:
+    fd: int32 = sys_open(cast[Ptr[char]](&path_buf[0]))
+    if fd < 0:
+        return -1
+    n: int64 = sys_read(fd, &hdr_buf[0], HDR_CAP)
+    sys_close(fd)
+    if n < 0:
+        return -1
+    return n
+
+
+# Print the first line of hdr_buf (the H1: typically "# name - foo").
+# We strip the leading "# " if present and write the rest of the line.
+# Output is suffix-less: caller adds its own newline.
+def write_h1(fd: int32, hdr_len: uint64):
+    # Find newline.
+    nl: uint64 = 0
+    while nl < hdr_len and hdr_buf[nl] != 10:
+        nl = nl + 1
+    # Skip leading '#' chars and a single space if present.
+    start: uint64 = 0
+    while start < nl and hdr_buf[start] == 35:     # '#'
+        start = start + 1
+    if start < nl and hdr_buf[start] == 32:        # ' '
+        start = start + 1
+    if start < nl:
+        sys_write(fd, cast[Ptr[uint8]](
+            cast[uint64](&hdr_buf[0]) + start), nl - start)
+
+
+# Print "<topic>  - <h1-text>\n" by stripping ".<N>.md" off the
+# entry name. entry is `topic.N.md` (with no NUL — caller passes elen).
+def emit_index_line(entry: Ptr[uint8], elen: uint64, hdr_len: uint64):
+    # Find ".N.md" suffix — back up 5 chars.
+    if elen < 5:
+        return
+    base_len: uint64 = elen - 5
+    sys_write(1, entry, base_len)
+    # Pad to column ~14 for readability. Compute spaces from base_len.
+    pad_col: uint64 = 14
+    written: uint64 = base_len
+    while written < pad_col:
+        sys_write(1, " ", 1)
+        written = written + 1
+    sys_write(1, " - ", 3)
+    write_h1(1, hdr_len)
+    sys_write(1, "\n", 1)
+
+
+def print_index():
+    write_str(1, "Hamnix commands. `man <topic>` or `help <topic>` for details.\n")
+    write_str(1, "\n")
+    n: int64 = sys_listdir(cast[Ptr[char]]("/usr/share/man/"),
+                           &list_buf[0], LIST_CAP)
+    if n <= 0:
+        write_str(2, "help: /usr/share/man/ is empty or missing\n")
+        return
+    nu: uint64 = cast[uint64](n)
+    i: uint64 = 0
+    while i < nu:
+        j: uint64 = i
+        while j < nu and list_buf[j] != 10:
+            j = j + 1
+        elen: uint64 = j - i
+        # Filter: only entries ending in ".md" (skip stray files).
+        if elen >= 3 \
+                and list_buf[i + elen - 3] == 46 \
+                and list_buf[i + elen - 2] == 109 \
+                and list_buf[i + elen - 1] == 100:
+            entry: Ptr[uint8] = cast[Ptr[uint8]](
+                cast[uint64](&list_buf[0]) + i)
+            if compose_full(entry, elen) == 0:
+                hdr_n: int64 = read_header(elen)
+                if hdr_n > 0:
+                    emit_index_line(entry, elen, cast[uint64](hdr_n))
+        i = j + 1
+    write_str(1, "\n")
+    write_str(1, "Also: `help builtins` for shell-internal commands.\n")
+
+
+def print_builtins():
+    write_str(1, "hamsh builtins (live inside the shell process):\n")
+    write_str(1, "\n")
+    write_str(1, "  cd <dir>            change working directory\n")
+    write_str(1, "  bind <src> <dst>    graft src onto the name dst (namespace)\n")
+    write_str(1, "  unmount <name>      remove a binding\n")
+    write_str(1, "  mount <src> <dst>   mount a file server (9P / cdev)\n")
+    write_str(1, "  import <ns> <name>  attach an external name into the local ns\n")
+    write_str(1, "  export <name>       publish a local name to /srv\n")
+    write_str(1, "  echo <words>        write argv to stdout\n")
+    write_str(1, "  svc <verb> <name>   service supervisor (start/stop/status)\n")
+    write_str(1, "  read [-s] VAR       read one line from stdin into VAR\n")
+    write_str(1, "  newshell <user>     password-authenticated re-execve as <user>\n")
+    write_str(1, "  exit                leave the shell\n")
+    write_str(1, "\n")
+    write_str(1, "Control constructs (statement-level, not commands):\n")
+    write_str(1, "  if / while / for / def / return / break / continue\n")
+    write_str(1, "  try { } except { }  spawn / enter / ns { }\n")
+    write_str(1, "\n")
+    write_str(1, "See `man hamsh` for the language reference.\n")
+
+
+def run_man(topic: Ptr[uint8]) -> int32:
+    # Forward to /bin/man so the search rules live in one place. argv
+    # is a small uint64 array of pointers; argv[0]=path, argv[1]=topic,
+    # argv[2..]=0 to terminate.
+    argv_buf[0] = cast[uint64](cast[Ptr[char]]("/bin/man"))
+    argv_buf[1] = cast[uint64](topic)
+    argv_buf[2] = 0
+    pid: int32 = sys_spawn(cast[Ptr[char]]("/bin/man"),
+                           &argv_buf[0], 0, 1, cast[Ptr[uint64]](0))
+    if pid < 0:
+        write_str(2, "help: cannot spawn /bin/man\n")
+        return 1
+    return cast[int32](sys_waitpid(pid))
+
+
+# True iff the bytes at a (NUL-terminated) equal the bytes at b
+# (NUL-terminated).
+def cstr_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] != b[i]:
+        return 0
+    return 1
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        print_index()
+        return 0
+    topic: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    if cstr_eq(topic, "builtins") != 0:
+        print_builtins()
+        return 0
+    return run_man(topic)
