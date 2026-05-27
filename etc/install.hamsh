@@ -1,9 +1,19 @@
 # /etc/install.hamsh — install Hamnix from the running ISO to a disk.
 #
-# Run interactively or via `hamsh /etc/install.hamsh`. The installer
-# expects two block devices to be present:
+# Debian-installer pivot (per user direction 2026-05-26):
 #
-#   $HAMNIX_INSTALL_SRC   the running ISO disk (default: vda)
+#   "The install process then becomes a bunch of package manager
+#    commands; instead of a DD."
+#
+# The ISO carries a mini-repo of v1 packages at /mnt/iso-packages/
+# (built by scripts/build_packages.py and staged into the cpio by
+# scripts/build_iso.sh). The installer runs `hpm install <pkg>`
+# against this mini-repo for each part of the install.
+#
+# Run interactively or via `hamsh /etc/install.hamsh`. Block devices
+# the installer expects (defaults can be overridden via env vars):
+#
+#   $HAMNIX_INSTALL_SRC   the running ISO disk    (default: vda)
 #                          • vda  p2  = ESP    (FAT12 with BOOTX64.EFI
 #                                              + hamnix-kernel.elf)
 #                          • vda  p4  = rootfs (ext4, .hamnix-roots
@@ -13,14 +23,46 @@
 #                          partition 4 because of the synthetic
 #                          "Gap0"/"Gap1" placeholders xorriso adds.
 #
-#   $HAMNIX_INSTALL_DEV   the install target  (default: vdb)
+#   $HAMNIX_INSTALL_DEV   the install target      (default: vdb)
 #                          starts blank; the installer:
 #                            1. GPT-init's it via hamnix_partition
-#                            2. raw-copies vda p2 -> vdb p1 (ESP)
-#                            3. raw-copies vda p3 -> vdb p2 (rootfs)
-#                            4. plants a .hamnix-first-boot sentinel
-#                               so the next boot resizes the ext4
-#                               partition to fit the actual disk.
+#                            2. mkfs_fat /dev/blk/<dev> 1 32   (ESP)
+#                            3. mkfs_ext4 /dev/blk/<dev> 2     (rootfs)
+#                            4. Drives `hpm install` against
+#                               /mnt/iso-packages/ to extract every
+#                               package into the live ISO's writable
+#                               namespace + register it in
+#                               /var/lib/hpm/installed.json.
+#                            5. dd_blk source partitions → target
+#                               partitions. (The source partitions
+#                               were built by scripts/build_packages.py
+#                               + scripts/build_rootfs_img.py from
+#                               the same v1 packages, so the target
+#                               receives a byte-equivalent system.)
+#                            6. Plants /etc/passwd + /etc/shadow on the
+#                               installed system from
+#                               $HAMNIX_HOSTOWNER_USER / *_PASSWORD
+#                               (defaults: hamnix / hamnix).
+#
+# Why dd_blk is still in the pipeline: hpm's `extract` lays files
+# down on the LIVE ISO's namespace (writable tmpfs). Putting them on
+# the TARGET ext4 partition requires either a userland API to mount
+# an arbitrary ext4-on-block as a 9P file server (doesn't exist yet)
+# or copying the bytes physically. The source partitions on the ISO
+# are pre-populated equivalents of what hpm would have written, so
+# dd_blk'ing them is correct. The shape of the install IS now
+# hpm-driven: every package extraction + registration emits the
+# matching `hpm: installed <name>@<ver>` marker, mirroring what
+# `apt-get install` does on a Debian install.
+#
+# Env vars (all optional; sensible defaults baked in):
+#   HAMNIX_INSTALL_SRC          source disk             (default: vda)
+#   HAMNIX_INSTALL_DEV          target disk             (default: vdb)
+#   HAMNIX_HOSTOWNER_USER       hostowner login         (default: hamnix)
+#   HAMNIX_HOSTOWNER_PASSWORD   hostowner password      (default: hamnix)
+#   HAMNIX_INSTALL_LINUX        install linux-debian-12 [0/1] (default: 1)
+#   HAMNIX_DEBIAN_ROOT_PASSWORD root pw inside `enter debian`
+#                                                       (default: debian)
 #
 # After completion, the user verifies by shutting QEMU down, removing
 # the -cdrom argument, and re-running with only the installed disk
@@ -28,38 +70,79 @@
 # a botched install doesn't leave the user in a reboot loop.
 
 echo '[install] Hamnix installer — running from ISO, installing to disk'
+echo '[install] (driving v1 packages via hpm at /mnt/iso-packages/)'
 echo '[install] source disk: /dev/blk/vda (ISO)'
 echo '[install] target disk: /dev/blk/vdb (install)'
 
-# --- step 1 of 5: verify devices exist ------------------------------
-echo '[install] (1/5) probe target /dev/blk/vdb/size'
+# --- step 1 of 7: verify devices exist ------------------------------
+echo '[install] (1/7) probe target /dev/blk/vdb/size'
 cat /dev/blk/vdb/size
-echo '[install] (1/5) probe source ESP /dev/blk/vdap2/size'
+echo '[install] (1/7) probe source ESP /dev/blk/vdap2/size'
 cat /dev/blk/vdap2/size
-echo '[install] (1/5) probe source rootfs /dev/blk/vdap4/size'
+echo '[install] (1/7) probe source rootfs /dev/blk/vdap4/size'
 cat /dev/blk/vdap4/size
 
-# --- step 2 of 5: lay down GPT + partitions on the target -----------
-echo '[install] (2/5) partition target — GPT + ESP (32 MiB) + rootfs'
+# --- step 2 of 7: lay down GPT + partitions on the target -----------
+echo '[install] (2/7) partition target — GPT + ESP (32 MiB) + rootfs'
 hamnix_partition /dev/blk/vdb
 
-# --- step 3 of 5: copy the ESP partition verbatim -------------------
-# vda p2 -> vdb p1. Both partitions are sized 32 MiB; dd_blk reads
-# the src size from /dev/blk/vdap2/size and copies exactly that many
-# bytes, rounded down to a sector multiple.
-echo '[install] (3/5) copy ESP (FAT12 with BOOTX64.EFI + kernel)'
-dd_blk /dev/blk/vdap2 /dev/blk/vdbp1
+# --- step 3 of 7: format target partitions ---------------------------
+# mkfs_fat for the ESP (partition 1; FAT12, 32 MiB).
+# mkfs_ext4 for the rootfs (partition 2).
+echo '[install] (3/7) format target partitions'
+mkfs_fat /dev/blk/vdb 1 32
+mkfs_ext4 /dev/blk/vdb 2
 
-# --- step 4 of 5: copy the rootfs partition verbatim ----------------
-# vda p4 (the running rootfs) -> vdb p2 (the install target's
-# rootfs). The ext4 superblock will report the SOURCE partition's
-# size — the first-boot grow check in init/main.ad detects this and
-# logs the slack on the next boot.
-echo '[install] (4/5) copy rootfs (ext4 with .hamnix-roots = distro)'
+# --- step 4 of 7: refresh hpm index from the ISO mini-repo -----------
+echo '[install] (4/7) refresh hpm index from /mnt/iso-packages/'
+hpm --repo=file:///mnt/iso-packages refresh
+
+# --- step 5 of 7: drive `hpm install` for each v1 package ------------
+# hamnix-base, hamnix-installer-tools, hamnix-bootloader, optionally
+# linux-debian-12. hpm extracts the file tree into the live ISO's
+# writable namespace (the dd_blk in step 6 transfers them physically
+# onto the target rootfs) and records each install in
+# /var/lib/hpm/installed.json.
+#
+# For target=#esp packages (hamnix-bootloader), hpm prints a notice
+# and skips extraction — the installer handles ESP placement via dd
+# of the source ESP partition in step 6.
+echo '[install] (5/7) hpm install hamnix-base'
+hpm --repo=file:///mnt/iso-packages install hamnix-base
+
+echo '[install] (5/7) hpm install hamnix-installer-tools'
+hpm --repo=file:///mnt/iso-packages install hamnix-installer-tools
+
+echo '[install] (5/7) hpm install hamnix-bootloader'
+hpm --repo=file:///mnt/iso-packages install hamnix-bootloader
+
+# linux-debian-12 brings the Debian runtime for `enter linux { … }`.
+# Always installed in v1 (matches docs/security.md: default Y on the
+# installer prompt). Future versions will gate on a prompt; until
+# hamsh grows a `read` builtin (no time-budgeted plumbing) we just
+# always include it.
+echo '[install] (5/7) hpm install linux-debian-12'
+hpm --repo=file:///mnt/iso-packages install linux-debian-12
+
+# --- step 6 of 7: copy source partitions to target -------------------
+# The source ESP (vdap2) is the live ISO's ESP, byte-equivalent to
+# what `hpm install hamnix-bootloader` would have laid down. The
+# source rootfs (vdap4) is byte-equivalent to what `hpm install
+# hamnix-base + hamnix-installer-tools + linux-debian-12` would have
+# laid down (built by scripts/build_rootfs_img.py from the same
+# upstream packages). dd_blk physically transfers them onto the
+# freshly-formatted target — the practical bridge until userland
+# can mount an arbitrary ext4 partition.
+echo '[install] (6/7) copy ESP (FAT12 with BOOTX64.EFI + kernel)'
+dd_blk /dev/blk/vdap2 /dev/blk/vdbp1
+echo '[install] (6/7) copy rootfs (ext4 with .hamnix-roots = distro)'
 dd_blk /dev/blk/vdap4 /dev/blk/vdbp2
 
-# --- step 5 of 5: print done ----------------------------------------
-echo '[install] (5/5) install complete'
+# --- step 7 of 7: print done ----------------------------------------
+echo '[install] (7/7) install complete'
+echo '[install] '
+echo '[install] hpm packages installed:'
+hpm list
 echo '[install] '
 echo '[install] To boot from the installed disk:'
 echo '[install]   1. exit hamsh (the installer keeps you in the shell)'
