@@ -397,10 +397,13 @@ When testing on real hardware:
 - **Install path shipped**: the ISO carries `etc/install.hamsh`, a
   7-step Debian-installer-shape script driven by `hpm install`
   against an ISO-local mini-repo at `/iso-packages/`. It lays down
-  GPT + partitions on the target, mkfs's ESP + rootfs, runs
-  `hpm install hamnix-base hamnix-bootloader hamnix-installer-tools
-  linux-debian-12`, prompts for hostowner credentials, and plants
-  `/etc/passwd` + `/etc/shadow` on the installed disk. The rootfs
+  GPT + partitions on the target, mkfs's ESP + rootfs, then runs
+  `hpm install hamnix-base` (a METAPACKAGE that pulls in every
+  component — init, hamsh, coreutils, net, sshd, hpm, fs tools,
+  drivers, installer-tools, bootloader — via `depends:`), followed
+  by `hpm install linux-debian-12` for the Debian runtime, prompts
+  for hostowner credentials, and plants `/etc/passwd` +
+  `/etc/shadow` on the installed disk. The rootfs
   ext4 partition is created small and grown to fit the target disk
   on first boot. `scripts/test_installer_full.sh` exercises the
   full loop (build ISO → install → reboot from disk → first-boot

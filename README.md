@@ -158,11 +158,17 @@ and discovery".
   DEFAULT namespace. It is NOT a substitute for apt; apt stays in
   the Linux namespace for Debian packages. v1 is binary-only with a
   greedy BFS dep solver + conflict detection; write commands gate
-  on uid==1 (hostowner). Five packages live at the canonical repo
-  `https://255.one/`: `hamnix-hello`, `hamnix-base`,
-  `hamnix-bootloader`, `hamnix-installer-tools`, `linux-debian-12`.
-  The installer (`etc/install.hamsh`) is now `hpm install`-driven
-  against an ISO-local mini-repo. See `docs/packages.md`,
+  on uid==1 (hostowner). The canonical repo `https://255.one/`
+  ships ~17 component packages plus the `hamnix-base` METAPACKAGE
+  that pulls them all in via `depends:` (`hamnix-init`,
+  `hamnix-hamsh`, `hamnix-coreutils`, `hamnix-net`, `hamnix-svc-sshd`,
+  `hpm`, `hamnix-fs-ext4`, `hamnix-fs-fat`, the `hamnix-drivers-*`
+  set, `hamnix-installer-tools`, `hamnix-bootloader`, and
+  `linux-debian-12`). The installer (`etc/install.hamsh`) is now
+  `hpm install hamnix-base`-driven against an ISO-local mini-repo;
+  the dep solver pulls the entire closure. A trimmed install can
+  pick a subset of components (e.g. embedded headless boards skip
+  the audio + USB driver packages). See `docs/packages.md`,
   `docs/architecture.md` § "What runs where".
 - **Security (Plan-9-shape)**: a single hostowner (uid 1) per
   installed system owns everything privileged; regular users

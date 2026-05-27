@@ -2,36 +2,67 @@
 """
 scripts/build_packages.py — build the v1 Hamnix package tarballs.
 
-This is the Debian-installer-shape pivot: the install process becomes
-a series of `hpm install <pkg>` calls instead of dd_blk-based partition
-copies. To make that work, the current Hamnix build outputs (kernel ELF,
-initramfs cpio content, framework .kos, the Debian-minbase rootfs tree)
-have to be repackaged as v1 hpm packages (per docs/packages.md).
+The Debian-installer-shape pivot: each install step is a `hpm install
+<pkg>`. To make that scale beyond the monolithic v1 set, this script
+now emits ~17 *component* packages plus a `hamnix-base` METAPACKAGE
+that pulls them all in via `depends:`. A future install can pick a
+subset (e.g. `{ hamnix-kernel, hamnix-init, hamnix-hamsh, hpm,
+hamnix-drivers-net-e1000e, hamnix-fs-ext4 }` for an embedded build)
+and skip everything else.
 
 Outputs (under build/packages/):
 
-  * hamnix-base-<v>.tar.gz          — the OS userland (init, hamsh, ed,
-                                       services, framework .kos, rc.boot).
-                                       target: #hamnix-system
-  * hamnix-bootloader-<v>.tar.gz    — BOOTX64.EFI + the kernel ELF.
-                                       target: #esp
-  * hamnix-installer-tools-<v>.tar.gz — the binaries install.hamsh itself
-                                       drives (mkfs_ext4, mkfs_fat,
-                                       hamnix_partition, dd_blk, hpm).
-                                       target: #hamnix-system
-  * linux-debian-12-<v>.tar.gz      — the curated Debian rootfs tree the
-                                       Linux namespace mounts.
-                                       target: #distro
-  * index.json                      — repo index in the schema specified
-                                       by docs/packages.md.
+  * hamnix-base-<v>.tar.gz             — metapackage (zero files,
+                                          depends on all component pkgs).
+                                          target: #hamnix-system
+  * hamnix-init-<v>.tar.gz             — /init + /etc/rc.boot etc.
+  * hamnix-hamsh-<v>.tar.gz            — /bin/hamsh + /etc/profile etc.
+  * hamnix-coreutils-<v>.tar.gz        — cat, ls, echo, etc. (~80 utils)
+  * hamnix-net-<v>.tar.gz              — ifconfig, ping, route, httpd
+  * hamnix-svc-sshd-<v>.tar.gz         — sshd + /etc/svc/sshd.hamsh
+  * hpm-<v>.tar.gz                     — /bin/hpm + var dirs
+  * hamnix-fs-ext4-<v>.tar.gz          — mkfs_ext4 + install_file_to_slot
+  * hamnix-fs-fat-<v>.tar.gz           — mkfs_fat
+  * hamnix-drivers-net-e1000e-<v>.tar.gz — e1000e.ko
+  * hamnix-drivers-block-ahci-<v>.tar.gz — ahci + libata + scsi_mod + ...
+  * hamnix-drivers-block-nvme-<v>.tar.gz — nvme + nvme_core
+  * hamnix-drivers-usb-xhci-<v>.tar.gz   — xhci_pci + xhci_hcd + usbcore
+  * hamnix-drivers-snd-hda-<v>.tar.gz    — snd_hda_intel + ALSA stack
+  * hamnix-installer-tools-<v>.tar.gz  — hamnix_partition + dd_blk
+  * hamnix-bootloader-<v>.tar.gz       — BOOTX64.EFI + kernel ELF
+  * linux-debian-12-<v>.tar.gz         — Debian 12 rootfs
+  * index.json                         — repo index (docs/packages.md)
 
-After this script runs the ISO builder can stage build/packages/ at
-/mnt/iso-packages/ on the cpio (Phase 3) and the installer can run
+Cleavage principle: every reusable subsystem is its own package so a
+shrink-wrapped install can pick exactly what it needs. A NUC with only
+USB+NVMe doesn't need ahci/snd-hda; an embedded headless build doesn't
+need linux-debian-12; a kiosk box might want only hamnix-{kernel,init,
+hamsh}.
 
-    hpm --repo=file:///mnt/iso-packages --target-prefix=/mnt/newroot \
-        install hamnix-base hamnix-installer-tools linux-debian-12
+After this script runs the ISO builder stages build/packages/ at
+/iso-packages/ on the cpio (build_initramfs.py) and the installer
+runs
 
-instead of dd_blk'ing whole partitions.
+    hpm --repo=file:///iso-packages --target-prefix=/tmp/newroot \\
+        install hamnix-base
+
+which (per docs/packages.md and the hpm v3 dep solver) pulls the
+entire closure transitively. Alternatively install.hamsh can name
+individual components for a slimmer build.
+
+DESIGN — file→package mapping. The mapping lives in this file under
+PACKAGE_SPECS (a list of dicts). Each entry declares:
+  * name, version, arch, description, target
+  * depends/conflicts/provides (PKGINFO + index.json fields)
+  * a `files` list of (src_path, target_path) tuples that the staging
+    helper copies into <pkg>-<v>/files/<target_path>
+  * an optional `extra_files` callable for packages with non-trivial
+    layout (linux-debian-12's usrmerge; hamnix-bootloader's SLIM mode)
+
+A future package = one new dict added to PACKAGE_SPECS. The
+file-mapping is the source of truth; gen_install_manifest.py can be
+extended later to read this same table if the brief's option-1 (per-
+package manifest fragments) becomes preferable.
 """
 
 from __future__ import annotations
@@ -40,7 +71,6 @@ import hashlib
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -56,9 +86,8 @@ KERNEL_ELF = BUILD / "hamnix-kernel.elf"
 EFI_STUB = BUILD / "hamnix-bootx64.efi"
 DEBIAN_MINBASE = HERE / "tests" / "distros" / "debian-minbase" / "rootfs"
 
-# v1: hold every package at the same version. The four-package set is
-# one atomic release (you don't ship a bootloader newer than the base
-# it boots into).
+# v1: every package shares one atomic release version. You don't ship
+# a bootloader newer than the base it boots into.
 PKG_VERSION = os.environ.get("HAMNIX_PKG_VERSION", "1.0.0")
 
 
@@ -86,7 +115,6 @@ def _copy_file(src: Path, dst: Path, mode: int | None = None) -> int:
     if mode is not None:
         dst.chmod(mode)
     else:
-        # Preserve executability.
         if src.stat().st_mode & 0o111:
             dst.chmod(0o755)
         else:
@@ -108,16 +136,12 @@ def _tar_gz(pkg_root: Path, out_path: Path) -> tuple[str, int]:
 
     Returns (sha256_hex, size_bytes).
     """
-    # tarfile defaults aren't fully deterministic (mtime, ordering),
-    # so we explicitly sort and pin mtimes.
     if out_path.exists():
         out_path.unlink()
     pkg_dirname = pkg_root.name
-    # Collect all entries, sorted by relative path.
     entries: list[Path] = sorted(pkg_root.rglob("*"))
     with tarfile.open(out_path, mode="w:gz", format=tarfile.GNU_FORMAT,
                       compresslevel=9) as tar:
-        # Add the top-level directory first.
         ti = tarfile.TarInfo(name=pkg_dirname)
         ti.type = tarfile.DIRTYPE
         ti.mode = 0o755
@@ -142,7 +166,6 @@ def _tar_gz(pkg_root: Path, out_path: Path) -> tuple[str, int]:
                 ti.mode = 0o755
                 tar.addfile(ti)
             elif ti.isreg():
-                # Preserve exec bit.
                 ti.mode = 0o755 if (p.stat().st_mode & 0o111) else 0o644
                 with p.open("rb") as f:
                     tar.addfile(ti, f)
@@ -156,29 +179,423 @@ def _tar_gz(pkg_root: Path, out_path: Path) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------
-# hamnix-base
+# File mappings — per-package
 # ---------------------------------------------------------------------
-# The boot-essential userland. Mirrors the "lean cpio" set in
-# scripts/build_initramfs.py: init shim, hamsh, ed, distrofs, motd,
-# sshd, ifconfig — basically what /etc/rc.boot calls early. We also
-# carry every framework .ko (kernel-modules/<X>/*.ko) and the
-# /etc/* config tree. This is what `hpm install hamnix-base` lays
-# down on a fresh disk.
+# Each spec resolves to a `files/` layout. Sources are project-relative;
+# missing sources are reported via _say and skipped (the package still
+# emits — useful for slim/CI builds where e.g. busybox isn't compiled).
 
-BASE_USER_KEEP = {
-    # The /init shim and the shell.
-    "init.elf",
-    "hamsh.elf",
-    # Distrofs + boot-time services.
-    "distrofs.elf",
-    "motd.elf",
-    "sshd.elf",
-    "ed.elf",
-    "ifconfig.elf",
-    # cat is used by /etc/rc.boot probes.
-    "cat.elf",
-}
+def _add_user_bin(file_map: list[tuple[Path, str]], stem: str,
+                  target_subpath: str = "bin") -> None:
+    """Add build/user/<stem>.elf at files/<target_subpath>/<stem>."""
+    src = USER_DIR / f"{stem}.elf"
+    rel = f"{target_subpath}/{stem}"
+    file_map.append((src, rel))
 
+
+def _add_etc_file(file_map: list[tuple[Path, str]], name: str,
+                  subdir: str = "") -> None:
+    """Add etc/<subdir>/<name> at files/etc/<subdir>/<name>."""
+    if subdir:
+        src = ETC_DIR / subdir / name
+        rel = f"etc/{subdir}/{name}"
+    else:
+        src = ETC_DIR / name
+        rel = f"etc/{name}"
+    file_map.append((src, rel))
+
+
+def _add_ko(file_map: list[tuple[Path, str]], modname: str,
+            ko_basename: str | None = None) -> None:
+    """Add kernel-modules/<modname>/<modname>.ko at files/lib/modules/.
+
+    Some modules ship under a different ko basename (nvme_core →
+    nvme-core.ko). Pass ko_basename to override.
+    """
+    if ko_basename is None:
+        ko_basename = modname
+    src = KMODS_DIR / modname / f"{ko_basename}.ko"
+    rel = f"lib/modules/{ko_basename}.ko"
+    file_map.append((src, rel))
+
+
+# ---- hamnix-init ----------------------------------------------------
+# /init shim + the rc.boot + inittab + etc identity files. Without
+# this package there's no PID 1, no boot rc — nothing comes up.
+
+def _files_init() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    # /init shim (special: not under /bin).
+    f.append((USER_DIR / "init.elf", "init"))
+    # etc boot config + identity.
+    for name in ("rc.boot", "inittab", "fstab", "hostname",
+                 "host.conf", "hosts", "issue", "issue.net",
+                 "login.defs", "lsb-release", "networks",
+                 "os-release", "passwd", "group", "shadow",
+                 "shells", "profile", "protocols",
+                 "resolv.conf", "services", "timezone", "users",
+                 "debian_version"):
+        _add_etc_file(f, name)
+    return f
+
+
+# ---- hamnix-hamsh ---------------------------------------------------
+# The shell. Pulls in /bin/hamsh + the issue/motd assets that hamsh
+# prints on session entry. /etc/profile is in hamnix-init (read by
+# every shell at startup, not just hamsh).
+
+def _files_hamsh() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hamsh")
+    _add_etc_file(f, "motd")
+    # banner is a userland binary (user/banner.ad) — its assets are
+    # baked in. The motd file in /etc is the actual greeting.
+    _add_user_bin(f, "banner")
+    return f
+
+
+# ---- hamnix-coreutils ----------------------------------------------
+# The large bag of small commands the shell expects. Everything that
+# isn't init/hamsh/net/sshd/hpm/fs-mkfs/installer/drivers ends up here.
+
+COREUTILS_BINS = (
+    "ascii", "awk", "base64", "basename", "cal", "cat", "clear", "cmp",
+    "cp", "cut", "date", "df", "diff", "dirname", "distrofs", "dmesg",
+    "du", "echo", "ed", "env_show", "expr", "false", "find", "free",
+    "getty", "grep", "halt", "hamwd", "head", "hostname", "id",
+    "insmod", "kill", "less", "ln", "login", "ls", "lsmod", "md5sum",
+    "mkdir", "more", "motd", "mv", "nsbindprobe", "nsrun", "od",
+    "p9srv_demo", "passwd", "pgrep", "poweroff", "preempt_demo",
+    "preempt_hog", "printf", "ps", "pwd", "reboot", "rev", "rm",
+    "rmmod", "sed", "seq", "sleep", "sort", "strings", "su", "tail",
+    "tee", "test", "top", "touch", "tr", "true", "uname", "uptime",
+    "u_server", "u_tlstest", "watch", "wc", "whatis", "which",
+    "whoami", "xargs", "yes",
+)
+
+
+def _files_coreutils() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    for stem in COREUTILS_BINS:
+        _add_user_bin(f, stem)
+    return f
+
+
+# ---- hamnix-net -----------------------------------------------------
+# Network userland: ifconfig (boot-rc dump), ping, route, httpd. The
+# kernel does the actual IP stack; these are the operator-facing tools.
+
+def _files_net() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "ifconfig")
+    _add_user_bin(f, "ping")
+    _add_user_bin(f, "route")
+    _add_user_bin(f, "httpd")
+    return f
+
+
+# ---- hamnix-svc-sshd ------------------------------------------------
+# In-tree SSH server. Decoupled from the base because a headless
+# embedded board can opt out of remote login.
+
+def _files_svc_sshd() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "sshd")
+    _add_etc_file(f, "sshd.hamsh", subdir="svc")
+    return f
+
+
+# ---- hpm ------------------------------------------------------------
+# The package manager itself. Split out because a locked-down embedded
+# system might ship a frozen image without runtime package mgmt.
+
+def _files_hpm() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hpm")
+    return f
+
+
+# ---- hamnix-fs-ext4 -------------------------------------------------
+# Ext4 toolchain: format + per-file install. install_rootfs_from_manifest
+# also lives here because it drives the kernel-side install_file ctl.
+
+def _files_fs_ext4() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "mkfs_ext4")
+    _add_user_bin(f, "install_file_to_slot")
+    _add_user_bin(f, "install_rootfs_from_manifest")
+    return f
+
+
+# ---- hamnix-fs-fat --------------------------------------------------
+
+def _files_fs_fat() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "mkfs_fat")
+    return f
+
+
+# ---- hamnix-drivers-net-e1000e --------------------------------------
+# Intel e1000e family (I219 PHY/MAC on most NUCs and laptops).
+
+def _files_drv_e1000e() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_ko(f, "e1000e")
+    return f
+
+
+# ---- hamnix-drivers-block-ahci --------------------------------------
+# AHCI SATA stack. libata + libahci are framework deps; scsi_mod +
+# scsi_common are the SCSI mid/lower layer the ATA-on-SCSI translator
+# pulls in.
+
+def _files_drv_ahci() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_ko(f, "ahci")
+    _add_ko(f, "libahci")
+    _add_ko(f, "libata")
+    _add_ko(f, "scsi_mod")
+    _add_ko(f, "scsi_common")
+    return f
+
+
+# ---- hamnix-drivers-block-nvme --------------------------------------
+
+def _files_drv_nvme() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_ko(f, "nvme")
+    _add_ko(f, "nvme_core", ko_basename="nvme-core")
+    return f
+
+
+# ---- hamnix-drivers-usb-xhci ----------------------------------------
+
+def _files_drv_xhci() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_ko(f, "xhci_pci")
+    _add_ko(f, "xhci_hcd")
+    _add_ko(f, "usbcore")
+    return f
+
+
+# ---- hamnix-drivers-snd-hda -----------------------------------------
+
+def _files_drv_snd_hda() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_ko(f, "snd_hda_intel")
+    _add_ko(f, "snd_hda_codec")
+    _add_ko(f, "snd_hda_core")
+    _add_ko(f, "snd_pcm")
+    _add_ko(f, "snd")
+    return f
+
+
+# ---- hamnix-installer-tools ----------------------------------------
+# Just the partitioner + dd_blk. mkfs_* moved to hamnix-fs-*; hpm is
+# its own package; hpm's solver pulls them in via the metapackage.
+
+def _files_installer_tools() -> list[tuple[Path, str]]:
+    f: list[tuple[Path, str]] = []
+    _add_user_bin(f, "hamnix_partition")
+    _add_user_bin(f, "dd_blk")
+    return f
+
+
+# ---------------------------------------------------------------------
+# Package spec table — the source of truth.
+# ---------------------------------------------------------------------
+#
+# Each entry: {name, files_fn, depends, conflicts, provides, target,
+# description}. files_fn returns the (src, target_rel) tuples.
+# Packages with non-trivial layout (bootloader SLIM mode, linux-debian
+# usrmerge) are handled by build_*() specials further below.
+
+PACKAGE_SPECS: list[dict] = [
+    {
+        "name": "hamnix-init",
+        "files_fn": _files_init,
+        "depends": [],
+        "description": "Hamnix init (PID 1 shim + /etc/rc.boot + identity)",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-hamsh",
+        "files_fn": _files_hamsh,
+        "depends": ["hamnix-init>=1"],
+        "description": "Hamnix shell — /bin/hamsh + motd/banner",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-coreutils",
+        "files_fn": _files_coreutils,
+        "depends": ["hamnix-hamsh>=1"],
+        "description": ("Hamnix core userland — coreutils-shaped tools "
+                        "(cat/ls/echo/ps/...)"),
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-net",
+        "files_fn": _files_net,
+        "depends": ["hamnix-hamsh>=1"],
+        "description": "Hamnix networking userland — ifconfig, ping, route, httpd",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-svc-sshd",
+        "files_fn": _files_svc_sshd,
+        "depends": ["hamnix-net>=1"],
+        "description": "Hamnix in-tree SSH-2 server (sshd + svc definition)",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hpm",
+        "files_fn": _files_hpm,
+        "depends": ["hamnix-net>=1"],
+        "description": "Hamnix package manager (hpm)",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-fs-ext4",
+        "files_fn": _files_fs_ext4,
+        "depends": ["hamnix-hamsh>=1"],
+        "description": "Hamnix ext4 toolchain — mkfs_ext4 + install_file_to_slot",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-fs-fat",
+        "files_fn": _files_fs_fat,
+        "depends": ["hamnix-hamsh>=1"],
+        "description": "Hamnix FAT toolchain — mkfs_fat",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-drivers-net-e1000e",
+        "files_fn": _files_drv_e1000e,
+        "depends": ["hamnix-init>=1"],
+        "description": "Intel e1000e Ethernet driver (.ko)",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-drivers-block-ahci",
+        "files_fn": _files_drv_ahci,
+        "depends": ["hamnix-init>=1"],
+        "description": "AHCI SATA block stack (ahci + libata + scsi_mod + ...)",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-drivers-block-nvme",
+        "files_fn": _files_drv_nvme,
+        "depends": ["hamnix-init>=1"],
+        "description": "NVMe block driver (nvme + nvme-core)",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-drivers-usb-xhci",
+        "files_fn": _files_drv_xhci,
+        "depends": ["hamnix-init>=1"],
+        "description": "USB xHCI host controller stack (xhci_pci + xhci_hcd + usbcore)",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-drivers-snd-hda",
+        "files_fn": _files_drv_snd_hda,
+        "depends": ["hamnix-init>=1"],
+        "description": "Intel HDA audio stack (snd_hda_intel + ALSA core)",
+        "target": "#hamnix-system",
+    },
+    {
+        "name": "hamnix-installer-tools",
+        "files_fn": _files_installer_tools,
+        "depends": ["hamnix-fs-ext4>=1", "hamnix-fs-fat>=1"],
+        "description": "Hamnix installer tools — partitioner + dd_blk",
+        "target": "#hamnix-system",
+    },
+]
+
+
+# ---------------------------------------------------------------------
+# Generic spec-driven package builder
+# ---------------------------------------------------------------------
+
+def _build_spec(spec: dict) -> dict | None:
+    """Build the tarball for a PACKAGE_SPECS entry.
+
+    Returns the index.json entry dict, or None if the package was
+    skipped (no files staged AND it's not a metapackage).
+    """
+    pkg_name = spec["name"]
+    pkg_dirname = f"{pkg_name}-{PKG_VERSION}"
+    staging = _stage_dir(PACKAGES_OUT / "_stage" / pkg_dirname)
+    files_root = staging / "files"
+    files_root.mkdir()
+
+    total_bytes = 0
+    n_files = 0
+    skipped: list[str] = []
+
+    file_map = spec["files_fn"]()
+    for src, rel in file_map:
+        if not src.is_file():
+            skipped.append(str(src.relative_to(HERE)) if src.is_relative_to(HERE) else str(src))
+            continue
+        total_bytes += _copy_file(src, files_root / rel)
+        n_files += 1
+
+    if skipped:
+        _say(f"{pkg_name}: skipped {len(skipped)} missing source(s) "
+             f"(first 3: {', '.join(skipped[:3])}"
+             f"{'…' if len(skipped) > 3 else ''})")
+
+    target = spec.get("target", "#hamnix-system")
+    description = spec["description"]
+
+    # PKGINFO assembly.
+    pkginfo: dict[str, str] = {
+        "name": pkg_name,
+        "version": PKG_VERSION,
+        "arch": "x86_64",
+        "description": description,
+        "target": target,
+        "maintainer": "HamnixOS",
+        "license": "ISC",
+        "homepage": "https://255.one/",
+    }
+    if spec.get("depends"):
+        # PKGINFO depends: comma-separated string per docs/packages.md.
+        pkginfo["depends"] = ", ".join(spec["depends"])
+    if spec.get("conflicts"):
+        pkginfo["conflicts"] = ", ".join(spec["conflicts"])
+    if spec.get("provides"):
+        pkginfo["provides"] = ", ".join(spec["provides"])
+
+    _write_pkginfo(staging, pkginfo)
+
+    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
+    sha, size = _tar_gz(staging, out_tar)
+    _say(f"built {out_tar.name}: {n_files} files, "
+         f"{total_bytes} src bytes, {size} tar bytes, sha={sha[:16]}…")
+
+    entry: dict = {
+        "name": pkg_name,
+        "version": PKG_VERSION,
+        "arch": "x86_64",
+        "url": f"packages/{pkg_dirname}.tar.gz",
+        "sha256": sha,
+        "size": size,
+        "description": description,
+        "depends": list(spec.get("depends", [])),
+        "target": target,
+    }
+    if spec.get("conflicts"):
+        entry["conflicts"] = list(spec["conflicts"])
+    if spec.get("provides"):
+        entry["provides"] = list(spec["provides"])
+    return entry
+
+
+# ---------------------------------------------------------------------
+# hamnix-base — metapackage. Zero files; depends on every component.
+# ---------------------------------------------------------------------
 
 def build_hamnix_base() -> dict:
     pkg_name = "hamnix-base"
@@ -186,70 +603,36 @@ def build_hamnix_base() -> dict:
     staging = _stage_dir(PACKAGES_OUT / "_stage" / pkg_dirname)
     files_root = staging / "files"
     files_root.mkdir()
-    total_bytes = 0
-    n_files = 0
 
-    # /init shim + /bin/<core userland>
-    if USER_DIR.is_dir():
-        for elf in sorted(USER_DIR.glob("*.elf")):
-            if elf.name == "init.elf":
-                total_bytes += _copy_file(elf, files_root / "init",
-                                          mode=0o755)
-                n_files += 1
-                continue
-            if elf.name not in BASE_USER_KEEP:
-                continue
-            bin_name = "bin/" + elf.stem
-            total_bytes += _copy_file(elf, files_root / bin_name,
-                                      mode=0o755)
-            n_files += 1
-    else:
-        _say(f"WARN: {USER_DIR.relative_to(HERE)} missing — "
-             f"hamnix-base will lack userland binaries")
+    # Metapackage = `hamnix-base` pulls in every component listed in
+    # PACKAGE_SPECS via depends. hpm's dep solver does the rest.
+    # hamnix-bootloader is also pulled in so a `hpm install hamnix-base`
+    # against an ISO mini-repo gets the full OS shape on disk; the
+    # installer copies BOOTX64.EFI separately because the ESP isn't a
+    # Hamnix-file-server target.
+    depends = [f"{s['name']}>={PKG_VERSION}" for s in PACKAGE_SPECS]
+    depends.append(f"hamnix-bootloader>={PKG_VERSION}")
 
-    # /etc/* config tree (one level + svc/*.hamsh).
-    if ETC_DIR.is_dir():
-        for ef in sorted(ETC_DIR.iterdir()):
-            if ef.is_file():
-                # Skip install.hamsh — that script lives in the live ISO's
-                # initramfs, not on the installed system.
-                if ef.name == "install.hamsh":
-                    continue
-                total_bytes += _copy_file(
-                    ef, files_root / "etc" / ef.name)
-                n_files += 1
-            elif ef.is_dir():
-                for sub in sorted(ef.iterdir()):
-                    if sub.is_file():
-                        rel = f"etc/{ef.name}/{sub.name}"
-                        total_bytes += _copy_file(sub, files_root / rel)
-                        n_files += 1
+    description = ("Hamnix base — metapackage pulling in every "
+                   "component (init/hamsh/coreutils/net/sshd/hpm/fs/"
+                   "drivers/installer/bootloader)")
 
-    # Framework .kos under /lib/modules. We mirror the cpio's "auto"
-    # subtree convention: kernel-modules/<X>/*.ko at /lib/modules/<X>.ko.
-    # Plus the special-cased e1000e.
-    e1000e_ko = KMODS_DIR / "e1000e" / "e1000e.ko"
-    if e1000e_ko.is_file():
-        total_bytes += _copy_file(e1000e_ko,
-                                  files_root / "lib/modules/e1000e.ko",
-                                  mode=0o644)
-        n_files += 1
-
-    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
     _write_pkginfo(staging, {
         "name": pkg_name,
         "version": PKG_VERSION,
         "arch": "x86_64",
-        "description": ("Hamnix base userland — init, hamsh, services, "
-                        "framework .kos"),
+        "description": description,
         "target": "#hamnix-system",
+        "depends": ", ".join(depends),
         "maintainer": "HamnixOS",
         "license": "ISC",
         "homepage": "https://255.one/",
     })
+
+    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
     sha, size = _tar_gz(staging, out_tar)
-    _say(f"built {out_tar.name}: {n_files} files, "
-         f"{total_bytes} src bytes, {size} tar bytes, sha={sha[:16]}…")
+    _say(f"built {out_tar.name}: METAPACKAGE (0 files, "
+         f"{len(depends)} depends), {size} tar bytes, sha={sha[:16]}…")
     return {
         "name": pkg_name,
         "version": PKG_VERSION,
@@ -257,21 +640,15 @@ def build_hamnix_base() -> dict:
         "url": f"packages/{pkg_dirname}.tar.gz",
         "sha256": sha,
         "size": size,
-        "description": ("Hamnix base userland — init, hamsh, services, "
-                        "framework .kos"),
-        "depends": [],
+        "description": description,
+        "depends": depends,
         "target": "#hamnix-system",
     }
 
 
 # ---------------------------------------------------------------------
-# hamnix-bootloader
+# hamnix-bootloader — BOOTX64.EFI + kernel ELF. target=#esp.
 # ---------------------------------------------------------------------
-# BOOTX64.EFI + the kernel ELF. target=#esp — the installer extracts
-# the package, then copies BOOTX64.EFI + hamnix-kernel.elf onto the
-# freshly-formatted FAT ESP partition. hpm itself doesn't write the
-# ESP (it's not a file-server-addressable target); the installer
-# handles that specially.
 
 def build_hamnix_bootloader() -> dict:
     pkg_name = "hamnix-bootloader"
@@ -282,10 +659,6 @@ def build_hamnix_bootloader() -> dict:
     total_bytes = 0
     n_files = 0
 
-    # SLIM mode emits a metadata-only tarball (PKGINFO only) — the
-    # kernel ELF + EFI stub aren't needed in that path. Only enforce
-    # the requirement when building the full-payload (non-slim)
-    # tarball intended for the upstream HamnixOS/packages mirror.
     slim_early = os.environ.get("HAMNIX_BOOTLOADER_SLIM") == "1"
     if not slim_early:
         if not KERNEL_ELF.is_file():
@@ -297,22 +670,11 @@ def build_hamnix_bootloader() -> dict:
                 f"[build_packages] {EFI_STUB.relative_to(HERE)} missing — "
                 f"run scripts/build_iso.sh first to produce the EFI stub")
 
-    # The full-fat bootloader payload (BOOTX64.EFI + the kernel ELF)
-    # lives in upstream HamnixOS/packages so a fresh-install user can
-    # `hpm install hamnix-bootloader` and get a real kernel. But ON THE
-    # ISO mini-repo (which is what build_iso.sh stages at
-    # /mnt/iso-packages), we cannot embed the kernel.elf inside the
-    # cpio that lives inside the kernel.elf — that's a 73 MB recursion
-    # bomb. The installer copies BOOTX64.EFI + kernel.elf onto the
-    # target ESP via dd_blk from the live ISO's source ESP (which is
-    # byte-equivalent), so hpm doesn't need the tarball's payload to
-    # complete the install.
-    #
-    # HAMNIX_BOOTLOADER_SLIM=1 — emit a metadata-only tarball (PKGINFO
-    # only, no files/). build_iso.sh sets this when assembling the
-    # mini-repo. The upstream HamnixOS/packages build (no env var)
-    # produces the full tarball so direct https://255.one/ downloads
-    # have a complete payload.
+    # The ISO mini-repo emits a metadata-only bootloader package (the
+    # full BOOTX64.EFI + kernel.elf payload lives in the live ISO's
+    # source ESP partition and is copied onto the target ESP via dd_blk
+    # by install.hamsh). On the upstream HamnixOS/packages build the
+    # full payload IS embedded.
     slim = os.environ.get("HAMNIX_BOOTLOADER_SLIM") == "1"
     if not slim:
         total_bytes += _copy_file(EFI_STUB, files_root / "BOOTX64.EFI",
@@ -325,29 +687,28 @@ def build_hamnix_bootloader() -> dict:
     else:
         _say("hamnix-bootloader: HAMNIX_BOOTLOADER_SLIM=1 — emitting "
              "metadata-only package (no files/)")
-        # Plant a README so the empty files/ tree is non-empty.
         (files_root / "README").write_text(
-            "This is the ISO mini-repo slim build of hamnix-bootloader. "
-            "The real BOOTX64.EFI + kernel.elf payload lives in the live "
-            "ISO's source ESP partition and is copied onto the target "
-            "ESP by /etc/install.hamsh via dd_blk. The full-payload "
-            "package is published at https://255.one/.\n",
+            "ISO mini-repo slim build. BOOTX64.EFI + kernel.elf live in "
+            "the live ISO's source ESP partition and are copied onto "
+            "the target ESP by /etc/install.hamsh via dd_blk. The full "
+            "payload is published at https://255.one/.\n",
             encoding="ascii")
         n_files += 1
 
-    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
+    description = ("Hamnix UEFI bootloader stub + kernel ELF "
+                   "(installs onto the ESP)")
     _write_pkginfo(staging, {
         "name": pkg_name,
         "version": PKG_VERSION,
         "arch": "x86_64",
-        "description": ("Hamnix UEFI bootloader stub + kernel ELF "
-                        "(installs onto the ESP)"),
+        "description": description,
         "target": "#esp",
-        "depends": "hamnix-base>=1",
+        "depends": "hamnix-init>=1",
         "maintainer": "HamnixOS",
         "license": "ISC",
         "homepage": "https://255.one/",
     })
+    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
     sha, size = _tar_gz(staging, out_tar)
     _say(f"built {out_tar.name}: {n_files} files, "
          f"{total_bytes} src bytes, {size} tar bytes, sha={sha[:16]}…")
@@ -358,102 +719,20 @@ def build_hamnix_bootloader() -> dict:
         "url": f"packages/{pkg_dirname}.tar.gz",
         "sha256": sha,
         "size": size,
-        "description": ("Hamnix UEFI bootloader stub + kernel ELF "
-                        "(installs onto the ESP)"),
-        "depends": ["hamnix-base>=1"],
+        "description": description,
+        "depends": ["hamnix-init>=1"],
         "target": "#esp",
     }
 
 
 # ---------------------------------------------------------------------
-# hamnix-installer-tools
+# linux-debian-12 — Debian rootfs (unchanged from v1).
 # ---------------------------------------------------------------------
-# Binaries the installer drives. We ship them as a separate package
-# so a freshly-installed system has them available for re-installing /
-# repartitioning later, AND so /etc/install.hamsh on the ISO can `hpm
-# install` them onto /mnt/newroot before laying down the boot files.
 
-INSTALLER_BIN_KEEP = [
-    "mkfs_ext4.elf",
-    "mkfs_fat.elf",
-    "hamnix_partition.elf",
-    "dd_blk.elf",
-    "hpm.elf",
-]
-
-
-def build_hamnix_installer_tools() -> dict:
-    pkg_name = "hamnix-installer-tools"
-    pkg_dirname = f"{pkg_name}-{PKG_VERSION}"
-    staging = _stage_dir(PACKAGES_OUT / "_stage" / pkg_dirname)
-    files_root = staging / "files"
-    files_root.mkdir()
-    total_bytes = 0
-    n_files = 0
-
-    for binname in INSTALLER_BIN_KEEP:
-        src = USER_DIR / binname
-        if not src.is_file():
-            _say(f"WARN: {src.relative_to(HERE)} missing — "
-                 f"installer tools will lack {binname}")
-            continue
-        # bin/<stem>
-        dst_rel = "bin/" + binname.removesuffix(".elf")
-        total_bytes += _copy_file(src, files_root / dst_rel, mode=0o755)
-        n_files += 1
-
-    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
-    _write_pkginfo(staging, {
-        "name": pkg_name,
-        "version": PKG_VERSION,
-        "arch": "x86_64",
-        "description": ("Hamnix installer tools — partitioner, mkfs, "
-                        "dd_blk, hpm"),
-        "target": "#hamnix-system",
-        "depends": "hamnix-base>=1",
-        "maintainer": "HamnixOS",
-        "license": "ISC",
-        "homepage": "https://255.one/",
-    })
-    sha, size = _tar_gz(staging, out_tar)
-    _say(f"built {out_tar.name}: {n_files} files, "
-         f"{total_bytes} src bytes, {size} tar bytes, sha={sha[:16]}…")
-    return {
-        "name": pkg_name,
-        "version": PKG_VERSION,
-        "arch": "x86_64",
-        "url": f"packages/{pkg_dirname}.tar.gz",
-        "sha256": sha,
-        "size": size,
-        "description": ("Hamnix installer tools — partitioner, mkfs, "
-                        "dd_blk, hpm"),
-        "depends": ["hamnix-base>=1"],
-        "target": "#hamnix-system",
-    }
-
-
-# ---------------------------------------------------------------------
-# linux-debian-12
-# ---------------------------------------------------------------------
-# The Debian rootfs the Linux namespace mounts. We reuse the curated
-# closure list from scripts/build_rootfs_img.py so the package mirrors
-# what the ext4 rootfs.img used to carry — except now hpm lays the
-# tree down at install time instead of dd_blk-copying a whole ext4
-# partition.
-
-# Mirrors REAL_DEBIAN_FILES + USRMERGE_ALIASES from build_rootfs_img.py.
 LINUX_DEBIAN_FILES = [
-    # Package managers proper.
-    "usr/bin/apt",
-    "usr/bin/apt-get",
-    "usr/bin/apt-cache",
-    "usr/bin/apt-config",
-    "usr/bin/apt-mark",
-    "usr/bin/dpkg",
-    "usr/bin/dpkg-deb",
-    "usr/bin/dpkg-query",
-    "usr/bin/dpkg-split",
-    # Dynamic linker + libc.
+    "usr/bin/apt", "usr/bin/apt-get", "usr/bin/apt-cache",
+    "usr/bin/apt-config", "usr/bin/apt-mark", "usr/bin/dpkg",
+    "usr/bin/dpkg-deb", "usr/bin/dpkg-query", "usr/bin/dpkg-split",
     "usr/lib64/ld-linux-x86-64.so.2",
     "usr/lib/x86_64-linux-gnu/libc.so.6",
     "usr/lib/x86_64-linux-gnu/libm.so.6",
@@ -461,7 +740,6 @@ LINUX_DEBIAN_FILES = [
     "usr/lib/x86_64-linux-gnu/libdl.so.2",
     "usr/lib/x86_64-linux-gnu/libresolv.so.2",
     "usr/lib/x86_64-linux-gnu/librt.so.1",
-    # apt's .so closure.
     "usr/lib/x86_64-linux-gnu/libapt-pkg.so.7.0",
     "usr/lib/x86_64-linux-gnu/libapt-pkg.so.7.0.0",
     "usr/lib/x86_64-linux-gnu/libapt-private.so.0.0",
@@ -488,26 +766,15 @@ LINUX_DEBIAN_FILES = [
     "usr/lib/x86_64-linux-gnu/libxxhash.so.0.8.3",
     "usr/lib/x86_64-linux-gnu/libcap.so.2",
     "usr/lib/x86_64-linux-gnu/libcap.so.2.75",
-    # dpkg's .so closure.
     "usr/lib/x86_64-linux-gnu/libmd.so.0",
     "usr/lib/x86_64-linux-gnu/libmd.so.0.1.0",
     "usr/lib/x86_64-linux-gnu/libselinux.so.1",
     "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0",
     "usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.14.0",
-    # /etc essentials.
-    "etc/debian_version",
-    "etc/os-release",
-    "etc/passwd",
-    "etc/group",
-    "etc/hostname",
-    "etc/apt/sources.list",
-    "etc/apt/apt.conf",
-    # dpkg's admindir scaffolding.
-    "var/lib/dpkg/status",
-    "var/lib/dpkg/available",
-    "var/lib/dpkg/diversions",
-    "var/lib/dpkg/statoverride",
-    # Trusted GPG keyring.
+    "etc/debian_version", "etc/os-release", "etc/passwd", "etc/group",
+    "etc/hostname", "etc/apt/sources.list", "etc/apt/apt.conf",
+    "var/lib/dpkg/status", "var/lib/dpkg/available",
+    "var/lib/dpkg/diversions", "var/lib/dpkg/statoverride",
     "usr/share/keyrings/debian-archive-keyring.gpg",
     "etc/apt/trusted.gpg.d/debian-archive-keyring.gpg",
 ]
@@ -529,12 +796,6 @@ def build_linux_debian_12() -> dict | None:
     total_bytes = 0
     n_files = 0
 
-    # Slim mode for the ISO mini-repo: emit metadata-only, no files/.
-    # The full Debian closure (~24 MB) is in the live ISO's source
-    # rootfs partition and gets dd_blk'd onto the target rootfs.
-    # Embedding the tarball in the cpio inside kernel.elf would blow
-    # past the 32 MB FAT12 ESP ceiling. The upstream
-    # HamnixOS/packages build (no env var) produces the full payload.
     slim = os.environ.get("HAMNIX_LINUX_DEBIAN_SLIM") == "1"
 
     if not DEBIAN_MINBASE.is_dir() and not slim:
@@ -542,6 +803,7 @@ def build_linux_debian_12() -> dict | None:
              f"linux-debian-12 will be SKIPPED. Run "
              f"tests/distros/debian-minbase/BUILD.sh first.")
         return None
+
     if slim:
         _say("linux-debian-12: HAMNIX_LINUX_DEBIAN_SLIM=1 — emitting "
              "metadata-only package (no files/)")
@@ -549,99 +811,66 @@ def build_linux_debian_12() -> dict | None:
             "ISO mini-repo slim build of linux-debian-12. The real "
             "Debian closure lives in the live ISO's source rootfs "
             "partition and is copied onto the target rootfs by "
-            "/etc/install.hamsh via dd_blk. The full payload is at "
-            "https://255.one/.\n", encoding="ascii")
+            "/etc/install.hamsh via the manifest installer. The full "
+            "payload is at https://255.one/.\n", encoding="ascii")
         (files_root / ".hamnix-roots").write_text("distro    .\n",
                                                   encoding="ascii")
         n_files = 2
-        out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
-        _write_pkginfo(staging, {
-            "name": pkg_name,
-            "version": PKG_VERSION,
-            "arch": "x86_64",
-            "description": ("Debian 12 (bookworm) rootfs for the Linux "
-                            "namespace"),
-            "target": "#distro",
-            "depends": "hamnix-base>=1",
-            "provides": "linux-distro",
-            "maintainer": "HamnixOS",
-            "license": "various (Debian)",
-            "homepage": "https://debian.org/",
-        })
-        sha, size = _tar_gz(staging, out_tar)
-        _say(f"built {out_tar.name}: {n_files} files (SLIM), "
-             f"{size} tar bytes, sha={sha[:16]}…")
-        return {
-            "name": pkg_name,
-            "version": PKG_VERSION,
-            "arch": "x86_64",
-            "url": f"packages/{pkg_dirname}.tar.gz",
-            "sha256": sha,
-            "size": size,
-            "description": ("Debian 12 (bookworm) rootfs for the Linux "
-                            "namespace"),
-            "depends": ["hamnix-base>=1"],
-            "provides": ["linux-distro"],
-            "target": "#distro",
-        }
+    else:
+        missing: list[str] = []
+        for rel in LINUX_DEBIAN_FILES:
+            src = DEBIAN_MINBASE / rel
+            if not src.is_file():
+                missing.append(rel)
+                continue
+            try:
+                data = src.read_bytes()
+            except (OSError, PermissionError) as e:
+                missing.append(f"{rel} ({e})")
+                continue
+            mode = 0o755 if (src.stat().st_mode & 0o111) else 0o644
+            dst = files_root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(data)
+            dst.chmod(mode)
+            total_bytes += len(data)
+            n_files += 1
+            for prefix, alias_prefix in LINUX_DEBIAN_USRMERGE.items():
+                if rel.startswith(prefix):
+                    alias_rel = alias_prefix + rel[len(prefix):]
+                    adst = files_root / alias_rel
+                    adst.parent.mkdir(parents=True, exist_ok=True)
+                    adst.write_bytes(data)
+                    adst.chmod(mode)
+                    total_bytes += len(data)
+                    n_files += 1
+                    break
+        if missing:
+            _say(f"linux-debian-12: skipped {len(missing)} optional files "
+                 f"(first 3: {', '.join(missing[:3])}{'…' if len(missing) > 3 else ''})")
 
-    missing: list[str] = []
-    for rel in LINUX_DEBIAN_FILES:
-        src = DEBIAN_MINBASE / rel
-        if not src.is_file():
-            missing.append(rel)
-            continue
-        try:
-            data = src.read_bytes()
-        except (OSError, PermissionError) as e:
-            missing.append(f"{rel} ({e})")
-            continue
-        mode = 0o755 if (src.stat().st_mode & 0o111) else 0o644
-        # Primary placement.
-        dst = files_root / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_bytes(data)
-        dst.chmod(mode)
-        total_bytes += len(data)
+        (files_root / ".hamnix-roots").write_text("distro    .\n",
+                                                  encoding="ascii")
         n_files += 1
-        # Usrmerge aliases.
-        for prefix, alias_prefix in LINUX_DEBIAN_USRMERGE.items():
-            if rel.startswith(prefix):
-                alias_rel = alias_prefix + rel[len(prefix):]
-                adst = files_root / alias_rel
-                adst.parent.mkdir(parents=True, exist_ok=True)
-                adst.write_bytes(data)
-                adst.chmod(mode)
-                total_bytes += len(data)
-                n_files += 1
-                break
-    if missing:
-        _say(f"linux-debian-12: skipped {len(missing)} optional files "
-             f"(first 3: {', '.join(missing[:3])}{'…' if len(missing) > 3 else ''})")
 
-    # Plant `.hamnix-roots` at the package files/ root so when hpm
-    # extracts it under the /distro target prefix, the file server
-    # discovers the named root entry at boot time.
-    (files_root / ".hamnix-roots").write_text("distro    .\n",
-                                              encoding="ascii")
-    n_files += 1
-
-    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
+    description = "Debian 12 (bookworm) rootfs for the Linux namespace"
     _write_pkginfo(staging, {
         "name": pkg_name,
         "version": PKG_VERSION,
         "arch": "x86_64",
-        "description": ("Debian 12 (bookworm) rootfs for the Linux "
-                        "namespace"),
+        "description": description,
         "target": "#distro",
-        "depends": "hamnix-base>=1",
+        "depends": "hamnix-init>=1",
         "provides": "linux-distro",
         "maintainer": "HamnixOS",
         "license": "various (Debian)",
         "homepage": "https://debian.org/",
     })
+
+    out_tar = PACKAGES_OUT / "packages" / f"{pkg_dirname}.tar.gz"
     sha, size = _tar_gz(staging, out_tar)
-    _say(f"built {out_tar.name}: {n_files} files, "
+    _say(f"built {out_tar.name}: {n_files} files"
+         f"{' (SLIM)' if slim else ''}, "
          f"{total_bytes} src bytes, {size} tar bytes, sha={sha[:16]}…")
     return {
         "name": pkg_name,
@@ -650,9 +879,8 @@ def build_linux_debian_12() -> dict | None:
         "url": f"packages/{pkg_dirname}.tar.gz",
         "sha256": sha,
         "size": size,
-        "description": ("Debian 12 (bookworm) rootfs for the Linux "
-                        "namespace"),
-        "depends": ["hamnix-base>=1"],
+        "description": description,
+        "depends": ["hamnix-init>=1"],
         "provides": ["linux-distro"],
         "target": "#distro",
     }
@@ -668,11 +896,7 @@ def main() -> int:
             "[build_packages] build/ missing — run scripts/build_iso.sh "
             "first to produce the artifacts this script repackages.")
     PACKAGES_OUT.mkdir(parents=True, exist_ok=True)
-    # tarballs land under packages/ to match index.json's `url:
-    # packages/<name>-<v>.tar.gz` paths (and the upstream repo layout
-    # at https://255.one/).
     (PACKAGES_OUT / "packages").mkdir(parents=True, exist_ok=True)
-    # Wipe stale tarballs but keep _stage so we can inspect on failure.
     for old in PACKAGES_OUT.glob("*.tar.gz"):
         old.unlink()
     for old in (PACKAGES_OUT / "packages").glob("*.tar.gz"):
@@ -681,12 +905,22 @@ def main() -> int:
         (PACKAGES_OUT / "index.json").unlink()
 
     entries: list[dict] = []
-    entries.append(build_hamnix_base())
+
+    # Build the component packages first (per PACKAGE_SPECS order).
+    for spec in PACKAGE_SPECS:
+        entry = _build_spec(spec)
+        if entry is not None:
+            entries.append(entry)
+
+    # Then the bootloader (target=#esp) and the Debian distro.
     entries.append(build_hamnix_bootloader())
-    entries.append(build_hamnix_installer_tools())
     deb_entry = build_linux_debian_12()
     if deb_entry is not None:
         entries.append(deb_entry)
+
+    # Finally hamnix-base (metapackage). It depends on the others, so
+    # the index lists it last for human-eyeball reading order.
+    entries.append(build_hamnix_base())
 
     # Cleanup staging area after a successful build.
     stage_root = PACKAGES_OUT / "_stage"
@@ -697,10 +931,10 @@ def main() -> int:
         "schema": 1,
         "repo": "HamnixOS/packages",
         "url": "https://255.one/",
-        "updated": os.environ.get("HAMNIX_PKG_DATE", "2026-05-26"),
-        "description": ("Hamnix package repository — v1 release "
-                        "(hamnix-base + bootloader + installer-tools + "
-                        "linux-debian-12)"),
+        "updated": os.environ.get("HAMNIX_PKG_DATE", "2026-05-27"),
+        "description": ("Hamnix package repository — component split "
+                        "(hamnix-base metapackage + ~16 components + "
+                        "bootloader + linux-debian-12)"),
         "packages": entries,
     }
     (PACKAGES_OUT / "index.json").write_text(

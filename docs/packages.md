@@ -6,12 +6,16 @@
 > `install` (with hooks, BFS dep solver, conflict detection) /
 > `remove` / `update` / `pin` / `unpin`. Verified by
 > `scripts/test_hpm.sh` (refresh/install/list/remove + conflict
-> negative test). Five v1 packages live at the canonical repo
-> `https://255.one/`: `hamnix-hello`, `hamnix-base`,
-> `hamnix-bootloader`, `hamnix-installer-tools`, `linux-debian-12`
-> (built by `scripts/build_packages.py`). The installer
-> (`etc/install.hamsh`) drives `hpm install` against an
-> ISO-local mini-repo at `/iso-packages/`.
+> negative test). The canonical repo `https://255.one/` ships
+> ~17 component packages plus the `hamnix-base` METAPACKAGE that
+> pulls them all in via `depends:`: `hamnix-init`, `hamnix-hamsh`,
+> `hamnix-coreutils`, `hamnix-net`, `hamnix-svc-sshd`, `hpm`,
+> `hamnix-fs-ext4`, `hamnix-fs-fat`, the `hamnix-drivers-*` set
+> (e1000e/ahci/nvme/xhci/snd-hda), `hamnix-installer-tools`,
+> `hamnix-bootloader`, and `linux-debian-12` (built by
+> `scripts/build_packages.py`). The installer (`etc/install.hamsh`)
+> drives `hpm install hamnix-base` against an ISO-local mini-repo
+> at `/iso-packages/`; the solver pulls the entire dep closure.
 
 `hpm` is the Hamnix-native package manager. It installs **Hamnix-side
 state**: kernel modules, native userland binaries, services, drivers,
@@ -316,16 +320,23 @@ Until then, mirrors are trusted iff their TLS cert is.
 ## Bootstrap: installer mini-repo
 
 The Hamnix installer ISO carries a minimal copy of the repo at
-`/mnt/iso-packages/` (a path baked into the ISO). The installer's
-hpm invocation points there:
+`/iso-packages/` (a path baked into the ISO). The installer's
+hpm invocation points there and asks for the `hamnix-base`
+metapackage; the solver pulls the rest of the OS via `depends:`:
 
 ```
-hpm --repo=file:///mnt/iso-packages install hamnix-base hamnix-installer-tools
+hpm --repo=file:///iso-packages install hamnix-base
+hpm --repo=file:///iso-packages install linux-debian-12   # optional
 ```
 
 After install + reboot, `hpm` defaults back to the network repo
 (`https://255.one/`) and `hpm update` pulls newer versions from
-upstream.
+upstream. A trimmed install (embedded / headless) can name
+components individually instead of `hamnix-base`:
+
+```
+hpm install hamnix-init hamnix-hamsh hpm hamnix-drivers-net-e1000e
+```
 
 ## Non-free pool
 

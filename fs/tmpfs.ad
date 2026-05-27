@@ -43,8 +43,8 @@
 # there is no ordering dependency on vfs_init().
 #
 # Caps (V2):
-#   TMPFS_MAX_FILES   = 256    total entries (files + directories), incl.
-#                              the two reserved roots → 254 usable.
+#   TMPFS_MAX_FILES   = 1024   total entries (files + directories), incl.
+#                              the two reserved roots → 1022 usable.
 #   TMPFS_CHUNK_SIZE  = 65536  one storage chunk (64 KiB).
 #   TMPFS_MAX_CHUNKS  = 256    chunks per file (16 MiB per file cap).
 #   TMPFS_FILE_CAP    = TMPFS_CHUNK_SIZE * TMPFS_MAX_CHUNKS = 16 MiB.
@@ -72,15 +72,20 @@
 # already there before chunking; what changed is that the cap is now
 # 16 MiB per file (real Debian package range) rather than 512 KiB.
 #
-# WHY 256 SLOTS (was 64): a live `apt update` of Debian
-# stable/main/binary-amd64 inflates to ~56 MiB across 68,755 packages.
-# apt persists that as ~112 shards of /tmp/apt/p/NNN at TMPFS_FILE_CAP
-# each plus the leading /tmp/apt/Packages mirror (back-compat) plus a
-# /tmp/apt/Packages.idx shard directory — 114 shard-related entries.
-# 256 lifts the ceiling well past that with headroom for other apt /
-# dpkg / httpd files; a slot itself is only ~64 bytes of BSS (TmpfsEntry)
-# so 192 extra slots cost ~12 KiB of zero-init BSS, the kmalloc'd
-# backing buffer is still lazy-allocated per slot.
+# WHY 1024 SLOTS (was 64 → 256 → 1024): two motivations.
+# (1) a live `apt update` of Debian stable/main/binary-amd64 inflates
+# to ~56 MiB across 68,755 packages, persisted as ~114 shard-related
+# entries (256 was sized to fit). (2) the post-split installer drives
+# `hpm install hamnix-base` (a metapackage pulling ~16 components) at
+# install time with `--target-prefix=/tmp/newroot/`, so the whole OS
+# closure (~150 files + ~10 dirs across init / hamsh / coreutils /
+# net / sshd / hpm / fs-tools / drivers / installer-tools) lands in
+# tmpfs in one shot. 256 ran out at the coreutils boundary
+# (`hpm: cannot create /tmp/newroot/bin/whoami`). 1024 gives ~8x
+# headroom for future growth in the component count.
+# A slot itself is only ~64 bytes of BSS (TmpfsEntry) so 768 extra
+# slots cost ~48 KiB of zero-init BSS, the kmalloc'd backing buffer
+# is still lazy-allocated per slot.
 #
 # Not in V1: O_APPEND, rename of directories with children moved,
 # hard links, permissions/ownership, mmap of tmpfs files. The backing
@@ -94,7 +99,7 @@ extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
 
 
-TMPFS_MAX_FILES:  uint64 = 256
+TMPFS_MAX_FILES:  uint64 = 1024
 TMPFS_CHUNK_SIZE: uint64 = 65536              # 64 KiB per storage chunk
 TMPFS_MAX_CHUNKS: uint64 = 256                # max chunks per file
 TMPFS_FILE_CAP:   uint64 = 16777216           # = CHUNK_SIZE * MAX_CHUNKS
@@ -121,7 +126,7 @@ class TmpfsEntry:
     name:       Array[32, uint8]      # NUL-terminated path COMPONENT
 
 
-tmpfs_table: Array[256, TmpfsEntry]
+tmpfs_table: Array[1024, TmpfsEntry]
 _tmpfs_root_ready: uint64             # 0 until _tmpfs_ensure_root() has run
 
 

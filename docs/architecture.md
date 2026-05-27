@@ -120,10 +120,13 @@ a Layer 5 application-level workflow — not a `hpm`-calls-apt
 shim. The two managers stay in their own namespaces.
 
 v1 is binary-only with a greedy BFS dependency solver + conflict
-detection; write commands gate on uid==1 (hostowner). Five v1
-packages live at the canonical repo `https://255.one/`:
-`hamnix-hello`, `hamnix-base`, `hamnix-bootloader`,
-`hamnix-installer-tools`, `linux-debian-12`. See
+detection; write commands gate on uid==1 (hostowner). The canonical
+repo `https://255.one/` ships ~17 component packages plus the
+`hamnix-base` METAPACKAGE that pulls them in via `depends:`
+(`hamnix-init`, `hamnix-hamsh`, `hamnix-coreutils`, `hamnix-net`,
+`hamnix-svc-sshd`, `hpm`, `hamnix-fs-ext4`, `hamnix-fs-fat`, the
+`hamnix-drivers-*` set, `hamnix-installer-tools`,
+`hamnix-bootloader`, `linux-debian-12`). See
 [`packages.md`](packages.md) for the format spec.
 
 ### Security model — Plan-9-shape

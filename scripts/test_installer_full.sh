@@ -116,10 +116,18 @@ check_marker '\[install\] Hamnix installer' "installer banner"
 check_marker '\[gpt\] init OK' "gpt_init"
 check_marker '\[gpt\] mkpart idx=0' "ESP mkpart"
 check_marker '\[gpt\] mkpart idx=1' "rootfs mkpart"
-# hpm-driven install: each package emits its own marker.
-check_marker 'hpm: installed hamnix-base'             "hpm install hamnix-base"
-check_marker 'hpm: installed hamnix-installer-tools'  "hpm install hamnix-installer-tools"
-check_marker 'hpm: installed hamnix-bootloader'       "hpm install hamnix-bootloader"
+# hpm-driven install: the installer drives `hpm install hamnix-base`,
+# a METAPACKAGE that depends on every component. hpm's solver
+# (cmd_install_solved) installs each leaf in topo order, emitting a
+# "hpm: installed <name>" line per package. The root metapackage
+# installs last. Assert key leaves + the root + the bootloader + the
+# distro package landed.
+check_marker 'hpm: installed hamnix-init'             "hpm install hamnix-init (component)"
+check_marker 'hpm: installed hamnix-hamsh'            "hpm install hamnix-hamsh (component)"
+check_marker 'hpm: installed hamnix-coreutils'        "hpm install hamnix-coreutils (component)"
+check_marker 'hpm: installed hamnix-installer-tools'  "hpm install hamnix-installer-tools (component)"
+check_marker 'hpm: installed hamnix-bootloader'       "hpm install hamnix-bootloader (component, #esp)"
+check_marker 'hpm: installed hamnix-base'             "hpm install hamnix-base (metapackage root)"
 check_marker 'hpm: installed linux-debian-12'         "hpm install linux-debian-12"
 # Byte transfer onto target:
 #   * ESP (FAT12) still uses dd_blk — exactly one occurrence.

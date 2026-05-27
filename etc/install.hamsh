@@ -109,12 +109,18 @@ mkfs_ext4 /dev/blk/vdbp2
 echo '[install] (4/7) refresh hpm index from /iso-packages/'
 hpm '--repo=file:///iso-packages' refresh
 
-# --- step 5 of 7: drive `hpm install` for each v1 package ------------
-# hamnix-base, hamnix-installer-tools, hamnix-bootloader, optionally
-# linux-debian-12. hpm extracts the file tree into the live ISO's
-# writable namespace (the dd_blk in step 6 transfers them physically
-# onto the target rootfs) and records each install in
-# /var/lib/hpm/installed.json.
+# --- step 5 of 7: drive `hpm install hamnix-base` --------------------
+# hamnix-base is a METAPACKAGE: zero files of its own, depends on
+# every component package (hamnix-init, -hamsh, -coreutils, -net,
+# -svc-sshd, hpm, -fs-ext4, -fs-fat, the -drivers-* set,
+# -installer-tools, and -bootloader). hpm's solver (cmd_install_solved
+# in user/hpm.ad) walks the depends-graph BFS-style, topo-sorts it,
+# and installs every leaf before the root. One `hpm install hamnix-
+# base` therefore lays down the entire OS in one call.
+#
+# We then install linux-debian-12 separately because the brief defers
+# whether the Debian runtime is mandatory (an embedded headless
+# install might skip it). HAMNIX_INSTALL_LINUX gates that.
 #
 # For target=#esp packages (hamnix-bootloader), hpm prints a notice
 # and skips extraction — the installer handles ESP placement via dd
@@ -127,14 +133,8 @@ hpm '--repo=file:///iso-packages' refresh
 # only PKGINFO, so hpm's extraction is effectively a no-op for
 # those packages — the bytes live in the source rootfs partition
 # at /n/distros/ and the manifest references them there.
-echo '[install] (5/7) hpm install hamnix-base'
+echo '[install] (5/7) hpm install hamnix-base (metapackage: pulls in the OS via depends)'
 hpm '--repo=file:///iso-packages' '--target-prefix=/tmp/newroot' install hamnix-base
-
-echo '[install] (5/7) hpm install hamnix-installer-tools'
-hpm '--repo=file:///iso-packages' '--target-prefix=/tmp/newroot' install hamnix-installer-tools
-
-echo '[install] (5/7) hpm install hamnix-bootloader'
-hpm '--repo=file:///iso-packages' '--target-prefix=/tmp/newroot' install hamnix-bootloader
 
 # linux-debian-12 brings the Debian runtime for `enter linux { ... }`.
 # Per docs/security.md Phase 12, the installer SHOULD prompt
