@@ -34,6 +34,10 @@ from kernel.block.blk import (
 )
 from kernel.printk.printk import printk0, printk1, printk2
 from drivers.rtc.cmos import rtc_read_unix_time
+# docs/security.md Phase 6: stamp the creating task's uid/gid into
+# the new inode's i_uid/i_gid fields. Kernel-internal create paths
+# (mkfs root inode, blob_save) fall back to uid 1 (hostowner).
+from kernel.sched.core import current_task_uid, current_task_gid
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 
@@ -1363,6 +1367,12 @@ def _ext4_init_regular_inode(data_blk: uint64, size: uint64):
     p: Ptr[uint8] = &ext4_new_inode_buf[0]
     _ext4_zero(p, ext4_inode_size)
     _ext4_write_u16(p, 0x81B4)                      # i_mode
+    # docs/security.md Phase 6: stamp owner/group from the calling
+    # task. A regular user creating a file owns it; hostowner-side
+    # kernel paths (boot rc, hpm install, installer) stamp uid 1.
+    # current_task_uid/gid is safe to call here — we're inside a
+    # syscall context for every userland-triggered create.
+    _ext4_inode_stamp_creator(p)
     _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 4),
                     cast[uint32](size))             # i_size_lo
     _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](p) + 26),
@@ -1389,6 +1399,24 @@ def _ext4_init_regular_inode(data_blk: uint64, size: uint64):
     # Stamp atime/ctime/mtime with the wall clock so a freshly-created
     # file reports a real mtime through stat (M16.x §12.3).
     _ext4_stamp_all_times(p)
+
+
+def _ext4_inode_stamp_creator(inode_buf: Ptr[uint8]):
+    # docs/security.md Phase 6: write the calling task's uid/gid into
+    # i_uid_lo/i_uid_hi + i_gid_lo/i_gid_hi. Falls back to uid 1
+    # (hostowner) when the call originates from a kernel context with
+    # no current task (boot bring-up, the kernel-internal mkfs path
+    # which uses _ext4_mkfs_build_root_inode directly).
+    cu: uint32 = current_task_uid()
+    cg: uint32 = current_task_gid()
+    if cu == 0:
+        # uid 0 doesn't exist in Hamnix per docs/security.md; treat the
+        # "current_task_uid returned 0" reading as "no task / boot
+        # context" and stamp hostowner.
+        cu = 1
+        cg = 1
+    ext4_inode_set_uid(inode_buf, cu)
+    ext4_inode_set_gid(inode_buf, cg)
 
 
 def _ext4_strlen(name: Ptr[char]) -> uint64:
@@ -2620,6 +2648,11 @@ def ext4_blob_save(name: Ptr[char], src: Ptr[uint8],
     p: Ptr[uint8] = &ext4_blob_inode[0]
     _ext4_zero(p, ext4_inode_size)
     _ext4_write_u16(p, 0x81B4)                       # i_mode = IFREG|0664
+    # docs/security.md Phase 6: ext4_blob_save is a kernel-internal
+    # snapshot path (distrofs RAM-table persist). It runs in PID 1's
+    # context for the boot/install seed and on hostowner-side later;
+    # stamp the calling task's uid/gid (uid 1 in both cases).
+    _ext4_inode_stamp_creator(p)
     _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](p) + 26), 1)  # i_links
     _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 32),
                     0x80000)                         # EXT4_EXTENTS_FL
@@ -2884,7 +2917,20 @@ def _ext4_mkfs_build_inode_bitmap(buf: Ptr[uint8]) -> int32:
 
 def _ext4_mkfs_build_root_inode(buf: Ptr[uint8]) -> int32:
     p: uint64 = cast[uint64](buf)
+    # i_mode: S_IFDIR | 0755 = 0x41ED. Root of a freshly-formatted
+    # filesystem is hostowner-only-writable (0755 directories grant
+    # rwx to owner, r-x to group/other). docs/security.md Phase 6:
+    # the root dir is owned by hostowner (uid 1 / gid 1), so a
+    # regular user can list its contents but can't create files in /.
     _ext4_write_u16(cast[Ptr[uint8]](p + 0x00), 0x41ED)
+    # docs/security.md Phase 6: stamp the root directory as
+    # hostowner-owned. mkfs is always invoked from hostowner-side
+    # (the installer / live ISO bootstrap); hardcoding uid 1 / gid 1
+    # is the correct policy for a freshly-formatted volume.
+    _ext4_write_u16(cast[Ptr[uint8]](p + 0x02), 1)      # i_uid_lo = 1
+    _ext4_write_u16(cast[Ptr[uint8]](p + 0x18), 1)      # i_gid_lo = 1
+    # The *_hi halves at offset 0x7C/0x7E stay 0 (the 4 KiB buf is
+    # already zeroed by the caller's _ext4_zero before this fn runs).
     _ext4_write_u32(cast[Ptr[uint8]](p + 0x04),
                     cast[uint32](EXT4_MKFS_BLOCK_SIZE))
     _ext4_write_u16(cast[Ptr[uint8]](p + 0x1A), 2)
