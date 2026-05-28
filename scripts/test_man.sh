@@ -107,21 +107,26 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
 set +e
+# NB: fixed-sleep input driving is fragile on loaded hosts — hamsh has
+# to be past stage-08 (ed-readline-first) before keystrokes land or
+# they get dropped. 8s initial pause + 3s between commands is the
+# margin that has empirically been stable across orchestrator hosts
+# (the agent's worktree passed at 4s/1s on a quiet box).
 (
-    sleep 4
+    sleep 8
     printf 'man man\n'
-    sleep 1
+    sleep 3
     printf 'man hamsh\n'
-    sleep 1
+    sleep 3
     printf 'help\n'
-    sleep 1
+    sleep 3
     printf 'help svc\n'
-    sleep 1
+    sleep 3
     printf 'man no-such-topic\n'
-    sleep 1
+    sleep 3
     printf 'exit\n'
-    sleep 1
-) | timeout 30s qemu-system-x86_64 \
+    sleep 2
+) | timeout 45s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
