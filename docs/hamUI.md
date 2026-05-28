@@ -131,7 +131,15 @@ come BEFORE the graphical work:
 1. **hamUI skeleton** — one window, ALL the AI-debug files (`text` /
    `output` / `kbdin` / `cmd` / `ns` / `pid`) working in text mode.
    **No framebuffer yet.** Unlocks AI collaboration well before
-   graphical OS.
+   graphical OS. **LANDED 2026-05-28**: see
+   `sys/src/9/port/devwsys.ad` for the cdev backend,
+   `tests/test_hamUI_phase1.ad` for the regression. Implements
+   `text` (64 KiB ring tee'd from devcons_write), `output` (16 KiB
+   ring reset on cmd injection), `cmd` (4 KiB queue, drained by
+   devcons_read + FD_STDIN_MARK arms in lieu of `kbdin`), `ns`
+   (plain-text mtab), `pid`, `uid`, `kind`, `geometry`, and the
+   `/dev/wsys` listing. `kbdin` deferred to Phase 2 — Phase 1's
+   `cmd` queue already supplies the same AI-debug capability.
 2. Multi-window via `/dev/wsys` (proves per-window-namespace
    invariant).
 3. Per-window namespace + elevation visible in `uid` / `ns` files.
