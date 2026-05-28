@@ -69,6 +69,10 @@ from kernel.sched.core import (
     # bring-up) call to flip identity.
     current_task_uid, current_task_gid,
     set_current_task_uid, set_current_task_gid,
+    # hamUI Phase 2: SYS_WSYS_ALLOC marks the wsys-bound child task as
+    # detached so hamUI exiting doesn't strand it as a zombie. Same
+    # accessors rfork(RFNOWAIT) uses.
+    set_task_detached, set_task_parent_pid,
 )
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_read_nb, vfs_write,
@@ -195,6 +199,10 @@ from sys.src.port9.port.syschan import (
 # child's SPAWN_STDIO_NS stdio fds 0/1/2 are FD_DEVFD_MARK — the
 # Layer-2 mapping onto the names /fd/0,1,2.
 from sys.src.port9.port.chan import pgrp_clone, pgrp_ref_inc, pgrp_current
+# hamUI Phase 2: /bin/hamUI tool registers a spawned child's pid against
+# a wid. Mirror SYS_SVC_PUBLISH's hostowner-only gate so only the
+# legitimate path mutates the wsys table.
+from sys.src.port9.port.devwsys import wsys_alloc_wid, wsys_free_wid
 from sys.src.port9.port.devfd import (
     FD_DEVFD_MARK, devfd_bind_cons,
     devfd_bind_pipe_r, devfd_bind_pipe_w,
@@ -412,6 +420,15 @@ SYS_SETUID:      uint64 = 290  # a0=uid; only hostowner (uid==1) can call; sets 
 # would be a confused-deputy escalation.
 SYS_SVC_PUBLISH: uint64 = 291  # a0=name, a1=payload (0=unpublish); returns 0/-1
 SYS_SET_REALTIME: uint64 = 292 # a0=unix_epoch_seconds; anchors rtc_boot_epoch on a0 - (TSC delta). user/ntpd.ad calls this.
+# hamUI Phase 2: per-wid window registration. The userland /bin/hamUI
+# tool sys_spawns a detached hamsh, then calls SYS_WSYS_ALLOC(child_pid)
+# to claim a wid for it. SYS_WSYS_FREE(wid) releases the slot at close
+# time (after SIGTERM'ing the bound shell). Hostowner-only, same
+# rationale as SYS_SVC_PUBLISH — only the supervisor / hamUI tool has
+# any business mutating the wsys table. Numbers 293/294 because F2's
+# SYS_SET_REALTIME took 292.
+SYS_WSYS_ALLOC:  uint64 = 293  # a0=pid; returns the assigned wid (>=2), -1 on full
+SYS_WSYS_FREE:   uint64 = 294  # a0=wid; returns 0/-1
 # HAMSH §7: sys_spawn's stdin_fd / stdout_fd sentinel. When the caller
 # passes SPAWN_STDIO_NS, the child's standard streams are NAMES in its
 # namespace (/fd/0,1,2 via the `#d` device), not dup'd integer fds —
@@ -2207,6 +2224,51 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         rrc: int32 = rtc_boot_epoch_set_now(a0)
         if rrc != 0:
             set_current_errstr("set_realtime: bad epoch")
+            return cast[uint64](cast[int64](-1))
+        return 0
+    if nr == SYS_WSYS_ALLOC:
+        # hamUI Phase 2: /bin/hamUI spawned a child shell with
+        # sys_spawn; claim a wid for it and bind the child's pid into
+        # the wsys table. ALSO mark the task detached so hamUI exiting
+        # doesn't strand the child as a zombie — registration against
+        # a wid is exactly "this task is a bg window, no parent will
+        # waitpid". a0 = child pid (uint64). Returns the wid (>=2) on
+        # success or -1 if the table is full / pid already bound /
+        # pid not found. Hostowner-only — same rationale as
+        # SYS_SVC_PUBLISH.
+        if current_task_uid() != 1:
+            set_current_errstr("wsys_alloc: permission denied (not hostowner)")
+            return cast[uint64](cast[int64](-1))
+        # Refuse to bind the CALLER's pid — that would mean hamUI is
+        # registering ITSELF as a window, which is nonsensical (the
+        # detach below would self-detach the caller). The legitimate
+        # path passes the CHILD's pid (sys_spawn's return).
+        if a0 == current_task_pid():
+            set_current_errstr("wsys_alloc: refuses self-registration")
+            return cast[uint64](cast[int64](-1))
+        # Locate the target task FIRST so a non-existent pid surfaces
+        # cleanly without ever touching the wsys table.
+        tgt_w: int32 = task_lookup_by_pid(a0)
+        if tgt_w < 0:
+            set_current_errstr("wsys_alloc: no such pid")
+            return cast[uint64](cast[int64](-1))
+        rc_w: int32 = wsys_alloc_wid(a0)
+        if rc_w < 0:
+            set_current_errstr("wsys_alloc: table full or pid already bound")
+            return cast[uint64](cast[int64](-1))
+        set_task_detached(tgt_w, 1)
+        set_task_parent_pid(tgt_w, 0)
+        return cast[uint64](cast[int64](rc_w))
+    if nr == SYS_WSYS_FREE:
+        # hamUI Phase 2: release a wid (after SIGTERM'ing the bound
+        # shell). a0 = wid. Returns 0 on success, -1 on bad wid /
+        # unfree slot / wid==1 (foreground is unfreeable).
+        if current_task_uid() != 1:
+            set_current_errstr("wsys_free: permission denied (not hostowner)")
+            return cast[uint64](cast[int64](-1))
+        rc_f: int32 = wsys_free_wid(cast[int32](a0))
+        if rc_f < 0:
+            set_current_errstr("wsys_free: bad wid or wid==1 (foreground)")
             return cast[uint64](cast[int64](-1))
         return 0
     if nr == SYS_PIPECHAN:

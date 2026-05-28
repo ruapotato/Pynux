@@ -1,0 +1,267 @@
+# user/hamUI.ad
+#
+# hamUI Phase 2 — userland CLI for the multi-window file tree.
+#
+# Subcommands:
+#   hamUI new            spawn a detached background hamsh as a fresh wid;
+#                        print the wid (decimal, newline-terminated) on
+#                        stdout.
+#   hamUI list           list active wids; one line per window:
+#                          "<wid> active text uid=<u> pid=<p> hamsh"
+#                        (just cats /dev/wsys).
+#   hamUI close <wid>    SIGTERM the bound hamsh and free the wid slot.
+#
+# Foreground vs background routing happens at the kernel devcons-tee
+# layer: every byte that crosses devcons_write resolves to the calling
+# task's wid via current_task_pid lookup. wid >= 2 windows are headless
+# (no serial-console / framebuffer output) — their stdout only flows
+# into /dev/wsys/<wid>/text. The bg shell is a real hamsh whose
+# /dev/cons reads pop from /dev/wsys/<wid>/cmd FIRST (same routing key).
+#
+# THE DETACHED-SPAWN IDIOM
+# ------------------------
+# To get a detached child whose pid we can hand to sys_wsys_alloc, we:
+#   1. sys_rfork(RFPROC | RFNAMEG | RFNOWAIT) — fork detached. The new
+#      task gets a private COW Pgrp and the detached flag set so it
+#      self-reaps at exit (no zombies — feedback_let_agents_run_wild
+#      § "agents don't accumulate"). RFNOWAIT severs the parent link
+#      so hamUI exiting doesn't strand it.
+#   2. Child: sys_execve("/bin/hamsh", argv) — replace this task with
+#      hamsh IN PLACE. The detached flag and the new pid are preserved
+#      (execve doesn't allocate a new task slot).
+#   3. Parent: sys_wsys_alloc(child_pid) records the binding, then
+#      hamUI exits.
+#
+# (Adder quirks honoured per feedback_compiler_quirks.md U9: all big
+# buffers at module scope; string literals kept as call-site Ptr[uint8]
+# rather than NUL-initialised globals.)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_exit(code: uint64)
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_kill(pid: int32, sig: int32) -> int32
+extern def sys_wsys_alloc(pid: uint64) -> int32
+extern def sys_wsys_free(wid: int32) -> int32
+extern def sys_errstr(buf: Ptr[uint8], nbuf: uint64) -> int32
+
+
+# Match the hamsh SPAWN_STDIO_NS sentinel: the child's stdio is bound
+# through /fd/0,1,2 (HAMSH §7). The kernel's sys_spawn auto-installs
+# FD_DEVFD_MARK fds for the child's 0/1/2 — the child writes go via
+# devcons_write which the wsys gate suppresses for bg wids.
+SPAWN_STDIO_NS: int32 = -2
+
+SIGTERM:        int32 = 15
+
+# Module-scope buffers — frame locals get too large otherwise.
+arg_buf:    Array[2, uint64]
+read_buf:   Array[1024, uint8]
+wid_buf:    Array[32, uint8]
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def cstr_eq(a: Ptr[uint8], b: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while a[i] != 0 and b[i] != 0:
+        if a[i] != b[i]:
+            return 0
+        i = i + 1
+    if a[i] != b[i]:
+        return 0
+    return 1
+
+
+def parse_uint(s: Ptr[uint8]) -> int32:
+    # NUL-terminated decimal -> int32. Returns -1 on empty / non-digit.
+    if s[0] == 0:
+        return -1
+    n: int32 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return -1
+        n = n * 10 + cast[int32](c) - 48
+        i = i + 1
+    return n
+
+
+def u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    if value == 0:
+        out[0] = 48
+        out[1] = 10
+        return 2
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    nw: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    out[nw] = 10
+    return nw + 1
+
+
+# ---- hamUI new ----------------------------------------------------
+#
+# rfork detached → child execve's /bin/hamsh. The parent records the
+# child's pid against a fresh wid via sys_wsys_alloc and prints the
+# wid to stdout. Returns 0 / 1 on success / failure (set in main).
+
+def cmd_new() -> int32:
+    # Spawn /bin/hamsh as a new task. SPAWN_STDIO_NS — the child gets
+    # a private COW Pgrp and FD_DEVFD_MARK stdio at /fd/0,1,2; its
+    # writes to fd 1/2 route through devcons_write, and the wsys-fg
+    # gate suppresses the UART/FB write for bg wids (so once we
+    # register the child against its wid, its output stays in
+    # /dev/wsys/<wid>/text and never reaches the serial console).
+    #
+    # Argv: argv[0] = "/bin/hamsh", argv[1] = NULL.
+    arg_buf[0] = cast[uint64](cast[Ptr[char]]("/bin/hamsh"))
+    arg_buf[1] = 0
+    pid: int32 = sys_spawn("/bin/hamsh", &arg_buf[0],
+                           SPAWN_STDIO_NS, SPAWN_STDIO_NS,
+                           cast[Ptr[uint64]](0))
+    if pid < 0:
+        write_str(2, "hamUI: sys_spawn /bin/hamsh failed: ")
+        errbuf: Array[128, uint8]
+        sys_errstr(&errbuf[0], 128)
+        write_str(2, &errbuf[0])
+        write_str(2, "\n")
+        return 1
+    # Register the child's pid against a fresh wid. The kernel's
+    # SYS_WSYS_ALLOC handler ALSO marks the task as detached so
+    # hamUI exiting doesn't strand the child as a zombie.
+    wid: int32 = sys_wsys_alloc(cast[uint64](pid))
+    if wid < 0:
+        write_str(2, "hamUI: sys_wsys_alloc failed (table full?)\n")
+        # Best-effort cleanup so the failure doesn't leak the spawn.
+        sys_kill(pid, SIGTERM)
+        return 1
+    # Print "<wid>\n" to stdout — the canonical "hamUI new prints the
+    # wid" contract.
+    n: uint64 = u64_to_dec(cast[uint64](wid), &wid_buf[0])
+    sys_write(1, &wid_buf[0], n)
+    return 0
+
+
+# ---- hamUI list ---------------------------------------------------
+#
+# Just cat /dev/wsys. The kernel's devwsys_listing_read renders the
+# active-windows table in the format the brief specifies.
+
+def cmd_list() -> int32:
+    fd: int32 = sys_open("/dev/wsys")
+    if fd < 0:
+        write_str(2, "hamUI: cannot open /dev/wsys\n")
+        return 1
+    while True:
+        n: int64 = sys_read(fd, &read_buf[0], 1024)
+        if n <= 0:
+            break
+        sys_write(1, &read_buf[0], cast[uint64](n))
+    sys_close(fd)
+    return 0
+
+
+# ---- hamUI close <wid> --------------------------------------------
+#
+# Read /dev/wsys/<wid>/pid to get the bound pid, SIGTERM it, then
+# sys_wsys_free(wid). Order matters: free FIRST would lose the pid
+# binding; kill FIRST without free would orphan the wid slot.
+
+def cmd_close(wid_str: Ptr[uint8]) -> int32:
+    wid: int32 = parse_uint(wid_str)
+    if wid < 2:
+        write_str(2, "hamUI: close: bad wid (1 is foreground and unfreeable)\n")
+        return 1
+    # Compose "/dev/wsys/<N>/pid" into read_buf as scratch.
+    prefix: Ptr[uint8] = "/dev/wsys/"
+    i: uint64 = 0
+    while prefix[i] != 0:
+        read_buf[i] = prefix[i]
+        i = i + 1
+    # wid digits.
+    nb: uint64 = u64_to_dec(cast[uint64](wid), &read_buf[i])
+    # u64_to_dec writes a trailing '\n' — drop it.
+    nb = nb - 1
+    i = i + nb
+    suffix: Ptr[uint8] = "/pid"
+    j: uint64 = 0
+    while suffix[j] != 0:
+        read_buf[i + j] = suffix[j]
+        j = j + 1
+    read_buf[i + j] = 0
+    fd: int32 = sys_open(cast[Ptr[char]](&read_buf[0]))
+    if fd < 0:
+        write_str(2, "hamUI: close: no such wid\n")
+        return 1
+    # Read the pid line. Up to 32 bytes is plenty for a decimal pid.
+    nbytes: int64 = sys_read(fd, &wid_buf[0], 32)
+    sys_close(fd)
+    if nbytes <= 0:
+        write_str(2, "hamUI: close: pid read failed\n")
+        return 1
+    # Parse the decimal pid (up to the newline).
+    pid_n: int32 = 0
+    k: uint64 = 0
+    while k < cast[uint64](nbytes):
+        c: uint8 = wid_buf[k]
+        if c < 48 or c > 57:
+            break
+        pid_n = pid_n * 10 + cast[int32](c) - 48
+        k = k + 1
+    if pid_n <= 0:
+        write_str(2, "hamUI: close: bad pid in /dev/wsys/<N>/pid\n")
+        return 1
+    # SIGTERM. Ignore the return — the shell may already have exited;
+    # we still want to free the slot.
+    sys_kill(pid_n, SIGTERM)
+    rc: int32 = sys_wsys_free(wid)
+    if rc < 0:
+        write_str(2, "hamUI: close: wsys_free failed\n")
+        return 1
+    return 0
+
+
+def usage(fd: int32):
+    write_str(fd, "Usage: hamUI new | list | close <wid>\n")
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        usage(2)
+        return 1
+    verb: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+    if cstr_eq(verb, "new") != 0:
+        return cmd_new()
+    if cstr_eq(verb, "list") != 0:
+        return cmd_list()
+    if cstr_eq(verb, "close") != 0:
+        if argc < 3:
+            write_str(2, "hamUI: close: missing wid\n")
+            return 1
+        return cmd_close(cast[Ptr[uint8]](argv[2]))
+    usage(2)
+    return 1

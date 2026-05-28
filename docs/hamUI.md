@@ -141,7 +141,18 @@ come BEFORE the graphical work:
    `/dev/wsys` listing. `kbdin` deferred to Phase 2 — Phase 1's
    `cmd` queue already supplies the same AI-debug capability.
 2. Multi-window via `/dev/wsys` (proves per-window-namespace
-   invariant).
+   invariant). **LANDED 2026-05-28**: `MAX_WINDOWS = 9` slots
+   (wids 1..8); per-wid text / output / cmd rings in
+   `sys/src/9/port/devwsys.ad`; `/dev/wsys/<N>/<leaf>` path parser
+   in `sys/src/9/port/namec.ad`; SYS_WSYS_ALLOC (292) / SYS_WSYS_FREE
+   (293) syscalls; `/bin/hamUI new|list|close` userland CLI in
+   `user/hamUI.ad`; regression in `scripts/test_hamUI_phase2.sh`.
+   Foreground/background design: wid 1 is the serial console hamsh;
+   wids 2..N are detached bg hamsh whose stdout / stderr land ONLY in
+   their `text` / `output` rings (devcons_write gates UART/FB on
+   `wsys_current_is_foreground`); their stdin reads from `cmd` only
+   (devcons_read gates kbd/uart fallthrough symmetrically so bg
+   shells don't steal keystrokes from the foreground).
 3. Per-window namespace + elevation visible in `uid` / `ns` files.
 4. Framebuffer-backed pixel windows + drag-to-create gesture.
 5. X11 bridge (Xvfb + event translation).

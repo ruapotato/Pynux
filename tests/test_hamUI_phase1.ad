@@ -171,13 +171,21 @@ def main() -> int32:
     else:
         write_str(1, "[test_hamUI_phase1] uid_ok=1\n")
 
-    # ---- 5. /dev/wsys == "1\n" ----
-    buf_list: Array[64, uint8]
-    nl: int64 = _read_path("/dev/wsys", &buf_list[0], 64)
+    # ---- 5. /dev/wsys starts with the wid 1 line ----
+    # Phase 2 grew the listing into the per-spec format
+    #   "<wid> active text uid=<u> pid=<p> hamsh\n"
+    # for each active wid. We check that the listing begins with
+    # "1 active" — wid 1 (the foreground hamsh) is always live in
+    # this fixture's universe, and the substring proves the cdev
+    # backend rendered the per-spec shape rather than the Phase 1
+    # bare-digit format.
+    buf_list: Array[256, uint8]
+    nl: int64 = _read_path("/dev/wsys", &buf_list[0], 256)
     if nl <= 0:
         write_str(1, "[test_hamUI_phase1] wsys list read FAIL\n")
         fails = fails + 1
-    elif _bytes_eq(&buf_list[0], cast[uint64](nl), "1\n") == 0:
+    elif _bytes_contains(&buf_list[0], cast[uint64](nl),
+                         "1 active text uid=") == 0:
         write_str(1, "[test_hamUI_phase1] wsys listing shape FAIL\n")
         fails = fails + 1
     else:

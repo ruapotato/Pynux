@@ -1,60 +1,62 @@
 # sys/src/9/port/devwsys.ad
 #
-# Layer 1 (Plan 9-shape) hamUI window-system device — Phase 1 backend
+# Layer 1 (Plan 9-shape) hamUI window-system device — Phase 2 backend
 # for `/dev/wsys/<wid>/*`. See docs/hamUI.md H-§A and H-§E for the
 # design.
 #
-# THE PHASE 1 PROMISE
+# THE PHASE 2 PROMISE
 # -------------------
-# A single text-mode "window" — the running hamsh — exposed as a tree
-# of files under /dev/wsys/1/. From any other shell / agent / cat
-# context, you can:
-#
-#   * `cat /dev/wsys/1/text`      — last 64 KiB of console output
-#   * `cat /dev/wsys/1/output`    — live tail since the last cmd
-#   * `echo "ls /etc" > /dev/wsys/1/cmd`   — inject as if typed
-#   * `cat /dev/wsys/1/ns`        — plain-text mtab dump
-#   * `cat /dev/wsys/1/pid`       — root pid of the windowed shell
-#   * `cat /dev/wsys/1/uid`       — effective uid
-#   * `cat /dev/wsys/1/kind`      — "text" (Phase 1 constant)
-#   * `cat /dev/wsys/1/geometry`  — "0 0 80 24" (Phase 1 constant)
-#
-# No graphics in Phase 1. No multi-window. The full Plan 9 multi-window
-# story (Phase 2+) is deferred; this file's job is to land the
-# AI-debug surface that unlocks every subsequent collaboration.
+# Multi-window: up to MAX_WINDOWS active windows, addressed as
+# /dev/wsys/<wid>/ for wid in 1..MAX_WINDOWS. wid 1 is the foreground —
+# the hamsh the user actually types into via the physical serial
+# console. wids 2..N are detached background hamsh instances; their
+# stdout/stderr does NOT reach the serial console, only their own
+# /dev/wsys/<N>/text ring. An AI agent (or scripted driver) drives a
+# bg window by writing to /dev/wsys/<N>/cmd and reading
+# /dev/wsys/<N>/text — exactly the AI-debug workflow Phase 1 unlocked,
+# but parallelised across windows.
 #
 # THE I/O TEE
 # -----------
-# Every byte that crosses devcons_write also lands in this module's
-# text + output rings. devcons.ad invokes wsys_text_push / wsys_output_push
-# from its write loop. The window is "really just hamsh" — hamsh's
-# stdout is bound to /fd/1 -> DEVFD_CONS -> devcons_write, so every
-# prompt line and every command output byte is mirrored.
+# Every byte that crosses devcons_write resolves through
+# _wsys_wid_for_current() — looks up the calling task's pid in the
+# wid table; defaults to wid 1 (foreground) if no mapping. That wid's
+# text + output rings receive the byte. For wid 1 the byte ALSO lands
+# on the UART / framebuffer (foreground console). For wid >= 2 the
+# byte is suppressed at the console layer — bg windows are headless.
 #
-# The cmd-injection side is symmetric: devcons_read consults
-# wsys_cmd_pop FIRST. When an outside agent does
-# `echo "ls /etc" > /dev/wsys/1/cmd`, those bytes get queued; the next
-# devcons_read pops them, hamsh's readline sees them indistinguishably
-# from keyboard input. Cmd injection also resets the output ring so
-# `cat /dev/wsys/1/output` after the cmd shows JUST that cmd's output.
+# CMD INJECTION
+# -------------
+# devcons_read pops from the CALLING window's cmd queue (same
+# _wsys_wid_for_current() lookup). When an outside agent does
+# `echo "ls" > /dev/wsys/2/cmd`, the bytes go to wid 2's queue; only
+# tasks bound to wid 2 will pop them — wid 1's hamsh never sees them.
+#
+# WID ALLOCATION
+# --------------
+# _wsys_alloc_wid() returns the first free slot (1..MAX_WINDOWS) or
+# -1 if full. The new userland tool /bin/hamUI calls
+# sys_wsys_alloc(child_pid) after sys_spawning a detached hamsh —
+# that syscall stamps the pid->wid mapping and returns the wid. wid 1
+# is reserved at boot for the foreground hamsh (its pid is recorded
+# the first time devcons_write tees with no existing mapping).
 #
 # BOUNDARY LAW
 # ------------
-# Layer 1 (native): pure Plan 9 surface. No io_uring / epoll / futex.
-# Snapshot-once read semantics for finite-content files (text, output,
-# ns, pid, uid, kind, geometry) so `cat` terminates instead of
-# regenerating forever. Implemented by the per-fd off cursor that
-# namec.ad threads through _devtab_read.
+# Layer 1 (native): pure Plan 9 surface. Snapshot-once read semantics
+# for finite-content files so `cat` terminates.
 #
 # ADDER QUIRKS HONOURED
 # ---------------------
-#   * Top-level Array storage only — every ring + queue lives at
-#     module scope.
+#   * Top-level Array storage only — every ring + per-wid table lives
+#     at module scope.
 #   * No sizeof; ring sizes are hand-numbered constants.
 #   * Leading-underscore top-level names are module-private.
 #   * Every shared-shape helper carries a `_wsys_` prefix to dodge the
-#     flat-namespace `_emit_str` collision class documented across the
-#     devcpuinfo / devmeminfo / devuptime / devhostname siblings.
+#     flat-namespace `_emit_str` collision class.
+#   * Per-wid storage is a flat Array sized to MAX_WINDOWS * RING_SIZE.
+#     Indexed as buf[wid * SIZE + offset] — a 2-D Array[N,M] sometimes
+#     trips the codegen on aggregate slot access, so we go flat.
 
 from kernel.sched.core import (
     current_task_pid, current_task_uid,
@@ -65,36 +67,176 @@ from sys.src.port9.port.chan import (
 )
 
 
-# --- text ring -------------------------------------------------------
+# --- per-wid table ---------------------------------------------------
 #
-# 64 KiB UTF-8 byte ring. devcons_write tees every byte here via
-# wsys_text_push. Reads return the most-recent min(count, max) bytes
-# in oldest-first order — exactly the shape kernel/printk/printk_log.ad
-# uses for the printk ring. The two are intentionally independent so a
-# kernel printk doesn't show up in /dev/wsys/1/text (which is meant
-# to mirror what the USER sees in the window).
+# MAX_WINDOWS slots, wids 1..MAX_WINDOWS. Slot 0 is unused — the design
+# spec says wids are 1-indexed and /dev/wsys/0 returns ENOENT.
+#
+# Each slot carries:
+#   in_use  : 1 if this wid is live, else 0
+#   pid     : the root shell pid bound to this wid (0 = unbound)
+#
+# The rings (text / output / cmd) live in separate flat Arrays keyed
+# by wid so we don't have to nest Arrays inside a struct (Adder's
+# nested-frame Array quirk).
+
+MAX_WINDOWS: uint64 = 9             # wids 0..8; wid 0 is reserved/unused
+
+wsys_slot_in_use: Array[9, int32]
+wsys_slot_pid:    Array[9, uint64]
+
+
+def _wsys_init_if_needed():
+    # Lazy init: stamp wid 1 (foreground) as in_use the first time we
+    # touch the table. The pid is filled in on the first devcons_write
+    # whose pid_for_current returns "unmapped" — i.e. the first user
+    # write from hamsh after init. Idempotent.
+    if wsys_slot_in_use[1] == 0:
+        wsys_slot_in_use[1] = 1
+        wsys_slot_pid[1] = 0
+
+
+def _wsys_wid_for_pid(pid: uint64) -> int32:
+    # Linear scan over MAX_WINDOWS — tiny, so no hash needed. Returns
+    # the wid (1..MAX_WINDOWS-1) bound to `pid`, or -1 if no slot
+    # claims this pid.
+    w: uint64 = 1
+    while w < MAX_WINDOWS:
+        if wsys_slot_in_use[w] != 0 and wsys_slot_pid[w] == pid:
+            return cast[int32](w)
+        w = w + 1
+    return -1
+
+
+def _wsys_wid_for_current() -> int32:
+    # The current task's wid — the routing key for devcons_write tee
+    # and devcons_read pop. If the current pid isn't bound to any wid,
+    # return 1 (foreground). This is the "every byte from an
+    # unmapped pid lands on wid 1" default that lets hamsh's PID 1
+    # boot output flow into wid 1's ring without needing an explicit
+    # init-time bind. The first devcons_write also OPPORTUNISTICALLY
+    # stamps wid 1's pid so subsequent lookups are O(1) per the explicit
+    # path.
+    _wsys_init_if_needed()
+    pid: uint64 = current_task_pid()
+    w: int32 = _wsys_wid_for_pid(pid)
+    if w > 0:
+        return w
+    # Unmapped pid → wid 1. Also record the foreground pid if wid 1's
+    # slot has none yet (first writer wins, which is hamsh's first
+    # banner print).
+    if wsys_slot_pid[1] == 0:
+        wsys_slot_pid[1] = pid
+    return 1
+
+
+def wsys_alloc_wid(pid: uint64) -> int32:
+    # Public: claim the lowest free slot in 2..MAX_WINDOWS-1 and bind
+    # it to `pid`. Returns the wid on success, -1 if the table is full
+    # or `pid` is already bound. wid 1 is reserved for foreground and
+    # is never handed out by this allocator.
+    _wsys_init_if_needed()
+    # Reject duplicate bindings — a caller mistakenly invoking alloc
+    # twice for the same child must surface that rather than leak a wid.
+    if _wsys_wid_for_pid(pid) > 0:
+        return -1
+    w: uint64 = 2
+    while w < MAX_WINDOWS:
+        if wsys_slot_in_use[w] == 0:
+            wsys_slot_in_use[w] = 1
+            wsys_slot_pid[w] = pid
+            # Zero-fill that slot's rings so a recycled wid doesn't
+            # leak the previous tenant's bytes.
+            _wsys_reset_rings(cast[int32](w))
+            return cast[int32](w)
+        w = w + 1
+    return -1
+
+
+def wsys_free_wid(wid: int32) -> int32:
+    # Public: release a wid slot. Closing wid 1 is rejected — losing
+    # the foreground would render the box unreachable. Returns 0 on
+    # success, -1 on bad wid / unfree-able. The caller (the userland
+    # hamUI tool) is responsible for sending SIGTERM to the bound pid
+    # FIRST; this just clears the table entry.
+    if wid <= 1:
+        return -1
+    u: uint64 = cast[uint64](wid)
+    if u >= MAX_WINDOWS:
+        return -1
+    if wsys_slot_in_use[u] == 0:
+        return -1
+    wsys_slot_in_use[u] = 0
+    wsys_slot_pid[u] = 0
+    _wsys_reset_rings(wid)
+    return 0
+
+
+def wsys_wid_in_use(wid: int32) -> int32:
+    # 1 iff `wid` names a live slot. Used by namec to gate
+    # /dev/wsys/<N>/* opens (ENOENT for unused or out-of-range wids).
+    if wid <= 0:
+        return 0
+    u: uint64 = cast[uint64](wid)
+    if u >= MAX_WINDOWS:
+        return 0
+    _wsys_init_if_needed()
+    return wsys_slot_in_use[u]
+
+
+def wsys_pid_for_wid(wid: int32) -> uint64:
+    # The pid bound to `wid`, 0 if unbound. Used by /dev/wsys/<N>/pid
+    # render so the file reports the WINDOW's shell pid, not the
+    # reader's pid (the Phase 1 semantics were "reader's pid" because
+    # the reader IS the window's hamsh; with multi-window we need an
+    # explicit per-wid pid).
+    if wid <= 0:
+        return 0
+    u: uint64 = cast[uint64](wid)
+    if u >= MAX_WINDOWS:
+        return 0
+    return wsys_slot_pid[u]
+
+
+# --- text rings (per wid) -------------------------------------------
+#
+# One 64 KiB ring per wid. Flat Array indexed as
+# wsys_text_buf[wid * WSYS_TEXT_SIZE + offset]. Per-wid head/count
+# cursors live in their own short Arrays.
 
 WSYS_TEXT_SIZE: uint64 = 65536
 
-wsys_text_buf:   Array[65536, uint8]
-wsys_text_head:  uint64 = 0       # next write position
-wsys_text_count: uint64 = 0       # total bytes ever pushed (no modulo)
+wsys_text_buf:   Array[589824, uint8]    # MAX_WINDOWS * WSYS_TEXT_SIZE = 9 * 65536
+wsys_text_head:  Array[9, uint64]
+wsys_text_count: Array[9, uint64]
+
+
+def _wsys_text_push_wid(wid: int32, c: uint8):
+    u: uint64 = cast[uint64](wid)
+    base: uint64 = u * WSYS_TEXT_SIZE
+    h: uint64 = wsys_text_head[u]
+    wsys_text_buf[base + h] = c
+    wsys_text_head[u] = (h + 1) % WSYS_TEXT_SIZE
+    wsys_text_count[u] = wsys_text_count[u] + 1
 
 
 def wsys_text_push(c: uint8):
-    # Single-byte append. devcons.ad calls this from its write loop
-    # so the tee is unconditional — every console byte mirrors here.
-    wsys_text_buf[wsys_text_head] = c
-    wsys_text_head = (wsys_text_head + 1) % WSYS_TEXT_SIZE
-    wsys_text_count = wsys_text_count + 1
+    # The OLD Phase 1 entry point devcons.ad calls. Routes to the wid
+    # the current task is bound to.
+    w: int32 = _wsys_wid_for_current()
+    _wsys_text_push_wid(w, c)
 
 
-def _wsys_text_snapshot(buf: Ptr[uint8], max: uint64) -> uint64:
-    # Copy up to `max` of the most-recent bytes into `buf`, oldest
-    # first. Returns the number of bytes actually written. Same
-    # algorithm as printk_log_snapshot — see that file for the case
-    # analysis.
-    avail: uint64 = wsys_text_count
+def _wsys_text_snapshot(wid: int32, out: Ptr[uint8],
+                        max: uint64) -> uint64:
+    # Copy up to `max` of the most-recent bytes of wid's text ring into
+    # `out`, oldest first. Same algorithm as printk_log_snapshot — see
+    # that file for the case analysis.
+    u: uint64 = cast[uint64](wid)
+    base: uint64 = u * WSYS_TEXT_SIZE
+    count: uint64 = wsys_text_count[u]
+    head: uint64 = wsys_text_head[u]
+    avail: uint64 = count
     if avail > WSYS_TEXT_SIZE:
         avail = WSYS_TEXT_SIZE
     want: uint64 = avail
@@ -103,53 +245,57 @@ def _wsys_text_snapshot(buf: Ptr[uint8], max: uint64) -> uint64:
     if want == 0:
         return 0
     start: uint64 = 0
-    if wsys_text_count <= WSYS_TEXT_SIZE:
-        start = wsys_text_count - want
+    if count <= WSYS_TEXT_SIZE:
+        start = count - want
     else:
-        start = (wsys_text_head + WSYS_TEXT_SIZE - want) % WSYS_TEXT_SIZE
+        start = (head + WSYS_TEXT_SIZE - want) % WSYS_TEXT_SIZE
     i: uint64 = 0
     while i < want:
-        buf[i] = wsys_text_buf[(start + i) % WSYS_TEXT_SIZE]
+        out[i] = wsys_text_buf[base + ((start + i) % WSYS_TEXT_SIZE)]
         i = i + 1
     return want
 
 
-# --- output ring -----------------------------------------------------
+# --- output rings (per wid) -----------------------------------------
 #
-# A second, smaller ring. devcons_write also tees here. The
-# distinguishing semantic vs. `text` is the RESET-PER-COMMAND behaviour:
-# every time an outside agent injects a command via /dev/wsys/1/cmd,
-# the output ring is cleared so the subsequent `cat /dev/wsys/1/output`
-# shows EXACTLY that cmd's output (plus the echoed prompt+cmd line).
-#
-# 16 KiB is more than enough for one command's typical output; if a
-# command floods more than that the oldest bytes wrap (same as text).
+# One 16 KiB ring per wid. RESET-PER-COMMAND semantic: when a cmd is
+# injected to a wid, that wid's output ring resets so a subsequent
+# `cat /dev/wsys/<wid>/output` shows just that command's output.
 
 WSYS_OUTPUT_SIZE: uint64 = 16384
 
-wsys_output_buf:   Array[16384, uint8]
-wsys_output_head:  uint64 = 0
-wsys_output_count: uint64 = 0
+wsys_output_buf:   Array[147456, uint8]    # 9 * 16384
+wsys_output_head:  Array[9, uint64]
+wsys_output_count: Array[9, uint64]
+
+
+def _wsys_output_push_wid(wid: int32, c: uint8):
+    u: uint64 = cast[uint64](wid)
+    base: uint64 = u * WSYS_OUTPUT_SIZE
+    h: uint64 = wsys_output_head[u]
+    wsys_output_buf[base + h] = c
+    wsys_output_head[u] = (h + 1) % WSYS_OUTPUT_SIZE
+    wsys_output_count[u] = wsys_output_count[u] + 1
 
 
 def wsys_output_push(c: uint8):
-    # devcons.ad fans every console byte here too. The reset (when a
-    # cmd is injected) lives in wsys_cmd_push below, so this push is
-    # also unconditional.
-    wsys_output_buf[wsys_output_head] = c
-    wsys_output_head = (wsys_output_head + 1) % WSYS_OUTPUT_SIZE
-    wsys_output_count = wsys_output_count + 1
+    w: int32 = _wsys_wid_for_current()
+    _wsys_output_push_wid(w, c)
 
 
-def _wsys_output_reset():
-    # Zero the cursors. The backing bytes don't need clearing — the
-    # snapshot reader uses `count` to determine the live window.
-    wsys_output_head  = 0
-    wsys_output_count = 0
+def _wsys_output_reset(wid: int32):
+    u: uint64 = cast[uint64](wid)
+    wsys_output_head[u] = 0
+    wsys_output_count[u] = 0
 
 
-def _wsys_output_snapshot(buf: Ptr[uint8], max: uint64) -> uint64:
-    avail: uint64 = wsys_output_count
+def _wsys_output_snapshot(wid: int32, out: Ptr[uint8],
+                          max: uint64) -> uint64:
+    u: uint64 = cast[uint64](wid)
+    base: uint64 = u * WSYS_OUTPUT_SIZE
+    count: uint64 = wsys_output_count[u]
+    head: uint64 = wsys_output_head[u]
+    avail: uint64 = count
     if avail > WSYS_OUTPUT_SIZE:
         avail = WSYS_OUTPUT_SIZE
     want: uint64 = avail
@@ -158,81 +304,80 @@ def _wsys_output_snapshot(buf: Ptr[uint8], max: uint64) -> uint64:
     if want == 0:
         return 0
     start: uint64 = 0
-    if wsys_output_count <= WSYS_OUTPUT_SIZE:
-        start = wsys_output_count - want
+    if count <= WSYS_OUTPUT_SIZE:
+        start = count - want
     else:
-        start = (wsys_output_head + WSYS_OUTPUT_SIZE - want) % WSYS_OUTPUT_SIZE
+        start = (head + WSYS_OUTPUT_SIZE - want) % WSYS_OUTPUT_SIZE
     i: uint64 = 0
     while i < want:
-        buf[i] = wsys_output_buf[(start + i) % WSYS_OUTPUT_SIZE]
+        out[i] = wsys_output_buf[base + ((start + i) % WSYS_OUTPUT_SIZE)]
         i = i + 1
     return want
 
 
-# --- cmd injection queue ---------------------------------------------
-#
-# 4 KiB linear queue. A write to /dev/wsys/1/cmd appends bytes here;
-# devcons_read pops one byte per call BEFORE consulting kbd / UART
-# rings. Result: an outside-driven `echo "ls /etc" > /dev/wsys/1/cmd`
-# arrives at hamsh's readline as if a very fast typist had hit the
-# keys, complete with the trailing newline.
-#
-# A linear queue (not a ring) is intentional — Phase 1 commands are
-# small and the queue starves to empty as soon as hamsh consumes
-# them. If we overflow (a script dumping > 4 KiB at once), additional
-# bytes are silently dropped to avoid clobbering the half-typed
-# in-flight command. A future revision can grow this to a ring once
-# we know multi-line injection is a real use case.
+# --- cmd injection queues (per wid) ---------------------------------
 
 WSYS_CMD_SIZE: uint64 = 4096
 
-wsys_cmd_buf:    Array[4096, uint8]
-wsys_cmd_tail:   uint64 = 0       # next byte to pop
-wsys_cmd_head:   uint64 = 0       # next byte to append
+wsys_cmd_buf:  Array[36864, uint8]    # 9 * 4096
+wsys_cmd_tail: Array[9, uint64]
+wsys_cmd_head: Array[9, uint64]
 
 
-def _wsys_cmd_compact():
-    # When the queue has drained (tail == head) reset both cursors so
-    # the next batch starts at offset 0. Cheap; avoids the ring
-    # complexity for the typical "burst-injected, fully consumed" case.
-    if wsys_cmd_tail == wsys_cmd_head:
-        wsys_cmd_tail = 0
-        wsys_cmd_head = 0
+def _wsys_cmd_compact(wid: int32):
+    u: uint64 = cast[uint64](wid)
+    if wsys_cmd_tail[u] == wsys_cmd_head[u]:
+        wsys_cmd_tail[u] = 0
+        wsys_cmd_head[u] = 0
 
 
-def wsys_cmd_push(c: uint8) -> int32:
-    # Append one byte. Returns 1 on success, 0 if the queue is full
-    # and the byte was dropped. The output ring is reset on the FIRST
-    # byte of a new burst — that way a burst doing
-    # `echo "ls /etc\n"` clears the output window so the subsequent
-    # `cat /dev/wsys/1/output` shows just that command's results.
-    _wsys_cmd_compact()
-    if wsys_cmd_head >= WSYS_CMD_SIZE:
-        return 0                                    # full
-    if wsys_cmd_head == 0 and wsys_cmd_tail == 0:
-        _wsys_output_reset()
-    wsys_cmd_buf[wsys_cmd_head] = c
-    wsys_cmd_head = wsys_cmd_head + 1
+def _wsys_cmd_push_wid(wid: int32, c: uint8) -> int32:
+    _wsys_cmd_compact(wid)
+    u: uint64 = cast[uint64](wid)
+    if wsys_cmd_head[u] >= WSYS_CMD_SIZE:
+        return 0
+    if wsys_cmd_head[u] == 0 and wsys_cmd_tail[u] == 0:
+        _wsys_output_reset(wid)
+    base: uint64 = u * WSYS_CMD_SIZE
+    wsys_cmd_buf[base + wsys_cmd_head[u]] = c
+    wsys_cmd_head[u] = wsys_cmd_head[u] + 1
     return 1
 
 
-def wsys_cmd_pop() -> int32:
-    # Pop one byte. Returns the byte value (0..255) on success, -1 if
-    # the queue is empty. devcons_read calls this first; on -1 it
-    # falls back to kbd/UART pops.
-    if wsys_cmd_tail >= wsys_cmd_head:
+def _wsys_cmd_pop_wid(wid: int32) -> int32:
+    u: uint64 = cast[uint64](wid)
+    if wsys_cmd_tail[u] >= wsys_cmd_head[u]:
         return -1
-    c: uint8 = wsys_cmd_buf[wsys_cmd_tail]
-    wsys_cmd_tail = wsys_cmd_tail + 1
-    _wsys_cmd_compact()
+    base: uint64 = u * WSYS_CMD_SIZE
+    c: uint8 = wsys_cmd_buf[base + wsys_cmd_tail[u]]
+    wsys_cmd_tail[u] = wsys_cmd_tail[u] + 1
+    _wsys_cmd_compact(wid)
     return cast[int32](c) & 0xFF
 
 
+def wsys_cmd_pop() -> int32:
+    # devcons_read calls this. Routes to the CALLING window's queue —
+    # bytes pushed to wid 2's /dev/wsys/2/cmd are only popped by tasks
+    # bound to wid 2, never by the foreground hamsh on wid 1.
+    w: int32 = _wsys_wid_for_current()
+    return _wsys_cmd_pop_wid(w)
+
+
+def _wsys_reset_rings(wid: int32):
+    # Zero the ring cursors for `wid`. Called from alloc/free so a
+    # recycled slot doesn't leak the previous tenant's bytes. The
+    # backing storage doesn't need clearing — the snapshot readers
+    # use the count/head cursors.
+    u: uint64 = cast[uint64](wid)
+    wsys_text_head[u] = 0
+    wsys_text_count[u] = 0
+    wsys_output_head[u] = 0
+    wsys_output_count[u] = 0
+    wsys_cmd_tail[u] = 0
+    wsys_cmd_head[u] = 0
+
+
 # --- ASCII formatting helpers ----------------------------------------
-#
-# Reverse-fill stack scratch then copy out top-down. Same shape every
-# sibling cdev uses; prefixed `_wsys_` to dodge the flat-namespace
-# `_emit_str` collision.
 
 def _wsys_u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
     if value == 0:
@@ -254,7 +399,6 @@ def _wsys_u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
 
 
 def _wsys_emit_str(out: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
-    # Append NUL-terminated string. Returns new pos.
     i: uint64 = 0
     while s[i] != 0:
         out[pos + i] = s[i]
@@ -264,7 +408,6 @@ def _wsys_emit_str(out: Ptr[uint8], pos: uint64, s: Ptr[uint8]) -> uint64:
 
 def _wsys_emit_path(out: Ptr[uint8], pos: uint64, cap: uint64,
                     path: Ptr[uint8]) -> uint64:
-    # Copy a NUL-terminated path buffer. Defensive cap.
     i: uint64 = 0
     while i < cap:
         c: uint8 = path[i]
@@ -277,21 +420,23 @@ def _wsys_emit_path(out: Ptr[uint8], pos: uint64, cap: uint64,
 
 # --- snapshot rendering ---------------------------------------------
 
-def _wsys_render_pid(out: Ptr[uint8]) -> uint64:
-    # "<pid>\n". Snapshot of the calling task's pid — i.e. the reader's
-    # pid, NOT the window's shell pid. Phase 1 has one window (hamsh)
-    # and the typical reader IS hamsh, so this conveniently matches the
-    # design-doc semantics. Phase 2's multi-window story will need the
-    # kernel to record the "root pid of window N's shell" separately.
-    pid: uint64 = current_task_pid()
+def _wsys_render_pid(wid: int32, out: Ptr[uint8]) -> uint64:
+    # "<pid>\n". The pid bound to `wid` — Phase 2's per-window pid.
+    # wid 1 (foreground) defaults to the calling task's pid if its slot
+    # has no recorded pid yet (boot-time first reader).
+    pid: uint64 = wsys_pid_for_wid(wid)
+    if pid == 0:
+        pid = current_task_pid()
     n: uint64 = _wsys_u64_to_dec(pid, out)
-    out[n] = 10                                     # '\n'
+    out[n] = 10
     return n + 1
 
 
 def _wsys_render_uid(out: Ptr[uint8]) -> uint64:
-    # "<uid>\n". Effective uid of the caller. After `newshell hostowner`
-    # this returns 1; before, it returns the calling user's uid.
+    # "<uid>\n". Effective uid of the caller. Phase 2 still renders the
+    # caller's uid; a future revision could store per-window uid (e.g.
+    # for `hamUI new -as hostowner` H-§B) but Phase 2's design says
+    # bg windows inherit the spawner's uid.
     uid: uint64 = cast[uint64](current_task_uid())
     n: uint64 = _wsys_u64_to_dec(uid, out)
     out[n] = 10
@@ -299,20 +444,17 @@ def _wsys_render_uid(out: Ptr[uint8]) -> uint64:
 
 
 def _wsys_render_kind(out: Ptr[uint8]) -> uint64:
-    # Phase 1 constant: "text\n". Phase 4+ will set this to "x11" or
-    # "framebuffer" when the window's `kind` flips on first GUI cmd.
-    out[0] = 116                                    # 't'
-    out[1] = 101                                    # 'e'
-    out[2] = 120                                    # 'x'
-    out[3] = 116                                    # 't'
-    out[4] = 10                                     # '\n'
+    # Phase 2 still constant: "text\n". Phase 4+ flips to "x11" /
+    # "framebuffer" on GUI cmd.
+    out[0] = 116
+    out[1] = 101
+    out[2] = 120
+    out[3] = 116
+    out[4] = 10
     return 5
 
 
 def _wsys_render_geometry(out: Ptr[uint8]) -> uint64:
-    # Phase 1 constant: "0 0 80 24\n" (text-mode 80x24). The shape
-    # matches Plan 9 rio's `<minx> <miny> <maxx> <maxy>` wctl
-    # geometry rendering so a ported tool consumes it unchanged.
     s: Ptr[uint8] = "0 0 80 24\n"
     i: uint64 = 0
     while s[i] != 0:
@@ -321,25 +463,35 @@ def _wsys_render_geometry(out: Ptr[uint8]) -> uint64:
     return i
 
 
-def _wsys_render_listing(out: Ptr[uint8]) -> uint64:
-    # /dev/wsys directory listing. Phase 1: only "1" (the lone
-    # window). Newline-terminated so `cat /dev/wsys` looks like a
-    # tiny one-line file.
-    out[0] = 49                                     # '1'
-    out[1] = 10
-    return 2
+def _wsys_render_listing(out: Ptr[uint8], cap: uint64) -> uint64:
+    # /dev/wsys directory listing. One line per active wid:
+    #   "<wid> active text uid=<u> pid=<p> hamsh \"<first 32 bytes>\"\n"
+    # Phase 2 framing per the brief. First-line-of-text is the most
+    # recent (or first) line of the wid's text ring — a quick "what's
+    # happening here" hint for an outside reader.
+    _wsys_init_if_needed()
+    pos: uint64 = 0
+    w: uint64 = 1
+    while w < MAX_WINDOWS:
+        if wsys_slot_in_use[w] != 0:
+            # Defensive cap: each line caps at ~80 bytes; bail before
+            # we'd run off the end of `out`.
+            if pos + 96 >= cap:
+                break
+            # wid
+            pos = pos + _wsys_u64_to_dec(w, &out[pos])
+            pos = _wsys_emit_str(out, pos, " active text uid=")
+            uid: uint64 = cast[uint64](current_task_uid())
+            pos = pos + _wsys_u64_to_dec(uid, &out[pos])
+            pos = _wsys_emit_str(out, pos, " pid=")
+            pid: uint64 = wsys_slot_pid[w]
+            pos = pos + _wsys_u64_to_dec(pid, &out[pos])
+            pos = _wsys_emit_str(out, pos, " hamsh\n")
+        w = w + 1
+    return pos
 
 
 def _wsys_render_ns(out: Ptr[uint8], cap: uint64) -> uint64:
-    # Plain-text mtab dump for the CALLING TASK's Pgrp. Format:
-    #
-    #   bind: <from_path> <to_path>
-    #   mount: <from_path> 9p
-    #
-    # One line per live MountEntry. The kind distinguishes a plain
-    # `bind` (CHAN_KIND_SRV not set) from a 9P-server mount. Matches
-    # the spirit of /proc/self/mounts but with the simpler "what is
-    # this window's namespace" shape an AI debugger wants.
     pos: uint64 = 0
     p: uint64 = pgrp_current()
     if p == 0:
@@ -348,16 +500,13 @@ def _wsys_render_ns(out: Ptr[uint8], cap: uint64) -> uint64:
     i: uint64 = 0
     while i < MNT_CAP:
         if g[0].mtab[i].in_use != 0:
-            # ~300 bytes worst case per row (label prefix +
-            # 2x128-byte paths + spaces + newline). Leave a 64-byte
-            # cushion before we'd run off the end of `out`.
             if pos + 320 >= cap:
                 break
             if g[0].mtab[i].chan.kind == CHAN_KIND_SRV:
                 pos = _wsys_emit_str(out, pos, "mount: ")
                 pos = _wsys_emit_path(out, pos, 128,
                                       &g[0].mtab[i].from_path[0])
-                out[pos] = 32                       # ' '
+                out[pos] = 32
                 pos = pos + 1
                 pos = _wsys_emit_str(out, pos, "9p\n")
             else:
@@ -368,7 +517,7 @@ def _wsys_render_ns(out: Ptr[uint8], cap: uint64) -> uint64:
                 pos = pos + 1
                 pos = _wsys_emit_path(out, pos, 128,
                                       &g[0].mtab[i].to_path[0])
-                out[pos] = 10                       # '\n'
+                out[pos] = 10
                 pos = pos + 1
         i = i + 1
     return pos
@@ -376,19 +525,14 @@ def _wsys_render_ns(out: Ptr[uint8], cap: uint64) -> uint64:
 
 # --- public read/write entry points ----------------------------------
 #
-# namec.ad dispatches into these per DEV_WSYS_* slot. The `off` cursor
-# (namec passes fd_pos) gives us snapshot-once semantics for the
-# finite-content files: an `off > 0` read on text / output / ns /
-# pid / uid / kind / geometry / wsys returns 0 (EOF) so `cat`
-# terminates instead of regenerating forever.
+# namec.ad dispatches into these per (wid, DEV_WSYS_*) tuple. The
+# wid is encoded into the inline chan id alongside the dev_type.
 
 WSYS_SCRATCH_CAP: uint64 = 65536
 
 
 def _wsys_copy_out(scratch: Ptr[uint8], n: uint64,
                    off: uint64, buf: Ptr[uint8], count: uint64) -> int64:
-    # Copy a sub-window [off, off+count) of `scratch[0..n)` into
-    # `buf`, honouring EOF semantics. Returns bytes copied or 0 at EOF.
     if off >= n:
         return 0
     remaining: uint64 = n - off
@@ -402,24 +546,25 @@ def _wsys_copy_out(scratch: Ptr[uint8], n: uint64,
     return cast[int64](take)
 
 
-def devwsys_text_read(off: uint64, buf: Ptr[uint8],
+def devwsys_text_read(wid: int32, off: uint64, buf: Ptr[uint8],
                       count: uint64) -> int64:
-    # Snapshot the full text ring (up to 64 KiB) into a scratch, then
-    # serve a windowed sub-read. `off > 0` after the ring is fully
-    # drained returns 0 so `cat` terminates.
     if count == 0:
         return 0
+    if wsys_wid_in_use(wid) == 0:
+        return -2                           # -ENOENT
     scratch: Array[65536, uint8]
-    n: uint64 = _wsys_text_snapshot(&scratch[0], WSYS_TEXT_SIZE)
+    n: uint64 = _wsys_text_snapshot(wid, &scratch[0], WSYS_TEXT_SIZE)
     return _wsys_copy_out(&scratch[0], n, off, buf, count)
 
 
-def devwsys_output_read(off: uint64, buf: Ptr[uint8],
+def devwsys_output_read(wid: int32, off: uint64, buf: Ptr[uint8],
                         count: uint64) -> int64:
     if count == 0:
         return 0
+    if wsys_wid_in_use(wid) == 0:
+        return -2
     scratch: Array[16384, uint8]
-    n: uint64 = _wsys_output_snapshot(&scratch[0], WSYS_OUTPUT_SIZE)
+    n: uint64 = _wsys_output_snapshot(wid, &scratch[0], WSYS_OUTPUT_SIZE)
     return _wsys_copy_out(&scratch[0], n, off, buf, count)
 
 
@@ -432,12 +577,14 @@ def devwsys_ns_read(off: uint64, buf: Ptr[uint8],
     return _wsys_copy_out(&scratch[0], n, off, buf, count)
 
 
-def devwsys_pid_read(off: uint64, buf: Ptr[uint8],
+def devwsys_pid_read(wid: int32, off: uint64, buf: Ptr[uint8],
                      count: uint64) -> int64:
     if count == 0:
         return 0
+    if wsys_wid_in_use(wid) == 0:
+        return -2
     scratch: Array[32, uint8]
-    n: uint64 = _wsys_render_pid(&scratch[0])
+    n: uint64 = _wsys_render_pid(wid, &scratch[0])
     return _wsys_copy_out(&scratch[0], n, off, buf, count)
 
 
@@ -470,28 +617,40 @@ def devwsys_geometry_read(off: uint64, buf: Ptr[uint8],
 
 def devwsys_listing_read(off: uint64, buf: Ptr[uint8],
                          count: uint64) -> int64:
-    # Read of /dev/wsys itself — the active-windows list. Phase 1: "1\n".
     if count == 0:
         return 0
-    scratch: Array[16, uint8]
-    n: uint64 = _wsys_render_listing(&scratch[0])
+    scratch: Array[1024, uint8]
+    n: uint64 = _wsys_render_listing(&scratch[0], 1024)
     return _wsys_copy_out(&scratch[0], n, off, buf, count)
 
 
-def devwsys_cmd_write(buf: Ptr[uint8], count: uint64) -> int64:
-    # Append `count` bytes to the cmd queue. devcons_read will dequeue
-    # them on subsequent reads as if they came from the keyboard.
-    # Bytes dropped on a full queue still count as "written" — the
-    # writer's loop terminates and the kernel printk'd no warning;
-    # this matches the Plan 9 8.5 / rio kbd FIFO drop behaviour.
+def devwsys_cmd_write(wid: int32, buf: Ptr[uint8],
+                      count: uint64) -> int64:
+    if wsys_wid_in_use(wid) == 0:
+        return -2
     i: uint64 = 0
     while i < count:
-        wsys_cmd_push(buf[i])
+        _wsys_cmd_push_wid(wid, buf[i])
         i = i + 1
     return cast[int64](count)
 
 
 def devwsys_readonly_write(buf: Ptr[uint8], count: uint64) -> int64:
-    # text / output / ns / pid / uid / kind / geometry / wsys are
-    # read-only. Mirrors the rest of the introspection cdev family.
     return -1
+
+
+# --- foreground routing introspection -------------------------------
+#
+# devcons.ad consults this BEFORE calling early_putc_user — if the
+# current task is bound to a bg wid (>= 2), we suppress the serial /
+# framebuffer write. The bytes still tee into that wid's text /
+# output rings via the wsys_text_push / wsys_output_push above.
+
+def wsys_current_is_foreground() -> int32:
+    # 1 iff the current task is bound to wid 1 (or no wid — defaults
+    # to foreground). 0 iff bound to a bg wid (>= 2): caller should
+    # skip the serial console write.
+    w: int32 = _wsys_wid_for_current()
+    if w <= 1:
+        return 1
+    return 0

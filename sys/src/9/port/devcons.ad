@@ -43,6 +43,7 @@ from kernel.sched.core import yield_to_others
 # readline as if the bytes had been typed.
 from sys.src.port9.port.devwsys import (
     wsys_text_push, wsys_output_push, wsys_cmd_pop,
+    wsys_current_is_foreground,
 )
 
 
@@ -65,13 +66,21 @@ def devcons_write(buf: Ptr[uint8], count: uint64) -> int64:
     # THRE if the transmitter is slow, so there's no short-write
     # case. Matches FD_STDOUT_MARK's return shape in
     # fs/vfs.ad::vfs_write.
+    #
+    # hamUI Phase 2: a bg window (wid >= 2) is HEADLESS — its
+    # writes tee into the per-wid text/output rings ONLY, never to
+    # the physical serial console. Without this gate every bg
+    # window's hamsh prompt would echo onto the user's terminal and
+    # multi-window would be unusable.
+    is_fg: int32 = wsys_current_is_foreground()
     i: uint64 = 0
     while i < count:
-        ch: int32 = cast[int32](buf[i])
-        early_putc_user(ch)
-        # hamUI Phase 1 tee: same byte into the per-window scrollback
-        # and live-output rings. Cheap (one array-store + counter
-        # bump each); no allocation; no syscall traffic.
+        if is_fg != 0:
+            ch: int32 = cast[int32](buf[i])
+            early_putc_user(ch)
+        # hamUI Phase 2 tee: same byte into the calling window's
+        # scrollback and live-output rings. The wsys_text_push entry
+        # internally resolves current pid → wid.
         wsys_text_push(buf[i])
         wsys_output_push(buf[i])
         i = i + 1
@@ -98,18 +107,26 @@ def devcons_read(buf: Ptr[uint8], count: uint64) -> int64:
     # fs/vfs.ad — signals the kernel that userland is at a live
     # prompt; tighten the console log-level so low-severity printk
     # chatter no longer corrupts the line being typed. Idempotent.
+    #
+    # hamUI Phase 2: a bg window (wid >= 2) reads its OWN cmd queue
+    # only — never kbd/uart. Otherwise the bg hamsh would race the
+    # foreground hamsh for keystrokes and the user's typing would
+    # vanish mid-character. Only wid 1 (the foreground) sees the
+    # physical keyboard. wsys_cmd_pop() and wsys_current_is_foreground
+    # both consult the current task's wid binding.
     console_set_interactive()
+    is_fg: int32 = wsys_current_is_foreground()
     n: uint64 = 0
     while n < count:
-        # hamUI Phase 1: prefer the wsys cmd-injection queue. When an
-        # outside agent does `echo cmd > /dev/wsys/1/cmd`, the bytes
-        # are queued here and drained as if from the keyboard. An
-        # empty queue (the common case) returns -1 cheaply and we
-        # fall through to the real keyboard / UART rings.
+        # Prefer the wsys cmd-injection queue. When an outside agent
+        # does `echo cmd > /dev/wsys/<wid>/cmd`, the bytes are queued
+        # here and drained as if from the keyboard. An empty queue
+        # returns -1 cheaply and we fall through to the real
+        # keyboard / UART rings — ONLY in the foreground window.
         c: int32 = wsys_cmd_pop()
-        if c < 0:
+        if c < 0 and is_fg != 0:
             c = kbd_rx_pop()
-        if c < 0:
+        if c < 0 and is_fg != 0:
             c = uart_rx_pop()
         if c < 0:
             if n > 0:

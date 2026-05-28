@@ -714,6 +714,38 @@ sys_set_realtime:
     .size sys_set_realtime, .-sys_set_realtime
 
 
+    /* --- sys_wsys_alloc(pid) -> int32 -------------------------------
+     * hamUI Phase 2: register a child task's pid against a wid slot
+     * (2..MAX_WINDOWS-1) in the kernel's wsys table. Returns the
+     * assigned wid on success or -1 if the table is full / pid is
+     * already bound. Hostowner-only on the kernel side. The /bin/hamUI
+     * tool calls this after sys_spawn'ing a detached hamsh — the wid
+     * is the addressing key for /dev/wsys/<wid>/* from any namespace.
+     * Number 293 (not 292) because F2's SYS_SET_REALTIME took 292. */
+    .globl sys_wsys_alloc
+    .type sys_wsys_alloc, @function
+sys_wsys_alloc:
+    movq    $293, %rax              /* SYS_WSYS_ALLOC */
+    syscall
+    ret
+    .size sys_wsys_alloc, .-sys_wsys_alloc
+
+
+    /* --- sys_wsys_free(wid) -> int32 --------------------------------
+     * hamUI Phase 2: release a wid slot. Caller is responsible for
+     * SIGTERM'ing the bound shell first; this just clears the table
+     * entry. Returns 0 on success, -1 on bad wid (or wid==1, which is
+     * the foreground console and is unfreeable). Number 294 because
+     * F2's SYS_SET_REALTIME took 292 and SYS_WSYS_ALLOC is 293. */
+    .globl sys_wsys_free
+    .type sys_wsys_free, @function
+sys_wsys_free:
+    movq    $294, %rax              /* SYS_WSYS_FREE */
+    syscall
+    ret
+    .size sys_wsys_free, .-sys_wsys_free
+
+
     /* --- sys_pipechan() -> int32 ------------------------------------
      * HAMSH §7: create a local pipe Chan pair; returns the pipe SLOT
      * id (NOT fds). The shell threads the slot into two sys_fdbind

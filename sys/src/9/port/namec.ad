@@ -105,6 +105,7 @@ from sys.src.port9.port.devwsys import (
     devwsys_kind_read, devwsys_geometry_read,
     devwsys_listing_read,
     devwsys_cmd_write, devwsys_readonly_write,
+    wsys_wid_in_use, MAX_WINDOWS,
 )
 # Native power control: /dev/reboot. A write of "poweroff"/"reboot"/
 # "halt" funnels into the shared kernel power routine (which also backs
@@ -157,19 +158,21 @@ DEV_MOUNTRPC:  int32 = 15          # /dev/mountrpc — HAMSH §6/§18 tripwire
 # /dev/urandom (Python's os.urandom, glibc getrandom fallback path, ...)
 # get the same kernel CSPRNG output.
 DEV_URANDOM:   int32 = 16          # /dev/urandom (alias of /dev/random)
-# hamUI Phase 1 file-tree (docs/hamUI.md H-§A). One slot per file in
-# the per-window tree. Phase 1 has ONE window (wid=1, kind=text); the
-# multi-window dispatch (paths parameterised by wid) lands in Phase 2.
-# Until then these slots are hard-coded to wid=1.
+# hamUI Phase 2 file-tree (docs/hamUI.md H-§A). One slot per file in
+# the per-window tree. The wid (1..MAX_WINDOWS-1) is carried in the
+# inline chan id's high bits — see _chan_id_make_inline_wsys below.
+# At dispatch time _devtab_read / _devtab_write peel the wid back out
+# and call devwsys_*_read(wid, ...). DEV_WSYS itself (the active-list
+# listing) is wid-less.
 DEV_WSYS:          int32 = 17      # /dev/wsys             (active-windows list)
-DEV_WSYS_TEXT:     int32 = 18      # /dev/wsys/1/text      (scrollback ring)
-DEV_WSYS_OUTPUT:   int32 = 19      # /dev/wsys/1/output    (live cmd output)
-DEV_WSYS_CMD:      int32 = 20      # /dev/wsys/1/cmd       (cmd injection sink)
-DEV_WSYS_NS:       int32 = 21      # /dev/wsys/1/ns        (mtab dump)
-DEV_WSYS_PID:      int32 = 22      # /dev/wsys/1/pid
-DEV_WSYS_UID:      int32 = 23      # /dev/wsys/1/uid
-DEV_WSYS_KIND:     int32 = 24      # /dev/wsys/1/kind      ("text\n")
-DEV_WSYS_GEOMETRY: int32 = 25      # /dev/wsys/1/geometry  ("0 0 80 24\n")
+DEV_WSYS_TEXT:     int32 = 18      # /dev/wsys/<N>/text    (scrollback ring)
+DEV_WSYS_OUTPUT:   int32 = 19      # /dev/wsys/<N>/output  (live cmd output)
+DEV_WSYS_CMD:      int32 = 20      # /dev/wsys/<N>/cmd     (cmd injection sink)
+DEV_WSYS_NS:       int32 = 21      # /dev/wsys/<N>/ns      (mtab dump)
+DEV_WSYS_PID:      int32 = 22      # /dev/wsys/<N>/pid
+DEV_WSYS_UID:      int32 = 23      # /dev/wsys/<N>/uid
+DEV_WSYS_KIND:     int32 = 24      # /dev/wsys/<N>/kind    ("text\n")
+DEV_WSYS_GEOMETRY: int32 = 25      # /dev/wsys/<N>/geometry ("0 0 80 24\n")
 # Native Plan-9 power-control cdev. Writing an ASCII verb
 # ("poweroff" / "reboot" / "halt", with or without a trailing newline)
 # triggers arch/x86/kernel/power.ad's shared power routine — the same
@@ -225,6 +228,12 @@ class ChanT:
 # trips the id verbatim.
 CHAN_INLINE_TAG: int32 = 0x40000000
 
+# hamUI Phase 2: an inline chan id additionally encodes a wid in
+# bits 8..15 (zero for non-wsys cdevs). dev_type lives in bits 0..7.
+# This avoids growing DEV_* into 8 sets of 9 per-wid slots — instead
+# the ONE per-leaf DEV_WSYS_* constant parametrises over wid via the
+# chan id. _devtab_read / _devtab_write peel the wid out before
+# dispatching into the devwsys_*_read(wid, ...) family.
 
 def _chan_id_is_inline(cid: int32) -> int32:
     if (cid & CHAN_INLINE_TAG) != 0:
@@ -233,11 +242,22 @@ def _chan_id_is_inline(cid: int32) -> int32:
 
 
 def _chan_id_inline_dev(cid: int32) -> int32:
-    return cid & 0x3FFFFFFF
+    # Just the dev_type — wid lives in bits 8..15 and is extracted
+    # separately via _chan_id_inline_wid.
+    return cid & 0xFF
+
+
+def _chan_id_inline_wid(cid: int32) -> int32:
+    return (cid >> 8) & 0xFF
 
 
 def _chan_id_make_inline(dev_type: int32) -> int32:
     return CHAN_INLINE_TAG | dev_type
+
+
+def _chan_id_make_inline_wsys(dev_type: int32, wid: int32) -> int32:
+    # Wid-tagged inline chan id for the DEV_WSYS_* family.
+    return CHAN_INLINE_TAG | (wid << 8) | dev_type
 
 
 # --- chan pool (DEV_MNT only) ---------------------------------------
@@ -382,32 +402,111 @@ def _devtab_lookup(path: Ptr[char]) -> int32:
         return DEV_MOUNTRPC
     if _streq(path, "/dev/reboot") != 0:
         return DEV_REBOOT
-    # hamUI Phase 1: /dev/wsys tree. Each leaf is its own devtab slot
-    # so namec / FD_CHAN_MARK dispatch routes a read straight to the
-    # matching cdev body without a runtime path-suffix parse. Phase 2
-    # (multi-window) will replace this with a wid-parameterised lookup.
+    # hamUI Phase 2: /dev/wsys tree. _devtab_lookup_wsys does the
+    # wid-aware parsing — see below. A non-wsys path returns DEV_NONE.
     if _streq(path, "/dev/wsys") != 0:
         return DEV_WSYS
-    if _streq(path, "/dev/wsys/1") != 0:
-        # A bare /dev/wsys/1 open returns the same listing as
-        # /dev/wsys (Phase 1 has one window). A real directory walker
-        # lands in Phase 2.
+    return DEV_NONE
+
+
+def _wsys_parse_wid(path: Ptr[char], pos: uint64,
+                    wid_out: Ptr[int32]) -> uint64:
+    # Parse decimal digits starting at path[pos]. Sets *wid_out and
+    # returns the position of the first non-digit (typically '/' or
+    # NUL). On no-digits, returns pos unchanged and *wid_out = -1.
+    n: int32 = 0
+    p: uint64 = pos
+    any_digit: int32 = 0
+    while True:
+        c: char = path[p]
+        if c < 48 or c > 57:
+            break
+        any_digit = 1
+        n = n * 10 + cast[int32](c) - 48
+        p = p + 1
+    if any_digit == 0:
+        wid_out[0] = -1
+        return pos
+    wid_out[0] = n
+    return p
+
+
+def _streq_at(path: Ptr[char], pos: uint64, suffix: Ptr[char]) -> int32:
+    # 1 iff path[pos..] == suffix (NUL-terminated equality).
+    i: uint64 = 0
+    while True:
+        a: char = path[pos + i]
+        b: char = suffix[i]
+        if a != b:
+            return 0
+        if a == 0:
+            return 1
+        i = i + 1
+
+
+def _starts_with(path: Ptr[char], prefix: Ptr[char]) -> int32:
+    # 1 iff `path` begins with `prefix` (suffix NUL terminates the
+    # match — path may be longer). Used for the "/dev/wsys/" prefix
+    # check; _streq_at requires full equality and would reject any
+    # path with characters past the prefix.
+    i: uint64 = 0
+    while True:
+        b: char = prefix[i]
+        if b == 0:
+            return 1
+        a: char = path[i]
+        if a != b:
+            return 0
+        i = i + 1
+
+
+def _devtab_lookup_wsys(path: Ptr[char], wid_out: Ptr[int32]) -> int32:
+    # Parse `/dev/wsys/<N>[/<leaf>]`. Returns the matching DEV_WSYS_*
+    # constant on success with *wid_out set, or DEV_NONE on miss
+    # (path is not in the wsys tree, wid is 0, wid is out of range,
+    # or wid is unused).
+    #
+    # The caller already handled the bare `/dev/wsys` path (returns
+    # DEV_WSYS via _devtab_lookup). Here we only get called for paths
+    # under `/dev/wsys/`.
+    if _starts_with(path, "/dev/wsys/") == 0:
+        return DEV_NONE
+    pos: uint64 = 10                           # past "/dev/wsys/"
+    w: int32 = -1
+    pos = _wsys_parse_wid(path, pos, &w)
+    if w < 0:
+        return DEV_NONE
+    # Reject wid 0 (spec: wids are 1-indexed) and out-of-range wids.
+    if w == 0:
+        return DEV_NONE
+    if cast[uint64](w) >= MAX_WINDOWS:
+        return DEV_NONE
+    # Gate by liveness — an unused wid returns ENOENT (caller treats
+    # DEV_NONE as fallthrough; we want ENOENT). The dispatch path
+    # below special-cases this via wsys_wid_in_use checks too, but
+    # surfacing it here means namec() returns NAMEC_ENOENT cleanly.
+    if wsys_wid_in_use(w) == 0:
+        return DEV_NONE
+    wid_out[0] = w
+    # Suffix dispatch.
+    if path[pos] == 0:
+        # Bare `/dev/wsys/<N>` — return listing (Phase 1 behaviour).
         return DEV_WSYS
-    if _streq(path, "/dev/wsys/1/text") != 0:
+    if _streq_at(path, pos, "/text") != 0:
         return DEV_WSYS_TEXT
-    if _streq(path, "/dev/wsys/1/output") != 0:
+    if _streq_at(path, pos, "/output") != 0:
         return DEV_WSYS_OUTPUT
-    if _streq(path, "/dev/wsys/1/cmd") != 0:
+    if _streq_at(path, pos, "/cmd") != 0:
         return DEV_WSYS_CMD
-    if _streq(path, "/dev/wsys/1/ns") != 0:
+    if _streq_at(path, pos, "/ns") != 0:
         return DEV_WSYS_NS
-    if _streq(path, "/dev/wsys/1/pid") != 0:
+    if _streq_at(path, pos, "/pid") != 0:
         return DEV_WSYS_PID
-    if _streq(path, "/dev/wsys/1/uid") != 0:
+    if _streq_at(path, pos, "/uid") != 0:
         return DEV_WSYS_UID
-    if _streq(path, "/dev/wsys/1/kind") != 0:
+    if _streq_at(path, pos, "/kind") != 0:
         return DEV_WSYS_KIND
-    if _streq(path, "/dev/wsys/1/geometry") != 0:
+    if _streq_at(path, pos, "/geometry") != 0:
         return DEV_WSYS_GEOMETRY
     return DEV_NONE
 
@@ -421,8 +520,8 @@ def _devtab_lookup(path: Ptr[char]) -> int32:
 # Either shape is "index a table by device kind" — the semantics are
 # identical, and the switch is unambiguous to the Adder codegen.
 
-def _devtab_read(dev_type: int32, off: uint64, buf: Ptr[uint8],
-                 count: uint64) -> int64:
+def _devtab_read(dev_type: int32, wid: int32, off: uint64,
+                 buf: Ptr[uint8], count: uint64) -> int64:
     # `off` is the read cursor. Most cdevs are stateless snapshot
     # devices and ignore it (every read regenerates) — but a device
     # like /dev/mountrpc that a `cat` walks to EOF must honour it, or
@@ -465,9 +564,12 @@ def _devtab_read(dev_type: int32, off: uint64, buf: Ptr[uint8],
         return devmounts_read(buf, count)
     if dev_type == DEV_DISKSTATS:
         return devdiskstats_read(buf, count)
-    # hamUI Phase 1: /dev/wsys tree. Every leaf is snapshot-once;
+    # hamUI Phase 2: /dev/wsys tree. Every leaf is snapshot-once;
     # devwsys_*_read consult `off` and report EOF when the snapshot is
-    # drained so `cat` terminates instead of regenerating forever.
+    # drained so `cat` terminates instead of regenerating forever. The
+    # wid was extracted from the inline chan id by namec_read() before
+    # this call and passed in as the wid argument; per-wid leaves
+    # (text/output/cmd/pid) thread it down to the devwsys backend.
     if dev_type == DEV_REBOOT:
         # /dev/reboot is write-only — reads return EOF so a stray cat
         # doesn't wedge. The action is the write side only.
@@ -475,18 +577,18 @@ def _devtab_read(dev_type: int32, off: uint64, buf: Ptr[uint8],
     if dev_type == DEV_WSYS:
         return devwsys_listing_read(off, buf, count)
     if dev_type == DEV_WSYS_TEXT:
-        return devwsys_text_read(off, buf, count)
+        return devwsys_text_read(wid, off, buf, count)
     if dev_type == DEV_WSYS_OUTPUT:
-        return devwsys_output_read(off, buf, count)
+        return devwsys_output_read(wid, off, buf, count)
     if dev_type == DEV_WSYS_CMD:
-        # /dev/wsys/1/cmd is write-only — reads return 0 (EOF) so a
+        # /dev/wsys/<N>/cmd is write-only — reads return 0 (EOF) so a
         # stray cat doesn't wedge. Cmd injection is the write side
         # only; there is no "current pending cmd" to expose.
         return 0
     if dev_type == DEV_WSYS_NS:
         return devwsys_ns_read(off, buf, count)
     if dev_type == DEV_WSYS_PID:
-        return devwsys_pid_read(off, buf, count)
+        return devwsys_pid_read(wid, off, buf, count)
     if dev_type == DEV_WSYS_UID:
         return devwsys_uid_read(off, buf, count)
     if dev_type == DEV_WSYS_KIND:
@@ -541,7 +643,7 @@ def _devreboot_write(buf: Ptr[uint8], count: uint64) -> int64:
     return cast[int64](count)
 
 
-def _devtab_write(dev_type: int32, buf: Ptr[uint8],
+def _devtab_write(dev_type: int32, wid: int32, buf: Ptr[uint8],
                   count: uint64) -> int64:
     if dev_type == DEV_REBOOT:
         return _devreboot_write(buf, count)
@@ -578,10 +680,11 @@ def _devtab_write(dev_type: int32, buf: Ptr[uint8],
         return devdiskstats_write(buf, count)
     if dev_type == DEV_MOUNTRPC:
         return devmountrpc_write(buf, count)
-    # hamUI Phase 1: cmd is the only writable slot. Every other slot is
+    # hamUI Phase 2: cmd is the only writable slot. Every other slot is
     # read-only (mirror of console writes / introspection snapshots).
+    # The wid was extracted from the inline chan id by namec_write().
     if dev_type == DEV_WSYS_CMD:
-        return devwsys_cmd_write(buf, count)
+        return devwsys_cmd_write(wid, buf, count)
     if dev_type == DEV_WSYS or dev_type == DEV_WSYS_TEXT \
             or dev_type == DEV_WSYS_OUTPUT or dev_type == DEV_WSYS_NS \
             or dev_type == DEV_WSYS_PID or dev_type == DEV_WSYS_UID \
@@ -680,10 +783,15 @@ def namec(path: Ptr[char], mode: int32) -> int32:
     # --- (2) local devtab: a well-known /dev/<name> ------------------
     # An inline (poolless) chan — the cdev backends are global and
     # stateless, so no pool slot is needed. The id round-trips the
-    # device kind directly.
+    # device kind directly. The wsys family also carries a wid in
+    # the chan id's high bits.
     dev_type: int32 = _devtab_lookup(path)
     if dev_type != DEV_NONE:
         return _chan_id_make_inline(dev_type)
+    wid: int32 = 0
+    dev_type = _devtab_lookup_wsys(path, &wid)
+    if dev_type != DEV_NONE:
+        return _chan_id_make_inline_wsys(dev_type, wid)
 
     # --- (3) not a chan — caller falls through to on-disk routing ---
     return NAMEC_FALLTHROUGH
@@ -809,11 +917,13 @@ def namec_read(cid: int32, off: uint64, buf: Ptr[uint8],
     if _chan_id_valid(cid) == 0:
         return -9                                           # -EBADF
     if _chan_id_is_inline(cid) != 0:
-        return _devtab_read(_chan_id_inline_dev(cid), off, buf, count)
+        return _devtab_read(_chan_id_inline_dev(cid),
+                            _chan_id_inline_wid(cid),
+                            off, buf, count)
     su: uint64 = cast[uint64](cid)
     if chan_pool[su].dev_type == DEV_MNT:
         return _mnt_read(su, off, buf, count)
-    return _devtab_read(chan_pool[su].dev_type, off, buf, count)
+    return _devtab_read(chan_pool[su].dev_type, 0, off, buf, count)
 
 
 def namec_write(cid: int32, off: uint64, buf: Ptr[uint8],
@@ -821,11 +931,13 @@ def namec_write(cid: int32, off: uint64, buf: Ptr[uint8],
     if _chan_id_valid(cid) == 0:
         return -9                                           # -EBADF
     if _chan_id_is_inline(cid) != 0:
-        return _devtab_write(_chan_id_inline_dev(cid), buf, count)
+        return _devtab_write(_chan_id_inline_dev(cid),
+                             _chan_id_inline_wid(cid),
+                             buf, count)
     su: uint64 = cast[uint64](cid)
     if chan_pool[su].dev_type == DEV_MNT:
         return _mnt_write(su, off, buf, count)
-    return _devtab_write(chan_pool[su].dev_type, buf, count)
+    return _devtab_write(chan_pool[su].dev_type, 0, buf, count)
 
 
 def namec_close(cid: int32) -> int32:
