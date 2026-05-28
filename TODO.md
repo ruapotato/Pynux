@@ -42,34 +42,32 @@ retrofitted backwards.
 
 ## Now — useful-system gap fill (priority-ordered, locked with user 2026-05-28)
 
-1. [~] **hamUI Phase 2** — multi-window via `/dev/wsys/<N>/`; bg hamsh
-   instances; serial console stays on wid 1. (in flight)
-2. [ ] **hamUI Phase 4a** — layered draw protocol cdev plumbing
+1. [ ] **hamUI Phase 4a** — layered draw protocol cdev plumbing
    ([`docs/hamUI.md`](docs/hamUI.md) H-§G): per-window
    `/dev/wsys/<wid>/draw/<name>/{kind,z,opacity,geometry,markup,fb}`
    + `ctl` verbs (`mklayer` / `rmlayer` / `setz` / `ls`). No
    rasterisation yet; just the file surface.
-3. [ ] **hamUI Phase 4b** — `hamUId` userland renderer daemon: hamML
+2. [ ] **hamUI Phase 4b** — `hamUId` userland renderer daemon: hamML
    parser + bitmap-font rasteriser + compositor.
-4. [ ] **hamUI Phase 4c** — framebuffer driver + drag-to-create
+3. [ ] **hamUI Phase 4c** — framebuffer driver + drag-to-create
    gesture (H-§D).
-5. [ ] **hamUI Phase 4d** — bitmap font store (mono/sans/serif BDF).
-6. [ ] **`lib/hamui.ad`** — Adder graphics library wrapping H-§G
+4. [ ] **hamUI Phase 4d** — bitmap font store (mono/sans/serif BDF).
+5. [ ] **`lib/hamui.ad`** — Adder graphics library wrapping H-§G
    (Window/Layer/Rect/Text/Image/Button/Input/Event + event loop).
    See [[memory/project_app_language_decision]] — Adder + hamsh,
    no third tier.
-7. [ ] **hamsh `use hamui`** — bindings on top of #6. May require
+6. [ ] **hamsh `use hamui`** — bindings on top of #5. May require
    hamsh extensions for closures + event loop + persistent state.
-8. [ ] **Outgoing `ssh` client** — `sshd` ships but nothing dials out.
+7. [ ] **Outgoing `ssh` client** — `sshd` ships but nothing dials out.
    `curl`/`wget` now exist (shared `user/http9.ad`); an SSH *client*
    is a separate protocol/crypto lift still to do.
-9. [ ] **Pipes + job control in hamsh** — audit `|`; add `&`
+8. [ ] **Pipes + job control in hamsh** — audit `|`; add `&`
     background, `bg`/`fg`/`jobs`, process groups + SIGTSTP/SIGCONT.
-10. [ ] **Real editor** — vi-shape or acme-shape. `ed` is too minimal.
-11. [ ] **`tar` + `gzip` / `gunzip`** — share/backup workflows.
-12. [ ] **Audio** — `snd_hda_intel.ko` loads cleanly; need `aplay`-shape
+9. [ ] **Real editor** — vi-shape or acme-shape. `ed` is too minimal.
+10. [ ] **`tar` + `gzip` / `gunzip`** — share/backup workflows.
+11. [ ] **Audio** — `snd_hda_intel.ko` loads cleanly; need `aplay`-shape
     userland tool that pushes PCM to the cdev.
-13. [ ] **`hpm update` + rollback** — install works; in-place upgrade
+12. [ ] **`hpm update` + rollback** — install works; in-place upgrade
     + snapshot-before-upgrade do not.
 
 ## hamUI later phases (after Phase 4)
@@ -88,6 +86,15 @@ retrofitted backwards.
 
 The Phase D inversion + §1..§13 critical path is **closed** (see
 STATUS.md). What remains, off the critical path and parallelisable:
+
+### Latent crashes
+- [ ] `#DF` at `load_cr3+0x3` (the `ret` after `mov %rdi,%cr3`) when a
+  freshly-built CR3's kernel half is unmapped (stale/uninitialised PML4
+  entry; trap rsp lands in low memory ~0x6693200). Fires *after* test
+  success in both ntpd and non-ntpd runs, so the suite still passes —
+  but it's a real double-fault. Likely cause: a new address space's
+  top-level PML4 isn't inheriting the kernel higher-half mappings before
+  the switch. Surfaced during hamUI Phase 2 landing.
 
 ### Phase D follow-ups
 - [ ] Layer-2 `/proc → /dev` translation as a namespace bind (retire
