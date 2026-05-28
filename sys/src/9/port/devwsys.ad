@@ -375,6 +375,8 @@ def _wsys_reset_rings(wid: int32):
     wsys_output_count[u] = 0
     wsys_cmd_tail[u] = 0
     wsys_cmd_head[u] = 0
+    # Drop any draw layers a recycled wid's previous tenant created.
+    _wsys_draw_reset_window(wid)
 
 
 # --- ASCII formatting helpers ----------------------------------------
@@ -654,3 +656,682 @@ def wsys_current_is_foreground() -> int32:
     if w <= 1:
         return 1
     return 0
+
+
+# === hamUI Phase 4a — layered-draw FILE SURFACE =====================
+#
+# docs/hamUI.md H-§G. This is the kernel-side per-window draw layer
+# tree exposed as cdev files under /dev/wsys/<wid>/draw/. THIS PHASE
+# IS PURELY THE FILE SURFACE — no rasterisation, no pixels rendered.
+# A later phase (4b) builds the userland renderer that rasterises the
+# markup/fb buffers this surface stores.
+#
+# Per-window layer table layout (static, codebase norm — no malloc):
+#   * Up to WSYS_DRAW_MAX_LAYERS (16) layers per window.
+#   * Each layer: a name (NUL-padded, up to WSYS_DRAW_NAME_CAP-1
+#     chars), kind (markup|fb), z-height, opacity (0..255), geometry
+#     (x/y/w/h), a markup text body (WSYS_DRAW_MARKUP_CAP bytes), and
+#     an fb pixel buffer (WSYS_DRAW_FB_CAP bytes RGBA8888).
+#
+# CAP RATIONALE
+#   markup: 8 KiB is comfortable for a chrome layer's hamML.
+#   fb:     256 KiB per layer = 256x256 RGBA8888 (262144 B) minus a
+#           little; we round to exactly 262144 so a 256x256 fb fits.
+#   Total fb storage = MAX_WINDOWS * MAX_LAYERS * FB_CAP. With the
+#   defaults that is 9 * 16 * 262144 = 36 MiB of BSS. That is the
+#   dominant cost of this surface; documented here so a future tuner
+#   knows where the memory went. (4b's userland renderer keeps the
+#   rastered bitmaps; the kernel only stores the raw layer bytes.)
+
+WSYS_DRAW_MAX_LAYERS: uint64 = 16
+WSYS_DRAW_NAME_CAP:   uint64 = 32
+WSYS_DRAW_MARKUP_CAP: uint64 = 8192
+WSYS_DRAW_FB_CAP:     uint64 = 262144      # 256 * 256 * 4 (RGBA8888)
+
+WSYS_LAYER_KIND_MARKUP: int32 = 0
+WSYS_LAYER_KIND_FB:     int32 = 1
+
+# Per-(wid, layer-slot) scalar metadata. Flat Arrays sized
+# MAX_WINDOWS * WSYS_DRAW_MAX_LAYERS = 9 * 16 = 144, indexed as
+# meta[wid * WSYS_DRAW_MAX_LAYERS + slot]. Mirrors the flat-Array
+# idiom the rings above use (Adder's nested-frame Array quirk).
+wsys_layer_in_use:  Array[144, int32]
+wsys_layer_kind:    Array[144, int32]
+wsys_layer_z:       Array[144, int64]
+wsys_layer_opacity: Array[144, int64]
+wsys_layer_x:       Array[144, int64]
+wsys_layer_y:       Array[144, int64]
+wsys_layer_w:       Array[144, int64]
+wsys_layer_h:       Array[144, int64]
+wsys_layer_markup_len: Array[144, uint64]
+wsys_layer_fb_len:     Array[144, uint64]
+
+# Layer name storage: flat Array of MAX_WINDOWS * MAX_LAYERS *
+# NAME_CAP = 9 * 16 * 32 = 4608 bytes. Indexed as
+# name[(wid * MAX_LAYERS + slot) * NAME_CAP + i]. NUL-padded.
+wsys_layer_name: Array[4608, uint8]
+
+# Markup bodies: 9 * 16 * 8192 = 1179648 bytes.
+wsys_layer_markup: Array[1179648, uint8]
+
+# Framebuffer bytes: 9 * 16 * 262144 = 37748736 bytes.
+wsys_layer_fb: Array[37748736, uint8]
+
+
+def _wsys_draw_base(wid: int32, slot: uint64) -> uint64:
+    # The (wid, slot) entry index into the per-slot scalar Arrays.
+    return cast[uint64](wid) * WSYS_DRAW_MAX_LAYERS + slot
+
+
+def _wsys_draw_name_base(wid: int32, slot: uint64) -> uint64:
+    return _wsys_draw_base(wid, slot) * WSYS_DRAW_NAME_CAP
+
+
+def _wsys_draw_markup_base(wid: int32, slot: uint64) -> uint64:
+    return _wsys_draw_base(wid, slot) * WSYS_DRAW_MARKUP_CAP
+
+
+def _wsys_draw_fb_base(wid: int32, slot: uint64) -> uint64:
+    return _wsys_draw_base(wid, slot) * WSYS_DRAW_FB_CAP
+
+
+def _wsys_name_match(wid: int32, slot: uint64,
+                     name: Ptr[uint8], namelen: uint64) -> int32:
+    # 1 iff the stored layer name at (wid, slot) equals the first
+    # `namelen` bytes of `name` AND the stored name is exactly that
+    # long (next stored byte is NUL or namelen hits NAME_CAP).
+    nb: uint64 = _wsys_draw_name_base(wid, slot)
+    i: uint64 = 0
+    while i < namelen:
+        if i >= WSYS_DRAW_NAME_CAP:
+            return 0
+        if wsys_layer_name[nb + i] != name[i]:
+            return 0
+        i = i + 1
+    # Stored name must terminate here (full-equality, not prefix).
+    if i >= WSYS_DRAW_NAME_CAP:
+        return 1
+    if wsys_layer_name[nb + i] == 0:
+        return 1
+    return 0
+
+
+def _wsys_draw_layer_index(wid: int32, name: Ptr[uint8],
+                           namelen: uint64) -> int32:
+    # Find the slot of the layer named `name` (first `namelen` bytes)
+    # for `wid`. Returns the slot (0..MAX_LAYERS-1) or -1 if absent.
+    s: uint64 = 0
+    while s < WSYS_DRAW_MAX_LAYERS:
+        if wsys_layer_in_use[_wsys_draw_base(wid, s)] != 0:
+            if _wsys_name_match(wid, s, name, namelen) != 0:
+                return cast[int32](s)
+        s = s + 1
+    return -1
+
+
+def _wsys_draw_free_slot(wid: int32) -> int32:
+    # Lowest free layer slot for `wid`, or -1 if the table is full.
+    s: uint64 = 0
+    while s < WSYS_DRAW_MAX_LAYERS:
+        if wsys_layer_in_use[_wsys_draw_base(wid, s)] == 0:
+            return cast[int32](s)
+        s = s + 1
+    return -1
+
+
+def _wsys_draw_reset_window(wid: int32):
+    # Clear every layer slot for `wid`. Called from alloc/free so a
+    # recycled wid doesn't leak the previous tenant's layers.
+    s: uint64 = 0
+    while s < WSYS_DRAW_MAX_LAYERS:
+        b: uint64 = _wsys_draw_base(wid, s)
+        wsys_layer_in_use[b] = 0
+        wsys_layer_markup_len[b] = 0
+        wsys_layer_fb_len[b] = 0
+        s = s + 1
+
+
+# --- ctl verb parsing helpers ---------------------------------------
+
+def _wsys_is_space(c: uint8) -> int32:
+    if c == 32 or c == 9:
+        return 1
+    return 0
+
+
+def _wsys_tok_skip_space(buf: Ptr[uint8], pos: uint64,
+                         count: uint64) -> uint64:
+    p: uint64 = pos
+    while p < count:
+        if _wsys_is_space(buf[p]) == 0:
+            if buf[p] != 10 and buf[p] != 13:
+                break
+        p = p + 1
+    return p
+
+
+def _wsys_tok_end(buf: Ptr[uint8], pos: uint64, count: uint64) -> uint64:
+    # Index of the first whitespace/newline/end at or after `pos`.
+    p: uint64 = pos
+    while p < count:
+        c: uint8 = buf[p]
+        if _wsys_is_space(c) != 0 or c == 10 or c == 13:
+            break
+        p = p + 1
+    return p
+
+
+def _wsys_tok_eq(buf: Ptr[uint8], start: uint64, end: uint64,
+                 word: Ptr[char]) -> int32:
+    # 1 iff buf[start..end) equals the NUL-terminated `word`.
+    i: uint64 = 0
+    p: uint64 = start
+    while True:
+        wc: char = word[i]
+        if wc == 0:
+            if p == end:
+                return 1
+            return 0
+        if p >= end:
+            return 0
+        if buf[p] != cast[uint8](wc):
+            return 0
+        i = i + 1
+        p = p + 1
+
+
+def _wsys_tok_to_i64(buf: Ptr[uint8], start: uint64,
+                     end: uint64) -> int64:
+    # Parse a (possibly negative) decimal integer from buf[start..end).
+    # Non-digit bytes terminate parsing early; an empty token is 0.
+    p: uint64 = start
+    neg: int32 = 0
+    if p < end and buf[p] == 45:               # '-'
+        neg = 1
+        p = p + 1
+    v: int64 = 0
+    while p < end:
+        c: uint8 = buf[p]
+        if c < 48 or c > 57:
+            break
+        v = v * 10 + cast[int64](c) - 48
+        p = p + 1
+    if neg != 0:
+        return 0 - v
+    return v
+
+
+def _wsys_buf_has_digit(buf: Ptr[uint8], count: uint64) -> int32:
+    # 1 iff buf[0..count) contains at least one ASCII decimal digit.
+    # The scalar draw files (z, opacity) use this to ignore a digit-less
+    # write — a redirect like `echo 100 > z` can land as two writes
+    # ("100" then a trailing "\n", or an empty flush), and a digit-less
+    # payload must NOT clobber the value the previous write just set.
+    i: uint64 = 0
+    while i < count:
+        c: uint8 = buf[i]
+        if c >= 48 and c <= 57:
+            return 1
+        i = i + 1
+    return 0
+
+
+# --- ctl write: mklayer / rmlayer / clear / setz / ls ---------------
+
+def devwsys_draw_ctl_write(wid: int32, buf: Ptr[uint8],
+                           count: uint64) -> int64:
+    # Parse and apply one ctl verb line. Verbs (H-§G):
+    #   mklayer <name> markup [w h]
+    #   mklayer <name> fb w h [bpp]
+    #   rmlayer <name>
+    #   clear <name>
+    #   setz <name> <n>
+    #   ls
+    # Returns the byte count consumed (write accepted) on success, or
+    # a negative errno on a hard failure (bad wid / table full).
+    if wsys_wid_in_use(wid) == 0:
+        return -2                                       # -ENOENT
+    if count == 0:
+        return 0
+    p: uint64 = _wsys_tok_skip_space(buf, 0, count)
+    verb_start: uint64 = p
+    verb_end: uint64 = _wsys_tok_end(buf, p, count)
+    if verb_start == verb_end:
+        return cast[int64](count)                       # blank line
+    # ls — nothing to do; the listing read regenerates on demand, so
+    # the verb is accepted as a no-op (kept for spec parity).
+    if _wsys_tok_eq(buf, verb_start, verb_end, "ls") != 0:
+        return cast[int64](count)
+    # Every other verb takes a <name> token.
+    p = _wsys_tok_skip_space(buf, verb_end, count)
+    name_start: uint64 = p
+    name_end: uint64 = _wsys_tok_end(buf, p, count)
+    namelen: uint64 = name_end - name_start
+    if namelen == 0:
+        return cast[int64](count)                       # missing name
+    if namelen >= WSYS_DRAW_NAME_CAP:
+        namelen = WSYS_DRAW_NAME_CAP - 1
+    np: Ptr[uint8] = &buf[name_start]
+
+    if _wsys_tok_eq(buf, verb_start, verb_end, "mklayer") != 0:
+        return _wsys_draw_mklayer(wid, np, namelen,
+                                  buf, name_end, count)
+    if _wsys_tok_eq(buf, verb_start, verb_end, "rmlayer") != 0:
+        idx: int32 = _wsys_draw_layer_index(wid, np, namelen)
+        if idx < 0:
+            return cast[int64](count)
+        wsys_layer_in_use[_wsys_draw_base(wid, cast[uint64](idx))] = 0
+        return cast[int64](count)
+    if _wsys_tok_eq(buf, verb_start, verb_end, "clear") != 0:
+        idx2: int32 = _wsys_draw_layer_index(wid, np, namelen)
+        if idx2 < 0:
+            return cast[int64](count)
+        b2: uint64 = _wsys_draw_base(wid, cast[uint64](idx2))
+        wsys_layer_markup_len[b2] = 0
+        wsys_layer_fb_len[b2] = 0
+        return cast[int64](count)
+    if _wsys_tok_eq(buf, verb_start, verb_end, "setz") != 0:
+        idx3: int32 = _wsys_draw_layer_index(wid, np, namelen)
+        if idx3 < 0:
+            return cast[int64](count)
+        zp: uint64 = _wsys_tok_skip_space(buf, name_end, count)
+        ze: uint64 = _wsys_tok_end(buf, zp, count)
+        wsys_layer_z[_wsys_draw_base(wid, cast[uint64](idx3))] = \
+            _wsys_tok_to_i64(buf, zp, ze)
+        return cast[int64](count)
+    # Unknown verb — accept-and-ignore (don't wedge a stray writer).
+    return cast[int64](count)
+
+
+def _wsys_draw_store_name(wid: int32, slot: uint64,
+                          name: Ptr[uint8], namelen: uint64):
+    nb: uint64 = _wsys_draw_name_base(wid, slot)
+    i: uint64 = 0
+    while i < namelen:
+        wsys_layer_name[nb + i] = name[i]
+        i = i + 1
+    # NUL-pad the remainder so _wsys_name_match's terminator test works.
+    while i < WSYS_DRAW_NAME_CAP:
+        wsys_layer_name[nb + i] = 0
+        i = i + 1
+
+
+def _wsys_draw_mklayer(wid: int32, name: Ptr[uint8], namelen: uint64,
+                       buf: Ptr[uint8], after_name: uint64,
+                       count: uint64) -> int64:
+    # mklayer <name> markup [w h]   |   mklayer <name> fb w h [bpp]
+    # If the layer already exists, this is a no-op success (idempotent
+    # re-declaration). geometry defaults to the full 640x480 window
+    # for markup; fb requires w h.
+    existing: int32 = _wsys_draw_layer_index(wid, name, namelen)
+    if existing >= 0:
+        return cast[int64](count)
+    slot: int32 = _wsys_draw_free_slot(wid)
+    if slot < 0:
+        return -28                                      # -ENOSPC
+    su: uint64 = cast[uint64](slot)
+    b: uint64 = _wsys_draw_base(wid, su)
+    # kind token
+    kp: uint64 = _wsys_tok_skip_space(buf, after_name, count)
+    ke: uint64 = _wsys_tok_end(buf, kp, count)
+    kind: int32 = WSYS_LAYER_KIND_MARKUP
+    if _wsys_tok_eq(buf, kp, ke, "fb") != 0:
+        kind = WSYS_LAYER_KIND_FB
+    # optional w h
+    wp: uint64 = _wsys_tok_skip_space(buf, ke, count)
+    we: uint64 = _wsys_tok_end(buf, wp, count)
+    hp: uint64 = _wsys_tok_skip_space(buf, we, count)
+    he: uint64 = _wsys_tok_end(buf, hp, count)
+    lw: int64 = 640
+    lh: int64 = 480
+    if wp != we:
+        lw = _wsys_tok_to_i64(buf, wp, we)
+    if hp != he:
+        lh = _wsys_tok_to_i64(buf, hp, he)
+    # Commit the slot.
+    _wsys_draw_store_name(wid, su, name, namelen)
+    wsys_layer_in_use[b] = 1
+    wsys_layer_kind[b] = kind
+    wsys_layer_z[b] = 0
+    wsys_layer_opacity[b] = 255
+    wsys_layer_x[b] = 0
+    wsys_layer_y[b] = 0
+    wsys_layer_w[b] = lw
+    wsys_layer_h[b] = lh
+    wsys_layer_markup_len[b] = 0
+    wsys_layer_fb_len[b] = 0
+    return cast[int64](count)
+
+
+# --- listing read: z-ascending one line per layer -------------------
+
+def _wsys_emit_i64(out: Ptr[uint8], pos: uint64, v: int64) -> uint64:
+    if v < 0:
+        out[pos] = 45                                   # '-'
+        return _wsys_u64_to_dec(cast[uint64](0 - v), &out[pos + 1]) \
+            + pos + 1
+    return _wsys_u64_to_dec(cast[uint64](v), &out[pos]) + pos
+
+
+def _wsys_draw_lowest_unlisted_z(wid: int32, prev_z: int64,
+                                 prev_slot: int32) -> int32:
+    # Return the slot with the lowest z strictly greater than prev_z,
+    # OR equal to prev_z but with a slot index greater than prev_slot
+    # (stable tiebreak). -1 when none remain. O(n^2) selection sort
+    # over <=16 slots — trivially cheap and avoids mutating storage.
+    best: int32 = -1
+    best_z: int64 = 0
+    s: uint64 = 0
+    while s < WSYS_DRAW_MAX_LAYERS:
+        b: uint64 = _wsys_draw_base(wid, s)
+        if wsys_layer_in_use[b] != 0:
+            z: int64 = wsys_layer_z[b]
+            after: int32 = 0
+            if z > prev_z:
+                after = 1
+            elif z == prev_z and cast[int32](s) > prev_slot:
+                after = 1
+            if after != 0:
+                if best < 0 or z < best_z:
+                    best = cast[int32](s)
+                    best_z = z
+        s = s + 1
+    return best
+
+
+def _wsys_render_draw_listing(wid: int32, out: Ptr[uint8],
+                              cap: uint64) -> uint64:
+    # One line per layer, z ascending:
+    #   "<name>  z=<z>  kind=<markup|fb>  <x>x<y>..<x+w>x<y+h>  opacity=<o>\n"
+    pos: uint64 = 0
+    prev_z: int64 = -9223372036854775807 - 1            # INT64_MIN
+    prev_slot: int32 = -1
+    while True:
+        slot: int32 = _wsys_draw_lowest_unlisted_z(wid, prev_z, prev_slot)
+        if slot < 0:
+            break
+        su: uint64 = cast[uint64](slot)
+        b: uint64 = _wsys_draw_base(wid, su)
+        if pos + 160 >= cap:
+            break
+        # name
+        nb: uint64 = _wsys_draw_name_base(wid, su)
+        ni: uint64 = 0
+        while ni < WSYS_DRAW_NAME_CAP:
+            c: uint8 = wsys_layer_name[nb + ni]
+            if c == 0:
+                break
+            out[pos] = c
+            pos = pos + 1
+            ni = ni + 1
+        pos = _wsys_emit_str(out, pos, "  z=")
+        pos = _wsys_emit_i64(out, pos, wsys_layer_z[b])
+        pos = _wsys_emit_str(out, pos, "  kind=")
+        if wsys_layer_kind[b] == WSYS_LAYER_KIND_FB:
+            pos = _wsys_emit_str(out, pos, "fb")
+        else:
+            pos = _wsys_emit_str(out, pos, "markup")
+        pos = _wsys_emit_str(out, pos, "  ")
+        # geometry "<x>x<y>..<x+w>x<y+h>"
+        pos = _wsys_emit_i64(out, pos, wsys_layer_x[b])
+        out[pos] = 120                                  # 'x'
+        pos = pos + 1
+        pos = _wsys_emit_i64(out, pos, wsys_layer_y[b])
+        pos = _wsys_emit_str(out, pos, "..")
+        pos = _wsys_emit_i64(out, pos,
+                             wsys_layer_x[b] + wsys_layer_w[b])
+        out[pos] = 120
+        pos = pos + 1
+        pos = _wsys_emit_i64(out, pos,
+                             wsys_layer_y[b] + wsys_layer_h[b])
+        pos = _wsys_emit_str(out, pos, "  opacity=")
+        pos = _wsys_emit_i64(out, pos, wsys_layer_opacity[b])
+        out[pos] = 10
+        pos = pos + 1
+        prev_z = wsys_layer_z[b]
+        prev_slot = slot
+    return pos
+
+
+def devwsys_draw_listing_read(wid: int32, off: uint64,
+                              buf: Ptr[uint8], count: uint64) -> int64:
+    if count == 0:
+        return 0
+    if wsys_wid_in_use(wid) == 0:
+        return -2
+    scratch: Array[4096, uint8]
+    n: uint64 = _wsys_render_draw_listing(wid, &scratch[0], 4096)
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+# --- per-leaf read/write --------------------------------------------
+#
+# The layer is identified by (wid, slot). namec.ad resolves the layer
+# NAME to a slot via _wsys_draw_layer_index and encodes the slot in
+# the inline chan id's bits 16..23 (see _chan_id_make_inline_wsys_draw
+# in namec.ad). Each leaf read/write takes (wid, slot, ...).
+
+def _wsys_draw_slot_live(wid: int32, slot: int32) -> int32:
+    if wsys_wid_in_use(wid) == 0:
+        return 0
+    if slot < 0:
+        return 0
+    su: uint64 = cast[uint64](slot)
+    if su >= WSYS_DRAW_MAX_LAYERS:
+        return 0
+    if wsys_layer_in_use[_wsys_draw_base(wid, su)] == 0:
+        return 0
+    return 1
+
+
+def devwsys_draw_kind_read(wid: int32, slot: int32, off: uint64,
+                           buf: Ptr[uint8], count: uint64) -> int64:
+    if count == 0:
+        return 0
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    scratch: Array[16, uint8]
+    b: uint64 = _wsys_draw_base(wid, cast[uint64](slot))
+    n: uint64 = 0
+    if wsys_layer_kind[b] == WSYS_LAYER_KIND_FB:
+        n = _wsys_emit_str(&scratch[0], 0, "fb")
+    else:
+        n = _wsys_emit_str(&scratch[0], 0, "markup")
+    scratch[n] = 10
+    n = n + 1
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_draw_z_read(wid: int32, slot: int32, off: uint64,
+                        buf: Ptr[uint8], count: uint64) -> int64:
+    if count == 0:
+        return 0
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    scratch: Array[32, uint8]
+    b: uint64 = _wsys_draw_base(wid, cast[uint64](slot))
+    n: uint64 = _wsys_emit_i64(&scratch[0], 0, wsys_layer_z[b])
+    scratch[n] = 10
+    n = n + 1
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_draw_z_write(wid: int32, slot: int32,
+                         buf: Ptr[uint8], count: uint64) -> int64:
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    # A digit-less write (e.g. the trailing-newline flush a redirect
+    # emits after the value) is a no-op — it must not reset the z just
+    # set by the preceding write. Always report the bytes consumed.
+    if _wsys_buf_has_digit(buf, count) == 0:
+        return cast[int64](count)
+    wsys_layer_z[_wsys_draw_base(wid, cast[uint64](slot))] = \
+        _wsys_tok_to_i64(buf, 0, count)
+    return cast[int64](count)
+
+
+def devwsys_draw_opacity_read(wid: int32, slot: int32, off: uint64,
+                              buf: Ptr[uint8], count: uint64) -> int64:
+    if count == 0:
+        return 0
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    scratch: Array[32, uint8]
+    b: uint64 = _wsys_draw_base(wid, cast[uint64](slot))
+    n: uint64 = _wsys_emit_i64(&scratch[0], 0, wsys_layer_opacity[b])
+    scratch[n] = 10
+    n = n + 1
+    return _wsys_copy_out(&scratch[0], n, off, buf, count)
+
+
+def devwsys_draw_opacity_write(wid: int32, slot: int32,
+                               buf: Ptr[uint8], count: uint64) -> int64:
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    # Digit-less write is a no-op — see devwsys_draw_z_write.
+    if _wsys_buf_has_digit(buf, count) == 0:
+        return cast[int64](count)
+    v: int64 = _wsys_tok_to_i64(buf, 0, count)
+    if v < 0:
+        v = 0
+    if v > 255:
+        v = 255
+    wsys_layer_opacity[_wsys_draw_base(wid, cast[uint64](slot))] = v
+    return cast[int64](count)
+
+
+def devwsys_draw_geometry_read(wid: int32, slot: int32, off: uint64,
+                               buf: Ptr[uint8], count: uint64) -> int64:
+    if count == 0:
+        return 0
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    scratch: Array[80, uint8]
+    b: uint64 = _wsys_draw_base(wid, cast[uint64](slot))
+    pos: uint64 = 0
+    pos = _wsys_emit_i64(&scratch[0], pos, wsys_layer_x[b])
+    scratch[pos] = 32
+    pos = pos + 1
+    pos = _wsys_emit_i64(&scratch[0], pos, wsys_layer_y[b])
+    scratch[pos] = 32
+    pos = pos + 1
+    pos = _wsys_emit_i64(&scratch[0], pos, wsys_layer_w[b])
+    scratch[pos] = 32
+    pos = pos + 1
+    pos = _wsys_emit_i64(&scratch[0], pos, wsys_layer_h[b])
+    scratch[pos] = 10
+    pos = pos + 1
+    return _wsys_copy_out(&scratch[0], pos, off, buf, count)
+
+
+def devwsys_draw_geometry_write(wid: int32, slot: int32,
+                                buf: Ptr[uint8], count: uint64) -> int64:
+    # Parse "x y w h" (decimal). Missing trailing fields keep their
+    # current value.
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    b: uint64 = _wsys_draw_base(wid, cast[uint64](slot))
+    p: uint64 = _wsys_tok_skip_space(buf, 0, count)
+    e: uint64 = _wsys_tok_end(buf, p, count)
+    if p != e:
+        wsys_layer_x[b] = _wsys_tok_to_i64(buf, p, e)
+    p = _wsys_tok_skip_space(buf, e, count)
+    e = _wsys_tok_end(buf, p, count)
+    if p != e:
+        wsys_layer_y[b] = _wsys_tok_to_i64(buf, p, e)
+    p = _wsys_tok_skip_space(buf, e, count)
+    e = _wsys_tok_end(buf, p, count)
+    if p != e:
+        wsys_layer_w[b] = _wsys_tok_to_i64(buf, p, e)
+    p = _wsys_tok_skip_space(buf, e, count)
+    e = _wsys_tok_end(buf, p, count)
+    if p != e:
+        wsys_layer_h[b] = _wsys_tok_to_i64(buf, p, e)
+    return cast[int64](count)
+
+
+def devwsys_draw_markup_read(wid: int32, slot: int32, off: uint64,
+                             buf: Ptr[uint8], count: uint64) -> int64:
+    if count == 0:
+        return 0
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    su: uint64 = cast[uint64](slot)
+    b: uint64 = _wsys_draw_base(wid, su)
+    n: uint64 = wsys_layer_markup_len[b]
+    base: uint64 = _wsys_draw_markup_base(wid, su)
+    return _wsys_copy_out(&wsys_layer_markup[base], n, off, buf, count)
+
+
+def devwsys_draw_markup_write(wid: int32, slot: int32, off: uint64,
+                              buf: Ptr[uint8], count: uint64) -> int64:
+    # Whole-layer write semantics (H-§G): a write at off==0 replaces
+    # the body; writes at off>0 append at that offset (so a chunked
+    # writer streaming a large body still composes). Caps at
+    # WSYS_DRAW_MARKUP_CAP.
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    su: uint64 = cast[uint64](slot)
+    b: uint64 = _wsys_draw_base(wid, su)
+    base: uint64 = _wsys_draw_markup_base(wid, su)
+    if off >= WSYS_DRAW_MARKUP_CAP:
+        return 0
+    take: uint64 = count
+    if off + take > WSYS_DRAW_MARKUP_CAP:
+        take = WSYS_DRAW_MARKUP_CAP - off
+    i: uint64 = 0
+    while i < take:
+        wsys_layer_markup[base + off + i] = buf[i]
+        i = i + 1
+    end: uint64 = off + take
+    if end > wsys_layer_markup_len[b]:
+        wsys_layer_markup_len[b] = end
+    return cast[int64](take)
+
+
+def devwsys_draw_fb_read(wid: int32, slot: int32, off: uint64,
+                         buf: Ptr[uint8], count: uint64) -> int64:
+    if count == 0:
+        return 0
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    su: uint64 = cast[uint64](slot)
+    b: uint64 = _wsys_draw_base(wid, su)
+    n: uint64 = wsys_layer_fb_len[b]
+    base: uint64 = _wsys_draw_fb_base(wid, su)
+    return _wsys_copy_out(&wsys_layer_fb[base], n, off, buf, count)
+
+
+def devwsys_draw_fb_write(wid: int32, slot: int32, off: uint64,
+                          buf: Ptr[uint8], count: uint64) -> int64:
+    if _wsys_draw_slot_live(wid, slot) == 0:
+        return -2
+    su: uint64 = cast[uint64](slot)
+    b: uint64 = _wsys_draw_base(wid, su)
+    base: uint64 = _wsys_draw_fb_base(wid, su)
+    if off >= WSYS_DRAW_FB_CAP:
+        return 0
+    take: uint64 = count
+    if off + take > WSYS_DRAW_FB_CAP:
+        take = WSYS_DRAW_FB_CAP - off
+    i: uint64 = 0
+    while i < take:
+        wsys_layer_fb[base + off + i] = buf[i]
+        i = i + 1
+    end: uint64 = off + take
+    if end > wsys_layer_fb_len[b]:
+        wsys_layer_fb_len[b] = end
+    return cast[int64](take)
+
+
+# --- name->slot resolution for namec --------------------------------
+#
+# namec.ad calls this to map a layer-name substring of a path to its
+# slot, which it then folds into the inline chan id. -1 means "no such
+# layer" (namec returns ENOENT).
+
+def wsys_draw_resolve_layer(wid: int32, name: Ptr[uint8],
+                            namelen: uint64) -> int32:
+    if wsys_wid_in_use(wid) == 0:
+        return -1
+    return _wsys_draw_layer_index(wid, name, namelen)

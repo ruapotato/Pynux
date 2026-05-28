@@ -106,6 +106,15 @@ from sys.src.port9.port.devwsys import (
     devwsys_listing_read,
     devwsys_cmd_write, devwsys_readonly_write,
     wsys_wid_in_use, MAX_WINDOWS,
+    # hamUI Phase 4a — layered-draw file surface (docs/hamUI.md H-§G).
+    devwsys_draw_ctl_write, devwsys_draw_listing_read,
+    devwsys_draw_kind_read,
+    devwsys_draw_z_read, devwsys_draw_z_write,
+    devwsys_draw_opacity_read, devwsys_draw_opacity_write,
+    devwsys_draw_geometry_read, devwsys_draw_geometry_write,
+    devwsys_draw_markup_read, devwsys_draw_markup_write,
+    devwsys_draw_fb_read, devwsys_draw_fb_write,
+    wsys_draw_resolve_layer,
 )
 # Native power control: /dev/reboot. A write of "poweroff"/"reboot"/
 # "halt" funnels into the shared kernel power routine (which also backs
@@ -173,15 +182,30 @@ DEV_WSYS_PID:      int32 = 22      # /dev/wsys/<N>/pid
 DEV_WSYS_UID:      int32 = 23      # /dev/wsys/<N>/uid
 DEV_WSYS_KIND:     int32 = 24      # /dev/wsys/<N>/kind    ("text\n")
 DEV_WSYS_GEOMETRY: int32 = 25      # /dev/wsys/<N>/geometry ("0 0 80 24\n")
+# hamUI Phase 4a layered-draw file surface (docs/hamUI.md H-§G). One
+# slot per draw leaf. The wid is carried in the inline chan id bits
+# 8..15 (as for the rest of the wsys family); for the per-layer leaves
+# the LAYER SLOT (0..15) is carried in bits 16..23 — see
+# _chan_id_make_inline_wsys_draw below. The layer is addressed by
+# NAME in the path; _devtab_lookup_wsys resolves the name to a slot
+# at open time via wsys_draw_resolve_layer.
+DEV_WSYS_DRAW:          int32 = 26  # /dev/wsys/<N>/draw            (z-ordered listing)
+DEV_WSYS_DRAW_CTL:      int32 = 27  # /dev/wsys/<N>/draw/ctl        (verb sink)
+DEV_WSYS_DRAW_KIND:     int32 = 28  # /dev/wsys/<N>/draw/<L>/kind   (ro)
+DEV_WSYS_DRAW_Z:        int32 = 29  # /dev/wsys/<N>/draw/<L>/z
+DEV_WSYS_DRAW_OPACITY:  int32 = 30  # /dev/wsys/<N>/draw/<L>/opacity
+DEV_WSYS_DRAW_GEOMETRY: int32 = 31  # /dev/wsys/<N>/draw/<L>/geometry
+DEV_WSYS_DRAW_MARKUP:   int32 = 32  # /dev/wsys/<N>/draw/<L>/markup
+DEV_WSYS_DRAW_FB:       int32 = 33  # /dev/wsys/<N>/draw/<L>/fb
 # Native Plan-9 power-control cdev. Writing an ASCII verb
 # ("poweroff" / "reboot" / "halt", with or without a trailing newline)
 # triggers arch/x86/kernel/power.ad's shared power routine — the same
 # core the Linux reboot(2)=169 syscall funnels through. This is the
 # Plan-9-shape surface: power control is a file you write to.
-DEV_REBOOT:    int32 = 26          # /dev/reboot
-DEV_MNT:       int32 = 27          # mounted 9P server (mountrpc)
+DEV_REBOOT:    int32 = 34          # /dev/reboot
+DEV_MNT:       int32 = 35          # mounted 9P server (mountrpc)
 
-DEV_MAX:       int32 = 28
+DEV_MAX:       int32 = 36
 
 
 # --- Chan: the universal handle -------------------------------------
@@ -251,6 +275,12 @@ def _chan_id_inline_wid(cid: int32) -> int32:
     return (cid >> 8) & 0xFF
 
 
+def _chan_id_inline_layer(cid: int32) -> int32:
+    # hamUI Phase 4a: the draw layer slot lives in bits 16..23 for the
+    # per-layer DEV_WSYS_DRAW_* leaves. Zero for everything else.
+    return (cid >> 16) & 0xFF
+
+
 def _chan_id_make_inline(dev_type: int32) -> int32:
     return CHAN_INLINE_TAG | dev_type
 
@@ -258,6 +288,15 @@ def _chan_id_make_inline(dev_type: int32) -> int32:
 def _chan_id_make_inline_wsys(dev_type: int32, wid: int32) -> int32:
     # Wid-tagged inline chan id for the DEV_WSYS_* family.
     return CHAN_INLINE_TAG | (wid << 8) | dev_type
+
+
+def _chan_id_make_inline_wsys_draw(dev_type: int32, wid: int32,
+                                   layer: int32) -> int32:
+    # Wid+layer-tagged inline chan id for the per-layer
+    # DEV_WSYS_DRAW_* leaves. dev_type in bits 0..7, wid in 8..15,
+    # layer slot in 16..23. The draw listing + ctl carry layer=0
+    # (unused) and use _chan_id_make_inline_wsys instead.
+    return CHAN_INLINE_TAG | (layer << 16) | (wid << 8) | dev_type
 
 
 # --- chan pool (DEV_MNT only) ---------------------------------------
@@ -460,15 +499,20 @@ def _starts_with(path: Ptr[char], prefix: Ptr[char]) -> int32:
         i = i + 1
 
 
-def _devtab_lookup_wsys(path: Ptr[char], wid_out: Ptr[int32]) -> int32:
+def _devtab_lookup_wsys(path: Ptr[char], wid_out: Ptr[int32],
+                        layer_out: Ptr[int32]) -> int32:
     # Parse `/dev/wsys/<N>[/<leaf>]`. Returns the matching DEV_WSYS_*
     # constant on success with *wid_out set, or DEV_NONE on miss
     # (path is not in the wsys tree, wid is 0, wid is out of range,
     # or wid is unused).
     #
+    # *layer_out is set to the resolved draw-layer slot for the
+    # per-layer DEV_WSYS_DRAW_* leaves, else 0.
+    #
     # The caller already handled the bare `/dev/wsys` path (returns
     # DEV_WSYS via _devtab_lookup). Here we only get called for paths
     # under `/dev/wsys/`.
+    layer_out[0] = 0
     if _starts_with(path, "/dev/wsys/") == 0:
         return DEV_NONE
     pos: uint64 = 10                           # past "/dev/wsys/"
@@ -508,6 +552,72 @@ def _devtab_lookup_wsys(path: Ptr[char], wid_out: Ptr[int32]) -> int32:
         return DEV_WSYS_KIND
     if _streq_at(path, pos, "/geometry") != 0:
         return DEV_WSYS_GEOMETRY
+    # hamUI Phase 4a — the /draw subtree (docs/hamUI.md H-§G).
+    if _starts_with_at(path, pos, "/draw") != 0:
+        return _devtab_lookup_wsys_draw(path, pos + 5, w, layer_out)
+    return DEV_NONE
+
+
+def _starts_with_at(path: Ptr[char], pos: uint64,
+                    prefix: Ptr[char]) -> int32:
+    # 1 iff path[pos..] begins with `prefix` (path may continue past).
+    i: uint64 = 0
+    while True:
+        b: char = prefix[i]
+        if b == 0:
+            return 1
+        a: char = path[pos + i]
+        if a != b:
+            return 0
+        i = i + 1
+
+
+def _devtab_lookup_wsys_draw(path: Ptr[char], pos: uint64, wid: int32,
+                             layer_out: Ptr[int32]) -> int32:
+    # `pos` points just past ".../draw". Resolve:
+    #   ""            -> DEV_WSYS_DRAW       (z-ordered listing)
+    #   "/ctl"        -> DEV_WSYS_DRAW_CTL
+    #   "/<layer>/<leaf>" -> DEV_WSYS_DRAW_<LEAF> with *layer_out set.
+    if path[pos] == 0:
+        return DEV_WSYS_DRAW
+    if _streq_at(path, pos, "/ctl") != 0:
+        return DEV_WSYS_DRAW_CTL
+    if path[pos] != 47:                          # must be '/'
+        return DEV_NONE
+    # Layer name runs from pos+1 to the next '/'.
+    name_start: uint64 = pos + 1
+    name_end: uint64 = name_start
+    while True:
+        c: char = path[name_end]
+        if c == 0 or c == 47:
+            break
+        name_end = name_end + 1
+    namelen: uint64 = name_end - name_start
+    if namelen == 0:
+        return DEV_NONE
+    # A bare "/draw/<layer>" with no leaf is not addressable as a file
+    # (it is a directory) — require a trailing leaf.
+    if path[name_end] != 47:
+        return DEV_NONE
+    # Resolve the layer name to a slot in the per-window layer table.
+    slot: int32 = wsys_draw_resolve_layer(
+        wid, cast[Ptr[uint8]](cast[uint64](path) + name_start), namelen)
+    if slot < 0:
+        return DEV_NONE                          # no such layer -> ENOENT
+    layer_out[0] = slot
+    leaf: uint64 = name_end                       # points at the '/'
+    if _streq_at(path, leaf, "/kind") != 0:
+        return DEV_WSYS_DRAW_KIND
+    if _streq_at(path, leaf, "/z") != 0:
+        return DEV_WSYS_DRAW_Z
+    if _streq_at(path, leaf, "/opacity") != 0:
+        return DEV_WSYS_DRAW_OPACITY
+    if _streq_at(path, leaf, "/geometry") != 0:
+        return DEV_WSYS_DRAW_GEOMETRY
+    if _streq_at(path, leaf, "/markup") != 0:
+        return DEV_WSYS_DRAW_MARKUP
+    if _streq_at(path, leaf, "/fb") != 0:
+        return DEV_WSYS_DRAW_FB
     return DEV_NONE
 
 
@@ -520,7 +630,7 @@ def _devtab_lookup_wsys(path: Ptr[char], wid_out: Ptr[int32]) -> int32:
 # Either shape is "index a table by device kind" — the semantics are
 # identical, and the switch is unambiguous to the Adder codegen.
 
-def _devtab_read(dev_type: int32, wid: int32, off: uint64,
+def _devtab_read(dev_type: int32, wid: int32, layer: int32, off: uint64,
                  buf: Ptr[uint8], count: uint64) -> int64:
     # `off` is the read cursor. Most cdevs are stateless snapshot
     # devices and ignore it (every read regenerates) — but a device
@@ -595,6 +705,25 @@ def _devtab_read(dev_type: int32, wid: int32, off: uint64,
         return devwsys_kind_read(off, buf, count)
     if dev_type == DEV_WSYS_GEOMETRY:
         return devwsys_geometry_read(off, buf, count)
+    # hamUI Phase 4a — layered-draw file surface (docs/hamUI.md H-§G).
+    if dev_type == DEV_WSYS_DRAW:
+        return devwsys_draw_listing_read(wid, off, buf, count)
+    if dev_type == DEV_WSYS_DRAW_CTL:
+        # ctl is write-only — reads return EOF so a stray cat doesn't
+        # wedge. The verb side is the write side only.
+        return 0
+    if dev_type == DEV_WSYS_DRAW_KIND:
+        return devwsys_draw_kind_read(wid, layer, off, buf, count)
+    if dev_type == DEV_WSYS_DRAW_Z:
+        return devwsys_draw_z_read(wid, layer, off, buf, count)
+    if dev_type == DEV_WSYS_DRAW_OPACITY:
+        return devwsys_draw_opacity_read(wid, layer, off, buf, count)
+    if dev_type == DEV_WSYS_DRAW_GEOMETRY:
+        return devwsys_draw_geometry_read(wid, layer, off, buf, count)
+    if dev_type == DEV_WSYS_DRAW_MARKUP:
+        return devwsys_draw_markup_read(wid, layer, off, buf, count)
+    if dev_type == DEV_WSYS_DRAW_FB:
+        return devwsys_draw_fb_read(wid, layer, off, buf, count)
     return -1
 
 
@@ -643,7 +772,8 @@ def _devreboot_write(buf: Ptr[uint8], count: uint64) -> int64:
     return cast[int64](count)
 
 
-def _devtab_write(dev_type: int32, wid: int32, buf: Ptr[uint8],
+def _devtab_write(dev_type: int32, wid: int32, layer: int32,
+                  off: uint64, buf: Ptr[uint8],
                   count: uint64) -> int64:
     if dev_type == DEV_REBOOT:
         return _devreboot_write(buf, count)
@@ -685,10 +815,24 @@ def _devtab_write(dev_type: int32, wid: int32, buf: Ptr[uint8],
     # The wid was extracted from the inline chan id by namec_write().
     if dev_type == DEV_WSYS_CMD:
         return devwsys_cmd_write(wid, buf, count)
+    # hamUI Phase 4a — layered-draw file surface (docs/hamUI.md H-§G).
+    if dev_type == DEV_WSYS_DRAW_CTL:
+        return devwsys_draw_ctl_write(wid, buf, count)
+    if dev_type == DEV_WSYS_DRAW_Z:
+        return devwsys_draw_z_write(wid, layer, buf, count)
+    if dev_type == DEV_WSYS_DRAW_OPACITY:
+        return devwsys_draw_opacity_write(wid, layer, buf, count)
+    if dev_type == DEV_WSYS_DRAW_GEOMETRY:
+        return devwsys_draw_geometry_write(wid, layer, buf, count)
+    if dev_type == DEV_WSYS_DRAW_MARKUP:
+        return devwsys_draw_markup_write(wid, layer, off, buf, count)
+    if dev_type == DEV_WSYS_DRAW_FB:
+        return devwsys_draw_fb_write(wid, layer, off, buf, count)
     if dev_type == DEV_WSYS or dev_type == DEV_WSYS_TEXT \
             or dev_type == DEV_WSYS_OUTPUT or dev_type == DEV_WSYS_NS \
             or dev_type == DEV_WSYS_PID or dev_type == DEV_WSYS_UID \
-            or dev_type == DEV_WSYS_KIND or dev_type == DEV_WSYS_GEOMETRY:
+            or dev_type == DEV_WSYS_KIND or dev_type == DEV_WSYS_GEOMETRY \
+            or dev_type == DEV_WSYS_DRAW:
         return devwsys_readonly_write(buf, count)
     return -1
 
@@ -789,8 +933,15 @@ def namec(path: Ptr[char], mode: int32) -> int32:
     if dev_type != DEV_NONE:
         return _chan_id_make_inline(dev_type)
     wid: int32 = 0
-    dev_type = _devtab_lookup_wsys(path, &wid)
+    layer: int32 = 0
+    dev_type = _devtab_lookup_wsys(path, &wid, &layer)
     if dev_type != DEV_NONE:
+        # The per-layer DEV_WSYS_DRAW_* leaves additionally encode the
+        # resolved layer slot in the chan id; the listing/ctl/legacy
+        # leaves carry layer=0 and use the plain wid-tagged encoder.
+        if dev_type >= DEV_WSYS_DRAW_KIND \
+                and dev_type <= DEV_WSYS_DRAW_FB:
+            return _chan_id_make_inline_wsys_draw(dev_type, wid, layer)
         return _chan_id_make_inline_wsys(dev_type, wid)
 
     # --- (3) not a chan — caller falls through to on-disk routing ---
@@ -919,11 +1070,12 @@ def namec_read(cid: int32, off: uint64, buf: Ptr[uint8],
     if _chan_id_is_inline(cid) != 0:
         return _devtab_read(_chan_id_inline_dev(cid),
                             _chan_id_inline_wid(cid),
+                            _chan_id_inline_layer(cid),
                             off, buf, count)
     su: uint64 = cast[uint64](cid)
     if chan_pool[su].dev_type == DEV_MNT:
         return _mnt_read(su, off, buf, count)
-    return _devtab_read(chan_pool[su].dev_type, 0, off, buf, count)
+    return _devtab_read(chan_pool[su].dev_type, 0, 0, off, buf, count)
 
 
 def namec_write(cid: int32, off: uint64, buf: Ptr[uint8],
@@ -933,11 +1085,12 @@ def namec_write(cid: int32, off: uint64, buf: Ptr[uint8],
     if _chan_id_is_inline(cid) != 0:
         return _devtab_write(_chan_id_inline_dev(cid),
                              _chan_id_inline_wid(cid),
-                             buf, count)
+                             _chan_id_inline_layer(cid),
+                             off, buf, count)
     su: uint64 = cast[uint64](cid)
     if chan_pool[su].dev_type == DEV_MNT:
         return _mnt_write(su, off, buf, count)
-    return _devtab_write(chan_pool[su].dev_type, 0, buf, count)
+    return _devtab_write(chan_pool[su].dev_type, 0, 0, off, buf, count)
 
 
 def namec_close(cid: int32) -> int32:
