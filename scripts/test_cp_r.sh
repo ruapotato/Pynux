@@ -78,8 +78,8 @@ QEMU_EXTRA_ARGS="-drive file=$ROOTFS_IMG,if=virtio,format=raw" \
 qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 90 \
     -- "mkdir /tmp/src"                                       2 \
        "mkdir /tmp/src/sub"                                   2 \
-       "echo hello-a > /tmp/src/a.txt"                        2 \
-       "echo hello-b > /tmp/src/sub/b.txt"                    2 \
+       "/bin/echo hello-a > /tmp/src/a.txt"                   2 \
+       "/bin/echo hello-b > /tmp/src/sub/b.txt"               2 \
        "cp -r /tmp/src /tmp/dst"                              3 \
        "echo TMPFS_A_BEGIN"                                   2 \
        "cat /tmp/dst/a.txt"                                   2 \
