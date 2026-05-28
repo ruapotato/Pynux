@@ -78,7 +78,7 @@ build_adder_user whoami               # M16.67: prints "root"
 build_adder_user id                   # M16.67: hard-wired uid=0(root) line
 build_adder_user clear                # M16.67: ANSI clear-screen + home
 build_adder_user hostname             # M16.67: /etc/hostname with fallback
-build_adder_user date                 # M16.67: uptime-as-clock until RTC
+build_adder_user date                 # /proc/realtime — RTC + TSC delta
 build_adder_user more                 # M16.67: 24-line pager over stdin
 build_adder_user find                 # M16.67: recursive listdir walk
 build_adder_user diff                 # M16.67: byte-compare two files
