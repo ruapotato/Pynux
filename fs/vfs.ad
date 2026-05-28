@@ -59,6 +59,12 @@ from kernel.sched.core import (
     current_task_uid, current_task_gid,
 )
 from sys.src.port9.port.devcons import devcons_read, devcons_write
+# hamUI Phase 1: the FD_STDIN_MARK arms (the legacy non-/dev/cons stdin
+# path that hamsh's ed_readline still hits) consult the wsys cmd queue
+# FIRST so an outside writer's `echo foo > /dev/wsys/1/cmd` arrives at
+# hamsh's readline indistinguishably from the keyboard. devcons.ad's
+# read arm already does the same; this keeps both surfaces consistent.
+from sys.src.port9.port.devwsys import wsys_cmd_pop
 from sys.src.port9.port.devtime import devtime_read, devtime_write
 from sys.src.port9.port.devpid import devpid_read, devpid_write
 from sys.src.port9.port.devrandom import devrandom_read, devrandom_write
@@ -2898,7 +2904,13 @@ def vfs_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
         # arm alongside the hamsh-side heartbeat once real-hardware
         # keyboard input works.
         console_set_interactive()
-        c: int32 = kbd_rx_pop()
+        # hamUI Phase 1: prefer the wsys cmd-injection queue. An
+        # outside agent writing `echo foo > /dev/wsys/1/cmd` queues
+        # bytes here that hamsh's ed_readline drains exactly as it
+        # would real keystrokes — no shell-side change required.
+        c: int32 = wsys_cmd_pop()
+        if c < 0:
+            c = kbd_rx_pop()
         if c < 0:
             c = uart_rx_pop()
         if c < 0:
@@ -3399,7 +3411,14 @@ def vfs_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
             # Either input source feeds stdin transparently — useful
             # for real-hardware boot where the user is typing on a
             # PS/2 keyboard, not piping through serial.
-            c: int32 = kbd_rx_pop()
+            # hamUI Phase 1: the wsys cmd-injection queue precedes
+            # both. Outside writers to /dev/wsys/1/cmd land here as if
+            # the user typed them. devcons_read does the same; this
+            # arm is the legacy stdin path that hamsh still uses for
+            # the blocking-read case.
+            c: int32 = wsys_cmd_pop()
+            if c < 0:
+                c = kbd_rx_pop()
             if c < 0:
                 c = uart_rx_pop()
             if c < 0:
