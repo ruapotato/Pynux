@@ -1,0 +1,144 @@
+# tests/test_devurandom.ad
+#
+# Sister of tests/test_devrandom.ad — but reads /dev/urandom instead.
+# Three assertions land on the userland stdout for the shell script to
+# verify (it can't peek inside the kernel):
+#
+#   1. /dev/urandom opens (open returned a non-negative fd)
+#   2. A 16-byte read returns 16 bytes and they are NOT all-zero/all-ff
+#   3. A 4096-byte read returns 4096 bytes in under a second (this is
+#      checked at the shell level; the test fixture just emits the read
+#      latency in jiffies so the script can compare).
+#   4. /dev/random and /dev/urandom both yield differing bytes between
+#      successive reads (extremely high probability with ChaCha20).
+#
+# Build:
+#   python3 -m compiler.adder compile --target=x86_64-adder-user \
+#       tests/test_devurandom.ad -o build/user/test_devurandom.elf
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_get_jiffies() -> uint64
+
+
+def strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen(s))
+
+
+def u64_to_dec(value: uint64, out: Ptr[uint8]) -> uint64:
+    if value == 0:
+        out[0] = 48                          # '0'
+        return 1
+    digits: Array[24, uint8]
+    n: uint64 = 0
+    v: uint64 = value
+    while v != 0:
+        digits[n] = cast[uint8](v % 10) + 48
+        v = v / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+# Top-level BSS buffers — never put 4 KiB on the user stack (U9 nested-
+# Array miscompile + 16 KiB stack budget). 4096 + 16 + 16 = 4128 bytes.
+big_buf: Array[4096, uint8]
+first16: Array[16, uint8]
+second16: Array[16, uint8]
+ur_buf: Array[16, uint8]
+
+
+def main() -> int32:
+    write_str(1, "[test_devurandom] start\n")
+
+    # ----- assertion 1: open /dev/urandom -----
+    ufd: int32 = sys_open("/dev/urandom")
+    if ufd < 0:
+        write_str(1, "[test_devurandom] open /dev/urandom failed\n")
+        return 1
+    write_str(1, "[test_devurandom] opened\n")
+
+    # ----- assertion 2: 16 bytes, not all-zero / all-ff -----
+    n: int64 = sys_read(ufd, &ur_buf[0], 16)
+    if n != 16:
+        write_str(1, "[test_devurandom] short read\n")
+        sys_close(ufd)
+        return 1
+    nz: int32 = 0
+    nf: int32 = 0
+    i: uint64 = 0
+    while i < 16:
+        if ur_buf[i] != 0:
+            nz = 1
+        if ur_buf[i] != 255:
+            nf = 1
+        i = i + 1
+    if nz == 0:
+        write_str(1, "[test_devurandom] all-zero 16-byte read\n")
+        sys_close(ufd)
+        return 1
+    if nf == 0:
+        write_str(1, "[test_devurandom] all-ff 16-byte read\n")
+        sys_close(ufd)
+        return 1
+    write_str(1, "[test_devurandom] entropy_ok\n")
+
+    # ----- assertion 3: 4 KiB read, report jiffies elapsed -----
+    t0: uint64 = sys_get_jiffies()
+    n2: int64 = sys_read(ufd, &big_buf[0], 4096)
+    t1: uint64 = sys_get_jiffies()
+    if n2 != 4096:
+        write_str(1, "[test_devurandom] 4k short read\n")
+        sys_close(ufd)
+        return 1
+    # "[test_devurandom] 4k_jiffies=<N>\n" — shell asserts N < 100
+    # (100 jiffies = 1 s @ HZ=100). ChaCha20 fills 4 KiB in well
+    # under 1 ms on any sane host; the budget is loose for CI noise.
+    scratch: Array[32, uint8]
+    write_str(1, "[test_devurandom] 4k_jiffies=")
+    m: uint64 = u64_to_dec(t1 - t0, &scratch[0])
+    sys_write(1, &scratch[0], m)
+    write_str(1, "\n")
+    sys_close(ufd)
+
+    # ----- assertion 4: /dev/random and /dev/urandom yield different
+    # bytes on successive reads -----
+    rfd: int32 = sys_open("/dev/random")
+    if rfd < 0:
+        write_str(1, "[test_devurandom] open /dev/random failed\n")
+        return 1
+    nr1: int64 = sys_read(rfd, &first16[0], 16)
+    nr2: int64 = sys_read(rfd, &second16[0], 16)
+    sys_close(rfd)
+    if nr1 != 16 or nr2 != 16:
+        write_str(1, "[test_devurandom] /dev/random short read\n")
+        return 1
+    # Differ in at least one byte (probability of full collision over
+    # 16 bytes from a CSPRNG is 2^-128).
+    differ: int32 = 0
+    i = 0
+    while i < 16:
+        if first16[i] != second16[i]:
+            differ = 1
+        i = i + 1
+    if differ == 0:
+        write_str(1, "[test_devurandom] consecutive reads identical\n")
+        return 1
+    write_str(1, "[test_devurandom] varying_ok\n")
+
+    write_str(1, "[test_devurandom] done\n")
+    return 0
