@@ -1649,24 +1649,35 @@ def ext4_create_smoke_test() -> int32:
     return 0
 
 
-# --- ext4 write (M16.64) ------------------------------------------
+# --- ext4 write -----------------------------------------------------
 #
 # Write-mode opens. Backed by the same ext4_open_files slot table as
 # reads, plus a per-slot "write" flag so vfs_write knows whether to
-# RMW the data block or refuse. M16.64 is single-block scope: files
-# created via vfs_open_write are capped at ext4_block_size bytes
-# (1 KiB on our image). Larger writes will need extent extension —
-# the natural follow-up.
+# RMW the data block or refuse.
 #
 # Semantics on open:
-#   * if the file already exists, free its inode + data block and
-#     re-create empty (matches O_CREAT | O_TRUNC, which is what
-#     hamsh's `> file` wants)
-#   * if not, allocate inode + block, write an empty inode, splice
-#     a dirent into the parent
-# Open returns a slot index; vfs_write does the RMW; close flushes
-# the final inode i_size via a re-write (it's already up-to-date
-# because we update i_size on each write — close is just close).
+#   * if the file already exists, free its inode + every data block
+#     held by its inline-leaf extents and re-create empty (matches
+#     O_CREAT | O_TRUNC, which is what hamsh's `> file` wants)
+#   * if not, allocate an inode, write an empty depth-0 extent leaf
+#     (eh_entries=0), splice a dirent into the parent. The first
+#     write call allocates the first data block — there's no
+#     pre-allocated empty block on disk.
+#
+# vfs_write calls ext4_write_open_file once per syscall. The writer
+# walks block by block from `pos`, allocating fresh physical blocks
+# and appending to the inode's inline extent leaf via
+# _ext4_extent_append_block whenever the write spills past the last
+# allocated logical block. This is the same growth pattern
+# ext4_blob_save uses on the install path. Cap is the depth-0 leaf
+# 4-slot limit (with coalescing); on our 4-KiB-block image that
+# covers a comfortable tens-of-MiB range before fragmentation forces
+# the 4-slot ceiling. Hitting the ceiling returns a short write —
+# extent-index-node support is a documented follow-up.
+#
+# Close flushes the final inode i_size via a re-write (it's already
+# up-to-date because we update i_size on each write — close is just
+# close).
 
 def _ext4_dir_unlink_in_root(name: Ptr[char]) -> uint32:
     # Find `name` in root dir, mark its dirent inum=0 (tombstone),
@@ -1799,16 +1810,20 @@ def ext4_open_create_or_trunc(name: Ptr[char]) -> int32:
     leaf: Ptr[char] = cast[Ptr[char]](0)
     if _ext4_split_parent_leaf(name, &parent_inum, &leaf) != 0:
         return -1
-    # Unlink old (best-effort — also frees its inode + first block).
+    # Unlink old — tombstones the dirent, walks the extent leaf to
+    # free every data block (so an overwrite doesn't leak the
+    # blocks that previous file contents covered), and frees the
+    # inode itself.
     leaf_len: uint64 = _ext4_strlen(leaf)
     old_inum: uint32 = _ext4_dir_unlink_in_dir(
         cast[uint64](parent_inum),
         cast[Ptr[uint8]](leaf), leaf_len)
     if old_inum != 0:
+        old_inode_buf: Array[256, uint8]
+        if ext4_read_inode(cast[uint64](old_inum),
+                           &old_inode_buf[0]) == 0:
+            _ext4_extent_trim_to(&old_inode_buf[0], 0)
         ext4_free_inode(old_inum)
-        # We don't free old blocks — would require walking the
-        # extent tree. Small leak per overwrite, tightened up in a
-        # follow-up. Same trade-off as the pre-subdir root-only path.
     # Fresh-empty create against the resolved parent.
     empty: Array[1, uint8]
     new_inum: uint32 = ext4_create_file(
@@ -1823,48 +1838,102 @@ def ext4_open_create_or_trunc(name: Ptr[char]) -> int32:
 
 def ext4_write_open_file(slot: int32, src: Ptr[uint8],
                          pos: uint64, count: uint64) -> int64:
-    # RMW the file's first data block at `pos`, bounded by the
-    # block size (M16.64 single-block scope). Updates the on-disk
-    # inode's i_size_lo if the write extends the file.
+    # Stream `count` bytes from `src` into the open file's data
+    # blocks starting at byte offset `pos`. Allocates fresh physical
+    # blocks and grows the inline extent leaf as the write spills
+    # past previously-allocated logical blocks (the same pattern
+    # ext4_blob_save uses on the install path). Updates i_size_lo
+    # and mtime; returns the byte count actually written, or a short
+    # count if the leaf hit its 4-slot depth-0 ceiling mid-write.
     if slot < 0:
         return -1
-    if pos >= ext4_block_size:
-        return 0                                # past single-block cap
-    take: uint64 = count
-    if pos + take > ext4_block_size:
-        take = ext4_block_size - pos
+    if count == 0:
+        return 0
     inum: uint32 = ext4_open_inum(slot)
     if inum == 0:
         return -1
-    # Read the inode to find the data block, and to update size.
     inode: Array[256, uint8]
     if ext4_read_inode(cast[uint64](inum), &inode[0]) != 0:
         return -1
-    phys: uint64 = _ext4_logical_to_physical(&inode[0], 0)
-    if phys == 0:
-        return -1
-    # Read-modify-write the data block.
-    if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
-        return -1
-    memcpy(cast[Ptr[uint8]](cast[uint64](&ext4_blk_buf[0]) + pos),
-           src, take)
-    if _ext4_write_block(phys, &ext4_blk_buf[0]) != 0:
-        return -1
-    # Extend i_size if needed, and always refresh mtime: a write
-    # mutates the data even when it doesn't grow the file, so stat
-    # must see a fresh mtime regardless (M16.x §12.3).
     cur_size: uint32 = ext4_inode_size_lo(&inode[0])
-    new_end:  uint64 = pos + take
+    written: uint64 = 0
+    while written < count:
+        cur_pos:     uint64 = pos + written
+        logical_blk: uint64 = cur_pos / ext4_block_size
+        off_in_blk:  uint64 = cur_pos % ext4_block_size
+        # Chunk = however many bytes will fit in the remainder of
+        # the current block before the next block boundary.
+        chunk: uint64 = ext4_block_size - off_in_blk
+        if chunk > count - written:
+            chunk = count - written
+        phys: uint64 = _ext4_logical_to_physical(&inode[0],
+                                                 logical_blk)
+        if phys == 0:
+            # The logical block is past every existing extent's
+            # coverage — allocate a new physical block and append
+            # it to the inline leaf. Fresh-allocated blocks are NOT
+            # pre-zeroed; we zero ext4_blk_buf here so a partial
+            # write doesn't expose previous tenants' bytes.
+            phys = ext4_alloc_block()
+            if phys == 0:
+                printk0("ext4: write FAIL (out of blocks)\n")
+                if written > 0:
+                    break
+                return -1
+            if _ext4_extent_append_block(&inode[0],
+                                         logical_blk, phys) != 0:
+                # Leaf full at depth 0; can't grow further. Free
+                # the orphan block (it never made it into the
+                # extent leaf) and return whatever we wrote.
+                ext4_free_block(phys)
+                printk0("ext4: write capped at extent leaf full\n")
+                break
+            _ext4_zero(&ext4_blk_buf[0], ext4_block_size)
+            # Splat the user bytes into the new block. No
+            # read-back: this block is freshly allocated and we
+            # just zeroed the scratch.
+            if chunk > 0:
+                memcpy(cast[Ptr[uint8]](
+                           cast[uint64](&ext4_blk_buf[0])
+                           + off_in_blk),
+                       cast[Ptr[uint8]](
+                           cast[uint64](src) + written),
+                       chunk)
+            if _ext4_write_block(phys, &ext4_blk_buf[0]) != 0:
+                return -1
+        else:
+            # Existing block — read-modify-write so we preserve any
+            # bytes already on either side of [off_in_blk,
+            # off_in_blk+chunk).
+            if _ext4_read_block(phys, &ext4_blk_buf[0]) != 0:
+                return -1
+            memcpy(cast[Ptr[uint8]](
+                       cast[uint64](&ext4_blk_buf[0]) + off_in_blk),
+                   cast[Ptr[uint8]](
+                       cast[uint64](src) + written),
+                   chunk)
+            if _ext4_write_block(phys, &ext4_blk_buf[0]) != 0:
+                return -1
+        written = written + chunk
+    # Extend i_size if needed, refresh mtime, and re-stamp
+    # i_blocks_lo so stat sees the right block count.
+    new_end: uint64 = pos + written
     if new_end > cast[uint64](cur_size):
         _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&inode[0]) + 4),
                         cast[uint32](new_end))
-        # Update the cached size in the open-file slot so the
-        # ext4_open_size() helper stays accurate for read-back.
         ext4_open_files[cast[uint64](slot)].file_size = new_end
+    # Re-stamp i_blocks_lo from the current extent coverage. In 512-byte
+    # units regardless of fs block size.
+    block_cnt: uint64 = _ext4_inode_block_count(&inode[0])
+    sectors_per_block: uint64 = ext4_block_size / SECTOR_SIZE
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](&inode[0]) + 28),
+                    cast[uint32](block_cnt * sectors_per_block))
     _ext4_stamp_mtime(&inode[0])
     if ext4_write_inode(cast[uint64](inum), &inode[0]) != 0:
         return -1
-    return cast[int64](take)
+    if written == 0:
+        return 0
+    return cast[int64](written)
 
 
 # --- ext4 unlink (M16.67) -----------------------------------------
@@ -1926,15 +1995,15 @@ def ext4_unlink(name: Ptr[char]) -> int32:
     if target_inum == 0:
         return -2                                  # -ENOENT
 
-    # Read the file's inode to find its first data block, then free
-    # that block. Multi-extent / index-tree files would need a full
-    # extent walk + free; M16.67 scope is single-block files (matches
-    # the M16.64 create + write cap).
+    # Read the file's inode and walk every extent in the inline
+    # leaf, freeing each physical block. _ext4_extent_trim_to(..., 0)
+    # does exactly this — the same helper ext4_truncate_inode uses
+    # for a full truncate-to-zero. Inline-leaf-only (eh_depth=0);
+    # an index-node file (eh_depth>0) would need an extent-tree walk
+    # — none of our writers produce that yet.
     finode: Array[256, uint8]
     if ext4_read_inode(cast[uint64](target_inum), &finode[0]) == 0:
-        phys_data: uint64 = _ext4_logical_to_physical(&finode[0], 0)
-        if phys_data != 0:
-            ext4_free_block(phys_data)
+        _ext4_extent_trim_to(&finode[0], 0)
     # Free the inode regardless — even if the block free failed,
     # we want the inode slot reclaimed.
     ext4_free_inode(target_inum)
