@@ -106,6 +106,10 @@ loop through userspace-posted srvfds. See
   + `date(1)` print real UTC.
 - **`/dev/urandom` + `/dev/random`** — ChaCha20 CSPRNG, RDSEED/RDRAND
   seeded.
+- **Power** — clean `shutdown` / `reboot` / `halt` / `poweroff`: a
+  Plan-9-native `/dev/reboot` cdev and the Linux `reboot(2)` syscall
+  share one kernel routine that flushes filesystems, then ACPI-S5
+  poweroff / i8042 reset / triple-fault reboot.
 - ~60 native userland binaries (`ls`, `cat`, `cp -r`, `find`, `du`,
   `df`, `ps`, `dmesg`, `top`, `man`, `help`, `ping`, `ifconfig`,
   `route`, `hpm`, `hamUI`, `date`, `ntpd`, ...).

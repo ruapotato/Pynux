@@ -666,3 +666,16 @@ collaboration unlock** — landed: an AI agent can `cat
 the close of the wave): hamUI Phase 2 multi-window + `/dev/urandom`
 + NTP client.
 
+## Wave — 2026-05-28: power management + parallel-track resumption
+
+Trajectory reaffirmed with user (*"Ultimately I wanna do it all. We
+can parallelize however possible."*): pursue every track — native
+hamUI, the Linux X11 bridge, the CLI "survival primitives", and the
+U-series Linux userspace ABI — choosing each agent by surface
+disjointness rather than a fixed priority order. Agents run on
+`claude-opus-4-8`.
+
+| Item | What | Status |
+|------|------|--------|
+| **Real shutdown / reboot / halt / poweroff** | The three power binaries were print-only stubs. Now both a Plan-9-native `/dev/reboot` cdev (`DEV_REBOOT=26`) and the Linux `reboot(2)`=169 syscall funnel into one shared `arch/x86/kernel/power.ad::power_action()` core. It flushes filesystems first (`vfs_fsync_all` + per-block-device `blk_flush`), then: **poweroff** = ACPI-S5 ports `0x604`/`0xB004`/`0x4004` then `cli;hlt`; **reboot** = i8042 `0xFE` pulse with triple-fault fallback; **halt** = `cli;hlt`. `reboot(2)` validates the real Linux magics and is hostowner-gated. `user/{poweroff,halt,reboot}.ad` rewritten to write the verb to `/dev/reboot`. New regression `scripts/test_poweroff.sh` asserts the VM actually exits (not hangs) — both poweroff and reboot legs PASS. (`7ec38e8`, `2600da0`, `9e7c676`, `d28591b`) | **Done** |
+

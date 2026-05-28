@@ -60,18 +60,16 @@ retrofitted backwards.
    no third tier.
 7. [ ] **hamsh `use hamui`** — bindings on top of #6. May require
    hamsh extensions for closures + event loop + persistent state.
-8. [ ] **shutdown / reboot / halt / poweroff** — ACPI shutdown vector
-   or 0x604/0xB004 magic write; reboot via triple-fault or KBC;
-   userland binaries + clean-unmount sequence.
-9. [ ] **Outgoing `ssh` client + `curl`/`wget`** — `sshd` ships but
-   nothing dials out. `hpm`'s HTTPS fetcher exists; expose it.
-10. [ ] **Pipes + job control in hamsh** — audit `|`; add `&`
+8. [~] **Outgoing `ssh` client + `curl`/`wget`** — `sshd` ships but
+   nothing dials out. `hpm`'s HTTPS fetcher exists; `user/net9.ad`
+   already has `net_dial_tls`; expose it. (curl/wget agent in flight)
+9. [ ] **Pipes + job control in hamsh** — audit `|`; add `&`
     background, `bg`/`fg`/`jobs`, process groups + SIGTSTP/SIGCONT.
-11. [ ] **Real editor** — vi-shape or acme-shape. `ed` is too minimal.
-12. [ ] **`tar` + `gzip` / `gunzip`** — share/backup workflows.
-13. [ ] **Audio** — `snd_hda_intel.ko` loads cleanly; need `aplay`-shape
+10. [ ] **Real editor** — vi-shape or acme-shape. `ed` is too minimal.
+11. [ ] **`tar` + `gzip` / `gunzip`** — share/backup workflows.
+12. [ ] **Audio** — `snd_hda_intel.ko` loads cleanly; need `aplay`-shape
     userland tool that pushes PCM to the cdev.
-14. [ ] **`hpm update` + rollback** — install works; in-place upgrade
+13. [ ] **`hpm update` + rollback** — install works; in-place upgrade
     + snapshot-before-upgrade do not.
 
 ## hamUI later phases (after Phase 4)
