@@ -79,9 +79,10 @@ from drivers.usb.usb import (
     USB_RT_SET_IDLE, HID_REQ_SET_IDLE,
     USB_DT_DEVICE, USB_DT_CONFIG,
     USB_CLASS_HID, USB_PROTOCOL_KEYBOARD,
+    USB_CLASS_MASS_STORAGE, USB_PROTOCOL_BULK_ONLY,
     usb_cfg_total_length, usb_cfg_value,
     usb_ep_address, usb_ep_attrs, usb_ep_max_packet, usb_ep_interval,
-    usb_ep_is_interrupt_in,
+    usb_ep_is_interrupt_in, usb_ep_is_bulk_in, usb_ep_is_bulk_out,
     usb_if_class, usb_if_protocol, usb_if_number,
 )
 
@@ -223,6 +224,8 @@ DIR_IN:   uint32 = 1
 
 # Endpoint type codes (Endpoint Context dword1 bits 3..5).
 EP_TYPE_CONTROL:   uint32 = 4
+EP_TYPE_BULK_OUT:  uint32 = 2
+EP_TYPE_BULK_IN:   uint32 = 6
 EP_TYPE_INT_IN:    uint32 = 7
 
 # Ring sizes. 256 entries × 16 bytes = 4096 bytes = 1 page. Last
@@ -319,6 +322,37 @@ class XhciState:
     # `reports_received` increments on every interrupt-IN completion
     # the poll loop sees, regardless of source (real or synthetic).
     reports_received: uint32
+
+    # --- Mass-storage (BOT) slot state -----------------------------
+    # A USB mass-storage device gets its own slot, distinct from the
+    # keyboard slot above. The keyboard path reuses the kbd_* fields
+    # because xhci_control_transfer hardcodes kbd_slot_id + the ep0
+    # ring; for storage we run enumeration through the SAME ep0
+    # machinery (temporarily pointing kbd_* at the storage slot's ep0
+    # ring during probe), then drive the two bulk endpoints through
+    # the dedicated rings below. Slots are enabled one at a time during
+    # init so there is no concurrency between the two paths.
+    ms_slot_id:    uint32         # 0 = none, else active mass-storage slot
+    ms_port:       uint32
+    ms_speed:      uint32
+    ms_input_ctx:  uint64         # input device context (4 KiB)
+    ms_output_ctx: uint64         # output device context (4 KiB)
+    ms_ep0_ring:   uint64         # ep0 control Transfer Ring (4 KiB)
+    ms_ep0_enqueue: uint32
+    ms_ep0_cycle:   uint32
+    ms_in_ring:    uint64         # bulk-IN Transfer Ring (4 KiB)
+    ms_in_enqueue: uint32
+    ms_in_cycle:   uint32
+    ms_in_ep:      uint32         # bulk-IN endpoint number (1..15)
+    ms_in_mps:     uint32
+    ms_out_ring:   uint64         # bulk-OUT Transfer Ring (4 KiB)
+    ms_out_enqueue: uint32
+    ms_out_cycle:   uint32
+    ms_out_ep:     uint32         # bulk-OUT endpoint number (1..15)
+    ms_out_mps:    uint32
+    ms_cfg_value:  uint8
+    ms_intf:       uint8
+    ms_enabled:    uint32         # 1 once both bulk eps are configured
 
 
 xhci: XhciState
@@ -1273,6 +1307,323 @@ def xhci_control_transfer(req_type: uint8, request: uint8,
         return cast[int32](length)
     printk1("[xhci] control xfer cc=%d\n", cast[uint64](cc))
     return -1
+
+
+# =====================================================================
+# Bulk transfer path — used by drivers/usb/storage.ad (BOT/SCSI).
+# =====================================================================
+#
+# The keyboard path above drives a single interrupt-IN endpoint. A
+# mass-storage device speaks Bulk-Only Transport over two bulk
+# endpoints (one IN, one OUT). The machinery is identical in shape to
+# the ep0 / interrupt-IN producers: enqueue a Normal TRB pointing at a
+# DMA buffer, ring DB[slot]=ep_id, wait for a Transfer Event. We expose
+# a generic enqueue-and-wait so storage.ad doesn't touch ring internals.
+#
+# xHCI endpoint IDs: for endpoint number N, OUT = 2*N, IN = 2*N+1
+# (xHCI §4.5.1, the "Device Context Index" / DCI). ep0 control = 1.
+#
+# A single Normal TRB carries up to 64 KiB. SCSI READ(10) of one or a
+# few 512-byte sectors fits comfortably; storage.ad chunks larger
+# requests so each call here is one TRB.
+
+def _xhci_bulk_enqueue(ring: uint64, enqueue: Ptr[uint32],
+                       cycle: Ptr[uint32],
+                       buf_pa: uint64, length: uint32):
+    # Enqueue one Normal TRB on a bulk Transfer Ring. Same producer
+    # shape as _xhci_ep0_enqueue but parameterized over the ring +
+    # its enqueue/cycle cursor (passed by pointer so we can drive
+    # either the IN or OUT ring). IOC so the controller posts a
+    # Transfer Event we can wait on.
+    plo: uint32 = cast[uint32](buf_pa & 0xFFFFFFFF)
+    phi: uint32 = cast[uint32]((buf_pa >> 32) & 0xFFFFFFFF)
+    # status: TD Transfer Length in bits 16:0 (and TD Size = 0 in
+    # bits 21:17 since this is the only/last TRB of the TD).
+    sts: uint32 = length & 0x1FFFF
+    ctl_no_cycle: uint32 = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) \
+                         | TRB_IOC_BIT
+    ctl: uint32 = ctl_no_cycle
+    if cycle[0] != 0:
+        ctl = ctl | TRB_CYCLE_BIT
+    _xhci_trb_write(ring, enqueue[0], plo, phi, sts, ctl)
+    enqueue[0] = enqueue[0] + 1
+    if enqueue[0] >= RING_USABLE:
+        enqueue[0] = 0
+        cycle[0] = cycle[0] ^ 1
+
+
+def xhci_bulk_out(slot: uint32, ep: uint32,
+                  buf: uint64, length: uint32) -> int32:
+    # Send `length` bytes from the DMA buffer at physical address `buf`
+    # to the device's bulk-OUT endpoint number `ep`. Returns the number
+    # of bytes the controller reports transferred, or -1 on failure.
+    # The Transfer Event's status[23:0] is the RESIDUAL (untransferred)
+    # byte count for a short packet; we convert it to bytes-moved.
+    if slot == 0:
+        return -1
+    _xhci_bulk_enqueue(xhci.ms_out_ring,
+                       cast[Ptr[uint32]](&xhci.ms_out_enqueue),
+                       cast[Ptr[uint32]](&xhci.ms_out_cycle),
+                       buf, length)
+    # DB[slot] = ep_id; OUT endpoint N -> DCI = 2*N.
+    ep_id: uint32 = ep * 2
+    db_addr: uint64 = xhci.db_base + cast[uint64](slot) * XHCI_DB_STRIDE
+    _xhci_w32(db_addr, ep_id)
+    resid: uint32 = 0
+    cc: int32 = _xhci_wait_transfer_event(cast[Ptr[uint32]](&resid))
+    if cc != cast[int32](TRB_CC_SUCCESS) \
+       and cc != cast[int32](TRB_CC_SHORT_PACKET):
+        printk1("[xhci] bulk-out cc=%d\n", cast[uint64](cc))
+        return -1
+    if resid > length:
+        resid = length
+    return cast[int32](length - resid)
+
+
+def xhci_bulk_in(slot: uint32, ep: uint32,
+                 buf: uint64, length: uint32) -> int32:
+    # Read up to `length` bytes from the device's bulk-IN endpoint
+    # number `ep` into the DMA buffer at physical address `buf`.
+    # Returns bytes received, or -1 on failure.
+    if slot == 0:
+        return -1
+    _xhci_bulk_enqueue(xhci.ms_in_ring,
+                       cast[Ptr[uint32]](&xhci.ms_in_enqueue),
+                       cast[Ptr[uint32]](&xhci.ms_in_cycle),
+                       buf, length)
+    # DB[slot] = ep_id; IN endpoint N -> DCI = 2*N + 1.
+    ep_id: uint32 = (ep * 2) + 1
+    db_addr: uint64 = xhci.db_base + cast[uint64](slot) * XHCI_DB_STRIDE
+    _xhci_w32(db_addr, ep_id)
+    resid: uint32 = 0
+    cc: int32 = _xhci_wait_transfer_event(cast[Ptr[uint32]](&resid))
+    if cc != cast[int32](TRB_CC_SUCCESS) \
+       and cc != cast[int32](TRB_CC_SHORT_PACKET):
+        printk1("[xhci] bulk-in cc=%d\n", cast[uint64](cc))
+        return -1
+    if resid > length:
+        resid = length
+    return cast[int32](length - resid)
+
+
+def xhci_ms_slot() -> uint32:
+    # Accessor for storage.ad — the active mass-storage slot ID (0 if
+    # none enumerated).
+    return xhci.ms_slot_id
+
+
+def xhci_ms_in_ep() -> uint32:
+    return xhci.ms_in_ep
+
+
+def xhci_ms_out_ep() -> uint32:
+    return xhci.ms_out_ep
+
+
+# --- Mass-storage enumeration ------------------------------------
+#
+# Mirror of _xhci_v1_attach_keyboard but for a BOT mass-storage
+# device. Reuses the ep0 control machinery (which is hardwired to the
+# kbd_* fields + kbd_slot_id) by temporarily redirecting those fields
+# at the storage slot's ep0 ring for the duration of the control-
+# transfer enumeration, then driving the bulk endpoints through the
+# dedicated ms_* rings. Returns the enabled slot ID (>0) on success,
+# 0 on any failure. Called from xhci_attach_mass_storage() which the
+# storage driver invokes; kept here because it pokes ring internals.
+
+def _xhci_attach_mass_storage_locked(target_port: uint32,
+                                     target_speed: uint32) -> uint32:
+    printk2("[usbms] attaching storage at port=%d speed=%d\n",
+            cast[uint64](target_port), cast[uint64](target_speed))
+    xhci.ms_port  = target_port
+    xhci.ms_speed = target_speed
+
+    if _xhci_port_reset(target_port) != 0:
+        printk0("[usbms] port reset failed\n")
+        return 0
+
+    # Allocate per-slot scratch.
+    xhci.ms_input_ctx  = _xhci_alloc_slot_context()
+    xhci.ms_output_ctx = _xhci_alloc_slot_context()
+    xhci.ms_ep0_ring   = alloc_pages(0)
+    xhci.ms_in_ring    = alloc_pages(0)
+    xhci.ms_out_ring   = alloc_pages(0)
+    if xhci.cfg_buf == 0:
+        xhci.cfg_buf = alloc_pages(0)
+    if xhci.ms_input_ctx == 0 or xhci.ms_output_ctx == 0 \
+       or xhci.ms_ep0_ring == 0 or xhci.ms_in_ring == 0 \
+       or xhci.ms_out_ring == 0 or xhci.cfg_buf == 0:
+        printk0("[usbms] per-slot alloc failed\n")
+        return 0
+    xhci.ms_ep0_enqueue = 0
+    xhci.ms_ep0_cycle   = 1
+    xhci.ms_in_enqueue  = 0
+    xhci.ms_in_cycle    = 1
+    xhci.ms_out_enqueue = 0
+    xhci.ms_out_cycle   = 1
+    _xhci_ring_init(xhci.ms_ep0_ring, 1)
+    _xhci_ring_init(xhci.ms_in_ring, 1)
+    _xhci_ring_init(xhci.ms_out_ring, 1)
+
+    # Enable Slot.
+    slot: uint32 = _xhci_v1_enable_slot()
+    if slot == 0:
+        printk0("[usbms] Enable Slot failed\n")
+        return 0
+    xhci.ms_slot_id = slot
+
+    # Redirect the ep0 control machinery (kbd_*) at this slot. The
+    # keyboard attach has not run yet at the point storage probes (the
+    # storage exercise runs its own attach), so this is exclusive.
+    xhci.kbd_slot_id     = slot
+    xhci.kbd_port        = target_port
+    xhci.kbd_ep0_ring    = xhci.ms_ep0_ring
+    xhci.kbd_input_ctx   = xhci.ms_input_ctx
+    xhci.kbd_output_ctx  = xhci.ms_output_ctx
+    xhci.kbd_ep0_enqueue = 0
+    xhci.kbd_ep0_cycle   = 1
+
+    max_pkt0: uint32 = 8
+    if target_speed == USB_SPEED_HIGH:
+        max_pkt0 = 64
+    if _xhci_v1_address_device(slot, target_port, target_speed,
+                               max_pkt0, xhci.ms_ep0_ring) != 0:
+        printk0("[usbms] Address Device failed\n")
+        return 0
+    printk1("[usbms] slot %d addressed\n", cast[uint64](slot))
+
+    # GET_DESCRIPTOR(DEVICE, 18).
+    if xhci_control_transfer(
+        USB_RT_GET_DESCRIPTOR, USB_REQ_GET_DESCRIPTOR,
+        cast[uint16](USB_DT_DEVICE) << 8, 0, 18, xhci.cfg_buf) < 0:
+        printk0("[usbms] GET_DESCRIPTOR(device) failed\n")
+        return 0
+
+    # GET_DESCRIPTOR(CONFIG, 9) then full config.
+    if xhci_control_transfer(
+        USB_RT_GET_DESCRIPTOR, USB_REQ_GET_DESCRIPTOR,
+        cast[uint16](USB_DT_CONFIG) << 8, 0, 9, xhci.cfg_buf) < 0:
+        printk0("[usbms] GET_DESCRIPTOR(config-9) failed\n")
+        return 0
+    total: uint16 = usb_cfg_total_length(cast[Ptr[uint8]](xhci.cfg_buf))
+    if total > 256:
+        total = 256
+    if xhci_control_transfer(
+        USB_RT_GET_DESCRIPTOR, USB_REQ_GET_DESCRIPTOR,
+        cast[uint16](USB_DT_CONFIG) << 8, 0, total, xhci.cfg_buf) < 0:
+        printk0("[usbms] GET_DESCRIPTOR(config-full) failed\n")
+        return 0
+    xhci.ms_cfg_value = usb_cfg_value(cast[Ptr[uint8]](xhci.cfg_buf))
+
+    # Walk descriptors: find the mass-storage interface + its bulk
+    # IN/OUT endpoints.
+    bulk_in:  uint32 = 0
+    bulk_out: uint32 = 0
+    in_mps:   uint32 = 512
+    out_mps:  uint32 = 512
+    intf:     uint8 = 0
+    found_ms: int32 = 0
+    off: uint64 = 9
+    while off + 2 <= cast[uint64](total):
+        dlen:  uint8 = cast[Ptr[uint8]](xhci.cfg_buf + off)[0]
+        dtype: uint8 = cast[Ptr[uint8]](xhci.cfg_buf + off + 1)[0]
+        if dlen == 0:
+            off = cast[uint64](total)
+        else:
+            dptr: Ptr[uint8] = cast[Ptr[uint8]](xhci.cfg_buf + off)
+            if dtype == 0x04:
+                if usb_if_class(dptr) == USB_CLASS_MASS_STORAGE \
+                   and usb_if_protocol(dptr) == USB_PROTOCOL_BULK_ONLY:
+                    intf = usb_if_number(dptr)
+                    found_ms = 1
+                else:
+                    found_ms = 0
+            elif dtype == 0x05:
+                if found_ms == 1:
+                    if usb_ep_is_bulk_in(dptr) != 0:
+                        bulk_in = cast[uint32](usb_ep_address(dptr) & 0xF)
+                        in_mps = cast[uint32](usb_ep_max_packet(dptr) \
+                                             & 0x07FF)
+                        if in_mps == 0:
+                            in_mps = 512
+                    elif usb_ep_is_bulk_out(dptr) != 0:
+                        bulk_out = cast[uint32](usb_ep_address(dptr) & 0xF)
+                        out_mps = cast[uint32](usb_ep_max_packet(dptr) \
+                                              & 0x07FF)
+                        if out_mps == 0:
+                            out_mps = 512
+            off = off + cast[uint64](dlen)
+    if bulk_in == 0 or bulk_out == 0:
+        printk2("[usbms] missing bulk endpoints in=%d out=%d\n",
+                cast[uint64](bulk_in), cast[uint64](bulk_out))
+        return 0
+    xhci.ms_intf    = intf
+    xhci.ms_in_ep   = bulk_in
+    xhci.ms_in_mps  = in_mps
+    xhci.ms_out_ep  = bulk_out
+    xhci.ms_out_mps = out_mps
+    printk2("[usbms] intf=%d bulk-in ep=%d ...\n",
+            cast[uint64](intf), cast[uint64](bulk_in))
+    printk2("[usbms] ... bulk-out ep=%d in_mps=%d\n",
+            cast[uint64](bulk_out), cast[uint64](in_mps))
+
+    # SET_CONFIGURATION.
+    if xhci_control_transfer(
+        USB_RT_SET_CONFIGURATION, USB_REQ_SET_CONFIGURATION,
+        cast[uint16](xhci.ms_cfg_value), 0, 0, 0) < 0:
+        printk0("[usbms] SET_CONFIGURATION failed\n")
+        return 0
+
+    # Configure BOTH bulk endpoints in a single Configure Endpoint
+    # command. _xhci_v1_configure_endpoint adds one endpoint per call
+    # and zeroes the input context each time, so call it twice — the
+    # second call re-adds only its own endpoint, but xHCI keeps
+    # previously-added endpoints in the device context across Configure
+    # Endpoint commands (Add flags are additive on the OUTPUT context).
+    in_dci:  uint32 = (bulk_in * 2) + 1
+    out_dci: uint32 = bulk_out * 2
+    if _xhci_v1_configure_endpoint(slot, out_dci, EP_TYPE_BULK_OUT,
+                                   out_mps, 0, xhci.ms_out_ring) != 0:
+        printk0("[usbms] Configure bulk-OUT failed\n")
+        return 0
+    if _xhci_v1_configure_endpoint(slot, in_dci, EP_TYPE_BULK_IN,
+                                   in_mps, 0, xhci.ms_in_ring) != 0:
+        printk0("[usbms] Configure bulk-IN failed\n")
+        return 0
+
+    xhci.ms_enabled = 1
+    printk1("[usbms] mass-storage slot %d ready\n", cast[uint64](slot))
+    return slot
+
+
+def xhci_attach_mass_storage() -> uint32:
+    # Public entry: scan the root hub for a connected port, run the
+    # BOT enumeration on the first candidate, and return the enabled
+    # slot ID (0 on failure / none found). storage.ad calls this after
+    # xhci_init has brought the transfer engine up. Mass storage shows
+    # up at HighSpeed (USB 2.0 stick under qemu-xhci) or SuperSpeed
+    # (USB 3.0). We accept any connected, enabled port — unlike the
+    # keyboard path we don't gate on USB-2-only speeds, because the
+    # bulk path is speed-agnostic once the slot is addressed.
+    if xhci.ms_slot_id != 0:
+        return xhci.ms_slot_id
+    n: uint32 = 0
+    while n < xhci.max_ports:
+        port_addr: uint64 = xhci.op_base + XHCI_PORT_BASE \
+                          + cast[uint64](n) * XHCI_PORT_STRIDE \
+                          + XHCI_PORT_PORTSC
+        portsc: uint32 = _xhci_r32(port_addr)
+        if (portsc & XHCI_PORTSC_CCS) != 0:
+            speed: uint32 = (portsc >> XHCI_PORTSC_SPEED_SHIFT) \
+                          & XHCI_PORTSC_SPEED_MASK
+            slot: uint32 = _xhci_attach_mass_storage_locked(n + 1, speed)
+            if slot != 0:
+                return slot
+            # This port wasn't a usable mass-storage device; keep
+            # scanning the remaining ports.
+        n = n + 1
+    printk0("[usbms] no mass-storage device found on root hub\n")
+    return 0
 
 
 # --- Interrupt-IN endpoint poll path -----------------------------

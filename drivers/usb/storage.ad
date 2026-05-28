@@ -1,0 +1,474 @@
+# drivers/usb/storage.ad
+#
+# USB Bulk-Only Mass Storage (BOT) class driver — exposes an attached
+# USB stick as a Hamnix block device at /dev/blk/sd0.
+#
+# This is the foundation for the Debian-Live model: a squashfs distro
+# image lives on a USB stick; a separate squashfs reader consumes the
+# block device this driver registers. The two meet ONLY at the
+# BlockDeviceOps.read_sectors interface — this file owns the transport,
+# not the filesystem.
+#
+# Transport stack (top to bottom):
+#
+#   register_blockdev("sd0")        kernel/block/blk.ad
+#     usbms_read_sectors  ─┐
+#     usbms_write_sectors ─┤        SCSI READ(10) / WRITE(10)
+#                          ▼
+#   usbms_scsi_*           SCSI command descriptor blocks (CDBs)
+#                          ▼
+#   usbms_bot_xfer         Bulk-Only Transport: CBW → data → CSW
+#                          ▼
+#   xhci_bulk_out / xhci_bulk_in    drivers/usb/xhci.ad (Normal TRBs)
+#
+# Bulk-Only Transport (USB Mass Storage Class — Bulk-Only Transport
+# spec, rev 1.0):
+#
+#   Command phase : host sends a 31-byte CBW (Command Block Wrapper)
+#                   on the bulk-OUT endpoint. Signature 0x43425355
+#                   ("USBC" little-endian). Carries a SCSI CDB.
+#   Data phase    : optional. Bytes flow IN or OUT per the CBW's
+#                   bmCBWFlags direction bit, on the matching bulk
+#                   endpoint, up to dCBWDataTransferLength bytes.
+#   Status phase  : device sends a 13-byte CSW (Command Status
+#                   Wrapper) on the bulk-IN endpoint. Signature
+#                   0x53425355 ("USBS"). bCSWStatus 0 = good.
+#
+# SCSI command set (subset — the minimum a read-only block device
+# needs, plus best-effort WRITE):
+#   TEST UNIT READY (0x00)  — is the medium present + ready?
+#   INQUIRY        (0x12)   — vendor/product strings, device type.
+#   READ CAPACITY  (0x25)   — last LBA + block size → capacity.
+#   READ(10)       (0x28)   — read N blocks at LBA.
+#   WRITE(10)      (0x2A)   — write N blocks at LBA (best-effort).
+#
+# References:
+#   - USB Mass Storage Class Bulk-Only Transport, rev 1.0 (1999).
+#   - SCSI Primary Commands (SPC) + Block Commands (SBC).
+#   - Linux drivers/usb/storage/transport.c (usb_stor_Bulk_transport).
+#   - drivers/block/brd.ad — block-device registration shape.
+
+from kernel.printk.printk import printk0, printk1, printk2
+from kernel.block.blk import (
+    BlockDeviceOps, register_blockdev, blk_scan_partitions,
+    SECTOR_SIZE,
+)
+from mm.page_alloc import alloc_pages
+from drivers.usb.xhci import (
+    xhci_bulk_out, xhci_bulk_in,
+    xhci_attach_mass_storage, xhci_ms_slot,
+    xhci_ms_in_ep, xhci_ms_out_ep,
+)
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
+
+
+# --- Bulk-Only Transport constants --------------------------------
+
+CBW_SIGNATURE: uint32 = 0x43425355         # "USBC"
+CSW_SIGNATURE: uint32 = 0x53425355         # "USBS"
+CBW_LEN:       uint32 = 31
+CSW_LEN:       uint32 = 13
+
+CBW_FLAG_IN:   uint8 = 0x80                 # bmCBWFlags: data IN
+CBW_FLAG_OUT:  uint8 = 0x00                 # bmCBWFlags: data OUT
+
+CSW_STATUS_GOOD:    uint8 = 0x00
+CSW_STATUS_FAILED:  uint8 = 0x01
+CSW_STATUS_PHASE:   uint8 = 0x02
+
+# SCSI opcodes.
+SCSI_TEST_UNIT_READY: uint8 = 0x00
+SCSI_INQUIRY:         uint8 = 0x12
+SCSI_READ_CAPACITY10: uint8 = 0x25
+SCSI_READ10:          uint8 = 0x28
+SCSI_WRITE10:         uint8 = 0x2A
+
+
+# --- Driver state -------------------------------------------------
+#
+# Single-device scope (one /dev/sd0). The DMA buffers are 4 KiB pages
+# pinned at probe time. On a kernel with identity-mapped low memory
+# the virtual address equals the physical address handed to the xHCI
+# bulk TRBs — same convention as xhci.ad / nvme.ad.
+
+class UsbmsDevice:
+    slot:        uint32       # xHCI slot id (0 = not attached)
+    in_ep:       uint32       # bulk-IN endpoint number
+    out_ep:      uint32       # bulk-OUT endpoint number
+    block_size:  uint32       # SCSI logical block size (typically 512)
+    last_lba:    uint64       # last addressable LBA (from READ CAPACITY)
+    capacity_sectors: uint64  # capacity in 512-byte sectors
+
+    cbw_buf:     uint64       # 31-byte CBW staging (page)
+    csw_buf:     uint64       # 13-byte CSW staging (page)
+    data_buf:    uint64       # bulk data DMA buffer (page, 4 KiB)
+    tag:         uint32       # rolling CBW tag
+
+
+usbms: UsbmsDevice
+usbms_ops: BlockDeviceOps
+
+
+# --- little-endian field writers ----------------------------------
+
+def _le32(p: Ptr[uint8], off: uint64, v: uint32):
+    p[off + 0] = cast[uint8](v & 0xFF)
+    p[off + 1] = cast[uint8]((v >> 8) & 0xFF)
+    p[off + 2] = cast[uint8]((v >> 16) & 0xFF)
+    p[off + 3] = cast[uint8]((v >> 24) & 0xFF)
+
+
+def _be32_read(p: Ptr[uint8], off: uint64) -> uint32:
+    # SCSI multi-byte fields are big-endian (network order).
+    return (cast[uint32](p[off + 0]) << 24) \
+         | (cast[uint32](p[off + 1]) << 16) \
+         | (cast[uint32](p[off + 2]) << 8) \
+         | cast[uint32](p[off + 3])
+
+
+def _be32_write(p: Ptr[uint8], off: uint64, v: uint32):
+    p[off + 0] = cast[uint8]((v >> 24) & 0xFF)
+    p[off + 1] = cast[uint8]((v >> 16) & 0xFF)
+    p[off + 2] = cast[uint8]((v >> 8) & 0xFF)
+    p[off + 3] = cast[uint8](v & 0xFF)
+
+
+def _be16_write(p: Ptr[uint8], off: uint64, v: uint16):
+    p[off + 0] = cast[uint8]((cast[uint32](v) >> 8) & 0xFF)
+    p[off + 1] = cast[uint8](cast[uint32](v) & 0xFF)
+
+
+# --- Bulk-Only Transport ------------------------------------------
+
+def usbms_bot_xfer(cdb: Ptr[uint8], cdb_len: uint8,
+                   data_pa: uint64, data_len: uint32,
+                   dir_in: int32) -> int32:
+    # One full BOT command: build + send the CBW on bulk-OUT, move the
+    # optional data phase on the matching bulk endpoint, then read +
+    # validate the CSW on bulk-IN. Returns the number of data bytes
+    # transferred (>=0) on a GOOD CSW, or -1 on any failure.
+    #
+    # `cdb` points at the SCSI command bytes (up to 16); `cdb_len` is
+    # its length. `data_pa` / `data_len` describe the data phase (0
+    # len = no data phase). `dir_in` 1 = device-to-host (bulk-IN),
+    # 0 = host-to-device (bulk-OUT).
+    if usbms.slot == 0:
+        return -1
+
+    cbw: Ptr[uint8] = cast[Ptr[uint8]](usbms.cbw_buf)
+    memset(cbw, 0, CBW_LEN)
+    # dCBWSignature (0..3).
+    _le32(cbw, 0, CBW_SIGNATURE)
+    # dCBWTag (4..7) — echoed back in the CSW.
+    usbms.tag = usbms.tag + 1
+    _le32(cbw, 4, usbms.tag)
+    # dCBWDataTransferLength (8..11).
+    _le32(cbw, 8, data_len)
+    # bmCBWFlags (12).
+    if dir_in != 0:
+        cbw[12] = CBW_FLAG_IN
+    else:
+        cbw[12] = CBW_FLAG_OUT
+    # bCBWLUN (13) — LUN 0.
+    cbw[13] = 0
+    # bCBWCBLength (14) — CDB length.
+    cbw[14] = cdb_len
+    # CBWCB (15..30) — the SCSI command block.
+    i: uint64 = 0
+    while i < cast[uint64](cdb_len) and i < 16:
+        cbw[15 + i] = cdb[i]
+        i = i + 1
+
+    # Command phase: ship the 31-byte CBW on bulk-OUT.
+    if xhci_bulk_out(usbms.slot, usbms.out_ep, usbms.cbw_buf,
+                     CBW_LEN) < 0:
+        printk0("[usbms] CBW send failed\n")
+        return -1
+
+    # Data phase.
+    moved: int32 = 0
+    if data_len != 0:
+        if dir_in != 0:
+            moved = xhci_bulk_in(usbms.slot, usbms.in_ep,
+                                 data_pa, data_len)
+        else:
+            moved = xhci_bulk_out(usbms.slot, usbms.out_ep,
+                                  data_pa, data_len)
+        if moved < 0:
+            printk0("[usbms] data phase failed\n")
+            return -1
+
+    # Status phase: read the 13-byte CSW on bulk-IN.
+    csw: Ptr[uint8] = cast[Ptr[uint8]](usbms.csw_buf)
+    memset(csw, 0, CSW_LEN)
+    if xhci_bulk_in(usbms.slot, usbms.in_ep, usbms.csw_buf,
+                    CSW_LEN) < 0:
+        printk0("[usbms] CSW read failed\n")
+        return -1
+
+    # Validate CSW: signature + tag echo + status.
+    sig: uint32 = cast[uint32](csw[0]) | (cast[uint32](csw[1]) << 8) \
+                | (cast[uint32](csw[2]) << 16) | (cast[uint32](csw[3]) << 24)
+    if sig != CSW_SIGNATURE:
+        printk1("[usbms] bad CSW signature %x\n", cast[uint64](sig))
+        return -1
+    status: uint8 = csw[12]
+    if status != CSW_STATUS_GOOD:
+        printk1("[usbms] CSW status=%d (command failed)\n",
+                cast[uint64](status))
+        return -1
+    return moved
+
+
+# --- Minimal SCSI over BOT ----------------------------------------
+
+def usbms_scsi_test_unit_ready() -> int32:
+    cdb: Array[6, uint8]
+    memset(&cdb[0], 0, 6)
+    cdb[0] = SCSI_TEST_UNIT_READY
+    return usbms_bot_xfer(&cdb[0], 6, 0, 0, 1)
+
+
+def usbms_scsi_inquiry() -> int32:
+    # Standard INQUIRY, 36-byte data into data_buf. Returns peripheral
+    # device type (bits 4:0 of byte 0; 0x00 = direct-access block),
+    # or -1 on failure.
+    cdb: Array[6, uint8]
+    memset(&cdb[0], 0, 6)
+    cdb[0] = SCSI_INQUIRY
+    cdb[4] = 36                              # allocation length
+    if usbms_bot_xfer(&cdb[0], 6, usbms.data_buf, 36, 1) < 0:
+        return -1
+    d: Ptr[uint8] = cast[Ptr[uint8]](usbms.data_buf)
+    pdt: uint8 = d[0] & 0x1F
+    printk1("[usbms] INQUIRY: peripheral-device-type=%d\n",
+            cast[uint64](pdt))
+    return cast[int32](pdt)
+
+
+def usbms_scsi_read_capacity() -> int32:
+    # READ CAPACITY(10): 8-byte response = (last LBA, block length),
+    # both big-endian 32-bit. Fills usbms.last_lba / block_size /
+    # capacity_sectors. Returns 0 on success, -1 on failure.
+    cdb: Array[10, uint8]
+    memset(&cdb[0], 0, 10)
+    cdb[0] = SCSI_READ_CAPACITY10
+    if usbms_bot_xfer(&cdb[0], 10, usbms.data_buf, 8, 1) < 0:
+        return -1
+    d: Ptr[uint8] = cast[Ptr[uint8]](usbms.data_buf)
+    last_lba: uint32 = _be32_read(d, 0)
+    blk_len:  uint32 = _be32_read(d, 4)
+    if blk_len == 0:
+        blk_len = 512
+    usbms.last_lba   = cast[uint64](last_lba)
+    usbms.block_size = blk_len
+    # capacity_sectors is in 512-byte units (the block layer's fixed
+    # SECTOR_SIZE). (last_lba + 1) logical blocks of block_size bytes.
+    total_blocks: uint64 = cast[uint64](last_lba) + 1
+    total_bytes:  uint64 = total_blocks * cast[uint64](blk_len)
+    usbms.capacity_sectors = total_bytes / SECTOR_SIZE
+    printk2("[usbms] READ CAPACITY: last_lba=%d block_size=%d\n",
+            cast[uint64](last_lba), cast[uint64](blk_len))
+    printk1("[usbms] capacity = %d x 512-byte sectors\n",
+            usbms.capacity_sectors)
+    return 0
+
+
+def _usbms_scsi_rw10(opcode: uint8, lba: uint32, blocks: uint16,
+                     data_pa: uint64, data_len: uint32,
+                     dir_in: int32) -> int32:
+    # Build a READ(10)/WRITE(10) CDB and run it. lba/blocks are in the
+    # device's native logical-block units (block_size).
+    cdb: Array[10, uint8]
+    memset(&cdb[0], 0, 10)
+    cdb[0] = opcode
+    # bytes 2..5: 32-bit big-endian LBA.
+    _be32_write(&cdb[0], 2, lba)
+    # bytes 7..8: 16-bit big-endian transfer length (blocks).
+    _be16_write(&cdb[0], 7, blocks)
+    return usbms_bot_xfer(&cdb[0], 10, data_pa, data_len, dir_in)
+
+
+# --- BlockDeviceOps callbacks -------------------------------------
+#
+# The block layer speaks in fixed 512-byte sectors. The device speaks
+# in `block_size`-byte logical blocks. When block_size == 512 (the
+# universal case for USB sticks) the mapping is 1:1. We convert
+# defensively for the rare 4096-byte-block device.
+
+def usbms_read_sectors(priv: uint64, lba: uint64, count: uint64,
+                       buf: Ptr[uint8]) -> int32:
+    # Read `count` 512-byte sectors starting at sector `lba` into buf.
+    # Chunk through the 4 KiB DMA bounce buffer so an arbitrarily large
+    # request never overruns a single bulk TRB. Returns 0 on success,
+    # -1 on failure.
+    if usbms.slot == 0:
+        return -1
+    bs: uint32 = usbms.block_size
+    if bs == 0:
+        bs = 512
+    # 512-byte sectors per device logical block (>=1; sub-512 blocks
+    # don't exist on real media so we floor at 1).
+    sectors_per_blk: uint64 = cast[uint64](bs) / SECTOR_SIZE
+    if sectors_per_blk == 0:
+        sectors_per_blk = 1
+    # How many sectors fit in the 4 KiB bounce buffer.
+    max_sectors: uint64 = 4096 / SECTOR_SIZE       # 8
+    # Round down to a whole number of device blocks per chunk.
+    chunk_blocks: uint64 = max_sectors / sectors_per_blk
+    if chunk_blocks == 0:
+        chunk_blocks = 1
+    chunk_sectors: uint64 = chunk_blocks * sectors_per_blk
+
+    done: uint64 = 0
+    while done < count:
+        n: uint64 = count - done
+        if n > chunk_sectors:
+            n = chunk_sectors
+        # Convert this chunk's sector range to device logical blocks.
+        dev_lba: uint64 = (lba + done) / sectors_per_blk
+        dev_blocks: uint64 = (n + sectors_per_blk - 1) / sectors_per_blk
+        bytes_n: uint32 = cast[uint32](dev_blocks * cast[uint64](bs))
+        moved: int32 = _usbms_scsi_rw10(
+            SCSI_READ10, cast[uint32](dev_lba),
+            cast[uint16](dev_blocks), usbms.data_buf, bytes_n, 1)
+        if moved < 0:
+            printk1("[usbms] read_sectors failed at lba=%d\n", lba + done)
+            return -1
+        # Copy exactly n*512 bytes out of the bounce buffer at the
+        # sector offset within the (block-aligned) device read.
+        skip: uint64 = ((lba + done) % sectors_per_blk) * SECTOR_SIZE
+        memcpy(cast[Ptr[uint8]](cast[uint64](buf) + done * SECTOR_SIZE),
+               cast[Ptr[uint8]](usbms.data_buf + skip),
+               n * SECTOR_SIZE)
+        done = done + n
+    return 0
+
+
+def usbms_write_sectors(priv: uint64, lba: uint64, count: uint64,
+                        buf: Ptr[uint8]) -> int32:
+    # Best-effort WRITE(10). Read-only correctness is what matters for
+    # squashfs, so this path is intentionally simple: it only handles
+    # block_size == 512 (the writes are whole device blocks; no
+    # read-modify-write for sub-block partial writes). Returns 0 on
+    # success, -1 otherwise.
+    if usbms.slot == 0:
+        return -1
+    bs: uint32 = usbms.block_size
+    if bs == 0:
+        bs = 512
+    sectors_per_blk: uint64 = cast[uint64](bs) / SECTOR_SIZE
+    if sectors_per_blk == 0:
+        sectors_per_blk = 1
+    max_sectors: uint64 = 4096 / SECTOR_SIZE
+    chunk_blocks: uint64 = max_sectors / sectors_per_blk
+    if chunk_blocks == 0:
+        chunk_blocks = 1
+    chunk_sectors: uint64 = chunk_blocks * sectors_per_blk
+
+    done: uint64 = 0
+    while done < count:
+        n: uint64 = count - done
+        if n > chunk_sectors:
+            n = chunk_sectors
+        # Only whole-device-block-aligned writes are supported.
+        if ((lba + done) % sectors_per_blk) != 0 \
+           or (n % sectors_per_blk) != 0:
+            printk0("[usbms] write_sectors: unaligned write unsupported\n")
+            return -1
+        dev_lba: uint64 = (lba + done) / sectors_per_blk
+        dev_blocks: uint64 = n / sectors_per_blk
+        bytes_n: uint32 = cast[uint32](dev_blocks * cast[uint64](bs))
+        memcpy(cast[Ptr[uint8]](usbms.data_buf),
+               cast[Ptr[uint8]](cast[uint64](buf) + done * SECTOR_SIZE),
+               n * SECTOR_SIZE)
+        moved: int32 = _usbms_scsi_rw10(
+            SCSI_WRITE10, cast[uint32](dev_lba),
+            cast[uint16](dev_blocks), usbms.data_buf, bytes_n, 0)
+        if moved < 0:
+            printk1("[usbms] write_sectors failed at lba=%d\n", lba + done)
+            return -1
+        done = done + n
+    return 0
+
+
+# --- Probe + registration -----------------------------------------
+
+def usbms_probe(slot: uint32, in_ep: uint32, out_ep: uint32) -> int32:
+    # Called once an xHCI mass-storage slot is enumerated + its bulk
+    # endpoints configured. Allocates the DMA staging buffers, runs the
+    # SCSI bring-up sequence (TEST UNIT READY → INQUIRY → READ
+    # CAPACITY), and registers /dev/sd0 backed by the SCSI READ(10)/
+    # WRITE(10) paths. Returns the block-device slot index (>=0) on
+    # success, -1 on failure.
+    printk2("[usbms] probe: slot=%d bulk-in-ep=%d ...\n",
+            cast[uint64](slot), cast[uint64](in_ep))
+    printk1("[usbms] ... bulk-out-ep=%d\n", cast[uint64](out_ep))
+    usbms.slot   = slot
+    usbms.in_ep  = in_ep
+    usbms.out_ep = out_ep
+    usbms.tag    = 0
+    usbms.block_size = 512
+
+    usbms.cbw_buf  = alloc_pages(0)
+    usbms.csw_buf  = alloc_pages(0)
+    usbms.data_buf = alloc_pages(0)
+    if usbms.cbw_buf == 0 or usbms.csw_buf == 0 or usbms.data_buf == 0:
+        printk0("[usbms] DMA buffer alloc failed\n")
+        return -1
+
+    # TEST UNIT READY — some devices report "not ready" once after
+    # power-on (unit-attention), so retry a few times.
+    ready: int32 = -1
+    attempt: uint32 = 0
+    while attempt < 4:
+        ready = usbms_scsi_test_unit_ready()
+        if ready == 0:
+            attempt = 4
+        else:
+            attempt = attempt + 1
+    if ready != 0:
+        printk0("[usbms] TEST UNIT READY never succeeded (continuing)\n")
+        # Not fatal: some emulated devices answer READ CAPACITY anyway.
+
+    if usbms_scsi_inquiry() < 0:
+        printk0("[usbms] INQUIRY failed\n")
+        return -1
+
+    if usbms_scsi_read_capacity() < 0:
+        printk0("[usbms] READ CAPACITY failed\n")
+        return -1
+    if usbms.capacity_sectors == 0:
+        printk0("[usbms] zero capacity — not registering\n")
+        return -1
+
+    usbms_ops.read_sectors  = usbms_read_sectors
+    usbms_ops.write_sectors = usbms_write_sectors
+    rc: int32 = register_blockdev("sd0", usbms.capacity_sectors,
+                                  &usbms_ops, cast[uint64](&usbms))
+    if rc < 0:
+        printk0("[usbms] register_blockdev failed\n")
+        return -1
+    printk1("[usbms] /dev/blk/sd0 ready (%d sectors)\n",
+            usbms.capacity_sectors)
+    # Scan for a partition table so /dev/blk/sd0pN siblings appear if
+    # the stick is partitioned (the squashfs may live on a partition).
+    blk_scan_partitions(rc)
+    return rc
+
+
+def usbms_init() -> int32:
+    # Driver entry point: ask the xHCI HCD to enumerate a mass-storage
+    # device on the root hub, then probe it. Returns the block-device
+    # slot on success, -1 if no device / probe failed. Non-fatal to
+    # boot — a system with no USB stick just logs the absence.
+    printk0("[usbms] init: scanning for USB mass-storage device\n")
+    slot: uint32 = xhci_attach_mass_storage()
+    if slot == 0:
+        printk0("[usbms] no USB mass-storage device attached\n")
+        return -1
+    in_ep:  uint32 = xhci_ms_in_ep()
+    out_ep: uint32 = xhci_ms_out_ep()
+    return usbms_probe(slot, in_ep, out_ep)

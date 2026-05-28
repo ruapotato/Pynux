@@ -142,6 +142,12 @@ from drivers.usb.xhci import (
     xhci_init, xhci_v1_selftest, xhci_v2_selftest,
     xhci_real_kbd_present,
 )
+# USB Bulk-Only Mass Storage (BOT) class driver — exposes an attached
+# USB stick as /dev/blk/sd0 by speaking SCSI over the xHCI bulk
+# endpoints. The exercise below (gated on /etc/usbms-test) enumerates
+# the device and reads sector 0 back to prove the path end to end; the
+# Debian-Live model consumes /dev/blk/sd0 to read a squashfs image.
+from drivers.usb.storage import usbms_init, usbms_read_sectors
 # EHCI (USB 2.0) host controller. Many 2008..2014 laptops — Asus
 # included — wire the built-in keyboard to an EHCI controller rather
 # than the i8042; on such hardware EHCI is the only path to a working
@@ -2760,6 +2766,73 @@ def http_redirect_smoke_test():
     printk0("[http-redirect] downgrade-reject path is wrapper-level (logged separately)\n")
 
 
+def usbms_exercise():
+    # USB mass-storage (BOT/SCSI over xHCI bulk) EXERCISE. Gated on the
+    # /etc/usbms-test cpio marker (planted by scripts/test_usbms.sh via
+    # ENABLE_USBMS_TEST=1) so default boots don't poke a USB stick that
+    # isn't there. Enumerates the attached device through
+    # xhci_attach_mass_storage(), registers /dev/blk/sd0, then reads
+    # sector 0 back and dumps the first bytes so the harness can match
+    # them against the known pattern written into the test image.
+    #
+    # PASS / FAIL channel: the `[usbms_test] PASS`/`FAIL` marker line.
+    found: int32 = 0
+    idx: uint64 = 0
+    cnt: uint64 = initramfs_entry_count()
+    while idx < cnt:
+        nm: Ptr[char] = initramfs_entry_name(idx)
+        ok: int32 = 1
+        target: Ptr[uint8] = "/etc/usbms-test"
+        j: uint64 = 0
+        while j < 16:                          # 15 chars + NUL
+            if cast[uint8](nm[j]) != target[j]:
+                ok = 0
+                j = 16
+            else:
+                j = j + 1
+        if ok == 1:
+            found = 1
+            idx = cnt
+        else:
+            idx = idx + 1
+    if found == 0:
+        printk0("[usbms] exercise SKIPPED (no /etc/usbms-test marker)\n")
+        return
+    printk0("[boot:07.s] usbms_exercise\n")
+    rc: int32 = usbms_init()
+    if rc < 0:
+        printk0("[usbms_test] FAIL: enumeration / probe did not register sd0\n")
+        return
+    sd0: int32 = find_blockdev("sd0")
+    if sd0 < 0:
+        printk0("[usbms_test] FAIL: /dev/blk/sd0 not found after probe\n")
+        return
+    buf: Array[512, uint8]
+    if blk_read_sectors(sd0, 0, 1, &buf[0]) != 0:
+        printk0("[usbms_test] FAIL: READ(10) of sector 0 failed\n")
+        return
+    # Dump the first 16 bytes as hex so the harness can match the
+    # known pattern stamped into the test image's sector 0.
+    printk2("[usbms_test] sector0[0..3]=%x %x\n",
+            cast[uint64](buf[0]), cast[uint64](buf[1]))
+    printk2("[usbms_test] sector0[2..3]=%x %x\n",
+            cast[uint64](buf[2]), cast[uint64](buf[3]))
+    # The test image stamps the ASCII tag "HAMNIXUSB" at offset 0.
+    tag: Ptr[uint8] = "HAMNIXUSB"
+    tag_ok: int32 = 1
+    k: uint64 = 0
+    while k < 9:
+        if buf[k] != tag[k]:
+            tag_ok = 0
+            k = 9
+        else:
+            k = k + 1
+    if tag_ok == 1:
+        printk0("[usbms_test] PASS: READ(10) sector 0 returned HAMNIXUSB tag\n")
+    else:
+        printk0("[usbms_test] FAIL: sector 0 tag mismatch\n")
+
+
 def memblock_smoke_test():
     printk0("Hamnix: memblock smoke test\n")
     a: uint64 = memblock_alloc(128, 16)
@@ -3469,6 +3542,12 @@ def start_kernel():
         printk0("[xhci_v1] self-test skipped: no USB keyboard found (set /etc/xhci-selftest cpio marker to force)\n")
         printk0("[boot:07] xhci_v2_selftest SKIPPED (no kbd marker)\n")
         printk0("[xhci_v2] self-test skipped: no USB keyboard found (set /etc/xhci-selftest cpio marker to force)\n")
+    # USB mass-storage (BOT/SCSI) exercise — gated on /etc/usbms-test.
+    # Enumerates an attached USB stick, registers /dev/blk/sd0, and
+    # reads sector 0 back. No-op on default boots (no marker). Runs
+    # after the HID selftests because both share the xHCI transfer
+    # engine; the storage path enables its own slot.
+    usbms_exercise()
     # EHCI V1 USB HID — synthetic interrupt-IN round-trip. Forges the
     # retired-qTD state the controller leaves behind for a completed
     # 8-byte boot report ('a'), drives ehci_poll(), and asserts the

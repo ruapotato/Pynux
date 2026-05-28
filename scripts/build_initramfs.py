@@ -204,6 +204,15 @@ if os.environ.get("ENABLE_NETCFG_SMOKE") == "1":
 if os.environ.get("ENABLE_XHCI_SELFTEST") == "1":
     FILES.append(("/etc/xhci-selftest", b"1\n"))
 
+# USB mass-storage (BOT/SCSI) exercise. Set ENABLE_USBMS_TEST=1 to
+# plant /etc/usbms-test; init/main.ad gates usbms_exercise() on it,
+# which enumerates an attached USB stick (boot QEMU with
+# `-device qemu-xhci -device usb-storage,drive=...`), registers
+# /dev/blk/sd0, and reads sector 0 back. Default boots ship no marker
+# so the storage probe is a no-op when no stick is present.
+if os.environ.get("ENABLE_USBMS_TEST") == "1":
+    FILES.append(("/etc/usbms-test", b"1\n"))
+
 # xHCI live-keyboard attach OPT-OUT. Mirrors ENABLE_XHCI_SELFTEST but
 # in the opposite direction: setting ENABLE_XHCI_NO_ATTACH=1 plants
 # /etc/xhci-no-attach so drivers/usb/xhci.ad's xhci_init() skips

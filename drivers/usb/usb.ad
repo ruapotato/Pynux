@@ -90,6 +90,16 @@ USB_SUBCLASS_BOOT:    uint8 = 0x01     # supports boot protocol
 USB_PROTOCOL_KEYBOARD: uint8 = 0x01    # boot-keyboard protocol
 USB_PROTOCOL_MOUSE:    uint8 = 0x02    # boot-mouse protocol
 
+# Mass-storage class (USB Mass Storage Class spec). A USB stick
+# presents bInterfaceClass=0x08 (Mass Storage). bInterfaceSubClass
+# 0x06 = SCSI transparent command set (the only one we drive);
+# bInterfaceProtocol 0x50 = Bulk-Only Transport (BOT), the transport
+# used by every modern thumb drive. drivers/usb/storage.ad matches on
+# class 0x08 + protocol 0x50 and speaks SCSI over the bulk endpoints.
+USB_CLASS_MASS_STORAGE: uint8 = 0x08
+USB_SUBCLASS_SCSI:      uint8 = 0x06   # SCSI transparent command set
+USB_PROTOCOL_BULK_ONLY: uint8 = 0x50   # Bulk-Only Transport (BOT)
+
 
 # --- USB speed enum (xHCI slot context PORTSC speed field) --------
 #
@@ -283,6 +293,27 @@ def usb_ep_is_interrupt_in(buf: Ptr[uint8]) -> int32:
     if (buf[3] & 0x03) != 0x03:
         return 0
     if (buf[2] & 0x80) == 0:
+        return 0
+    return 1
+
+
+def usb_ep_is_bulk_in(buf: Ptr[uint8]) -> int32:
+    # bmAttributes bits 0..1 = 2 (bulk) AND bEndpointAddress bit 7 set
+    # (IN direction). A BOT mass-storage interface always exposes one
+    # bulk-IN + one bulk-OUT endpoint; we match each by direction.
+    if (buf[3] & 0x03) != 0x02:
+        return 0
+    if (buf[2] & 0x80) == 0:
+        return 0
+    return 1
+
+
+def usb_ep_is_bulk_out(buf: Ptr[uint8]) -> int32:
+    # bmAttributes bits 0..1 = 2 (bulk) AND bEndpointAddress bit 7 clear
+    # (OUT direction).
+    if (buf[3] & 0x03) != 0x02:
+        return 0
+    if (buf[2] & 0x80) != 0:
         return 0
     return 1
 
