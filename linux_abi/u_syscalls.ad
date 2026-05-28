@@ -165,7 +165,7 @@ from drivers.net.udp import (
 # access to it via usock_any_tls_active().
 from drivers.net.tls import tls_init, tls_handshake
 from kernel.sched.core import (
-    TaskStruct, current_task,
+    TaskStruct, current_task, current_task_uid,
     current_task_pid, task_lookup_by_pid, task_exit_current,
     signal_post, signal_pending, get_cwd_buf, set_task_cwd, current_idx_get,
     set_task_fs_base, set_task_clear_child_tid,
@@ -196,6 +196,15 @@ from kernel.sched.core import (
 # region present in the task's OWN PML4 as a private 4 KiB PTE chain.
 from fs.elf import elf_install_user_heap
 from arch.x86.kernel.time import get_jiffies, tsc_monotonic_ns, HZ
+# reboot(2): a Linux ELF binary's reboot()/poweroff() routes here.
+# Same shared power_action core the native /dev/reboot cdev and the
+# native do_syscall(SYS_REBOOT) arm use.
+from arch.x86.kernel.power import (
+    power_action, POWER_HALT, POWER_REBOOT, POWER_POWEROFF,
+    LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+    LINUX_REBOOT_CMD_RESTART, LINUX_REBOOT_CMD_HALT,
+    LINUX_REBOOT_CMD_POWER_OFF,
+)
 from drivers.rtc.cmos import rtc_boot_epoch_get
 from mm.slab import kmalloc, kfree, kzalloc
 from mm.page_alloc import alloc_pages, free_pages
@@ -352,6 +361,9 @@ SYS_truncate:        uint64 = 76
 SYS_ftruncate:       uint64 = 77
 SYS_rename:          uint64 = 82
 SYS_sync:            uint64 = 162
+SYS_reboot:          uint64 = 169
+# LINUX_REBOOT_* magics/cmds are imported from arch.x86.kernel.power
+# (the single source of truth, shared with the native SYS_REBOOT arm).
 SYS_renameat:        uint64 = 264
 SYS_renameat2:       uint64 = 316
 SYS_nanosleep:       uint64 = 35
@@ -1449,6 +1461,34 @@ def _u_sync(a0: uint64, a1: uint64, a2: uint64,
     # the one writable ext4 mount; flush it and return 0. sync(2) has
     # no failure return in Linux, so we always report success.
     vfs_fsync_all()
+    return 0
+
+
+def _u_reboot(a0: uint64, a1: uint64, a2: uint64,
+              a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int reboot(int magic, int magic2, int cmd, void *arg)
+    # a0=magic1, a1=magic2, a2=cmd, a3=arg. Validate the magics, gate
+    # on hostowner (uid 1), decode cmd to a POWER_* action, then funnel
+    # into the shared power_action core (which flushes filesystems and
+    # never returns on a power-taking command). Same core the native
+    # /dev/reboot cdev and the native do_syscall(SYS_REBOOT) arm use.
+    if a0 != LINUX_REBOOT_MAGIC1 or a1 != LINUX_REBOOT_MAGIC2:
+        set_current_errstr("reboot: bad magic")
+        return ELINUX_INVAL
+    if current_task_uid() != 1:
+        set_current_errstr("reboot: permission denied (not hostowner)")
+        return cast[int64](-1)
+    if a2 == LINUX_REBOOT_CMD_POWER_OFF:
+        power_action(POWER_POWEROFF)                         # never returns
+        return 0
+    if a2 == LINUX_REBOOT_CMD_RESTART:
+        power_action(POWER_REBOOT)                           # never returns
+        return 0
+    if a2 == LINUX_REBOOT_CMD_HALT:
+        power_action(POWER_HALT)                             # never returns
+        return 0
+    # Unmodelled cmd (CAD_ON/OFF, SW_SUSPEND, RESTART2, KEXEC) — accept
+    # the magics but no-op so a guest's startup reboot(CAD_OFF) succeeds.
     return 0
 
 
@@ -5211,6 +5251,8 @@ def linux_u_syscall_dispatch(nr: uint64,
         return _u_fsync(a0, a1, a2, a3, a4, a5)
     if nr == SYS_sync:
         return _u_sync(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_reboot:
+        return _u_reboot(a0, a1, a2, a3, a4, a5)
     if nr == SYS_truncate:
         return _u_truncate(a0, a1, a2, a3, a4, a5)
     if nr == SYS_ftruncate:

@@ -225,6 +225,16 @@ from sys.src.port9.port.devsrv import (
 # rtc_boot_epoch in cmos.ad so that base + TSC-delta = caller-supplied
 # Unix epoch from this instant forward.
 from drivers.rtc.cmos import rtc_boot_epoch_set_now
+# Power control: reboot(2)=169 funnels into the SAME kernel routine the
+# native /dev/reboot cdev uses. Importing power here also pulls power.ad
+# into the kernel compilation unit so namec.ad's extern reference to
+# power_action resolves at link time.
+from arch.x86.kernel.power import (
+    power_action, POWER_HALT, POWER_REBOOT, POWER_POWEROFF,
+    LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+    LINUX_REBOOT_CMD_RESTART, LINUX_REBOOT_CMD_HALT,
+    LINUX_REBOOT_CMD_POWER_OFF,
+)
 
 extern def do_execve_finish(new_rip: uint64, new_rsp: uint64,
                             argc: uint64, argv: uint64)
@@ -434,6 +444,13 @@ SYS_BIND_SOCK_RETIRED:   uint64 = 49            # retired — see /net (devnet.a
 SYS_LISTEN_SOCK_RETIRED: uint64 = 50            # retired — see /net (devnet.ad)
 SYS_INIT_MODULE:    uint64 = 175                # a0=image, a1=size, a2=params
 SYS_DELETE_MODULE:  uint64 = 176                # a0=name, a1=flags
+# reboot(2): the stock Linux x86_64 number, so a Linux guest binary's
+# reboot()/poweroff() lands here. a0=magic1, a1=magic2, a2=cmd, a3=arg.
+# Funnels into the same power_action core the native /dev/reboot cdev
+# uses. The magics and cmd constants are the real Linux values.
+SYS_REBOOT:         uint64 = 169                # a0=magic1, a1=magic2, a2=cmd, a3=arg
+# LINUX_REBOOT_* magics/cmds are imported from arch.x86.kernel.power
+# (the single source of truth, shared with the Linux-ABI _u_reboot).
 
 # M16.35: the previous user_rsp_save / kernel_rsp globals were
 # retired in favour of a per-task syscall stack. syscall_entry now
@@ -2396,6 +2413,34 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
             set_current_errstr("srv: dup failed")
             return cast[uint64](-1)
         return cast[uint64](new_fd)
+    if nr == SYS_REBOOT:
+        # reboot(2). a0=magic1, a1=magic2, a2=cmd, a3=arg. Validate the
+        # two magics (Linux rejects a bad magic with -EINVAL to guard
+        # against accidental calls), gate on hostowner (same threat
+        # model as SYS_SETUID / SYS_SET_REALTIME — only PID-1's uid-1
+        # supervisor should be able to power the box), decode the cmd to
+        # a POWER_* action, then funnel into the shared power_action
+        # core. On the power-taking commands power_action never returns.
+        if a0 != LINUX_REBOOT_MAGIC1 or a1 != LINUX_REBOOT_MAGIC2:
+            set_current_errstr("reboot: bad magic")
+            return cast[uint64](cast[int64](-22))            # -EINVAL
+        if current_task_uid() != 1:
+            set_current_errstr("reboot: permission denied (not hostowner)")
+            return cast[uint64](cast[int64](-1))
+        if a2 == LINUX_REBOOT_CMD_POWER_OFF:
+            power_action(POWER_POWEROFF)                     # never returns
+            return 0
+        if a2 == LINUX_REBOOT_CMD_RESTART:
+            power_action(POWER_REBOOT)                       # never returns
+            return 0
+        if a2 == LINUX_REBOOT_CMD_HALT:
+            power_action(POWER_HALT)                         # never returns
+            return 0
+        # Other Linux reboot cmds (CAD_ON/OFF, SW_SUSPEND, RESTART2,
+        # KEXEC) are not modelled — accept the magics but no-op so a
+        # guest's reboot(LINUX_REBOOT_CMD_CAD_OFF) startup call (glibc
+        # does this) succeeds instead of erroring.
+        return 0
     if nr == SYS_INIT_MODULE:
         # Linux-ABI .ko loader (L1). a0=Ptr[uint8] image, a1=size,
         # a2=Ptr[char] params (param string, NUL-terminated; can be
