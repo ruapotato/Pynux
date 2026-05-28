@@ -293,6 +293,7 @@ from fs.ext4 import (
     ext4_rename, ext4_fsync, ext4_truncate_inode, ext4_set_open_size,
     ext4_resolve_file, ext4_read_inode, ext4_inode_mtime,
     ext4_blob_save, ext4_blob_load, ext4_is_mounted,
+    ext4_mkdir_live,
     # docs/security.md Phase 5: ext4 inode owner/group/mode accessor.
     ext4_inode_owner_at,
 )
@@ -1641,6 +1642,8 @@ def vfs_mkdir(name: Ptr[char]) -> int32:
     #   9P-mounted prefix  →  namec_mkdir (Tcreate DMDIR, mkdir -p)
     #   /tmp/*             →  tmpfs_mkdir (creates a dir entry under
     #                         the parent)
+    #   /ext/*             →  ext4_mkdir_live (writes a real dir
+    #                         entry on the live ext4 mount)
     #   else               →  -EROFS
     # The 9P arm comes FIRST: a path under a distrofs (or any 9P SRV)
     # mount must mkdir on the server, not fall through to the local
@@ -1657,6 +1660,11 @@ def vfs_mkdir(name: Ptr[char]) -> int32:
     # -ENAMETOOLONG, propagated verbatim.
     if is_tmpfs_path(name) != 0:
         return tmpfs_mkdir(name)
+    # /ext/*: mkdir on the live ext4 mount. Strip the /ext prefix so
+    # ext4_mkdir_live sees a partition-relative path. ext4_mkdir_live
+    # returns 0 / -EEXIST / -ENOTDIR / -ENOENT / -EINVAL / -EROFS / -1.
+    if is_ext_path(name) != 0:
+        return ext4_mkdir_live(strip_ext_prefix(name))
     return EROFS
 
 

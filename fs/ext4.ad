@@ -3755,6 +3755,66 @@ def ext4_mkdir_at_slot(slot: int32, path: Ptr[char]) -> int32:
     return rc
 
 
+def ext4_mkdir_live(path: Ptr[char]) -> int32:
+    # Live mkdir against the currently-mounted ext4 slot. Unlike
+    # ext4_mkdir_at_slot (which is the installer-time helper and
+    # save/restore-wraps an ext4_init against an UN-mounted target),
+    # this is called from vfs_mkdir for a /ext/* path while the FS is
+    # already live. The save/restore dance would be wrong here: the
+    # singleton ext4 mount state we'd save IS the one we want to use.
+    #
+    # Semantics:
+    #   * `path` is partition-relative (caller already stripped /ext/).
+    #   * mkdir -p: missing intermediate components are created first
+    #     by _ext4_walk_path_mkdir_p; only the LEAF needs explicit
+    #     creation here.
+    #   * leaf-exists-and-is-dir -> -EEXIST.
+    #   * leaf-exists-and-is-file -> -ENOTDIR.
+    #   * empty / bare-root path -> -EINVAL.
+    # Returns 0 on success, -1/-EEXIST/-ENOTDIR/-EINVAL/-EROFS on
+    # failure (matches the negative-errno convention used by
+    # tmpfs_mkdir, what vfs_mkdir propagates verbatim).
+    if ext4_blockdev_slot < 0:
+        return -30                                          # -EROFS
+    if path[0] == 0:
+        return -22                                          # -EINVAL
+    leaf_off: uint64 = 0
+    leaf_len: uint64 = 0
+    parent_inum: uint32 = _ext4_walk_path_mkdir_p(
+        path, &leaf_off, &leaf_len)
+    if parent_inum == 0:
+        return -2                                           # -ENOENT
+    if leaf_len == 0 or leaf_len > 255:
+        return -22                                          # -EINVAL
+    # Copy leaf into the shared scratch, NUL-terminate.
+    i: uint64 = 0
+    while i < leaf_len:
+        ext4_walk_comp_buf[i] = cast[uint8](path[leaf_off + i] & 0xFF)
+        i = i + 1
+    ext4_walk_comp_buf[leaf_len] = 0
+    leaf_name: Ptr[char] = cast[Ptr[char]](&ext4_walk_comp_buf[0])
+
+    child_inum:  uint32 = 0
+    child_ftype: uint8  = 0
+    r: int32 = _ext4_dir_find_entry(
+        cast[uint64](parent_inum), leaf_name,
+        &child_inum, &child_ftype)
+    if r < 0:
+        return -1
+    if r != 0:
+        # Existing entry — must be a dir for idempotency; bare file
+        # collision is -ENOTDIR.
+        if child_ftype == 2:
+            return -17                                      # -EEXIST
+        return -20                                          # -ENOTDIR
+    new_inum: uint32 = _ext4_dir_create_child(
+        cast[uint64](parent_inum), leaf_name)
+    if new_inum == 0:
+        return -1
+    blk_flush(ext4_blockdev_slot)
+    return 0
+
+
 # --- ext4 offline resize-to-fit-disk (M16.x) ----------------------
 #
 # First-boot grow path: when an installed disk is larger than the
