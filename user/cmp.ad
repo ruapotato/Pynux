@@ -3,7 +3,11 @@
 # Hamnix `cmp A B`: byte-compares two files. Silent on match
 # (exit 0). On mismatch, prints "A B differ: byte N, line L" and
 # exits 1. Errors (missing file etc) exit 2 with diagnostic.
-# Bounded by 8 KiB per file (matches the M16.64 single-block cap).
+# Bounded by 8 KiB per file — userland slurps both files into
+# fixed buffers and compares in-memory. A larger file would need
+# a streaming-compare rewrite (read+compare BUF bytes at a time
+# from each fd); not done here. (The kernel write path is now
+# multi-block — that's a separate change.)
 
 extern def sys_open(path: Ptr[char]) -> int32
 extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
