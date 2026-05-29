@@ -327,10 +327,21 @@ sys_spawn:
     .size sys_spawn, .-sys_spawn
 
 
-    /* --- sys_waitpid(pid) -> int64 (child exit_code or -errno) ------ */
+    /* --- sys_waitpid(pid) -> int64 (child exit_code or -errno) ------
+     * Single-arg, BLOCKING wait. SYS_WAITPID reads a1 (%rsi) as a flags
+     * word whose bit 0 is WNOHANG. This wrapper takes ONE C argument
+     * (pid, in %edi), so %rsi is whatever the caller happened to leave
+     * there — it is NOT a syscall argument. We MUST zero it, or a stale
+     * %rsi with bit 0 set silently turns this blocking wait into a
+     * WNOHANG poll: the kernel returns -EAGAIN without reaping, the
+     * caller treats that as the child's status, and the EXITED child is
+     * never reaped — leaking a task slot per such call until the table
+     * fills and every further sys_spawn fails ("command not found").
+     * Zeroing %rsi pins the documented "a1=0 -> blocking" contract. */
     .globl sys_waitpid
     .type sys_waitpid, @function
 sys_waitpid:
+    xorl    %esi, %esi              /* a1 = flags = 0 (BLOCKING, no WNOHANG) */
     movq    $12, %rax               /* SYS_WAITPID */
     syscall
     ret
