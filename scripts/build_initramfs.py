@@ -771,44 +771,21 @@ def build_archive() -> bytes:
     # always goes to /init (unless overridden via INIT_ELF above).
     # Everything else is found by hamsh's PATH walker.
     #
-    # When HAMNIX_CPIO_LEAN is set, the cpio keeps ONLY the binaries
-    # the boot path needs before the rootfs partition mounts (init,
-    # hamsh, distrofs, and any binary the rc references early).
-    # Everything else is staged into the rootfs.img instead — see
-    # CPIO_USER_KEEP in scripts/build_rootfs_img.py for the symmetry.
-    CPIO_LEAN_USER_KEEP = {
-        "init.elf",
-        "hamsh.elf",
-        "distrofs.elf",
-        # Below: small binaries hamsh/rc spawns early — `motd` is
-        # spawned at top of rc.boot; `sshd` is a boot service; `ed`
-        # is the framework editor that should be available on the
-        # serial console even without rootfs mounted.
-        "motd.elf",
-        "sshd.elf",
-        "ed.elf",
-        "ifconfig.elf",
-        # Installer binaries — used by /etc/install.hamsh when the
-        # live ISO is running. The installer formats + copies onto
-        # a blank disk BEFORE any rootfs partition is mounted, so
-        # they must live in the cpio (not in rootfs.img). `cat` is
-        # used by the installer to probe /dev/blk/<dev>/size, so
-        # it also needs to be present in the lean cpio.
-        "cat.elf",
-        "dd_blk.elf",
-        "install_file_to_slot.elf",
-        "install_rootfs_from_manifest.elf",
-        "hamnix_partition.elf",
-        "mkfs_ext4.elf",
-        "mkfs_fat.elf",
-        # hpm itself — the installer drives `hpm install` against the
-        # /mnt/iso-packages/ mini-repo as the core of the new install
-        # flow (Debian-installer pattern).
-        "hpm.elf",
-    }
+    # The full native Adder toolset (~110 ELFs, ~2.2 MiB total) ALWAYS
+    # lives in the cpio, even on the lean ISO path. The cpio is baked
+    # into the kernel ELF and is the ONLY filesystem guaranteed
+    # readable on every boot medium (CD/ATAPI, USB, virtio, AHCI) —
+    # the ext4 rootfs partition is unreachable off a GNOME Boxes CD or
+    # a real-HW USB stick, so anything stripped to the partition simply
+    # disappears there ("no commands found"). At ~2.2 MiB the toolset
+    # is negligible against the 32 MB ESP budget (kernel ELF 26→28 MB).
+    # HAMNIX_CPIO_LEAN therefore strips ONLY the heavy distro closure
+    # (busybox runtime + the real Debian apt/dpkg slice, tens of MB);
+    # the native tools are never lean-stripped. This restores 70a6715
+    # ("keep native Adder userland tools in the lean cpio"), which
+    # 4c8c10b had wrongly undone.
     user_dir = here / "build" / "user"
     if user_dir.is_dir():
-        skipped_lean = 0
         for elf in sorted(user_dir.glob("*.elf")):
             if init_override_real is not None:
                 if elf.resolve() == init_override_real:
@@ -823,32 +800,10 @@ def build_archive() -> bytes:
                 print(f"  embedded /init ({len(data)} bytes from "
                       f"build/user/{elf.name})")
                 continue
-            # LEAN (ISO path): the ~110 native Adder tools are staged
-            # into the rootfs partition's sysroot/bin by
-            # scripts/build_rootfs_img.py, and the kernel binds
-            # `#sysroot` at `/` so /bin/<tool> resolves there. The cpio
-            # therefore keeps ONLY the binaries the boot path needs
-            # BEFORE the partition is bound (CPIO_LEAN_USER_KEEP:
-            # init/hamsh/distrofs, the early rc-spawned services, and
-            # the installer binaries that run against a blank disk). All
-            # others are dropped — that is the lean win that keeps the
-            # kernel ELF under the 32 MB ESP budget.
-            #
-            # NON-LEAN (`-kernel` developer tests): no rootfs partition
-            # is attached, so EVERY tool must stay in the cpio. The
-            # bootstrap rc's `bind '#sysroot' /` fails there and the
-            # try/except falls back to sourcing /etc/rc.boot.full from
-            # the cpio, which needs the full toolset present.
-            if cpio_lean and elf.name not in CPIO_LEAN_USER_KEEP:
-                skipped_lean += 1
-                continue
             bin_name = "/bin/" + elf.stem
             blob += cpio_entry(bin_name, data)
             print(f"  embedded {bin_name} ({len(data)} bytes from "
                   f"build/user/{elf.name})")
-        if cpio_lean and skipped_lean:
-            print(f"  [LEAN] skipped {skipped_lean} userland binaries "
-                  f"(served from rootfs.img sysroot/bin instead)")
 
     # HAMNIX_HAMSH_RC=<path>: when set, replace etc/hamsh.rc (or plant
     # one if absent) with the file at <path>. Used by tests that drive
