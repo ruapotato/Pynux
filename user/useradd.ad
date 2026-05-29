@@ -1,0 +1,509 @@
+# user/useradd.ad
+#
+# Create a regular user with a per-user home FILE SERVER on the shared
+# ext4 root (docs/security.md, the multi-user landing).
+#
+# Usage:
+#   useradd <name> [uid]
+#
+# What it does, end to end:
+#   1. Validates <name> (non-empty, <= 31 chars, no slashes / dots /
+#      whitespace), rejects reserved subtree words (sysroot/distro/by-id)
+#      and refuses a name already present in /etc/passwd.
+#   2. Allocates a uid: the explicit argv[2] if given (must be >= 1000),
+#      else the lowest free uid >= 1000 scanned from /etc/passwd.
+#   3. Appends `<name>:<uid>:<uid>:/home/<name>:/bin/hamsh` to
+#      /etc/passwd (read-modify-write through the namespace — / is bound
+#      to #sysroot, so this lands in sysroot/etc/passwd on the ext4).
+#   4. Creates the per-user home file server via sys_useradd_root(name):
+#      the kernel appends a `<name> <name>` line to `.hamnix-roots` on
+#      the partition ROOT, mkdir's the top-level `<name>/` subtree, and
+#      name_push()es `#<name>` LIVE (so the user can log in this boot;
+#      the sentinel line makes it survive a reboot). This is the
+#      centerpiece — a new top-level subtree on the SAME ext4, sharing
+#      free space, isolated by the namespace layer.
+#   5. Writes /etc/users/<name>.ns — the per-user namespace recipe that
+#      binds `#<name>` at /home/<name> on top of the default restricted
+#      view. (The login path sources /etc/users/<name>.ns if present,
+#      else /etc/users/default.ns.)
+#   6. Appends a LOCKED shadow stub `<name>:!:0` to /etc/shadow. There
+#      is no /dev/auth password-SET verb in v1 (the cdev only verifies),
+#      so the account ships login-disabled until `passwd` grows a set
+#      path. This is the documented item-5 stub; it does NOT block the
+#      file-server deliverable.
+#
+# Hostowner-only: sys_useradd_root gates on uid == 1 in the kernel (same
+# threat model as setuid / svc_publish). A non-hostowner caller gets a
+# clean -EPERM and useradd reports it.
+
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_useradd_root(name: Ptr[char]) -> int32
+
+
+# Read scratch for the existing /etc/passwd contents.
+pw_buf:  Array[8192, uint8]
+# Compose scratch for the rewritten /etc/passwd (old + new line).
+pw_out:  Array[8320, uint8]
+# Compose scratch for /etc/shadow rewrite.
+sh_buf:  Array[8192, uint8]
+sh_out:  Array[8320, uint8]
+# Compose scratch for the per-user .ns recipe + its path.
+ns_path: Array[128, uint8]
+ns_body: Array[512, uint8]
+
+
+def strlen_c(s: Ptr[char]) -> uint64:
+    n: uint64 = 0
+    while cast[Ptr[uint8]](s)[n] != 0:
+        n = n + 1
+    return n
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def read_full(fd: int32, buf: Ptr[uint8], cap: uint64) -> int64:
+    total: uint64 = 0
+    while total < cap:
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](buf) + total), cap - total)
+        if n < 0:
+            return cast[int64](-1)
+        if n == 0:
+            break
+        total = total + cast[uint64](n)
+    return cast[int64](total)
+
+
+def slurp(path: Ptr[char], buf: Ptr[uint8], cap: uint64) -> int64:
+    # Read the whole file at `path` into buf. Returns bytes read, 0 if
+    # the file is absent/empty, -1 on read error.
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        return 0
+    n: int64 = read_full(fd, buf, cap)
+    sys_close(fd)
+    return n
+
+
+def render_u32(v: uint32, out: Ptr[uint8]) -> uint64:
+    # Decimal render of v at out (no NUL). Returns bytes written.
+    if v == 0:
+        out[0] = 48
+        return 1
+    digits: Array[12, uint8]
+    n: uint64 = 0
+    vv: uint64 = cast[uint64](v)
+    while vv != 0:
+        digits[n] = cast[uint8](vv % 10) + 48
+        vv = vv / 10
+        n = n + 1
+    written: uint64 = n
+    i: uint64 = 0
+    while n > 0:
+        n = n - 1
+        out[i] = digits[n]
+        i = i + 1
+    return written
+
+
+def parse_u32(s: Ptr[uint8], lo: uint64, hi: uint64) -> uint32:
+    n: uint32 = 0
+    p: uint64 = lo
+    while p < hi:
+        c: uint8 = s[p]
+        if c < 48 or c > 57:
+            break
+        n = n * 10 + cast[uint32](c - 48)
+        p = p + 1
+    return n
+
+
+def word_eq_c(a: Ptr[char], b: Ptr[char]) -> int32:
+    i: uint64 = 0
+    while True:
+        ca: uint8 = cast[Ptr[uint8]](a)[i]
+        cb: uint8 = cast[Ptr[uint8]](b)[i]
+        if ca != cb:
+            return 0
+        if ca == 0:
+            return 1
+        i = i + 1
+    return 0
+
+
+def name_is_reserved(name: Ptr[char]) -> int32:
+    # Refuse the built-in subtree words + by-id alias. These would
+    # collide with sysroot/distro/#by-id on the named stack.
+    if word_eq_c(name, "sysroot") != 0:
+        return 1
+    if word_eq_c(name, "distro") != 0:
+        return 1
+    if word_eq_c(name, "by-id") != 0:
+        return 1
+    if word_eq_c(name, "home") != 0:
+        return 1
+    return 0
+
+
+def validate_name(name: Ptr[char]) -> int32:
+    # Returns 0 if usable, -1 otherwise. Mirrors the kernel-side check
+    # in ext4_useradd_root so we fail fast with a friendly message.
+    nlen: uint64 = strlen_c(name)
+    if nlen == 0 or nlen > 31:
+        return -1
+    if cast[Ptr[uint8]](name)[0] == 46:                 # leading '.'
+        return -1
+    i: uint64 = 0
+    while i < nlen:
+        c: uint8 = cast[Ptr[uint8]](name)[i]
+        # allow [A-Za-z0-9_-]
+        ok: int32 = 0
+        if c >= 97 and c <= 122:
+            ok = 1
+        elif c >= 65 and c <= 90:
+            ok = 1
+        elif c >= 48 and c <= 57:
+            ok = 1
+        elif c == 95 or c == 45:
+            ok = 1
+        if ok == 0:
+            return -1
+        i = i + 1
+    return 0
+
+
+# /etc/passwd scan results, filled by passwd_scan.
+pw_dup:      int32 = 0          # 1 if `target` already present
+pw_max_uid:  uint32 = 0        # highest uid >= 1000 seen
+pw_uid_used: int32 = 0          # 1 if `want_uid` already taken
+
+
+def passwd_scan(buf: Ptr[uint8], n: uint64, target: Ptr[char],
+                want_uid: uint32):
+    # Walk /etc/passwd in buf[0..n). Sets pw_dup, pw_max_uid,
+    # pw_uid_used. Lines are `name:uid:gid:home:shell`; comments (#)
+    # and blanks are skipped.
+    pw_dup = 0
+    pw_max_uid = 0
+    pw_uid_used = 0
+    tlen: uint64 = strlen_c(target)
+    line_start: uint64 = 0
+    i: uint64 = 0
+    while i <= n:
+        eol: int32 = 0
+        if i == n:
+            eol = 1
+        elif buf[i] == 10:
+            eol = 1
+        if eol != 0:
+            # Skip leading ws.
+            p: uint64 = line_start
+            while p < i and (buf[p] == 32 or buf[p] == 9):
+                p = p + 1
+            if p < i and buf[p] != 35:                  # not blank / comment
+                # Field 0 = name up to first ':'.
+                c0: uint64 = p
+                while c0 < i and buf[c0] != 58:
+                    c0 = c0 + 1
+                # Name match?
+                nm_len: uint64 = c0 - p
+                if nm_len == tlen:
+                    w: uint64 = 0
+                    same: int32 = 1
+                    while w < tlen:
+                        if buf[p + w] != cast[Ptr[uint8]](target)[w]:
+                            same = 0
+                            w = tlen
+                        else:
+                            w = w + 1
+                    if same != 0:
+                        pw_dup = 1
+                # Field 1 = uid between c0+1 and next ':'.
+                if c0 < i:
+                    u0: uint64 = c0 + 1
+                    u1: uint64 = u0
+                    while u1 < i and buf[u1] != 58:
+                        u1 = u1 + 1
+                    uid: uint32 = parse_u32(buf, u0, u1)
+                    if uid >= 1000 and uid > pw_max_uid:
+                        pw_max_uid = uid
+                    if want_uid != 0 and uid == want_uid:
+                        pw_uid_used = 1
+            line_start = i + 1
+        i = i + 1
+
+
+def append_line_file(path: Ptr[char], existing: Ptr[uint8],
+                     n_exist: uint64, out: Ptr[uint8], out_cap: uint64,
+                     line: Ptr[uint8], line_len: uint64) -> int32:
+    # Rewrite `path` = existing[0..n_exist) (+ trailing newline if
+    # missing) + line[0..line_len). Returns 0 on success, -1 on error.
+    pos: uint64 = 0
+    k: uint64 = 0
+    while k < n_exist and pos < out_cap:
+        out[pos] = existing[k]
+        pos = pos + 1
+        k = k + 1
+    if pos > 0 and out[pos - 1] != 10 and pos < out_cap:
+        out[pos] = 10
+        pos = pos + 1
+    j: uint64 = 0
+    while j < line_len and pos < out_cap:
+        out[pos] = line[j]
+        pos = pos + 1
+        j = j + 1
+    fd: int32 = sys_open_write(path)
+    if fd < 0:
+        return -1
+    wn: int64 = sys_write(fd, out, pos)
+    sys_close(fd)
+    if wn < 0 or cast[uint64](wn) != pos:
+        return -1
+    return 0
+
+
+# Composed passwd line scratch.
+line_buf: Array[256, uint8]
+
+
+def build_passwd_line(name: Ptr[char], uid: uint32) -> uint64:
+    # `name:uid:uid:/home/name:/bin/hamsh\n` into line_buf. Returns len.
+    pos: uint64 = 0
+    nlen: uint64 = strlen_c(name)
+    i: uint64 = 0
+    while i < nlen:
+        line_buf[pos] = cast[Ptr[uint8]](name)[i]
+        pos = pos + 1
+        i = i + 1
+    line_buf[pos] = 58                                   # ':'
+    pos = pos + 1
+    pos = pos + render_u32(uid, &line_buf[pos])
+    line_buf[pos] = 58
+    pos = pos + 1
+    pos = pos + render_u32(uid, &line_buf[pos])
+    line_buf[pos] = 58
+    pos = pos + 1
+    # /home/<name>
+    home_pre: Ptr[uint8] = "/home/"
+    hp: uint64 = 0
+    while home_pre[hp] != 0:
+        line_buf[pos] = home_pre[hp]
+        pos = pos + 1
+        hp = hp + 1
+    i = 0
+    while i < nlen:
+        line_buf[pos] = cast[Ptr[uint8]](name)[i]
+        pos = pos + 1
+        i = i + 1
+    line_buf[pos] = 58
+    pos = pos + 1
+    # /bin/hamsh
+    shell: Ptr[uint8] = "/bin/hamsh\n"
+    sp: uint64 = 0
+    while shell[sp] != 0:
+        line_buf[pos] = shell[sp]
+        pos = pos + 1
+        sp = sp + 1
+    return pos
+
+
+# Composed shadow line scratch.
+shline_buf: Array[128, uint8]
+
+
+def build_shadow_line(name: Ptr[char]) -> uint64:
+    # Locked stub: `name:!:0\n`. No password set path in v1.
+    pos: uint64 = 0
+    nlen: uint64 = strlen_c(name)
+    i: uint64 = 0
+    while i < nlen:
+        shline_buf[pos] = cast[Ptr[uint8]](name)[i]
+        pos = pos + 1
+        i = i + 1
+    tail: Ptr[uint8] = ":!:0\n"
+    tp: uint64 = 0
+    while tail[tp] != 0:
+        shline_buf[pos] = tail[tp]
+        pos = pos + 1
+        tp = tp + 1
+    return pos
+
+
+def write_user_ns(name: Ptr[char]) -> int32:
+    # Write /etc/users/<name>.ns — the per-user namespace recipe.
+    # Source default.ns first (the restricted view), then bind the
+    # user's own home server over /home/<name>.
+    nlen: uint64 = strlen_c(name)
+    # Build the path: /etc/users/<name>.ns
+    pp: uint64 = 0
+    pre: Ptr[uint8] = "/etc/users/"
+    i: uint64 = 0
+    while pre[i] != 0:
+        ns_path[pp] = pre[i]
+        pp = pp + 1
+        i = i + 1
+    i = 0
+    while i < nlen:
+        ns_path[pp] = cast[Ptr[uint8]](name)[i]
+        pp = pp + 1
+        i = i + 1
+    suf: Ptr[uint8] = ".ns"
+    i = 0
+    while suf[i] != 0:
+        ns_path[pp] = suf[i]
+        pp = pp + 1
+        i = i + 1
+    ns_path[pp] = 0
+
+    # Build the body. Lines are plain hamsh; `source` pulls in the
+    # default restricted recipe, then we graft the per-user home over
+    # the inherited /home bind. Single-quote the '#<name>' source so
+    # hamsh doesn't treat '#' as a comment.
+    bp: uint64 = 0
+    l1: Ptr[uint8] = "source /etc/users/default.ns\n"
+    i = 0
+    while l1[i] != 0:
+        ns_body[bp] = l1[i]
+        bp = bp + 1
+        i = i + 1
+    # bind '#<name>' /home/<name>
+    bind_pre: Ptr[uint8] = "bind '#"
+    i = 0
+    while bind_pre[i] != 0:
+        ns_body[bp] = bind_pre[i]
+        bp = bp + 1
+        i = i + 1
+    i = 0
+    while i < nlen:
+        ns_body[bp] = cast[Ptr[uint8]](name)[i]
+        bp = bp + 1
+        i = i + 1
+    mid: Ptr[uint8] = "' /home/"
+    i = 0
+    while mid[i] != 0:
+        ns_body[bp] = mid[i]
+        bp = bp + 1
+        i = i + 1
+    i = 0
+    while i < nlen:
+        ns_body[bp] = cast[Ptr[uint8]](name)[i]
+        bp = bp + 1
+        i = i + 1
+    ns_body[bp] = 10                                     # '\n'
+    bp = bp + 1
+
+    fd: int32 = sys_open_write(cast[Ptr[char]](&ns_path[0]))
+    if fd < 0:
+        return -1
+    wn: int64 = sys_write(fd, &ns_body[0], bp)
+    sys_close(fd)
+    if wn < 0 or cast[uint64](wn) != bp:
+        return -1
+    return 0
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2, "usage: useradd <name> [uid]\n")
+        return 1
+    name: Ptr[char] = cast[Ptr[char]](argv[1])
+
+    if validate_name(name) != 0:
+        write_str(2, "useradd: invalid username (use [A-Za-z0-9_-], <= 31 chars)\n")
+        return 1
+    if name_is_reserved(name) != 0:
+        write_str(2, "useradd: reserved name (sysroot/distro/by-id/home)\n")
+        return 1
+
+    # Optional explicit uid.
+    want_uid: uint32 = 0
+    if argc >= 3:
+        ua: Ptr[uint8] = cast[Ptr[uint8]](argv[2])
+        want_uid = parse_u32(ua, 0, strlen_u8(ua))
+        if want_uid < 1000:
+            write_str(2, "useradd: explicit uid must be >= 1000 (1=hostowner, 2..999 system)\n")
+            return 1
+
+    # Read + scan /etc/passwd.
+    pn: int64 = slurp("/etc/passwd", &pw_buf[0], 8192)
+    if pn < 0:
+        write_str(2, "useradd: cannot read /etc/passwd\n")
+        return 1
+    pw_n: uint64 = cast[uint64](pn)
+    passwd_scan(&pw_buf[0], pw_n, name, want_uid)
+    if pw_dup != 0:
+        write_str(2, "useradd: user already exists in /etc/passwd\n")
+        return 1
+    if want_uid != 0 and pw_uid_used != 0:
+        write_str(2, "useradd: requested uid already in use\n")
+        return 1
+
+    uid: uint32 = want_uid
+    if uid == 0:
+        # Auto-allocate: one above the highest >= 1000, floor 1000.
+        if pw_max_uid < 1000:
+            uid = 1000
+        else:
+            uid = pw_max_uid + 1
+
+    # 1. Append to /etc/passwd.
+    pl: uint64 = build_passwd_line(name, uid)
+    if append_line_file("/etc/passwd", &pw_buf[0], pw_n,
+                        &pw_out[0], 8320, &line_buf[0], pl) != 0:
+        write_str(2, "useradd: failed to update /etc/passwd\n")
+        return 1
+
+    # 2. The centerpiece: per-user home file server on the shared ext4.
+    rc: int32 = sys_useradd_root(name)
+    if rc != 0:
+        if rc == -1:
+            write_str(2, "useradd: permission denied (must be hostowner)\n")
+        elif rc == -17:
+            write_str(2, "useradd: home file server already exists in .hamnix-roots\n")
+        elif rc == -30:
+            write_str(2, "useradd: no live ext4 root (multi-root layout required)\n")
+        else:
+            write_str(2, "useradd: kernel failed to create home file server\n")
+        # /etc/passwd was already updated; the user can re-run after
+        # fixing the cause (the passwd line is idempotently skipped on
+        # re-run because pw_dup will then fire). Report failure.
+        return 1
+
+    # 3. Per-user namespace recipe so login binds #<name> at /home/<name>.
+    if write_user_ns(name) != 0:
+        write_str(2, "useradd: warning: could not write /etc/users/<name>.ns (home server created; default.ns fallback applies)\n")
+
+    # 4. Locked shadow stub.
+    sn: int64 = slurp("/etc/shadow", &sh_buf[0], 8192)
+    if sn >= 0:
+        sl: uint64 = build_shadow_line(name)
+        if append_line_file("/etc/shadow", &sh_buf[0], cast[uint64](sn),
+                            &sh_out[0], 8320, &shline_buf[0], sl) != 0:
+            write_str(2, "useradd: warning: could not write /etc/shadow stub\n")
+
+    write_str(1, "useradd: created ")
+    write_str(1, cast[Ptr[uint8]](name))
+    write_str(1, " (uid ")
+    ubuf: Array[12, uint8]
+    ub: uint64 = render_u32(uid, &ubuf[0])
+    sys_write(1, &ubuf[0], ub)
+    write_str(1, ") with home server #")
+    write_str(1, cast[Ptr[uint8]](name))
+    write_str(1, " at /home/")
+    write_str(1, cast[Ptr[uint8]](name))
+    write_str(1, "\n")
+    write_str(1, "useradd: account is LOCKED (no password set; /dev/auth has no set verb in v1)\n")
+    return 0

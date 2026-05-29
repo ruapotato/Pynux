@@ -961,6 +961,24 @@ sys_dfs_save:
     .size sys_dfs_save, .-sys_dfs_save
 
 
+    /* --- sys_useradd_root(name) -> int32 ----------------------------
+     * docs/security.md multi-user landing: create a per-user home FILE
+     * SERVER on the shared ext4 root. name = NUL-terminated username.
+     * The kernel appends a `<name> <name>` line to `.hamnix-roots`,
+     * mkdir's the top-level `<name>/` subtree, and name_push()es the
+     * `#<name>` root LIVE (so the user can log in this boot; the
+     * sentinel line makes it survive a reboot). Hostowner-only at the
+     * kernel side. Returns 0 on success or a negative errno
+     * (-EROFS/-EINVAL/-EEXIST/-ENOSPC/-EPERM). Number 295. */
+    .globl sys_useradd_root
+    .type sys_useradd_root, @function
+sys_useradd_root:
+    movq    $295, %rax              /* SYS_USERADD_ROOT */
+    syscall
+    ret
+    .size sys_useradd_root, .-sys_useradd_root
+
+
     /* --- syscall6(nr, a0, a1, a2, a3, a4, a5) -> int64 ---------------
      * Generic 6-arg syscall trampoline. SysV passes nr in %rdi, a0..a5
      * in %rsi/%rdx/%rcx/%r8/%r9/[stack]; the kernel syscall ABI wants

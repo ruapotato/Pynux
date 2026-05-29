@@ -3968,6 +3968,166 @@ def ext4_mkdir_live(path: Ptr[char]) -> int32:
     return 0
 
 
+# --- useradd home file-server provisioning ------------------------
+#
+# Adding a user to Hamnix means giving them their own top-level file
+# SERVER on the shared ext4 root (docs/security.md): a named subtree
+# `#<name>` that composes to `/ext/<name>/...` on disk and gets bound
+# at /home/<name> in the user's login namespace. This keeps each
+# home isolated by namespace while sharing the whole disk's free
+# space.
+#
+# The partition ROOT (inum 2) carries the `.hamnix-roots` sentinel
+# (one `<word> <relpath>` line per named subtree; the kernel's Phase 5
+# discovery name_push()es `#<word>` for each) plus the per-name
+# top-level subtree directories. The root is NOT addressable from a
+# userland namespace (`/` is bound to `#sysroot`), so a userland
+# binary CANNOT edit the sentinel or mkdir the top-level dir itself.
+# This kernel-side helper does both atomically, driven by the
+# SYS_USERADD_ROOT syscall (hostowner-gated in syscall.ad).
+
+ext4_useradd_sentinel_buf: Array[4096, uint8]
+ext4_useradd_new_buf:      Array[4160, uint8]
+
+
+def _ext4_useradd_name_already_in_sentinel(
+        name: Ptr[char], buf: Ptr[uint8], n: uint64) -> int32:
+    # Returns 1 if a line of the sentinel body begins with `<name> `
+    # (or `<name>` as the whole line), else 0. Line-oriented scan over
+    # the `<word> <relpath>` records.
+    nlen: uint64 = _ext4_strlen(name)
+    if nlen == 0:
+        return 0
+    i: uint64 = 0
+    while i < n:
+        # Start of a line at i. Match name bytes.
+        lmatch: int32 = 1
+        j: uint64 = 0
+        while j < nlen:
+            if i + j >= n:
+                lmatch = 0
+                break
+            if buf[i + j] != cast[uint8](name[j] & 0xFF):
+                lmatch = 0
+                break
+            j = j + 1
+        if lmatch == 1:
+            # Char after the matched name must be a separator or EOL.
+            after: uint64 = i + nlen
+            if after >= n:
+                return 1
+            c: uint8 = buf[after]
+            if c == 0x20 or c == 0x09 or c == 0x0A or c == 0x0D:
+                return 1
+        # Advance to the start of the next line.
+        while i < n and buf[i] != 0x0A:
+            i = i + 1
+        i = i + 1                                  # step over the '\n'
+    return 0
+
+
+def ext4_useradd_root(name: Ptr[char]) -> int32:
+    # Provision the per-user home file server on the live ext4 root:
+    #   1. validate `name` (<=31 chars, no '/'/whitespace, no leading
+    #      dot),
+    #   2. read `.hamnix-roots` from the partition root,
+    #   3. refuse if `<name>` already declared (-EEXIST),
+    #   4. rewrite `.hamnix-roots` = old body + `<name> <name>\n`,
+    #   5. mkdir the top-level `<name>/` subtree (EEXIST is OK),
+    #   6. flush the block device.
+    # Returns 0 on success, or a negative errno:
+    #   -30 (-EROFS)  no ext4 mounted / .hamnix-roots absent,
+    #   -22 (-EINVAL) bad name,
+    #   -17 (-EEXIST) name already a named root,
+    #   -28 (-ENOSPC) sentinel would exceed the scratch buffer / write
+    #                 short.
+    if ext4_blockdev_slot < 0:
+        return -30
+    if name == cast[Ptr[char]](0) or name[0] == 0:
+        return -22
+    nlen: uint64 = _ext4_strlen(name)
+    if nlen == 0 or nlen > 31:
+        return -22
+    if name[0] == 0x2E:                            # leading '.'
+        return -22
+    k: uint64 = 0
+    while k < nlen:
+        c: char = name[k]
+        if c == 0x2F or c == 0x20 or c == 0x09 or c == 0x0A or c == 0x0D:
+            return -22                             # '/', space, tab, CR/LF
+        k = k + 1
+    # Read the current sentinel body. Its absence means this disk was
+    # not staged as a multi-root image — refuse rather than silently
+    # create one.
+    body_n: uint64 = 0
+    if ext4_read_root_file(".hamnix-roots",
+                           &ext4_useradd_sentinel_buf[0],
+                           4096, &body_n) != 0:
+        return -30
+    if _ext4_useradd_name_already_in_sentinel(
+            name, &ext4_useradd_sentinel_buf[0], body_n) == 1:
+        return -17
+    # Build new content: old body, ensure a trailing newline, then the
+    # `<name> <name>\n` record. Bound everything to the 4160-byte
+    # scratch (4096 body + 64 for "<name> <name>\n" with name<=31).
+    out_n: uint64 = 0
+    i: uint64 = 0
+    while i < body_n:
+        if out_n >= 4160:
+            return -28
+        ext4_useradd_new_buf[out_n] = ext4_useradd_sentinel_buf[i]
+        out_n = out_n + 1
+        i = i + 1
+    # Guarantee a newline boundary before the appended record.
+    if out_n > 0 and ext4_useradd_new_buf[out_n - 1] != 0x0A:
+        if out_n >= 4160:
+            return -28
+        ext4_useradd_new_buf[out_n] = 0x0A
+        out_n = out_n + 1
+    # `<name>` again `<name>` `\n`.
+    j: uint64 = 0
+    while j < nlen:
+        if out_n >= 4160:
+            return -28
+        ext4_useradd_new_buf[out_n] = cast[uint8](name[j] & 0xFF)
+        out_n = out_n + 1
+        j = j + 1
+    if out_n >= 4160:
+        return -28
+    ext4_useradd_new_buf[out_n] = 0x20             # ' '
+    out_n = out_n + 1
+    j = 0
+    while j < nlen:
+        if out_n >= 4160:
+            return -28
+        ext4_useradd_new_buf[out_n] = cast[uint8](name[j] & 0xFF)
+        out_n = out_n + 1
+        j = j + 1
+    if out_n >= 4160:
+        return -28
+    ext4_useradd_new_buf[out_n] = 0x0A             # '\n'
+    out_n = out_n + 1
+    # Rewrite .hamnix-roots in place (O_CREAT|O_TRUNC).
+    slot: int32 = ext4_open_create_or_trunc(".hamnix-roots")
+    if slot < 0:
+        return -30
+    w: int64 = ext4_write_open_file(
+        slot, &ext4_useradd_new_buf[0], 0, out_n)
+    ext4_close(slot)
+    if w < 0 or cast[uint64](w) != out_n:
+        return -28
+    # Create the top-level subtree dir. EEXIST is fine (the dir may
+    # have been staged already); any other negative is a hard error
+    # EXCEPT we still consider the sentinel written.
+    mk: int32 = ext4_mkdir_live(name)
+    if mk != 0 and mk != -17:
+        # Sentinel is updated but the dir create failed; surface it.
+        blk_flush(ext4_blockdev_slot)
+        return mk
+    blk_flush(ext4_blockdev_slot)
+    return 0
+
+
 # --- ext4 offline resize-to-fit-disk (M16.x) ----------------------
 #
 # First-boot grow path: when an installed disk is larger than the

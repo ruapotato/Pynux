@@ -133,6 +133,7 @@ build_adder_user lsmod                # M16.87: stub module table
 build_adder_user dmesg                # M16.87: placeholder until kernel ring buf
 build_adder_user su                   # M16.87: stub (single-user)
 build_adder_user passwd               # M16.87: stub (no shadow file)
+build_adder_user useradd              # per-user home FILE SERVER on the shared ext4 root (docs/security.md)
 build_adder_user login                # M16.87: stub auth hint
 build_adder_user getty                # M16.87: announces + exec /bin/hamsh
 # distrorun RETIRED: the distro-shape namespace is no longer a bespoke
