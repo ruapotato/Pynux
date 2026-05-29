@@ -615,6 +615,27 @@ def ahci_ko_marker_found() -> int32:
     return 1
 
 
+def libata_ko_marker_found() -> int32:
+    # Returns 1 if /etc/libata-ko is in the cpio archive (planted by
+    # scripts/build_initramfs.py when ENABLE_LIBATA_KO=1). Used by
+    # init/main.ad to gate the libata.ko harvest exercise: an explicit,
+    # ordered kmod_linux_load of scsi_common.ko -> scsi_mod.ko ->
+    # libata.ko. scsi_mod must load FIRST so its __ksymtab is in the
+    # cross-module registry; libata.ko's ~23 scsi_* / sdev_* UND symbols
+    # then resolve cross-module (visible as `[ksymtab_hit] libata ->
+    # scsi_mod: <symbol>`) rather than landing in the unresolved-external
+    # panic path. This is a LOAD-ONLY exercise (no block I/O): the bar is
+    # "links + init returns 0", proving the L-shim + loader absorb the
+    # generic Linux ATA/SCSI layer. scripts/test_libata_ko.sh owns it.
+    cpio_init()
+    target: Ptr[uint8] = "/etc/libata-ko"
+    target_len: uint64 = 14                          # strlen("/etc/libata-ko")
+    idx: int64 = _find_initramfs_entry(target, target_len)
+    if idx < 0:
+        return 0
+    return 1
+
+
 def nvme_io_ko_marker_found() -> int32:
     # Returns 1 if /etc/nvme-io-ko is in the cpio archive (planted by
     # scripts/build_initramfs.py when ENABLE_NVME_IO_TEST=1). Used by

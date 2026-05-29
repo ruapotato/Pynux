@@ -126,6 +126,7 @@ from kernel.modprobe import (
     auto_modules_marker_found,
     framework_modules_marker_found,
     ahci_ko_marker_found,
+    libata_ko_marker_found,
     nvme_io_ko_marker_found,
     xhci_ko_marker_found,
 )
@@ -4302,6 +4303,59 @@ def start_kernel():
         else:
             printk1("[boot:35.D] modules_dep_load_with_deps OK (rc=%d)\n",
                     cast[uint64](md_rc))
+
+    # libata.ko harvest exercise. When /etc/libata-ko is present
+    # (scripts/test_libata_ko.sh sets ENABLE_LIBATA_KO=1) we close the
+    # half-finished libata.ko harvest: load the generic Linux ATA/SCSI
+    # layer through the L-shim loader and confirm it links + inits.
+    #
+    # libata.ko's modinfo carries NO `depends:` line in this Debian
+    # build, so the modules.dep walker can't auto-pull its real
+    # dependency (scsi_mod). We therefore drive an EXPLICIT, ORDERED
+    # load: scsi_common.ko -> scsi_mod.ko -> libata.ko. scsi_mod MUST
+    # load first so its 152-entry __ksymtab is registered in the loader's
+    # cross-module registry; only then do libata.ko's ~23 scsi_* /
+    # sdev_* UND symbols resolve cross-module (visible as
+    # `[ksymtab_hit] libata -> scsi_mod: <symbol>`) instead of hitting
+    # the unresolved-external panic path. This is a LOAD-ONLY harvest —
+    # the bar is "relocations skipped=0 + init returned 0", proving the
+    # loader + linux_abi shims absorb the generic ATA/SCSI subsystem.
+    if libata_ko_marker_found() == 1:
+        printk0("[boot:35.LAT] libata.ko harvest: scsi_common -> scsi_mod -> libata\n")
+        # 1. scsi_common.ko — tiny SCSI sense/command helper library.
+        lat_sc_blob: uint64 = initramfs_data_ptr("/lib/modules/scsi_common.ko")
+        lat_sc_size: uint64 = initramfs_data_size("/lib/modules/scsi_common.ko")
+        if lat_sc_blob != 0:
+            lat_sc_rc: int32 = kmod_linux_load(
+                cast[Ptr[uint8]](lat_sc_blob), lat_sc_size)
+            printk1("[boot:35.LAT] scsi_common.ko load rc=%d\n",
+                    cast[uint64](lat_sc_rc))
+        else:
+            printk0("[boot:35.LAT] scsi_common.ko NOT FOUND in initramfs\n")
+        # 2. scsi_mod.ko — the SCSI mid-layer. Registers the EXPORT_SYMBOL
+        #    surface libata depends on.
+        lat_sm_blob: uint64 = initramfs_data_ptr("/lib/modules/scsi_mod.ko")
+        lat_sm_size: uint64 = initramfs_data_size("/lib/modules/scsi_mod.ko")
+        if lat_sm_blob != 0:
+            lat_sm_rc: int32 = kmod_linux_load(
+                cast[Ptr[uint8]](lat_sm_blob), lat_sm_size)
+            printk1("[boot:35.LAT] scsi_mod.ko load rc=%d\n",
+                    cast[uint64](lat_sm_rc))
+        else:
+            printk0("[boot:35.LAT] scsi_mod.ko NOT FOUND in initramfs\n")
+        # 3. libata.ko — the harvest target. Its scsi_* UND now resolve
+        #    cross-module against scsi_mod's freshly-registered ksymtab.
+        lat_la_blob: uint64 = initramfs_data_ptr("/lib/modules/libata.ko")
+        lat_la_size: uint64 = initramfs_data_size("/lib/modules/libata.ko")
+        if lat_la_blob != 0:
+            lat_la_rc: int32 = kmod_linux_load(
+                cast[Ptr[uint8]](lat_la_blob), lat_la_size)
+            printk1("[boot:35.LAT] libata.ko load rc=%d\n",
+                    cast[uint64](lat_la_rc))
+            if lat_la_rc >= 0:
+                printk0("[boot:35.LAT] libata.ko harvest OK\n")
+        else:
+            printk0("[boot:35.LAT] libata.ko NOT FOUND in initramfs\n")
 
     # Storage L-shim exercise path. When /etc/ahci-ko is present
     # (scripts/test_ahci_io.sh sets ENABLE_AHCI_KO=1), the hand-rolled

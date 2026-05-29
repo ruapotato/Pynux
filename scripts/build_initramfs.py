@@ -297,6 +297,16 @@ if os.environ.get("ENABLE_XHCI_FORCE_INIT") == "1":
 if os.environ.get("ENABLE_AHCI_KO") == "1":
     FILES.append(("/etc/ahci-ko", b"1\n"))
 
+# libata.ko harvest (generic Linux ATA/SCSI layer). scripts/test_libata_ko.sh
+# sets ENABLE_LIBATA_KO=1 to plant /etc/libata-ko. The kernel-side
+# boot:35.LAT path (init/main.ad) gates on this marker and drives an
+# explicit ordered load scsi_common -> scsi_mod -> libata so libata's
+# scsi_* / sdev_* UND symbols resolve cross-module against scsi_mod's
+# ksymtab. Load-only exercise: confirms the loader + linux_abi shims
+# absorb the generic ATA/SCSI subsystem (links + init returns 0).
+if os.environ.get("ENABLE_LIBATA_KO") == "1":
+    FILES.append(("/etc/libata-ko", b"1\n"))
+
 # Storage pivot (Agent D): nvme.ko (PCIe NVM Express SSD driver —
 # every modern NVMe device).
 # scripts/test_nvme_ko.sh sets ENABLE_NVME_KO=1 to plant /etc/nvme-ko.
