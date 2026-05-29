@@ -72,6 +72,12 @@ from arch.x86.kernel.e820 import (
 from fs.vfs import (
     vfs_init, vfs_open, vfs_read, vfs_write, vfs_close,
     initramfs_data_ptr, initramfs_data_size,
+    # Namespace-aware blob resolution: reads a path off whatever
+    # backend the calling namespace routes it to (cpio entry OR a
+    # kmalloc'd copy of an ext4 partition file reached via a
+    # `#sysroot` named-root bind). This is how the kernel ELF-loads
+    # /init off the ext4 root with NO cpio in the final state.
+    ns_blob_ptr, ns_blob_size,
 )
 # V1: in-kernel 9P client smoke test. Spawns two kernel-side pipe
 # slots, drives a synthetic responder that serves a one-file FS,
@@ -92,6 +98,13 @@ from sys.src.port9.port.chan import (
     # and the by-id alias table from sentinel files / synthesised
     # partuuids. docs/rootfs_partition.md "Future direction".
     name_push, byid_register,
+    # M16.img: install the boot-time `bind '#sysroot' /` into the root
+    # Pgrp from the kernel, so the very first exec (/init, then
+    # /bin/hamsh + /etc/rc.boot) resolves off the ext4 sysroot subtree
+    # with NO cpio. mnttab_bind operates on the calling task's Pgrp;
+    # at this point in start_kernel the boot task's pgrp is 0, which
+    # _ensure_root resolves to the (just-chan_init'd) root Pgrp.
+    mnttab_bind,
 )
 from fs.elf import (
     elf_load_blob, elf_last_img_lo_get, elf_last_img_hi_get,
@@ -504,6 +517,13 @@ HAMNIX_ROOTS_BAD:       int32 = -1    # parse error
 # Counts the anonymous (sentinel-less) partitions discovered, so each
 # gets a unique `#part<N>` name.
 fs_anon_index: uint32 = 0
+
+# Slot of the ext4 rootfs partition mount_rootfs_partition() last
+# mounted (>= 0), or -1 if no ext4 partition was found this boot. Set
+# in start_kernel; read by the kernel-side `bind '#sysroot' /` and the
+# ext4-root /init loader so a cpio-less installed disk boots its real
+# userland off the partition.
+g_rootfs_slot: int32 = -1
 
 
 def _is_word_ch(c: uint8, first: int32) -> int32:
@@ -3470,7 +3490,7 @@ def start_kernel():
     # box with no ext4 partition (e.g. tests booting with no rootfs.img
     # attached) sees the [rootfs] no ext4 partition found line and
     # continues with init namespace = cpio only.
-    mount_rootfs_partition()
+    g_rootfs_slot = mount_rootfs_partition()
     # M16.x (installer): first-boot resize hook. If we booted from an
     # installed disk (not the ISO) AND the ext4 rootfs partition has
     # more capacity than the FS's recorded block count, log a warning
@@ -4148,6 +4168,47 @@ def start_kernel():
     printk0("[boot:31] chan_init\n")
     chan_init()
 
+    # M16.img: graft the ext4 `sysroot` subtree onto the root lookup
+    # name FROM THE KERNEL, so the boot init task's FIRST exec resolves
+    # off the partition with no cpio dependency.
+    #
+    # mount_rootfs_partition() (above, boot:~) parsed `.hamnix-roots`
+    # and name_push()ed `#sysroot -> sysroot/`. mnttab_bind freezes
+    # `#sysroot` to a stable `#by-id/<partuuid>/sysroot` alias at bind
+    # time, so a later `/init` / `/bin/hamsh` / `/etc/rc.boot` lookup
+    # rewrites to `/ext/sysroot/<rest>` and lands on ext4 via
+    # _open_ext4_read. We run it AFTER chan_init (root Pgrp exists) and
+    # BEFORE the /init ELF load below. The boot task's pgrp is 0, which
+    # _ensure_root resolves to this same root Pgrp, so the bind is
+    # inherited by /init and every child it spawns.
+    #
+    # On a box with no ext4 partition (the `-kernel` developer test
+    # path), g_rootfs_slot == -1 and `#sysroot` was never registered;
+    # mnttab_bind would return -1 (dangling named source rejected), so
+    # we skip the bind entirely and the cpio fallback in the /init
+    # loader keeps that path bootable.
+    if g_rootfs_slot >= 0:
+        sysroot_src: Array[10, uint8]
+        sysroot_src[0] = 35                        # '#'
+        sysroot_src[1] = 115                       # 's'
+        sysroot_src[2] = 121                       # 'y'
+        sysroot_src[3] = 115                       # 's'
+        sysroot_src[4] = 114                       # 'r'
+        sysroot_src[5] = 111                       # 'o'
+        sysroot_src[6] = 111                       # 'o'
+        sysroot_src[7] = 116                       # 't'
+        sysroot_src[8] = 0
+        root_dst: Array[2, uint8]
+        root_dst[0] = 47                           # '/'
+        root_dst[1] = 0
+        # mnttab_bind(new=DST, old=SRC): the named source is `old`.
+        bind_rc: int32 = mnttab_bind(&root_dst[0], &sysroot_src[0], 0)
+        if bind_rc == 0:
+            printk0("[rootfs] kernel bind '#sysroot' / OK (ext4 root active)\n")
+        else:
+            printk1("[rootfs] kernel bind '#sysroot' / FAILED rc=%d (cpio fallback)\n",
+                    cast[uint64](cast[int64](bind_rc)))
+
     # V1 9P self-test: drive a kernel-side responder over two pipe
     # slots, run mount + walk + open + read end-to-end. Output:
     # `[p9smoke] PASS` on success, `[p9smoke] FAIL: <what>` otherwise.
@@ -4553,10 +4614,19 @@ def start_kernel():
     # at build time by scripts/build_initramfs.py); fs/elf.ad walks
     # its PT_LOAD segments and returns the live entry address.
     printk0("[boot:36] /init ELF lookup + load\n")
-    init_blob: uint64 = initramfs_data_ptr("/init")
-    init_size: uint64 = initramfs_data_size("/init")
+    # M16.img: resolve /init through the boot namespace. With the
+    # kernel `bind '#sysroot' /` above in place, ns_blob_ptr("/init")
+    # rewrites to `#by-id/<partuuid>/sysroot/init` and slurps the ELF
+    # off ext4 into a kmalloc'd buffer — the cpio-less installed-disk
+    # path. ns_blob_ptr ALSO returns the cpio entry directly when the
+    # name resolves there (the `-kernel` developer fallback with no
+    # ext4 partition), so this single call covers both worlds. The
+    # cache inside ns_blob_load keeps the paired _ptr/_size lookups to
+    # one read.
+    init_blob: uint64 = ns_blob_ptr("/init")
+    init_size: uint64 = ns_blob_size("/init")
     if init_blob == 0:
-        printk0("Hamnix: /init not in initramfs; falling back to baked entry\n")
+        printk0("Hamnix: /init not in namespace; falling back to baked entry\n")
         init_entry: uint64 = cast[uint64](&user_demo_entry)
     else:
         printk2("Hamnix: ELF-loading /init (%d bytes from %p)\n",

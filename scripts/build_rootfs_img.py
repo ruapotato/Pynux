@@ -242,13 +242,17 @@ SYSROOT_BIN_SKIP = {
     "init.elf",
 }
 
-# etc/ files that are CPIO-bootstrap-only and must NOT be staged onto
-# the partition's sysroot/etc. rc.boot is the tiny cpio bootstrap; the
-# partition carries rc.boot.full (the real rc) instead, and the
-# bootstrap `source`s it after binding #sysroot at /.
-SYSROOT_ETC_SKIP = {
-    "rc.boot",
-}
+# etc/ files that must NOT be staged onto the partition's sysroot/etc.
+#
+# rc.boot IS staged on the partition now (cpio-less installed disk):
+# the kernel ELF-loads sysroot/init off ext4, which execs `/bin/hamsh
+# /etc/rc.boot`, and with the kernel's `bind '#sysroot' /` already
+# applied that resolves to sysroot/etc/rc.boot on the partition. The
+# bootstrap rc applies the device binds (#s,#p,#/), re-asserts the
+# sysroot bind (harmless / idempotent — the kernel already did it),
+# and `source`s rc.boot.full. Nothing here is skipped today; the set
+# is kept for future cpio-only files.
+SYSROOT_ETC_SKIP: set[str] = set()
 
 
 def _stage_adder_tools(sysroot: Path) -> tuple[int, int]:
@@ -279,6 +283,31 @@ def _stage_adder_tools(sysroot: Path) -> tuple[int, int]:
         n_files += 1
         n_bytes += len(data)
     return n_files, n_bytes
+
+
+def _stage_init_shim(sysroot: Path) -> bool:
+    """Stage build/user/init.elf as sysroot/init (the boot entrypoint).
+
+    The kernel ELF-loads `/init` at boot. On a cpio-less installed
+    disk the kernel binds `#sysroot` at `/` first, so `/init` resolves
+    to this `sysroot/init` file on the ext4 partition (NOT the bin/
+    tools — init is the first-task entrypoint, exec'd by the kernel,
+    never PATH-resolved). The shim then execs `/bin/hamsh
+    /etc/rc.boot`, both of which resolve off sysroot/ through the same
+    bind. Returns True if staged.
+    """
+    init_src = HERE / "build" / "user" / "init.elf"
+    if not init_src.is_file():
+        print(f"[build_rootfs_img] WARN: {init_src.relative_to(HERE)} "
+              f"absent — sysroot/init missing (run build_user.sh); "
+              f"a cpio-less disk will not boot", flush=True)
+        return False
+    dst = sysroot / "init"
+    dst.write_bytes(init_src.read_bytes())
+    dst.chmod(0o755)
+    print(f"[build_rootfs_img] staged init shim "
+          f"({dst.stat().st_size} bytes) at sysroot/init", flush=True)
+    return True
 
 
 def _stage_sysroot_etc(sysroot: Path) -> int:
@@ -379,6 +408,7 @@ def _stage_directory(staging: Path):
     tn, tb = _stage_adder_tools(sysroot)
     print(f"[build_rootfs_img] staged {tn} Adder tools "
           f"({tb/(1<<20):.1f} MiB) into sysroot/bin/", flush=True)
+    _stage_init_shim(sysroot)
     en = _stage_sysroot_etc(sysroot)
     print(f"[build_rootfs_img] staged {en} sysroot/etc files "
           f"(incl. rc.boot.full)", flush=True)

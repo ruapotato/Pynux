@@ -451,6 +451,21 @@ def _ns_blob_partition_load(resolved: Ptr[char]) -> uint64:
     # and read the whole file into a kmalloc'd buffer. Returns the
     # buffer pointer (size left in _ns_blob_load_last_size) or 0 on
     # failure. Caller owns caching/freeing.
+    #
+    # FD-LESS FAST PATH (M16.img boot keystone): a `#by-id/.../ext4`
+    # path is read directly via ext4_resolve_file + ext4_read_file with
+    # NO fd. This is REQUIRED for the kernel's boot:36 /init load, which
+    # runs in the boot/idle task context BEFORE the first user task
+    # exists — that task has no usable fd table, so vfs_open would
+    # return -EMFILE. Userspace callers (with real fd tables) still get
+    # the same result through this path; the vfs_open fallback below
+    # covers non-ext4 backends (tmpfs/cpio/srv).
+    blob: uint64 = 0
+    bsize: uint64 = 0
+    by_id_rc: int32 = _ns_ext4_slurp_by_id(resolved, &blob, &bsize)
+    if by_id_rc == 1:
+        _ns_blob_load_last_size = bsize
+        return blob
     fd: int32 = vfs_open(resolved)
     if fd < 0:
         return 0
@@ -1411,6 +1426,52 @@ def _open_hash_by_id(name: Ptr[char], partuuid_start: uint64) -> int32:
     return _open_named_subpath(&dir_buf[0], name, i)
 
 
+def _compose_ext_path(dir_prefix: Ptr[uint8], name: Ptr[char],
+                      rest_start: uint64, out: Ptr[uint8],
+                      cap: uint64) -> int32:
+    # Compose a synthetic `/ext/<dir_prefix>/<rest>` path into `out`.
+    # Returns the length written (excluding NUL), or -1 on overflow.
+    # Factored out of _open_named_subpath so both the fd-backed open
+    # and the fd-less blob slurp share one canonical composition.
+    p: uint64 = 0
+    # Plant "/ext".
+    out[0] = 47                                  # '/'
+    out[1] = 101                                 # 'e'
+    out[2] = 120                                 # 'x'
+    out[3] = 116                                 # 't'
+    p = 4
+    # Append "/<dir_prefix>" if non-empty AND not "." (which means
+    # whole-partition per the sentinel convention).
+    if dir_prefix[0] != 0 and dir_prefix[0] != 46:
+        out[p] = 47                              # '/'
+        p = p + 1
+        k: uint64 = 0
+        while dir_prefix[k] != 0 and p + 1 < cap:
+            out[p] = dir_prefix[k]
+            p = p + 1
+            k = k + 1
+        # Strip a trailing '/' the sentinel may include (`home/`).
+        if out[p - 1] == 47:
+            p = p - 1
+    # Append the remainder of name (after the `#word` segment).
+    if name[rest_start] == 47:
+        # The remainder already has a leading '/'.
+        pass
+    elif name[rest_start] != 0:
+        # Insert a '/' between dir_prefix and the remainder.
+        out[p] = 47
+        p = p + 1
+    j: uint64 = rest_start
+    while name[j] != 0 and p + 1 < cap:
+        out[p] = cast[uint8](name[j])
+        p = p + 1
+        j = j + 1
+    if p + 1 >= cap:
+        return -1
+    out[p] = 0
+    return cast[int32](p)
+
+
 def _open_named_subpath(dir_prefix: Ptr[uint8], name: Ptr[char],
                         rest_start: uint64) -> int32:
     # Compose a synthetic `/ext/<dir_prefix>/<rest>` path and call
@@ -1419,46 +1480,92 @@ def _open_named_subpath(dir_prefix: Ptr[uint8], name: Ptr[char],
     # path resolution already lands on the right partition. Multi-
     # mount support is a future refactor.
     scratch: Array[512, uint8]
-    p: uint64 = 0
-    # Plant "/ext".
-    scratch[0] = 47                              # '/'
-    scratch[1] = 101                             # 'e'
-    scratch[2] = 120                             # 'x'
-    scratch[3] = 116                             # 't'
-    p = 4
-    # Append "/<dir_prefix>" if non-empty AND not "." (which means
-    # whole-partition per the sentinel convention).
-    if dir_prefix[0] != 0 and dir_prefix[0] != 46:
-        scratch[p] = 47                          # '/'
-        p = p + 1
-        k: uint64 = 0
-        while dir_prefix[k] != 0 and p + 1 < 512:
-            scratch[p] = dir_prefix[k]
-            p = p + 1
-            k = k + 1
-        # Strip a trailing '/' the sentinel may include (`home/`).
-        if scratch[p - 1] == 47:
-            p = p - 1
-    # Append the remainder of name (after the `#word` segment).
-    if name[rest_start] == 47:
-        # The remainder already has a leading '/'.
-        pass
-    elif name[rest_start] != 0:
-        # Insert a '/' between dir_prefix and the remainder.
-        scratch[p] = 47
-        p = p + 1
-    j: uint64 = rest_start
-    while name[j] != 0 and p + 1 < 512:
-        scratch[p] = cast[uint8](name[j])
-        p = p + 1
-        j = j + 1
-    scratch[p] = 0
+    if _compose_ext_path(dir_prefix, name, rest_start,
+                         &scratch[0], 512) < 0:
+        return ENOENT
     # For p == 4 (just "/ext" with no remainder, no dir), this is
     # the partition root. is_ext_path / _open_ext4_read handle the
     # bare "/ext" case via _open_dir_ext (not done here; we route
     # to the normal _open_ext4_read which will return ENOENT for
     # a bare directory in the current code path). Best-effort.
     return _open_ext4_read(cast[Ptr[char]](&scratch[0]))
+
+
+def _ns_ext4_slurp_by_id(name: Ptr[char], buf_out: Ptr[uint64],
+                         size_out: Ptr[uint64]) -> int32:
+    # FD-LESS read of an ext4-backed `#by-id/<partuuid>/<dir>/<rest>`
+    # path into a freshly kmalloc'd buffer. Returns 1 on success
+    # (buf_out / size_out filled, caller owns the buffer), 0 if `name`
+    # is not a resolvable `#by-id` ext4 path, -1 on a read/alloc error.
+    #
+    # WHY THIS EXISTS (the M16.img boot keystone): the kernel ELF-loads
+    # /init at boot:36 — BEFORE the first user task is created (boot:38).
+    # The boot/idle task has no usable fd table, so vfs_open() of the
+    # resolved `#by-id/.../sysroot/init` path returns -EMFILE. ext4's
+    # ext4_resolve_file + ext4_read_file need no fd, so we read the
+    # partition file directly here. This is what lets a cpio-less
+    # installed disk boot its real /init off ext4.
+    if name[0] != cast[uint8]('#'):
+        return 0
+    word_buf: Array[40, uint8]
+    pos: int32 = 0
+    word_end: uint64 = 0
+    if _hash_word_extract(name, &word_buf[0], 40, &pos, &word_end) < 0:
+        return 0
+    if _hash_is_by_id(&word_buf[0]) == 0:
+        return 0
+    if name[word_end] != 47:                     # need '/' before partuuid
+        return 0
+    partuuid_start: uint64 = word_end + 1
+    # Parse the partuuid up to the next '/'.
+    pu_buf: Array[40, uint8]
+    i: uint64 = partuuid_start
+    o: uint64 = 0
+    while name[i] != 0 and name[i] != 47 and o + 1 < 40:
+        pu_buf[o] = cast[uint8](name[i])
+        o = o + 1
+        i = i + 1
+    pu_buf[o] = 0
+    if o == 0:
+        return 0
+    if byid_lookup(&pu_buf[0]) == 0:
+        return 0
+    # Honor the by-id entry's stored sentinel relpath (same as
+    # _open_hash_by_id). A frozen `bind '#sysroot' /` baked the dir
+    # into the path, so the remainder from `i` already carries
+    # `/sysroot/<rest>` and dir_prefix is empty; for a bare reference
+    # the stored dir is applied.
+    dir_buf: Array[256, uint8]
+    dir_buf[0] = 0
+    byid_lookup_dir(&pu_buf[0], &dir_buf[0], 256)
+    scratch: Array[512, uint8]
+    if _compose_ext_path(&dir_buf[0], name, i, &scratch[0], 512) < 0:
+        return -1
+    # scratch is now `/ext/<dir>/<rest>`; strip the `/ext/` prefix so
+    # ext4_resolve_file walks relative to the partition root.
+    rel: Ptr[char] = strip_ext_prefix(cast[Ptr[char]](&scratch[0]))
+    inum: uint32 = 0
+    fsize: uint64 = 0
+    if ext4_resolve_file(rel, &inum, &fsize) == 0:
+        return -1
+    if fsize == 0 or fsize > _NS_BLOB_MAX:
+        return -1
+    buf: uint64 = kmalloc(fsize)
+    if buf == 0:
+        return -1
+    total: uint64 = 0
+    while total < fsize:
+        n: int64 = ext4_read_file(inum, total, fsize - total,
+                                  cast[Ptr[uint8]](buf + total))
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    if total == 0:
+        kfree(buf)
+        return -1
+    buf_out[0] = buf
+    size_out[0] = total
+    return 1
 
 
 def _open_hash_alias(name: Ptr[char]) -> int32:
