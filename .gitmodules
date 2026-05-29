@@ -1,3 +1,6 @@
 [submodule "adder"]
 	path = adder
 	url = https://github.com/HamnixOS/adder.git
+[submodule "packages"]
+	path = packages
+	url = https://github.com/HamnixOS/packages.git

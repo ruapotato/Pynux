@@ -109,7 +109,14 @@ HERE = Path(__file__).resolve().parent.parent
 BUILD = HERE / "build"
 USER_DIR = BUILD / "user"
 MOD_DIR = BUILD / "mod"
-PACKAGES_OUT = BUILD / "packages"
+# Output channel tree. Defaults to build/packages/ (a throwaway build
+# artifact) but is overridable via HAMNIX_PACKAGES_OUT so the canonical
+# package tree can be regenerated directly into the HamnixOS/packages
+# submodule (the source of truth served at 255.one, and the tree the
+# ISO build embeds as its installer mirror). main() only unlinks stale
+# *.tar.gz / index.json — it never rm -rf's this dir, so a submodule's
+# .git is safe.
+PACKAGES_OUT = Path(os.environ.get("HAMNIX_PACKAGES_OUT", str(BUILD / "packages")))
 ETC_DIR = HERE / "etc"
 MAN_DIR = ETC_DIR / "man"
 KMODS_DIR = HERE / "kernel-modules"
