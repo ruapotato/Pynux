@@ -130,7 +130,7 @@ from linux_abi.api_pci import _l_pci_alloc_shim_dev, \
 from linux_abi.api_irq import MSIX_POOL_BASE_VECTOR, MSIX_POOL_SIZE
 from drivers.rtc.cmos import rtc_init
 from drivers.acpi.acpi import acpi_init
-from drivers.input.atkbd import atkbd_init
+from drivers.input.atkbd import atkbd_init, kbd_rx_pop
 # V0 USB HID skeleton — xHCI host-controller probe + HID boot-keyboard
 # translator. On hardware/QEMU configs without a PS/2 controller
 # (T480+, modern Dells, MacBooks via boot-camp), this is the only path
@@ -141,6 +141,7 @@ from drivers.input.atkbd import atkbd_init
 from drivers.usb.xhci import (
     xhci_init, xhci_v1_selftest, xhci_v2_selftest,
     xhci_real_kbd_present,
+    xhci_kbd_live_reset, xhci_kbd_live_attached, xhci_live_reports,
 )
 # USB Bulk-Only Mass Storage (BOT) class driver — exposes an attached
 # USB stick as /dev/blk/sd0 by speaking SCSI over the xHCI bulk
@@ -3588,6 +3589,41 @@ def start_kernel():
         printk0("[xhci_v1] self-test skipped: no USB keyboard found (set /etc/xhci-selftest cpio marker to force)\n")
         printk0("[boot:07] xhci_v2_selftest SKIPPED (no kbd marker)\n")
         printk0("[xhci_v2] self-test skipped: no USB keyboard found (set /etc/xhci-selftest cpio marker to force)\n")
+
+    # --- LIVE interrupt-IN round-trip gate scan ---------------------
+    #
+    # Scan for the /etc/xhci-kbd-live cpio marker (planted only by
+    # scripts/test_xhci_kbd_live.sh). The actual live keyboard watch
+    # runs LATER (boot:14.L, after the LAPIC timer + monotonic clock
+    # are up) because a genuine wire round-trip needs the timer tick to
+    # fire xhci_poll AND real wall-clock time for the harness to issue
+    # `sendkey` over the QEMU monitor. Here we only record whether the
+    # marker is present. Default boots ship no marker, so the watch is
+    # skipped and a PS/2-only real laptop is unaffected.
+    printk0("[boot:07.L] xhci kbd-live gate scan\n")
+    xhci_kbd_live_marker: int32 = 0
+    kl_idx: uint64 = 0
+    kl_count: uint64 = initramfs_entry_count()
+    while kl_idx < kl_count:
+        kl_name: Ptr[char] = initramfs_entry_name(kl_idx)
+        kl_ok: int32 = 1
+        kl_target: Ptr[uint8] = "/etc/xhci-kbd-live"
+        kl_j: uint64 = 0
+        while kl_j < 19:                       # 18 chars + NUL
+            if cast[uint8](kl_name[kl_j]) != kl_target[kl_j]:
+                kl_ok = 0
+                kl_j = 19                       # break
+            else:
+                kl_j = kl_j + 1
+        if kl_ok == 1:
+            xhci_kbd_live_marker = 1
+            kl_idx = kl_count                  # break
+        else:
+            kl_idx = kl_idx + 1
+    if xhci_kbd_live_marker == 1:
+        printk0("[boot:07.L] xhci kbd-live marker present (watch deferred to boot:14.L)\n")
+    else:
+        printk0("[boot:07.L] xhci kbd-live watch SKIPPED (no /etc/xhci-kbd-live marker)\n")
     # USB mass-storage (BOT/SCSI) exercise — gated on /etc/usbms-test.
     # Enumerates an attached USB stick, registers /dev/blk/sd0, and
     # reads sector 0 back. No-op on default boots (no marker). Runs
@@ -3638,6 +3674,67 @@ def start_kernel():
     # above but its IRQ is IF-blocked here, so the busy-poll is clean.
     printk0("[boot:14] tsc_init\n")
     tsc_init()
+
+    # --- boot:14.L: LIVE USB keyboard round-trip --------------------
+    #
+    # Runs only when the /etc/xhci-kbd-live marker was found at boot:07.L
+    # AND a REAL usb-kbd enumerated end to end (xhci_kbd_live_attached).
+    # This is the genuine wire round-trip the V1/V2 synthetic selftests
+    # deliberately do NOT provide: we enable CPU interrupts so the LAPIC
+    # timer tick (boot:12) fires drivers/usb/xhci.ad::xhci_poll, which
+    # drains the Event Ring of REAL interrupt-IN Transfer Events the
+    # controller posts when a key is pressed. The harness injects that
+    # keypress via the QEMU monitor `sendkey a` after seeing the READY
+    # banner. The byte flows xhci_poll -> hid_kbd_report -> kbd_rx_push
+    # with ZERO synthetic injection; the PASS marker is gated on
+    # kbd_live_attached (never set by the synthetic path) so a forged
+    # event can't fake it. We bound the wait by a jiffies wall-clock
+    # (see below) so a missing keypress yields a TIMEOUT, never a hang.
+    if xhci_kbd_live_marker == 1:
+        if xhci_kbd_live_attached() != 0:
+            printk0("[boot:14.L] xhci live keyboard round-trip watch\n")
+            xhci_kbd_live_reset()
+            before_live: uint32 = xhci_live_reports()
+            # Tell the harness we're ready; it greps this exact line
+            # then fires `sendkey a` over the QEMU monitor.
+            printk0("[xhci_kbd_live] READY: send a real key now (expecting ascii=97)\n")
+            # Enable IRQs so the LAPIC timer tick drives xhci_poll and
+            # advances `jiffies`. We bound the wait by jiffies (HZ=100,
+            # i.e. 100 ticks/s) rather than tsc_monotonic_ns(): under
+            # QEMU/TCG the guest TSC does NOT track wall-clock (it ran
+            # ~1500x fast here, collapsing a 30 s ns deadline to ~20 ms),
+            # whereas `jiffies` is incremented by the same LAPIC timer
+            # whose ticks print these log timestamps — a provably real
+            # ~100 Hz wall-clock. 3000 jiffies ≈ 30 s.
+            local_irq_enable()
+            kl_j0: uint64 = get_jiffies()
+            kl_deadline: uint64 = kl_j0 + 3000             # ~30 s at HZ=100
+            kl_done: int32 = 0
+            while kl_done == 0:
+                if xhci_live_reports() > before_live:
+                    kl_done = 1
+                else:
+                    if get_jiffies() >= kl_deadline:
+                        kl_done = 1
+                    else:
+                        cpu_relax()
+            local_irq_disable()
+            # Assert: a genuine live completion bumped the counter, and
+            # the byte the HID layer pushed is 'a' (97).
+            if xhci_live_reports() > before_live:
+                kl_byte: int32 = kbd_rx_pop()
+                if kl_byte == 97:
+                    printk1("[xhci_kbd_live] PASS: live 'a' from usb-kbd reached kbd_rx_push (ascii=%d, genuine wire round-trip)\n",
+                            cast[uint64](kl_byte))
+                else:
+                    printk1("[xhci_kbd_live] FAIL: live byte mismatch got=%d want=97\n",
+                            cast[uint64](kl_byte))
+            else:
+                printk0("[xhci_kbd_live] TIMEOUT: no genuine interrupt-IN completion seen (no key arrived off the wire)\n")
+                printk0("[xhci_kbd_live] FAIL: live round-trip did not complete\n")
+        else:
+            printk0("[boot:14.L] xhci live keyboard watch SKIPPED: marker present but no live usb-kbd enumerated\n")
+            printk0("[xhci_kbd_live] FAIL: no live usb-kbd enumerated — refusing to forge a PASS\n")
 
     # M16.24: bring up the secondary CPU via INIT-SIPI-SIPI. Requires
     # QEMU launched with `-smp 2`. If launched with -smp 1 the SIPI

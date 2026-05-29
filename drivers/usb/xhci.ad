@@ -323,6 +323,36 @@ class XhciState:
     # the poll loop sees, regardless of source (real or synthetic).
     reports_received: uint32
 
+    # --- Live-wire (genuine round-trip) gate -----------------------
+    # `kbd_live_attached` is set to 1 ONLY by _xhci_v1_attach_keyboard
+    # on a successful live enumeration (real Enable Slot / Address
+    # Device / Configure Endpoint + armed interrupt-IN ring backed by a
+    # REAL usb-kbd on the root hub). It is NEVER set by the synthetic
+    # V1/V2 selftests — those flip kbd_enabled + kbd_slot_id but leave
+    # this flag at 0. The poll loop uses it to decide whether a
+    # harvested Transfer Event is a GENUINE wire completion or a forged
+    # one, so the live PASS marker can never be emitted off synthetic
+    # ring state. This is the honesty gate the live test asserts on.
+    kbd_live_attached: uint32
+    # Counts ONLY genuine live interrupt-IN completions (kbd_live_attached
+    # == 1 at harvest time). The live keyboard test asserts this is
+    # non-zero AFTER a `sendkey` — proving a real wire round-trip, not a
+    # forged event.
+    live_reports_received: uint32
+    # One-shot latch so the "[xhci_kbd_live] first genuine report" banner
+    # fires exactly once on the first real wire completion.
+    live_first_logged: uint32
+    # Set to 1 by the synthetic V1/V2 selftests for the duration of their
+    # forged-event xhci_poll() calls. When set, the poll loop's live
+    # branch refuses to count the completion as a genuine wire report —
+    # even though kbd_live_attached may already be 1 (a real usb-kbd
+    # enumerated, then the synthetic test injected a forged event on top
+    # of the live ring). Without this guard a forged 'a' event would
+    # falsely trip the live PASS marker, which is exactly the
+    # regression-in-honesty the live test must catch. Cleared after each
+    # synthetic injection so subsequent REAL completions count again.
+    synthetic_inject_active: uint32
+
     # --- Mass-storage (BOT) slot state -----------------------------
     # A USB mass-storage device gets its own slot, distinct from the
     # keyboard slot above. The keyboard path reuses the kbd_* fields
@@ -1670,27 +1700,67 @@ def xhci_poll():
     # kbd_enabled — that keeps boot logs clean on the V0 path.
     if xhci.kbd_enabled == 0:
         return
-    # Drain up to 16 events per tick (bounded so a controller stuck
-    # in a tight event loop doesn't wedge the system).
+    # Fully drain the Event Ring each poll. A USB boot keyboard's
+    # interrupt-IN endpoint completes one IN TRB every polling interval
+    # whether or not a key is down (the "no keys" report is 8 zero
+    # bytes), so QEMU posts a steady stream of Transfer Events. If we
+    # only drained a handful per tick the 256-entry Event Ring would
+    # fill between ticks, the controller would post
+    # CC_EVENT_RING_FULL_ERROR, and our consumer cycle would desync —
+    # exactly the wedge observed before this fix. The cap (4 * RING_TRBS)
+    # is a safety bound, not the expected exit: the loop normally exits
+    # via the peek-returns-0 break once the ring is empty.
     drained: uint32 = 0
+    cap: uint32 = RING_TRBS * 4
     p:   uint64 = 0
     s:   uint32 = 0
     c:   uint32 = 0
-    while drained < 16:
+    while drained < cap:
         if _xhci_evt_peek(cast[Ptr[uint64]](&p),
                           cast[Ptr[uint32]](&s),
                           cast[Ptr[uint32]](&c)) == 0:
-            drained = 16              # break
+            drained = cap              # break: ring empty
         else:
             ev_type: uint32 = (c >> TRB_TYPE_SHIFT) & 0x3F
             if ev_type == TRB_TYPE_TRANSFER_EVT:
                 cc: uint32 = (s >> 24) & 0xFF
                 if cc == TRB_CC_SUCCESS or cc == TRB_CC_SHORT_PACKET:
-                    # p is the physical address of the completed
-                    # buffer — feed it to the HID layer.
+                    # p is the physical address of the completed 8-byte
+                    # boot-report buffer. report[2] is the first HID
+                    # usage code; it is 0 on a "no keys down" report
+                    # (the idle poll) and non-zero only when a key is
+                    # actually pressed. We dispatch every report to the
+                    # HID layer (hid_kbd_report itself ignores the all-
+                    # zero idle reports) but only treat a report that
+                    # CARRIES a keycode as a genuine live wire event —
+                    # otherwise the idle poll stream would trip the live
+                    # marker without any real keypress.
+                    rp: Ptr[uint8] = cast[Ptr[uint8]](p)
+                    has_key: uint32 = 0
+                    if cast[uint32](rp[2]) != 0:
+                        has_key = 1
                     hid_kbd_report(cast[Ptr[uint8]](p))
                     xhci.reports_received = xhci.reports_received + 1
-                    # Re-arm.
+                    # Genuine-wire accounting. This branch runs for BOTH
+                    # the live timer-tick path and the synthetic
+                    # selftests (which forge a Transfer Event at the
+                    # dequeue cursor then call xhci_poll). Only count it
+                    # as a LIVE report when the keyboard was attached via
+                    # the real enumeration walk (kbd_live_attached, never
+                    # set by the synthetic path) AND the report carries a
+                    # real keycode. This is the honesty gate the live
+                    # keyboard test relies on: neither a forged event nor
+                    # an idle "no keys" poll can trip the live marker.
+                    if xhci.kbd_live_attached != 0 \
+                       and xhci.synthetic_inject_active == 0 \
+                       and has_key != 0:
+                        xhci.live_reports_received = \
+                            xhci.live_reports_received + 1
+                        if xhci.live_first_logged == 0:
+                            xhci.live_first_logged = 1
+                            printk1("[xhci_kbd_live] genuine interrupt-IN completion: usage=0x%x\n",
+                                    cast[uint64](rp[2]))
+                    # Re-arm a fresh IN TRB for the next interval.
                     _xhci_int_arm_one()
             _xhci_evt_advance()
             drained = drained + 1
@@ -2042,7 +2112,14 @@ def _xhci_v1_attach_keyboard():
     _xhci_int_arm_one()
 
     xhci.kbd_enabled = 1
+    # Live-wire honesty gate: a REAL usb-kbd enumerated end to end and
+    # its interrupt-IN ring is armed. From here a genuine keypress
+    # (e.g. QEMU monitor `sendkey`) produces a controller-posted
+    # Transfer Event that xhci_poll harvests — see the kbd_live_attached
+    # branch there. The synthetic V1/V2 selftests never set this flag.
+    xhci.kbd_live_attached = 1
     printk0("[xhci] USB keyboard enabled: events armed\n")
+    printk0("[xhci_kbd_live] live interrupt-IN endpoint armed (slot ready for sendkey)\n")
     printk0("[boot:01.f.n] xhci attach: complete\n")
 
 
@@ -2130,10 +2207,15 @@ def xhci_v1_selftest():
     buf_pa: uint64 = cast[uint64](&xhci_v1_test_buf[0])
     _xhci_v1_inject_transfer_event(buf_pa, 8)
 
-    # Drain (one event expected).
+    # Drain (one event expected). Mark the injection as synthetic so
+    # xhci_poll's live branch does NOT count this forged event as a
+    # genuine wire report (kbd_live_attached may already be 1 if a real
+    # usb-kbd enumerated before this test ran).
+    xhci.synthetic_inject_active = 1
     before: uint32 = xhci.reports_received
     xhci_poll()
     after: uint32 = xhci.reports_received
+    xhci.synthetic_inject_active = 0
 
     if after > before:
         printk1("[xhci_v1] transfer-engine PASS (%d reports)\n",
@@ -2257,6 +2339,10 @@ def xhci_v2_selftest():
     pass_count: uint32 = 0
     fail_count: uint32 = 0
 
+    # All three injections below are synthetic forged events — keep
+    # xhci_poll's live branch from counting them as genuine wire reports.
+    xhci.synthetic_inject_active = 1
+
     # Event 1 — 'h' (104).
     _xhci_v1_inject_transfer_event(cast[uint64](&xhci_v2_buf0[0]), 8)
     xhci_poll()
@@ -2312,6 +2398,10 @@ def xhci_v2_selftest():
         printk1("[xhci_v2] FAIL: int-ring enqueue delta=%d (want 3)\n",
                 cast[uint64](enq_delta))
 
+    # Synthetic injections done — re-enable live counting for any real
+    # wire completions that follow (e.g. the live keyboard watch).
+    xhci.synthetic_inject_active = 0
+
     if fail_count == 0:
         printk2("[xhci_v2] continuous-poll PASS (%d reports, ring+%d)\n",
                 cast[uint64](rep_delta), cast[uint64](enq_delta))
@@ -2328,3 +2418,56 @@ def xhci_v2_selftest():
     xhci.kbd_enabled = saved_enabled
     if saved_slot == 0:
         xhci.kbd_slot_id = 0
+
+
+# =====================================================================
+# Live interrupt-IN round-trip — a REAL keypress off the wire.
+# =====================================================================
+#
+# Unlike the V1/V2 selftests above (which FORGE a Transfer Event TRB
+# into the Event Ring), this path waits for the controller itself to
+# post a genuine Transfer Event when a real usb-kbd generates a HID
+# report. Under QEMU that report is produced by the monitor HMP command
+# `sendkey <key>`; on real silicon it's an actual key being pressed.
+#
+# Flow:
+#   1. The keyboard must have enumerated for real (kbd_live_attached==1,
+#      set only by _xhci_v1_attach_keyboard). If it didn't, we print a
+#      diagnostic and return WITHOUT a PASS — never a forged success.
+#   2. Drain any startup noise out of the shared kbd FIFO.
+#   3. Print the "READY" banner. The test harness blocks on this line
+#      then fires `sendkey a` over the QEMU monitor.
+#   4. Spin, calling xhci_poll() directly to drain the Event Ring (the
+#      timer-tick caller also polls, but driving it here makes the test
+#      deterministic and self-contained — no dependency on scheduler
+#      timing). On each genuine completion xhci_poll bumps
+#      live_reports_received and the HID layer pushes the ASCII byte.
+#   5. As soon as live_reports_received goes non-zero, pop the FIFO and
+#      assert the byte matches the expected ASCII. PASS is emitted ONLY
+#      here, gated on the genuine-wire counter — a forged event can't
+#      reach this line because the synthetic path never sets
+#      kbd_live_attached.
+#
+# Spin budget is large (the harness needs time to observe READY and
+# round-trip a monitor command) but bounded — a missing keypress yields
+# a TIMEOUT diagnostic, never a hang and never a false PASS.
+
+def xhci_kbd_live_reset():
+    # Prep for a live keyboard round-trip watch (driven from
+    # init/main.ad's boot:14.L IRQ window). Drains the shared kbd FIFO
+    # of any startup bytes so the post-keypress pop sees only the live
+    # byte. The first-genuine-completion banner latch is left as-is —
+    # it fires once when the real wire completion lands in xhci_poll.
+    while kbd_rx_pop() >= 0:
+        pass
+
+
+def xhci_kbd_live_attached() -> uint32:
+    # Accessor for init/main.ad's gate: 1 iff a real usb-kbd enumerated
+    # end to end (Enable Slot / Address Device / Configure Endpoint +
+    # armed interrupt-IN ring). The live watch only runs when this is 1.
+    return xhci.kbd_live_attached
+
+
+def xhci_live_reports() -> uint32:
+    return xhci.live_reports_received

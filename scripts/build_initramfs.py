@@ -204,6 +204,20 @@ if os.environ.get("ENABLE_NETCFG_SMOKE") == "1":
 if os.environ.get("ENABLE_XHCI_SELFTEST") == "1":
     FILES.append(("/etc/xhci-selftest", b"1\n"))
 
+# xHCI LIVE keyboard round-trip. Set ENABLE_XHCI_KBD_LIVE=1 to plant
+# /etc/xhci-kbd-live; init/main.ad gates xhci_kbd_live_watch() on it.
+# Unlike ENABLE_XHCI_SELFTEST (which drives the SYNTHETIC forged-event
+# selftests), this opts into a GENUINE wire round-trip: the kernel
+# blocks after enumerating a real usb-kbd, prints a READY banner, and
+# waits for the controller to post a real interrupt-IN Transfer Event
+# for a keypress the harness injects over the QEMU monitor `sendkey`.
+# Only scripts/test_xhci_kbd_live.sh sets this (alongside
+# ENABLE_XHCI_KO=0 so the hand-rolled drivers/usb/xhci.ad actually
+# owns the controller). Default boots ship no marker, so a PS/2-only
+# real laptop never enters the watch loop.
+if os.environ.get("ENABLE_XHCI_KBD_LIVE") == "1":
+    FILES.append(("/etc/xhci-kbd-live", b"1\n"))
+
 # USB mass-storage (BOT/SCSI) exercise. Set ENABLE_USBMS_TEST=1 to
 # plant /etc/usbms-test; init/main.ad gates usbms_exercise() on it,
 # which enumerates an attached USB stick (boot QEMU with
