@@ -472,6 +472,26 @@ def _sym_addr(image: Ptr[uint8], sym_idx: uint64) -> uint64:
         if _force_shim_name(name) == 1:
             addr0: uint64 = linux_abi_lookup(name)
             if addr0 != 0:
+                # The call target is overridden to the Hamnix shim for
+                # safety (the real .ko impl would dereference slab/DMA
+                # infra we don't fully back). But cross-module dispatch
+                # capability is a SEPARATE fact: if a previously-loaded
+                # .ko genuinely EXPORT_SYMBOL'd this name, the registry
+                # resolved it cross-module — the force-shim merely picks
+                # a different CALL target. Emit the [ksymtab_hit] diag in
+                # that case so the registry/dispatch wiring is observable
+                # and testable independent of which target we invoke. The
+                # consumer (cur_modname) -> provider (owner) edge is real
+                # regardless of the override.
+                ks_addr: uint64 = ksymtab_lookup(name)
+                if ks_addr != 0:
+                    ks_owner: uint64 = ksymtab_owner(name)
+                    printk2(
+                        "[ksymtab_hit] %s -> %s: ",
+                        cast[uint64](&cur_modname[0]),
+                        ks_owner)
+                    printk1("%s", cast[uint64](name))
+                    printk0(" (force-shim overrides call target)\n")
                 printk1("[force_shim] %s -> linux_abi (override .ko ksymtab)\n",
                         cast[uint64](name))
                 return addr0
