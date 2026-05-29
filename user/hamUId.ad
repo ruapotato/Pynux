@@ -1547,8 +1547,223 @@ def composite_fb_layer(wid: int32, slot: uint64):
         yy = yy + 1
 
 
+# ====================================================================
+# Phase 4c — physical presentation to /dev/fb
+# ====================================================================
+#
+# `hamUId present <wid>` composites the window exactly like `render`
+# (reusing the 4b compositor that fills `target` with the 640x480
+# window frame), reads /dev/fb's geometry, scales the window frame to
+# fit the screen with letterboxing (preserve aspect, centre, black
+# bars), and writes it to /dev/fb as RGBA8888.
+#
+# We present one SCREEN ROW at a time into screen_row, then write the
+# whole row to /dev/fb at the pixel offset (scr_y * scr_w) * 4. The
+# kernel cdev repacks RGBA -> hardware pixel order per fb_pixfmt and
+# honours fb_pitch, so userland only deals in RGBA8888. Row-at-a-time
+# keeps userland memory bounded regardless of screen resolution.
+
+SCREEN_ROW_MAXW: uint64 = 4096          # cap a single screen row at 4096 px
+screen_row: Array[16384, uint8]         # SCREEN_ROW_MAXW * 4
+
+# Parsed /dev/fb geometry.
+FBG_W: uint64 = 0
+FBG_H: uint64 = 0
+FBG_PITCH: uint64 = 0
+FBG_BPP: uint64 = 0
+FBG_PIXFMT: uint64 = 0
+
+
+def read_fb_geometry() -> int32:
+    # Read "WIDTH HEIGHT PITCH BPP PIXFMT\n" from /dev/fb. Returns 1 on
+    # success (FBG_* populated), 0 on failure.
+    p: Ptr[uint8] = "/dev/fb"
+    fd: int32 = sys_open(cast[Ptr[char]](p))
+    if fd < 0:
+        return 0
+    n: int64 = read_whole(fd, &num_buf[0], 64)
+    sys_close(fd)
+    if n <= 0:
+        return 0
+    total: uint64 = cast[uint64](n)
+    # Parse five space-separated decimals.
+    pos: Array[1, uint64]
+    pos[0] = 0
+    FBG_W = cast[uint64](next_dec(&num_buf[0], &pos[0], total))
+    FBG_H = cast[uint64](next_dec(&num_buf[0], &pos[0], total))
+    FBG_PITCH = cast[uint64](next_dec(&num_buf[0], &pos[0], total))
+    FBG_BPP = cast[uint64](next_dec(&num_buf[0], &pos[0], total))
+    FBG_PIXFMT = cast[uint64](next_dec(&num_buf[0], &pos[0], total))
+    if FBG_W == 0 or FBG_H == 0:
+        return 0
+    return 1
+
+
+def next_dec(buf: Ptr[uint8], pos: Ptr[uint64], total: uint64) -> int64:
+    # Skip non-digits, then parse a run of decimal digits. Advances *pos.
+    i: uint64 = pos[0]
+    while i < total and (buf[i] < 48 or buf[i] > 57):
+        i = i + 1
+    v: int64 = 0
+    while i < total and buf[i] >= 48 and buf[i] <= 57:
+        v = v * 10 + cast[int64](cast[int32](buf[i]) - 48)
+        i = i + 1
+    pos[0] = i
+    return v
+
+
+def composite_window(wid: int32) -> int32:
+    # Run the 4b compositor: parse the layer listing, fill `target` with
+    # the composited 640x480 window frame. Returns 0 on success, 1 if
+    # the wid's draw listing can't be read.
+    font_init()
+    read_fb_wid = wid
+    if parse_listing(wid) < 0:
+        return 1
+    target_clear()
+    si: uint64 = 0
+    while si < LT_COUNT:
+        lp: Ptr[uint8] = layer_name_ptr(si)
+        if cstr_eq(lp, "_screen") == 0:
+            layerbuf_clear()
+            if LT_KIND[si] == 1:
+                composite_fb_layer(wid, si)
+            else:
+                rasterise_markup(wid, si)
+            composite_layer(LT_OPAC[si])
+        si = si + 1
+    return 0
+
+
+def cmd_present(wid: int32) -> int32:
+    if composite_window(wid) != 0:
+        write_str(2, "hamUId: present: cannot read /dev/wsys/<wid>/draw\n")
+        return 1
+    if read_fb_geometry() == 0:
+        write_str(2, "hamUId: present: cannot read /dev/fb geometry\n")
+        return 1
+    sw: uint64 = FBG_W
+    sh: uint64 = FBG_H
+    if sw > SCREEN_ROW_MAXW:
+        sw = SCREEN_ROW_MAXW
+    # Aspect-preserving fit of WIN_W x WIN_H into sw x sh. Integer math:
+    # scale numerator/denominator = min(sw/WIN_W, sh/WIN_H). To avoid
+    # fractions we compute the destination content rectangle directly.
+    #   fit_w = min(sw, sh * WIN_W / WIN_H)
+    #   fit_h = min(sh, sw * WIN_H / WIN_W)
+    fit_w: uint64 = sw
+    fit_h: uint64 = (sw * WIN_H) / WIN_W
+    if fit_h > sh:
+        fit_h = sh
+        fit_w = (sh * WIN_W) / WIN_H
+    if fit_w > sw:
+        fit_w = sw
+    if fit_w == 0:
+        fit_w = 1
+    if fit_h == 0:
+        fit_h = 1
+    # Letterbox offsets (centre the content rect).
+    ox: uint64 = (sw - fit_w) / 2
+    oy: uint64 = (sh - fit_h) / 2
+    # Open /dev/fb for writing the frame.
+    pw: Ptr[uint8] = "/dev/fb"
+    wf: int32 = sys_open_write(cast[Ptr[char]](pw))
+    if wf < 0:
+        write_str(2, "hamUId: present: cannot open /dev/fb for write\n")
+        return 1
+    # Emit one screen row at a time.
+    sy: uint64 = 0
+    while sy < sh:
+        # Clear row to black (letterbox bars).
+        ci: uint64 = 0
+        rb: uint64 = sw * 4
+        while ci < rb:
+            screen_row[ci] = 0
+            ci = ci + 1
+        # If this screen row is inside the content band, scale-sample the
+        # window frame into it.
+        if sy >= oy and sy < oy + fit_h:
+            # Source row in the window (nearest-neighbour).
+            relq: uint64 = sy - oy
+            srcy: uint64 = (relq * WIN_H) / fit_h
+            if srcy >= WIN_H:
+                srcy = WIN_H - 1
+            dx: uint64 = 0
+            while dx < fit_w:
+                srcx: uint64 = (dx * WIN_W) / fit_w
+                if srcx >= WIN_W:
+                    srcx = WIN_W - 1
+                so: uint64 = (srcy * WIN_W + srcx) * 4
+                doff: uint64 = (ox + dx) * 4
+                if (ox + dx) < sw:
+                    screen_row[doff] = target[so]
+                    screen_row[doff + 1] = target[so + 1]
+                    screen_row[doff + 2] = target[so + 2]
+                    screen_row[doff + 3] = 255
+                dx = dx + 1
+        # Write this row at its pixel offset in the screen frame. The fd
+        # cursor advances by the bytes written, so successive rows land
+        # at the right offset automatically (no explicit lseek needed —
+        # we write exactly sw*4 bytes per row, contiguously).
+        sys_write(wf, &screen_row[0], sw * 4)
+        sy = sy + 1
+    sys_close(wf)
+    # Emit a deterministic AI/CI-readable summary line so a headless test
+    # can assert the present happened even without screendump.
+    emit_present_summary(wid, sw, sh, fit_w, fit_h, ox, oy)
+    return 0
+
+
+def emit_present_summary(wid: int32, sw: uint64, sh: uint64,
+                         fit_w: uint64, fit_h: uint64,
+                         ox: uint64, oy: uint64):
+    # "PRESENT wid=<w> screen=<sw>x<sh> fit=<fw>x<fh> off=<ox>,<oy>\n"
+    line: Array[128, uint8]
+    p: uint64 = 0
+    pfx: Ptr[uint8] = "PRESENT wid="
+    k: uint64 = 0
+    while pfx[k] != 0:
+        line[p] = pfx[k]
+        p = p + 1
+        k = k + 1
+    p = p + u64_to_dec(cast[uint64](wid), &line[p])
+    s1: Ptr[uint8] = " screen="
+    k = 0
+    while s1[k] != 0:
+        line[p] = s1[k]
+        p = p + 1
+        k = k + 1
+    p = p + u64_to_dec(sw, &line[p])
+    line[p] = 120                                    # 'x'
+    p = p + 1
+    p = p + u64_to_dec(sh, &line[p])
+    s2: Ptr[uint8] = " fit="
+    k = 0
+    while s2[k] != 0:
+        line[p] = s2[k]
+        p = p + 1
+        k = k + 1
+    p = p + u64_to_dec(fit_w, &line[p])
+    line[p] = 120
+    p = p + 1
+    p = p + u64_to_dec(fit_h, &line[p])
+    s3: Ptr[uint8] = " off="
+    k = 0
+    while s3[k] != 0:
+        line[p] = s3[k]
+        p = p + 1
+        k = k + 1
+    p = p + u64_to_dec(ox, &line[p])
+    line[p] = 44                                     # ','
+    p = p + 1
+    p = p + u64_to_dec(oy, &line[p])
+    line[p] = 10
+    p = p + 1
+    sys_write(1, &line[0], p)
+
+
 def usage(fd: int32):
-    write_str(fd, "Usage: hamUId render <wid>\n")
+    write_str(fd, "Usage: hamUId render <wid> | hamUId present <wid>\n")
 
 
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
@@ -1565,5 +1780,14 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             write_str(2, "hamUId: render: bad wid\n")
             return 1
         return cmd_render(wid)
+    if cstr_eq(verb, "present") != 0:
+        if argc < 3:
+            write_str(2, "hamUId: present: missing wid\n")
+            return 1
+        pwid: int32 = parse_uint(cast[Ptr[uint8]](argv[2]))
+        if pwid < 1:
+            write_str(2, "hamUId: present: bad wid\n")
+            return 1
+        return cmd_present(pwid)
     usage(2)
     return 1
