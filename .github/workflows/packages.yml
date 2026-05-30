@@ -1,0 +1,131 @@
+name: Publish packages
+
+# Build the Hamnix package set from this repo (the SOURCE OF TRUTH) and
+# publish the regenerated channel tree to HamnixOS/packages, which GitHub
+# Pages serves at https://255.one/ as the hpm mirror.
+#
+# Package definitions live here in scripts/build_packages.py and consume
+# first-party sources (user/*.ad, etc/, kernel-modules/*.ko, the kernel
+# ELF + EFI stub). build_packages.py writes a Debian-shape channel tree
+# (main/, non-free/, non-free-firmware/) and only ever unlinks stale
+# *.tar.gz / index.json inside the output dir — it never rm -rf's it — so
+# the packages repo's CNAME / index.html / README.md survive a republish.
+#
+# AUTH (one-time, user action): this workflow pushes to a SECOND repo, so
+# the default GITHUB_TOKEN (scoped to this repo only) is not enough. Add a
+# repository secret named PACKAGES_DEPLOY_TOKEN — a fine-grained PAT with
+# Contents: Read and write on HamnixOS/packages (or a classic PAT with
+# `repo`). Until that secret exists the publish step is skipped (the build
+# still runs and validates), so CI never hard-fails for a missing token.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'user/**'
+      - 'etc/**'
+      - 'kernel-modules/**'
+      - 'lib/**'
+      - 'init/**'
+      - 'arch/x86/boot/efi_stub.S'
+      - 'scripts/build_packages.py'
+      - 'scripts/build_user.sh'
+      - 'scripts/build_modules.sh'
+      - '.github/workflows/packages.yml'
+  workflow_dispatch:
+    inputs:
+      pkg_version:
+        description: 'Package version stamp (default 1.0.0)'
+        required: false
+        default: '1.0.0'
+
+# Never let two publish runs race on the packages repo's git history.
+concurrency:
+  group: publish-packages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build + publish hpm channel tree
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Hamnix (source of truth)
+        uses: actions/checkout@v4
+        with:
+          # The Adder compiler is now inlined under adder/ (no submodule),
+          # so a plain checkout has everything the build needs.
+          submodules: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils
+
+      - name: Build userland (build/user/*.elf)
+        run: bash scripts/build_user.sh
+
+      - name: Build kernel framework modules (.ko)
+        run: bash scripts/build_modules.sh
+
+      - name: Compile bare-metal kernel + EFI stub
+        run: |
+          mkdir -p build
+          HAMNIX_CPIO_EMPTY=1 python3 scripts/build_initramfs.py
+          python3 -m compiler.adder compile \
+            --target=x86_64-bare-metal \
+            init/main.ad \
+            -o build/hamnix-kernel.elf
+          as --64 -o build/efi_stub.o arch/x86/boot/efi_stub.S
+          ld -m i386pep --subsystem 10 -e efi_main --image-base 0 \
+            --no-dynamic-linker -nostdlib \
+            -o build/hamnix-bootx64.efi build/efi_stub.o
+
+      - name: Check out the packages repo (publish target)
+        id: clone_pkgs
+        env:
+          DEPLOY_TOKEN: ${{ secrets.PACKAGES_DEPLOY_TOKEN }}
+        run: |
+          if [ -z "$DEPLOY_TOKEN" ]; then
+            echo "PACKAGES_DEPLOY_TOKEN not set — build-only validation run."
+            echo "have_token=false" >> "$GITHUB_OUTPUT"
+            echo "out_dir=$PWD/build/packages" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:${DEPLOY_TOKEN}@github.com/HamnixOS/packages.git" \
+            _pkgrepo
+          echo "have_token=true" >> "$GITHUB_OUTPUT"
+          echo "out_dir=$PWD/_pkgrepo" >> "$GITHUB_OUTPUT"
+
+      - name: Build the channel tree
+        env:
+          HAMNIX_PACKAGES_OUT: ${{ steps.clone_pkgs.outputs.out_dir }}
+          HAMNIX_PKG_VERSION: ${{ github.event.inputs.pkg_version || '1.0.0' }}
+        run: |
+          mkdir -p "$HAMNIX_PACKAGES_OUT"
+          python3 scripts/build_packages.py
+          echo "---- channel index summary ----"
+          for ch in main non-free non-free-firmware; do
+            idx="$HAMNIX_PACKAGES_OUT/$ch/index.json"
+            [ -f "$idx" ] && echo "$ch: $(grep -c '"name"' "$idx") packages"
+          done
+
+      - name: Commit + push to HamnixOS/packages
+        if: steps.clone_pkgs.outputs.have_token == 'true'
+        run: |
+          cd _pkgrepo
+          git config user.name  "hamnix-ci[bot]"
+          git config user.email "ci@255.one"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No package changes to publish."
+            exit 0
+          fi
+          git commit -m "ci: republish packages from ${GITHUB_SHA::12}"
+          git push origin HEAD:main
