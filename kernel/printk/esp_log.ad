@@ -435,3 +435,130 @@ def esp_log_rescan():
 
 def esp_log_is_ready() -> int32:
     return esp_log_ready
+
+
+# --- USB ESP write self-test ---------------------------------------
+#
+# THE PROBLEM THIS PROVES
+# -----------------------
+# The serial-less NUC persists its boot log to LOG.TXT on the USB ESP via
+# raw blk_write_sectors on sd0p1. READING the stick works, but on real
+# hardware the WRITE had effectively never been exercised before — every
+# prior USB boot was read-only — and LOG.TXT came back as the untouched
+# build-time newline fill (zero real log bytes). We could not tell WHICH
+# stage of the write path failed because the NUC has no serial; the only
+# forensic channel is a phone photo of the LAST FEW screen lines.
+#
+# This self-test closes that gap. Near the END of boot (after usbms_init()
+# + esp_log_rescan() have armed sd0p1) it does a real round-trip on the USB
+# ESP using the SAME raw path a flush uses: it writes a known sentinel into
+# the FIRST sector of LOG.TXT's OWN data extent, reads it back, and prints
+# ONE unmistakable banner line that survives in the last screen lines:
+#
+#   "esp_log: USB ESP write self-test PASS (sd0p1)"
+# or a SPECIFIC failure reason:
+#   "esp_log: USB ESP write self-test FAIL: bulk-OUT no completion"
+#   "esp_log: USB ESP write self-test FAIL: readback mismatch"
+#   "esp_log: USB ESP write self-test FAIL: no USB ESP target"
+#
+# SAFETY: we ONLY ever touch sector 0 of LOG.TXT's data extent — space the
+# very next esp_log_flush() overwrites anyway — never an arbitrary LBA.
+
+# Build flag: default ON so the next NUC boot is diagnostic. The .img boot
+# path leaves it ON; a future caller can clear it for a quiet boot.
+esp_log_selftest_enabled: int32 = 1
+
+
+def esp_log_set_selftest(on: int32):
+    esp_log_selftest_enabled = on
+
+
+def _name_is_sd0p1(nm: Ptr[char]) -> int32:
+    # True iff the block-device name is exactly "sd0p1" (the USB ESP
+    # partition). We restrict the self-test to the USB target — that is
+    # the write path that has never run on real hardware. Writing a
+    # sentinel to the QEMU virtio ESP would be harmless but the banner is
+    # about the USB stick specifically.
+    want: Ptr[char] = "sd0p1"
+    i: uint64 = 0
+    while want[i] != 0:
+        if nm[i] != want[i]:
+            return 0
+        i = i + 1
+    return nm[i] == 0
+
+
+def esp_log_write_selftest() -> int32:
+    # Round-trip the USB ESP write path and print an unmistakable banner.
+    # Returns 0 on PASS, -1 on any FAIL (or when disabled / no USB target).
+    if esp_log_selftest_enabled == 0:
+        return 0
+    if esp_log_ready == 0:
+        printk0("esp_log: USB ESP write self-test FAIL: no USB ESP target\n")
+        return -1
+
+    # Find the sd0p1 (USB ESP) target among the armed flush targets.
+    found: int32 = 0
+    sel_slot: int32 = -1
+    sel_lba:  uint64 = 0
+    ti: uint64 = 0
+    while ti < esp_log_target_cnt:
+        nm: Ptr[char] = blk_slot_name(esp_log_targets[ti].slot)
+        if _name_is_sd0p1(nm) != 0:
+            found = 1
+            sel_slot = esp_log_targets[ti].slot
+            sel_lba  = esp_log_targets[ti].data_lba
+            ti = esp_log_target_cnt
+        else:
+            ti = ti + 1
+    if found == 0:
+        printk0("esp_log: USB ESP write self-test FAIL: no USB ESP target\n")
+        return -1
+
+    # Build a sentinel in esp_scratch: a recognizable ASCII banner padded
+    # with newlines so it reads cleanly if a human ever peeks at it (it is
+    # immediately overwritten by the real flush). The leading bytes carry
+    # a fixed magic we verify on readback.
+    sentinel: Ptr[char] = "HAMNIX-ESP-USB-WRITE-SELFTEST-OK\n"
+    slen: uint64 = _str_len(sentinel)
+    i: uint64 = 0
+    while i < SECTOR_SIZE:
+        if i < slen:
+            esp_scratch[i] = cast[uint8](sentinel[i] & 0xFF)
+        else:
+            esp_scratch[i] = 10                  # '\n' fill
+        i = i + 1
+
+    # WRITE the sentinel into sector 0 of LOG.TXT's data extent via the
+    # exact raw path a flush uses. Retry a couple of times so a single
+    # transient bulk-OUT hiccup (now recovered inside the USB driver)
+    # doesn't trip a false FAIL.
+    wrote: int32 = -1
+    wa: int32 = 0
+    while wa < 3:
+        if blk_write_sectors(sel_slot, sel_lba, 1, &esp_scratch[0]) == 0:
+            wrote = 0
+            wa = 3
+        else:
+            wa = wa + 1
+    if wrote != 0:
+        printk0("esp_log: USB ESP write self-test FAIL: bulk-OUT no completion\n")
+        return -1
+
+    # READ it back into a fresh region of esp_scratch and compare the
+    # magic prefix. Clear esp_scratch first so a no-op read can't pass.
+    j: uint64 = 0
+    while j < SECTOR_SIZE:
+        esp_scratch[j] = 0
+        j = j + 1
+    if blk_read_sectors(sel_slot, sel_lba, 1, &esp_scratch[0]) != 0:
+        printk0("esp_log: USB ESP write self-test FAIL: readback I/O error\n")
+        return -1
+    k: uint64 = 0
+    while k < slen:
+        if esp_scratch[k] != cast[uint8](sentinel[k] & 0xFF):
+            printk0("esp_log: USB ESP write self-test FAIL: readback mismatch\n")
+            return -1
+        k = k + 1
+    printk0("esp_log: USB ESP write self-test PASS (sd0p1)\n")
+    return 0

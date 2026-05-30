@@ -1736,6 +1736,69 @@ def xhci_stall_recoveries() -> uint32:
     return xhci.stall_recoveries
 
 
+def xhci_recover_bulk_in() -> int32:
+    # Public BOT-layer hook: fully recover the live mass-storage bulk-IN
+    # endpoint after a failed CSW read (device STALLed the status
+    # endpoint, or our event wait timed out while the device was busy
+    # programming NAND and NAKing the IN). Clears the device-side HALT
+    # feature, resets the host-controller endpoint, and repositions the
+    # transfer ring — exactly the sequence _xhci_bulk_xfer runs on a cc=6,
+    # but callable from storage.ad WITHOUT a TRB already in flight so the
+    # CSW read can be retried on a clean endpoint. Returns 0 on success.
+    if xhci.ms_slot_id == 0 or xhci.ms_enabled == 0:
+        return -1
+    in_ep_id: uint32 = (xhci.ms_in_ep * 2) + 1
+    return _xhci_recover_stalled_ep(xhci.ms_slot_id, in_ep_id,
+                                    xhci.ms_in_ring,
+                                    cast[Ptr[uint32]](&xhci.ms_in_enqueue),
+                                    cast[Ptr[uint32]](&xhci.ms_in_cycle))
+
+
+def xhci_recover_bulk_out() -> int32:
+    # Public BOT-layer hook: recover the live mass-storage bulk-OUT
+    # endpoint (device STALLed the command/data phase). Same machinery as
+    # xhci_recover_bulk_in for the OUT direction. Returns 0 on success.
+    if xhci.ms_slot_id == 0 or xhci.ms_enabled == 0:
+        return -1
+    out_ep_id: uint32 = xhci.ms_out_ep * 2
+    return _xhci_recover_stalled_ep(xhci.ms_slot_id, out_ep_id,
+                                    xhci.ms_out_ring,
+                                    cast[Ptr[uint32]](&xhci.ms_out_enqueue),
+                                    cast[Ptr[uint32]](&xhci.ms_out_cycle))
+
+
+def xhci_bulk_only_mass_storage_reset() -> int32:
+    # Bulk-Only Mass Storage Reset (USB MSC BOT spec §3.1): a class-
+    # specific control request that tells the DEVICE to abort the current
+    # command, reset its BOT state machine, and leave both bulk endpoints
+    # ready (but still HALTED from the host's view if they were stalled).
+    # The full BOT-spec reset-recovery is:
+    #   1. Bulk-Only Mass Storage Reset (bmRequestType=0x21, bRequest=0xFF,
+    #      wValue=0, wIndex=interface, wLength=0).
+    #   2. Clear-Feature(HALT) on the bulk-IN endpoint.
+    #   3. Clear-Feature(HALT) on the bulk-OUT endpoint.
+    # plus re-point both transfer rings (Reset Endpoint + Set TR Dequeue)
+    # so the host controller and device agree on a clean dequeue cursor.
+    # This is the heavy hammer storage.ad reaches for when a CSW phase
+    # error or a persistent CSW failure means the BOT state machine itself
+    # is out of sync — lighter than re-enumerating the device.
+    # Returns 0 if the control request and both endpoint recoveries land.
+    if xhci.ms_slot_id == 0 or xhci.ms_enabled == 0:
+        return -1
+    # Class request: host-to-device | class | interface recipient.
+    rc: int32 = xhci_control_transfer(0x21, 0xFF, 0,
+                                      cast[uint16](xhci.ms_intf), 0, 0)
+    if rc < 0:
+        printk0("[usbms] Bulk-Only Mass Storage Reset request failed\n")
+        # Continue anyway — some devices NAK the reset but still benefit
+        # from the endpoint clears below.
+    r1: int32 = xhci_recover_bulk_out()
+    r2: int32 = xhci_recover_bulk_in()
+    if r1 != 0 or r2 != 0:
+        return -1
+    return 0
+
+
 def xhci_maybe_run_stall_selftest():
     # Called ONCE from usbms_probe after the bulk endpoints are live, on
     # the FIRST registration of a USB mass-storage device. It drives the

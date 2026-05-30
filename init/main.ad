@@ -25,7 +25,9 @@ from kernel.printk.printk import (
     printk0, printk1, printk2,
     pr_info, pr_warn, pr_err, pr_emerg,
 )
-from kernel.printk.esp_log import esp_log_init, esp_log_flush, esp_log_rescan
+from kernel.printk.esp_log import (
+    esp_log_init, esp_log_flush, esp_log_rescan, esp_log_write_selftest,
+)
 from kernel.panic import WARN_ON
 from kernel.list import (
     ListHead, INIT_LIST_HEAD, list_add, list_add_tail,
@@ -4829,6 +4831,15 @@ def start_kernel():
     # ring-3 transition that follows. Also wires TSS.IST1 to a
     # scratch stack so #DF has somewhere to land when the
     # interrupted RSP is unusable.
+    # USB ESP write self-test (drivers/usb/storage.ad + kernel/printk/
+    # esp_log.ad). Runs near the END of boot so its single PASS/FAIL banner
+    # lands in the LAST few screen lines a serial-less NUC can be
+    # photographed showing. It round-trips a sentinel through the raw USB
+    # bulk-OUT WRITE(10) path on sd0p1 — the path that had never run on real
+    # hardware and left LOG.TXT all-newlines. A no-op (returns 0) on a
+    # non-USB boot or when no sd0p1 ESP target is armed.
+    printk0("[boot:40.5] esp_log_write_selftest\n")
+    esp_log_write_selftest()
     # Persist everything up to the late-init phases before we touch the
     # trap table / hand off to userland — these are exactly the points a
     # bad real-hardware boot tends to die at.

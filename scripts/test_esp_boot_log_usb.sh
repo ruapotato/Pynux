@@ -69,6 +69,12 @@ PROMPT_MARKER="handing off to interactive shell"
 # End-of-log marker the flush writes right after the captured text so the
 # file reads cleanly in a text editor (no NUL sea).
 END_MARKER="END OF HAMNIX LOG"
+# The USB ESP write self-test banner. Printed near the end of boot after a
+# real sentinel round-trip through the raw bulk-OUT WRITE(10) path on
+# sd0p1, then captured by the final flush. Its presence PROVES the write
+# path actually completed a write+readback on this (emulated) xHCI — the
+# exact path that silently failed on the real NUC.
+SELFTEST_MARKER="USB ESP write self-test PASS (sd0p1)"
 
 # --- environment gates (skip cleanly) ---------------------------------
 if [ ! -e /dev/kvm ]; then
@@ -246,6 +252,17 @@ if grep -a -q "$END_MARKER" "$RECOVERED"; then
     echo "[test_esp_log_usb] PASS: end-of-log marker ('$END_MARKER') present — file is clean text, not NUL-padded."
 else
     echo "[test_esp_log_usb] FAIL: end-of-log marker ('$END_MARKER') absent — flush did not write the clean terminator." >&2
+    fail=1
+fi
+
+# THE WRITE-PATH KEYSTONE: the USB ESP write self-test banner must be on
+# the ESP. It only prints after a sentinel was written via raw bulk-OUT
+# WRITE(10) AND read back byte-for-byte — so its presence is direct proof
+# the write path completed, not just that something landed on disk.
+if grep -a -q -F "$SELFTEST_MARKER" "$RECOVERED"; then
+    echo "[test_esp_log_usb] PASS: USB ESP write self-test banner ('$SELFTEST_MARKER') present — bulk-OUT WRITE(10) round-trip verified."
+else
+    echo "[test_esp_log_usb] FAIL: USB ESP write self-test banner ('$SELFTEST_MARKER') NOT on the USB ESP — the write-path round-trip did not pass." >&2
     fail=1
 fi
 

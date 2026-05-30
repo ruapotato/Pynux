@@ -59,6 +59,8 @@ from drivers.usb.xhci import (
     xhci_attach_mass_storage, xhci_ms_slot,
     xhci_ms_in_ep, xhci_ms_out_ep,
     xhci_maybe_run_stall_selftest,
+    xhci_recover_bulk_in, xhci_recover_bulk_out,
+    xhci_bulk_only_mass_storage_reset,
 )
 
 extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
@@ -237,26 +239,99 @@ def _usbms_bot_xfer_inner(cdb: Ptr[uint8], cdb_len: uint8,
             printk0("[usbms] data phase failed\n")
             return -1
 
-    # Status phase: read the 13-byte CSW on bulk-IN.
-    csw: Ptr[uint8] = cast[Ptr[uint8]](usbms.csw_buf)
-    memset(csw, 0, CSW_LEN)
-    if xhci_bulk_in(usbms.slot, usbms.in_ep, usbms.csw_buf,
-                    CSW_LEN) < 0:
-        printk0("[usbms] CSW read failed\n")
+    # Status phase: read + validate the 13-byte CSW on bulk-IN, with
+    # BOT-spec recovery for a slow/halting device.
+    #
+    # REAL-HARDWARE WRITE HAZARD (why this is not a single bulk-IN read)
+    # -----------------------------------------------------------------
+    # On a real USB stick a WRITE(10) makes the device program NAND, which
+    # is SLOW (milliseconds). During that time the device NAKs the CSW
+    # bulk-IN (or STALLs the status endpoint). QEMU's emulated MSC returns
+    # the CSW instantly, so this never bit us in simulation, but on the NUC
+    # a single bulk-IN with a fixed spin budget can time out (cc=0 -> -1)
+    # even though the write is succeeding — reported as a flush failure and
+    # an all-newline LOG.TXT. Per the Bulk-Only Transport spec (§5.3 / §6.6
+    # error handling) the host must, on a status-phase STALL/failure,
+    # Clear-Feature(HALT) the bulk-IN endpoint and RE-ATTEMPT the CSW read
+    # once before declaring a phase error. We retry the CSW read a bounded
+    # number of times, recovering the bulk-IN endpoint between attempts,
+    # which both gives slow NAND time to finish AND clears a halted status
+    # endpoint. A persistent failure / phase error escalates to a full
+    # Bulk-Only Mass Storage Reset so a wedged BOT state machine can't
+    # poison every subsequent transfer.
+    if _usbms_read_csw() != 0:
         return -1
+    return moved
 
-    # Validate CSW: signature + tag echo + status.
-    sig: uint32 = cast[uint32](csw[0]) | (cast[uint32](csw[1]) << 8) \
-                | (cast[uint32](csw[2]) << 16) | (cast[uint32](csw[3]) << 24)
-    if sig != CSW_SIGNATURE:
-        printk1("[usbms] bad CSW signature %x\n", cast[uint64](sig))
-        return -1
-    status: uint8 = csw[12]
-    if status != CSW_STATUS_GOOD:
+
+def _usbms_read_csw() -> int32:
+    # Read + validate the CSW for the command just issued. Returns 0 on a
+    # GOOD CSW (signature + tag echo + status==0), -1 otherwise. Retries
+    # the bulk-IN read with endpoint recovery to tolerate a device that
+    # NAKs/STALLs the status phase while it finishes a slow write.
+    csw: Ptr[uint8] = cast[Ptr[uint8]](usbms.csw_buf)
+    attempt: int32 = 0
+    while attempt < 4:
+        memset(csw, 0, CSW_LEN)
+        rc: int32 = xhci_bulk_in(usbms.slot, usbms.in_ep, usbms.csw_buf,
+                                 CSW_LEN)
+        if rc < 0:
+            # No CSW (status endpoint halted, or the device is still busy
+            # programming and NAKed until we timed out). Recover the
+            # bulk-IN endpoint and re-attempt — this clears a device-side
+            # HALT and resets the ring so the next read starts clean.
+            if attempt + 1 >= 4:
+                printk0("[usbms] CSW read failed (status endpoint wedged)\n")
+                xhci_bulk_only_mass_storage_reset()
+                return -1
+            xhci_recover_bulk_in()
+            attempt = attempt + 1
+            continue
+        # Validate CSW: signature + tag echo + status.
+        sig: uint32 = cast[uint32](csw[0]) | (cast[uint32](csw[1]) << 8) \
+                    | (cast[uint32](csw[2]) << 16) \
+                    | (cast[uint32](csw[3]) << 24)
+        if sig != CSW_SIGNATURE:
+            # A garbage/short CSW means we are out of phase with the
+            # device's BOT state machine. Re-attempt after recovering the
+            # endpoint; if it persists, hard-reset the BOT engine.
+            printk1("[usbms] bad CSW signature %x\n", cast[uint64](sig))
+            if attempt + 1 >= 4:
+                xhci_bulk_only_mass_storage_reset()
+                return -1
+            xhci_recover_bulk_in()
+            attempt = attempt + 1
+            continue
+        # dCSWTag (4..7) must echo the CBW tag we sent.
+        rtag: uint32 = cast[uint32](csw[4]) | (cast[uint32](csw[5]) << 8) \
+                     | (cast[uint32](csw[6]) << 16) \
+                     | (cast[uint32](csw[7]) << 24)
+        if rtag != usbms.tag:
+            printk2("[usbms] CSW tag mismatch got=%d want=%d\n",
+                    cast[uint64](rtag), cast[uint64](usbms.tag))
+            if attempt + 1 >= 4:
+                xhci_bulk_only_mass_storage_reset()
+                return -1
+            xhci_recover_bulk_in()
+            attempt = attempt + 1
+            continue
+        status: uint8 = csw[12]
+        if status == CSW_STATUS_GOOD:
+            return 0
+        if status == CSW_STATUS_PHASE:
+            # Phase Error (BOT §6.5): the only spec-mandated recovery is a
+            # full Bulk-Only Mass Storage Reset. The command is lost; the
+            # caller (write_sectors/read_sectors) retries it on a clean
+            # BOT engine.
+            printk0("[usbms] CSW phase error -> mass-storage reset\n")
+            xhci_bulk_only_mass_storage_reset()
+            return -1
+        # Command Failed (status==1): a genuine SCSI error (e.g. medium
+        # not ready). Not a transport fault — don't reset, just report.
         printk1("[usbms] CSW status=%d (command failed)\n",
                 cast[uint64](status))
         return -1
-    return moved
+    return -1
 
 
 # --- Minimal SCSI over BOT ----------------------------------------
