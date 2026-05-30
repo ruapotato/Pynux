@@ -197,6 +197,14 @@ XHCI_PORTSC_WPR:   uint32 = 0x80000000  # Warm Port Reset (RW1S, USB3 trigger)
 # Bits that are write-1-to-clear and must be masked off when we
 # write back PORTSC otherwise we'll clear something unintentionally.
 XHCI_PORTSC_W1C_MASK: uint32 = 0x00FE0000
+# Bits that are plain RW and SAFE to carry across a read-modify-write:
+# PP (Port Power, bit9) plus the wake-enable bits WCE/WDE/WOE (bits
+# 25..27). Everything else in PORTSC is either RW1S (PR bit4, WPR bit31
+# — re-asserting them bounces the link), RW1CS (PED bit1 — writing 1
+# *disables* an enabled port!), or PLS (bits5..8, only written with the
+# LWS strobe). So a safe PORTSC write preserves ONLY this mask and ORs
+# in exactly the trigger / change bits the caller asked for.
+XHCI_PORTSC_PRESERVE_MASK: uint32 = 0x0E000200
 # Speed lives in bits 10..13 (4 bits). 1=FullSpeed, 2=LowSpeed,
 # 3=HighSpeed, 4=SuperSpeed.
 XHCI_PORTSC_SPEED_SHIFT: uint32 = 10
@@ -306,6 +314,8 @@ class XhciState:
     max_ports:    uint32      # from HCSPARAMS1[31:24]
     hci_version:  uint32      # BCD, e.g. 0x0100
     ac64:         uint32      # HCCPARAMS1.AC64; 0xFF until caps are read
+    ss_port_lo:   uint32      # first USB3 (SuperSpeed) root port (1-based); 0=none
+    ss_port_hi:   uint32      # last  USB3 (SuperSpeed) root port (1-based); 0=none
 
     # V1 transfer-engine state — see "Ring layout" comment block below
     # for the lifetime + addressing rules. dcbaa / cmd_ring / event_ring
@@ -437,6 +447,16 @@ class XhciState:
     ms_cfg_value:  uint8
     ms_intf:       uint8
     ms_enabled:    uint32         # 1 once both bulk eps are configured
+
+    # Last-attach-attempt diagnostics. The per-step printk0 failure lines
+    # in _xhci_attach_mass_storage_locked scroll off the top of a real-HW
+    # crash frame, so we also latch the furthest milestone the most recent
+    # attempt reached + which port it was on. The late xhci_port_report()
+    # prints these in-frame so a single photo says exactly where SuperSpeed
+    # enumeration died. Stages: 0=none 1=port-reset 2=allocs 3=enable-slot
+    # 4=address-device 5=desc-device 6=desc-cfg9 7=desc-cfgfull+eps 8=enabled.
+    ms_attach_stage: uint32
+    ms_attach_port:  uint32
 
     # Idempotency latch: set to 1 the moment xhci_init() makes its
     # init/skip decision (whether it brought the controller fully up,
@@ -772,6 +792,15 @@ def xhci_port_report():
         n = n + 1
     printk1("[xhci-ports] ports_connected=%d\n",
             cast[uint64](xhci.ports_connected))
+    # Last mass-storage attach attempt: how far did it get and on which
+    # port. Stage 8 = fully enabled; anything less names the exact step
+    # the SuperSpeed enumeration died on, in the same crash frame.
+    # 0=none 1=port-reset 2=allocs 3=enable-slot 4=address-device
+    # 5=desc-device 6=desc-cfg9 7=desc-cfgfull+eps 8=enabled.
+    printk2("[xhci-ports] ms_attach port=%d stage=%d",
+            cast[uint64](xhci.ms_attach_port),
+            cast[uint64](xhci.ms_attach_stage))
+    printk1(" slot=%d\n", cast[uint64](xhci.ms_slot_id))
     xhci_proto_report()
 
 
@@ -815,6 +844,53 @@ def xhci_proto_report():
         else:
             cap_addr = cap_addr + cast[uint64](nxt) * 4
             hops = hops + 1
+
+
+def _xhci_record_ss_range(bar0: uint64):
+    # Record the USB3 (SuperSpeed, major revision 3) root-port range from
+    # the Supported Protocol caps into xhci.ss_port_{lo,hi}. SuperSpeed
+    # ports must NOT be driven with a USB2 hot reset (PORTSC.PR) — that
+    # knocks the trained SS link down to Rx.Detect — so the reset path
+    # consults this range to pick warm reset (WPR) instead. 0/0 = none
+    # (e.g. QEMU exposes the range too, but its stick comes up PED=1 so
+    # the reset fast path makes the gating moot there).
+    xhci.ss_port_lo = 0
+    xhci.ss_port_hi = 0
+    if bar0 == 0:
+        return
+    hccparams1: uint32 = _xhci_r32(bar0 + XHCI_CAP_HCCPARAMS1)
+    xecp: uint32 = (hccparams1 >> XHCI_HCCPARAMS1_XECP_SHIFT) & 0xFFFF
+    if xecp == 0:
+        return
+    cap_addr: uint64 = bar0 + cast[uint64](xecp) * 4
+    hops: uint32 = 0
+    while hops < 64:
+        capreg: uint32 = _xhci_r32(cap_addr)
+        cap_id: uint32 = capreg & XHCI_XECP_ID_MASK
+        if cap_id == XHCI_XECP_ID_PROTOCOL:
+            major: uint32 = (capreg >> 24) & 0xFF
+            if major == 3:
+                dw2:   uint32 = _xhci_r32(cap_addr + 8)
+                poff:  uint32 = dw2 & 0xFF
+                pcnt:  uint32 = (dw2 >> 8) & 0xFF
+                if poff != 0 and pcnt != 0:
+                    xhci.ss_port_lo = poff
+                    xhci.ss_port_hi = poff + pcnt - 1
+        nxt: uint32 = (capreg >> XHCI_XECP_NEXT_SHIFT) & XHCI_XECP_NEXT_MASK
+        if nxt == 0:
+            hops = 64                       # break — end of list
+        else:
+            cap_addr = cap_addr + cast[uint64](nxt) * 4
+            hops = hops + 1
+
+
+def _xhci_port_is_ss(port: uint32) -> int32:
+    # 1 if `port` (1-based) lies in the recorded USB3 SuperSpeed range.
+    if xhci.ss_port_hi == 0:
+        return 0
+    if port >= xhci.ss_port_lo and port <= xhci.ss_port_hi:
+        return 1
+    return 0
 
 
 # --- Public entry point -------------------------------------------
@@ -955,6 +1031,14 @@ def xhci_init_ex(force_bare_metal: int32) -> int32:
     xhci.ac64 = ac64
     printk2("[xhci] HCCPARAMS1=%x AC64=%d (1=64-bit DMA ok, 0=32-bit only)\n",
             cast[uint64](hccparams1), cast[uint64](ac64))
+
+    # Record the USB3 SuperSpeed port range from the Supported Protocol
+    # caps so the reset path can avoid USB2 hot-resetting a SS link (which
+    # drops it to Rx.Detect). On a real xHC the boot stick enumerates as
+    # SuperSpeed on a USB3 port; this is what lets us drive it correctly.
+    _xhci_record_ss_range(bar0)
+    printk2("[xhci] SuperSpeed port range: %d..%d\n",
+            cast[uint64](xhci.ss_port_lo), cast[uint64](xhci.ss_port_hi))
 
     # BIOS->OS ownership handoff (xHCI §7.1). MUST run before the
     # controller reset / run sequence while the controller is still
@@ -1370,6 +1454,19 @@ def _xhci_v1_bringup() -> int32:
 
 # --- Slot + endpoint lifecycle -----------------------------------
 
+def _xhci_portsc_write(port_addr: uint64, bits: uint32):
+    # The ONLY safe way to write PORTSC. A naive read-modify-write that
+    # carries the current value forward re-asserts whatever happened to be
+    # latched: PED (bit1) is RW1CS so writing it back as 1 *disables* a
+    # just-enabled port (this killed the SuperSpeed boot stick on real HW —
+    # port 17 went 0x221203 -> 0x20200 the instant we acked CSC), and PR /
+    # WPR are RW1S so carrying them re-triggers a reset. So we preserve only
+    # the genuinely-RW bits (PP + wake enables) and OR in exactly the
+    # trigger and/or W1C-ack bits the caller wants asserted this write.
+    cur: uint32 = _xhci_r32(port_addr)
+    _xhci_w32(port_addr, (cur & XHCI_PORTSC_PRESERVE_MASK) | bits)
+
+
 def _xhci_port_reset(port: uint32) -> int32:
     # Drive a root-hub port through the connect -> reset -> enable
     # handshake. On a real xHC the device may sit with the link parked
@@ -1394,23 +1491,28 @@ def _xhci_port_reset(port: uint32) -> int32:
     # bounces the link. This keeps the emulated boot path identical.
     if (pre & XHCI_PORTSC_PED) != 0:
         if (pre & XHCI_PORTSC_W1C_MASK) != 0:
-            keep0: uint32 = pre & ~XHCI_PORTSC_W1C_MASK
-            _xhci_w32(port_addr, keep0 | (pre & XHCI_PORTSC_W1C_MASK))
+            _xhci_portsc_write(port_addr, pre & XHCI_PORTSC_W1C_MASK)
         post0: uint32 = _xhci_r32(port_addr)
         _xhci_port_reset_report(port, post0)
         return 0
 
-    # First try a hot reset (PR). This enables USB 2.x ports and is the
-    # only reset QEMU's emulated controller ever needs.
+    # USB3 SuperSpeed ports: do NOT assert a USB2 hot reset (PORTSC.PR).
+    # On real silicon PR knocks a trained SS link down to Rx.Detect (the
+    # boot stick on port 18 dropped CCS=1->0 exactly this way). A Warm
+    # Port Reset (WPR) is the correct SS recovery, so go straight to it.
+    if _xhci_port_is_ss(port) != 0:
+        printk1("[xhci] port %d is SuperSpeed; using warm reset (WPR)\n",
+                cast[uint64](port))
+        return _xhci_do_reset(port_addr, port, XHCI_PORTSC_WPR,
+                              XHCI_PORTSC_WRC)
+
+    # USB2 port: a hot reset (PR) enables it and is the only reset QEMU's
+    # emulated controller ever needs.
     if _xhci_do_reset(port_addr, port, XHCI_PORTSC_PR, XHCI_PORTSC_PRC) == 0:
         return 0
 
-    # Hot reset did not enable the port. On real silicon a SuperSpeed
-    # (USB3) root port can sit at PLS=Polling with the link never trained
-    # to U0 — a hot reset cannot recover it; a Warm Port Reset (WPR) must
-    # retrain the SS link. WPR is RsvdZ on USB2 ports, so issuing it as a
-    # fallback is harmless there. QEMU never reaches this (its USB2 port
-    # is already PED=1 on attach), so the emulated boot stays identical.
+    # Hot reset did not enable the USB2 port. Fall back to a warm reset
+    # (WPR is RsvdZ on USB2 ports, so it's a harmless last resort).
     printk1("[xhci] port %d hot-reset PED=0; trying warm reset (WPR)\n",
             cast[uint64](port))
     return _xhci_do_reset(port_addr, port, XHCI_PORTSC_WPR, XHCI_PORTSC_WRC)
@@ -1427,19 +1529,17 @@ def _xhci_do_reset(port_addr: uint64, port: uint32,
     # way so the real-HW photo is decisive.
     pre: uint32 = _xhci_r32(port_addr)
     if (pre & XHCI_PORTSC_W1C_MASK) != 0:
-        keep1: uint32 = pre & ~XHCI_PORTSC_W1C_MASK
-        _xhci_w32(port_addr, keep1 | (pre & XHCI_PORTSC_W1C_MASK))
+        _xhci_portsc_write(port_addr, pre & XHCI_PORTSC_W1C_MASK)
 
-    base: uint32 = _xhci_r32(port_addr) & ~XHCI_PORTSC_W1C_MASK
-    _xhci_w32(port_addr, base | trigger)
+    _xhci_portsc_write(port_addr, trigger)
 
     spin: uint64 = 0
     while spin < 5000000:
         p2: uint32 = _xhci_r32(port_addr)
         if (p2 & change) != 0 and (p2 & XHCI_PORTSC_PR) == 0:
-            # Ack every latched change bit (RW1C) for a clean slate.
-            keep2: uint32 = p2 & ~XHCI_PORTSC_W1C_MASK
-            _xhci_w32(port_addr, keep2 | (p2 & XHCI_PORTSC_W1C_MASK))
+            # Ack every latched change bit (RW1C) for a clean slate —
+            # WITHOUT carrying PED/PR forward (see _xhci_portsc_write).
+            _xhci_portsc_write(port_addr, p2 & XHCI_PORTSC_W1C_MASK)
             post: uint32 = _xhci_r32(port_addr)
             _xhci_port_reset_report(port, post)
             if (post & XHCI_PORTSC_PED) == 0:
@@ -2177,10 +2277,13 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
     xhci.ms_enabled = 0
     xhci.ms_port  = target_port
     xhci.ms_speed = target_speed
+    xhci.ms_attach_stage = 0
+    xhci.ms_attach_port  = target_port
 
     if _xhci_port_reset(target_port) != 0:
         printk0("[usbms] port reset failed\n")
         return 0
+    xhci.ms_attach_stage = 1
 
     # The PORTSC speed field is only valid AFTER reset (before reset a
     # real-HW USB2 port sits at PLS=Polling with a meaningless speed).
@@ -2210,6 +2313,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
        or xhci.ms_out_ring == 0 or xhci.cfg_buf == 0:
         printk0("[usbms] per-slot alloc failed\n")
         return 0
+    xhci.ms_attach_stage = 2
     xhci.ms_ep0_enqueue = 0
     xhci.ms_ep0_cycle   = 1
     xhci.ms_in_enqueue  = 0
@@ -2226,6 +2330,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
         printk0("[usbms] Enable Slot failed\n")
         return 0
     xhci.ms_slot_id = slot
+    xhci.ms_attach_stage = 3
 
     # Redirect the ep0 control machinery (kbd_*) at this slot. The
     # keyboard attach has not run yet at the point storage probes (the
@@ -2238,13 +2343,20 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
     xhci.kbd_ep0_enqueue = 0
     xhci.kbd_ep0_cycle   = 1
 
+    # Control-endpoint (ep0) max packet size by speed: Low/Full=8,
+    # Full(alt)/High=64, SuperSpeed=512 (the SS descriptor encodes it as
+    # the exponent 9 => 2^9). Wrong sizing makes Address Device + the
+    # first GET_DESCRIPTOR to a SuperSpeed stick fail.
     max_pkt0: uint32 = 8
     if target_speed == USB_SPEED_HIGH:
         max_pkt0 = 64
+    if target_speed == USB_SPEED_SUPER:
+        max_pkt0 = 512
     if _xhci_v1_address_device(slot, target_port, target_speed,
                                max_pkt0, xhci.ms_ep0_ring) != 0:
         printk0("[usbms] Address Device failed\n")
         return 0
+    xhci.ms_attach_stage = 4
     printk1("[usbms] slot %d addressed\n", cast[uint64](slot))
 
     # GET_DESCRIPTOR(DEVICE, 18).
@@ -2253,6 +2365,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
         cast[uint16](USB_DT_DEVICE) << 8, 0, 18, xhci.cfg_buf) < 0:
         printk0("[usbms] GET_DESCRIPTOR(device) failed\n")
         return 0
+    xhci.ms_attach_stage = 5
 
     # GET_DESCRIPTOR(CONFIG, 9) then full config.
     if xhci_control_transfer(
@@ -2260,6 +2373,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
         cast[uint16](USB_DT_CONFIG) << 8, 0, 9, xhci.cfg_buf) < 0:
         printk0("[usbms] GET_DESCRIPTOR(config-9) failed\n")
         return 0
+    xhci.ms_attach_stage = 6
     total: uint16 = usb_cfg_total_length(cast[Ptr[uint8]](xhci.cfg_buf))
     if total > 256:
         total = 256
@@ -2268,6 +2382,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
         cast[uint16](USB_DT_CONFIG) << 8, 0, total, xhci.cfg_buf) < 0:
         printk0("[usbms] GET_DESCRIPTOR(config-full) failed\n")
         return 0
+    xhci.ms_attach_stage = 7
     xhci.ms_cfg_value = usb_cfg_value(cast[Ptr[uint8]](xhci.cfg_buf))
 
     # Walk descriptors: find the mass-storage interface + its bulk
@@ -2347,6 +2462,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
         return 0
 
     xhci.ms_enabled = 1
+    xhci.ms_attach_stage = 8
     printk1("[usbms] mass-storage slot %d ready\n", cast[uint64](slot))
     return slot
 
@@ -2365,21 +2481,37 @@ def xhci_attach_mass_storage() -> uint32:
     # must keep scanning the other connected ports for the real stick.
     if xhci.ms_enabled != 0 and xhci.ms_slot_id != 0:
         return xhci.ms_slot_id
-    n: uint32 = 0
-    while n < xhci.max_ports:
-        port_addr: uint64 = xhci.op_base + XHCI_PORT_BASE \
-                          + cast[uint64](n) * XHCI_PORT_STRIDE \
-                          + XHCI_PORT_PORTSC
-        portsc: uint32 = _xhci_r32(port_addr)
-        if (portsc & XHCI_PORTSC_CCS) != 0:
-            speed: uint32 = (portsc >> XHCI_PORTSC_SPEED_SHIFT) \
-                          & XHCI_PORTSC_SPEED_MASK
-            slot: uint32 = _xhci_attach_mass_storage_locked(n + 1, speed)
-            if slot != 0:
-                return slot
-            # This port wasn't a usable mass-storage device; keep
-            # scanning the remaining ports.
-        n = n + 1
+    # Two-pass scan: USB3 SuperSpeed ports FIRST (pass 0), then everything
+    # else (pass 1). The boot stick enumerates as SuperSpeed on a USB3
+    # port; attaching it before we reset the USB2 keyboard ports avoids
+    # disturbing the shared bus/hub and resetting the stick's link out
+    # from under us (observed on real HW: the SS stick on port 18 dropped
+    # while we were busy hot-resetting FullSpeed keyboard ports 3 and 9).
+    pass_no: uint32 = 0
+    while pass_no < 2:
+        n: uint32 = 0
+        while n < xhci.max_ports:
+            want_ss: int32 = _xhci_port_is_ss(n + 1)
+            take: int32 = 0
+            if pass_no == 0 and want_ss != 0:
+                take = 1
+            if pass_no == 1 and want_ss == 0:
+                take = 1
+            if take != 0:
+                port_addr: uint64 = xhci.op_base + XHCI_PORT_BASE \
+                                  + cast[uint64](n) * XHCI_PORT_STRIDE \
+                                  + XHCI_PORT_PORTSC
+                portsc: uint32 = _xhci_r32(port_addr)
+                if (portsc & XHCI_PORTSC_CCS) != 0:
+                    speed: uint32 = (portsc >> XHCI_PORTSC_SPEED_SHIFT) \
+                                  & XHCI_PORTSC_SPEED_MASK
+                    slot: uint32 = _xhci_attach_mass_storage_locked(n + 1,
+                                                                    speed)
+                    if slot != 0:
+                        return slot
+                    # Not a usable mass-storage device; keep scanning.
+            n = n + 1
+        pass_no = pass_no + 1
     printk0("[usbms] no mass-storage device found on root hub\n")
     return 0
 
