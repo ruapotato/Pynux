@@ -564,6 +564,14 @@ class XhciState:
     diag_ep_state:   uint32
     diag_ep_deq:     uint64
     diag_ep_dw1:     uint32
+    # Live PORTSC of the boot/MSC port (xhci.ms_port), latched at first bulk
+    # failure. QEMU attaches its emulated MSC at High-Speed, so SuperSpeed
+    # link power-management is NEVER exercised in the VM — but the real stick
+    # is a SuperSpeed device on a USB3 port. If the link has left PLS=U0 (0)
+    # by the time bulk starts, the controller fetches our TRB but the transfer
+    # never completes on the wire (evt_seen=0, ep parked at base, ep_state
+    # still Running) — indistinguishable from a ring bug WITHOUT this datum.
+    diag_portsc:     uint32
 
 
 xhci: XhciState
@@ -2345,6 +2353,16 @@ def _xhci_bulk_note_failure(ep_id: uint32, db_addr: uint64,
             ep_dw1   = octx[1]
             ep_deq   = cast[uint64](octx[2]) \
                      | (cast[uint64](octx[3]) << 32)
+        # Live PORTSC of the boot/MSC port (1-based xhci.ms_port). Tells us
+        # the SuperSpeed link state (PLS) AT bulk-fail time: PLS=0 (U0) means
+        # the link is up and the device is simply not completing; PLS!=0
+        # (U1/U2/U3/Recovery/...) means the link left U0 and the controller
+        # can't run transfers — a SuperSpeed-only failure QEMU never shows.
+        portsc: uint32 = 0
+        if xhci.op_base != 0 and xhci.ms_port != 0:
+            portsc = _xhci_r32(xhci.op_base + XHCI_PORT_BASE \
+                + (cast[uint64](xhci.ms_port) - 1) * XHCI_PORT_STRIDE \
+                + XHCI_PORT_PORTSC)
         # Latch the snapshot so the late telemetry frame can reprint it.
         xhci.diag_evt_seen   = xhci.last_evt_seen
         xhci.diag_last_evt_p = xhci.last_evt_p
@@ -2354,6 +2372,7 @@ def _xhci_bulk_note_failure(ep_id: uint32, db_addr: uint64,
         xhci.diag_ep_state   = ep_state
         xhci.diag_ep_deq     = ep_deq
         xhci.diag_ep_dw1     = ep_dw1
+        xhci.diag_portsc     = portsc
         printk2("[xhci-bulk] FAIL dir_in=%d ep_id=%d\n",
                 cast[uint64](is_in), cast[uint64](ep_id))
         printk2("[xhci-bulk] db=%p dbval=%d\n",
@@ -2366,6 +2385,10 @@ def _xhci_bulk_note_failure(ep_id: uint32, db_addr: uint64,
                 cast[uint64](ep_state), ep_deq)
         printk2("[xhci-bulk] ep_dw1=%x my_deq=%p\n",
                 cast[uint64](ep_dw1), trb_pa)
+        printk2("[xhci-bulk] portsc=%x pls=%d\n",
+                cast[uint64](portsc),
+                cast[uint64]((portsc >> XHCI_PORTSC_PLS_SHIFT) \
+                             & XHCI_PORTSC_PLS_MASK))
     if xhci.bulk_fail_count >= 4:
         if xhci.bulk_dead == 0:
             printk0("[xhci-bulk] endpoint declared DEAD; suppressing further bulk I/O\n")
@@ -2398,6 +2421,10 @@ def xhci_bulk_diag_report():
             cast[uint64](xhci.diag_ep_state), xhci.diag_ep_deq)
     printk2("[xhci-bulk] (late) ep_dw1=%x my_deq=%p\n",
             cast[uint64](xhci.diag_ep_dw1), xhci.diag_expect_trb)
+    printk2("[xhci-bulk] (late) portsc=%x pls=%d\n",
+            cast[uint64](xhci.diag_portsc),
+            cast[uint64]((xhci.diag_portsc >> XHCI_PORTSC_PLS_SHIFT) \
+                         & XHCI_PORTSC_PLS_MASK))
 
 
 def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
