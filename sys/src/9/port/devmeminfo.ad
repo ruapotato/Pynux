@@ -33,7 +33,14 @@ from mm.memblock import (
     memblock_region_base, memblock_region_top,
     memblock_used, memblock_avail,
 )
-from mm.page_alloc import page_alloc_total, page_alloc_free_count
+from mm.page_alloc import (
+    page_alloc_total, page_alloc_free_count,
+    page_alloc_freed_total, page_alloc_in_use,
+)
+from mm.vma import vma_nodes_live
+from kernel.sched.core import (
+    tasks_spawned_total, tasks_reaped_total, tasks_live_count,
+)
 
 
 # Kernel pages are 4 KiB; one kB column equals (bytes >> 10).
@@ -94,8 +101,8 @@ def _emit_count_line(out: Ptr[uint8], pos: uint64,
 
 def _build_meminfo(out: Ptr[uint8], cap: uint64) -> uint64:
     # Fill out[] with the meminfo text. Returns total bytes written.
-    # Worst-case ~140 bytes (six labels + 20-digit decimals). Caller
-    # supplies a 256-byte scratch in devmeminfo_read.
+    # Worst-case ~350 bytes (twelve labels + 20-digit decimals). Caller
+    # supplies a 512-byte scratch in devmeminfo_read.
 
     # memblock region = the kernel-managed physical RAM window. Its
     # "total" is the original capacity, computed before any bump
@@ -124,18 +131,31 @@ def _build_meminfo(out: Ptr[uint8], cap: uint64) -> uint64:
         in_use_pages = npages_total - npages_free
     pos = _emit_count_line(out, pos, "KmallocLive: ", in_use_pages)
 
+    # Leak-accounting fields. These expose cumulative + current-live
+    # counters across the page allocator, VMA layer, and task scheduler.
+    # A spawn/reap cycle that returns PagesInUse / VmaNodesLive /
+    # TasksLive to baseline is leak-free; monotonic growth is a leak.
+    pos = _emit_count_line(out, pos, "PagesTotal:     ", npages_total)
+    pos = _emit_count_line(out, pos, "PagesFreedTotal:", page_alloc_freed_total())
+    pos = _emit_count_line(out, pos, "PagesInUse:     ", page_alloc_in_use())
+    pos = _emit_count_line(out, pos, "VmaNodesLive:   ", vma_nodes_live())
+    pos = _emit_count_line(out, pos, "TasksSpawned:   ", tasks_spawned_total())
+    pos = _emit_count_line(out, pos, "TasksReaped:    ", tasks_reaped_total())
+    pos = _emit_count_line(out, pos, "TasksLive:      ", tasks_live_count())
+
     return pos
 
 
 # --- public API -------------------------------------------------------
 
 def devmeminfo_read(buf: Ptr[uint8], count: uint64) -> int64:
-    # Stateless snapshot. 256 bytes covers the worst-case rendered
-    # blob today; caller's `count` is the only cap on bytes copied.
+    # Stateless snapshot. 512 bytes covers the worst-case rendered
+    # blob with the new leak-accounting fields; caller's `count` is
+    # the only cap on bytes copied.
     if count == 0:
         return 0
-    scratch: Array[256, uint8]
-    n: uint64 = _build_meminfo(&scratch[0], 256)
+    scratch: Array[512, uint8]
+    n: uint64 = _build_meminfo(&scratch[0], 512)
     take: uint64 = count
     if take > n:
         take = n

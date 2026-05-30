@@ -481,6 +481,16 @@ task_table:  Array[16, TaskStruct]
 next_pid:    uint64 = 1
 current_idx: uint64 = 0                  # index into task_table
 
+# Memory-leak accounting: cumulative task spawn/reap counters.
+# nr_tasks_spawned is incremented each time kthread_create or
+# create_user_task allocates a slot; nr_tasks_reaped is incremented
+# each time task_reap marks a slot STATE_FREE. The difference
+# (nr_tasks_spawned - nr_tasks_reaped) is the number of live+zombie
+# slots currently in use. After a clean spawn/reap cycle it must
+# return to baseline.
+nr_tasks_spawned: uint64 = 0
+nr_tasks_reaped:  uint64 = 0
+
 # --- Exit-time CLEARTID wake hook (boundary-discipline inversion) ----
 #
 # CLONE_CHILD_CLEARTID is a Linux-ABI (Layer 2) contract: a clone()d
@@ -808,6 +818,7 @@ def kthread_create(entry: uint64, name0: uint64) -> int32:
     task_table[s].gid = 1
     _init_fd_table(s)
     next_pid = next_pid + 1
+    nr_tasks_spawned = nr_tasks_spawned + 1
     return slot
 
 
@@ -1083,6 +1094,7 @@ def create_user_thread(entry: uint64, name0: uint64,
     _init_fd_table(s)
     _inherit_cwd_from_parent(s)
     next_pid = next_pid + 1
+    nr_tasks_spawned = nr_tasks_spawned + 1
     return slot
 
 
@@ -1299,6 +1311,7 @@ def task_exit_current(code: int64):
         printk_set_level(PRINTK_LEVEL_NOTICE)
         printk2("task: pid %d exited detached (code=%d) — self-reaped\n",
                 task_table[current_idx].pid, cast[uint64](code))
+        nr_tasks_reaped = nr_tasks_reaped + 1
         task_table[current_idx].state = STATE_FREE
         schedule()
         return
@@ -1795,6 +1808,7 @@ def task_reap(slot: int32):
     if task_table[su].is_user != 0 and task_table[su].kstack_base != 0:
         free_pages(task_table[su].kstack_base, KSTACK_ORDER)
         task_table[su].kstack_base = 0
+    nr_tasks_reaped = nr_tasks_reaped + 1
     task_table[su].state = STATE_FREE
 
 
@@ -1813,6 +1827,31 @@ def _order_for_bytes(nbytes: uint64) -> int32:
 
 def task_pid_at(slot: int32) -> uint64:
     return task_table[cast[uint64](slot)].pid
+
+
+def tasks_spawned_total() -> uint64:
+    # Cumulative count of task slots ever allocated (kthread + user).
+    # Used by the memory-leak accounting layer.
+    return nr_tasks_spawned
+
+
+def tasks_reaped_total() -> uint64:
+    # Cumulative count of task slots ever freed back to STATE_FREE.
+    # Used by the memory-leak accounting layer.
+    return nr_tasks_reaped
+
+
+def tasks_live_count() -> uint64:
+    # Count of task slots currently in use (STATE_READY / _RUNNING /
+    # _EXITED). Computed by walking the table — cheap at NTASKS=16.
+    n: uint64 = 0
+    i: uint64 = 0
+    while i < NTASKS:
+        st: uint64 = task_table[i].state
+        if st != STATE_FREE:
+            n = n + 1
+        i = i + 1
+    return n
 
 
 def set_linux_userspace_mode(slot: int32, on: int32):

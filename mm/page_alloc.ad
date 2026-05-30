@@ -40,6 +40,10 @@ nr_pages_total:   uint64 = 0
 # Higher-order free lists are not counted yet; the metric is mostly
 # useful for the existing order-0 smoke test.
 nr_pages_free:    uint64 = 0
+# Cumulative pages returned to the allocator via free_pages. The
+# current in-use count is (nr_pages_total - nr_pages_freed_total)
+# once the buddy allocator is fully up. Monotonically increasing.
+nr_pages_freed_total: uint64 = 0
 
 
 # --- order-N alloc / free ------------------------------------------
@@ -121,6 +125,12 @@ def free_pages(addr: uint64, order: int32):
         return
     if order < 0 or order > MAX_ORDER:
         return
+
+    # Accounting: track cumulative pages freed. The difference
+    # (nr_pages_total - nr_pages_freed_total) gives the pages currently
+    # in active use — a useful leak probe after spawn/reap cycles.
+    freed_pages: uint64 = cast[uint64](1) << cast[uint64](order)
+    nr_pages_freed_total = nr_pages_freed_total + freed_pages
 
     cur_addr:  uint64 = addr
     cur_order: int32  = order
@@ -267,8 +277,9 @@ def page_alloc_init():
     # Globals start zeroed by BSS init; nothing functional to do.
     # Keeping the function so the call-site in arch/x86/mm/init.ad
     # reads like Linux's mem_init() flow.
-    nr_pages_total = 0
-    nr_pages_free  = 0
+    nr_pages_total        = 0
+    nr_pages_free         = 0
+    nr_pages_freed_total  = 0
 
 
 def page_alloc_total() -> uint64:
@@ -277,3 +288,17 @@ def page_alloc_total() -> uint64:
 
 def page_alloc_free_count() -> uint64:
     return nr_pages_free
+
+
+def page_alloc_freed_total() -> uint64:
+    # Cumulative pages ever returned via free_pages. Used by the
+    # memory-leak accounting layer: in-use = total - freed_total.
+    return nr_pages_freed_total
+
+
+def page_alloc_in_use() -> uint64:
+    # Pages currently allocated (not yet freed). Robust metric for
+    # leak detection: monotonically non-decreasing unless pages leak.
+    if nr_pages_total >= nr_pages_freed_total:
+        return nr_pages_total - nr_pages_freed_total
+    return 0

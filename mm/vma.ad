@@ -144,6 +144,11 @@ VMA_LARGE_LIMIT:  uint64 = 0xFFC00000           # just under 4 GiB
 # entry (elf_install_user_mapping refuses a range crossing 1 GiB).
 vma_large_next:   uint64 = 0x40000000
 
+# Memory-leak accounting: live VmaNode count. Incremented in
+# _vma_node_new, decremented in _vma_node_free. A spawn/reap cycle
+# that leaks nodes would show monotonic growth here.
+nr_vma_nodes_live: uint64 = 0
+
 
 # ---------------------------------------------------------------------
 # VmaChunk / VmaNode
@@ -214,6 +219,7 @@ def _vma_node_new() -> uint64:
     if p == 0:
         return 0
     memset(cast[Ptr[uint8]](p), 0, VMA_NODE_SIZE)
+    nr_vma_nodes_live = nr_vma_nodes_live + 1
     return p
 
 
@@ -381,6 +387,8 @@ def _vma_node_free(node: uint64, pml4_phys: uint64):
         carr: uint64 = cast[Ptr[VmaNode]](node)[0].chunks
         if carr != 0:
             kfree(carr)
+        if nr_vma_nodes_live > 0:
+            nr_vma_nodes_live = nr_vma_nodes_live - 1
         kfree(node)
         return
 
@@ -397,12 +405,16 @@ def _vma_node_free(node: uint64, pml4_phys: uint64):
                     free_pages(cphys, corder)
                 i = i + 1
             kfree(carr)
+        if nr_vma_nodes_live > 0:
+            nr_vma_nodes_live = nr_vma_nodes_live - 1
         kfree(node)
         return
     backing: uint64 = cast[Ptr[VmaNode]](node)[0].backing
     if backing != 0:
         order: int32 = cast[Ptr[VmaNode]](node)[0].order
         free_pages(backing, order)
+    if nr_vma_nodes_live > 0:
+        nr_vma_nodes_live = nr_vma_nodes_live - 1
     kfree(node)
 
 
@@ -1476,3 +1488,9 @@ def vma_count(slot: uint64) -> uint64:
         n = n + 1
         cur = _vma_node_get_next(cur)
     return n
+
+
+def vma_nodes_live() -> uint64:
+    # Current count of live VmaNode heap allocations across all tasks.
+    # A spawn/reap cycle that returns to the same value is leak-free.
+    return nr_vma_nodes_live
