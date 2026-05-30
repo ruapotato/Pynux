@@ -4873,6 +4873,16 @@ def start_kernel():
     else:
         printk1("[usb-late] sd0_slot=%d (USB stick enumerated)\n",
                 cast[uint64](usb_sd0))
+    # /init resolution outcome, reprinted in the SAME on-screen frame as the
+    # ring-3 hand-off trap-diag (the boot:36 lines scroll off before a crash).
+    # blob=0 -> ns_blob_ptr("/init") found nothing => the ext4 root read off
+    # the freshly-enumerated sd0 failed and we fell back to the baked
+    # user_demo_entry. entry==userdemo confirms baked fallback; entry!=userdemo
+    # means /init ELF loaded and the fault is in its code / per-task mapping.
+    # Compare entry/userdemo against the trap-diag rip to see which one ran.
+    printk2("[boot:init] blob=%p size=%d\n", init_blob, init_size)
+    printk2("[boot:init] entry=%p userdemo=%p\n",
+            init_entry, cast[uint64](&user_demo_entry))
     esp_log_flush()
     printk0("[boot:42] start_first_task\n")
     printk0("Hamnix: entering parent via start_first_task...\n")
