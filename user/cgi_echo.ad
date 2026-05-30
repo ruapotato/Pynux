@@ -1,0 +1,81 @@
+# user/cgi_echo.ad — sample CGI script for the Hamnix native web server.
+#
+# Demonstrates the Hamnix-native CGI calling convention (see
+# user/httpd_worker.ad "CGI ENVIRONMENT"):
+#   * The CGI variables arrive as argv[] "NAME=VALUE" pairs.
+#   * The request body arrives on stdin (fd 0).
+#   * The response BODY is written to stdout (fd 1); httpd_worker wraps
+#     it with the HTTP status line + Content-Type + Content-Length.
+#
+# This script echoes the CGI environment and the request body back as a
+# small HTML page, so a test can assert that the method, query string,
+# and POST body all reached the script.
+#
+# Build (scripts/build_user.sh): lands at /bin/cgi_echo. A vhost docroot
+# that wants to expose it at /cgi-bin/echo should provide a path that
+# resolves there (the test stages /var/www/cgi-bin/echo == this binary).
+#
+# Compiler-quirk discipline: every buffer is a top-level BSS Array; no
+# string-literal globals; no adjacent string concat.
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+
+out_buf:  Array[8192, uint8]
+in_buf:   Array[8192, uint8]
+
+
+def slen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def emit(at: uint64, s: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while s[i] != 0 and at + i < 8191:
+        out_buf[at + i] = s[i]
+        i = i + 1
+    return at + i
+
+
+def emit_ptr(at: uint64, p: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while p[i] != 0 and at + i < 8191:
+        out_buf[at + i] = p[i]
+        i = i + 1
+    return at + i
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    at: uint64 = 0
+    at = emit(at, "<html><body>\n")
+    at = emit(at, "<h1>Hamnix CGI</h1>\n")
+    at = emit(at, "<p>CGI_ECHO_OK</p>\n")
+
+    # Dump the CGI variables (argv[1..]).
+    at = emit(at, "<ul>\n")
+    i: int32 = 1
+    while i < argc:
+        at = emit(at, "<li>")
+        at = emit_ptr(at, cast[Ptr[uint8]](argv[cast[uint64](i)]))
+        at = emit(at, "</li>\n")
+        i = i + 1
+    at = emit(at, "</ul>\n")
+
+    # Read and echo the request body from stdin.
+    n: int64 = sys_read(0, &in_buf[0], 8191)
+    if n > 0:
+        in_buf[cast[uint64](n)] = 0
+        at = emit(at, "<pre>BODY:")
+        k: uint64 = 0
+        while k < cast[uint64](n) and at < 8180:
+            out_buf[at] = in_buf[k]
+            at = at + 1
+            k = k + 1
+        at = emit(at, "</pre>\n")
+
+    at = emit(at, "</body></html>\n")
+    sys_write(1, &out_buf[0], at)
+    return 0

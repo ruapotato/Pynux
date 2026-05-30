@@ -398,6 +398,48 @@ if os.environ.get("HAMNIX_HTTPD_DOCROOT") == "1":
     FILES.append(("/var/www/hello.txt",
                   b"hello from hamnix httpd\n"))
 
+# httpd concurrent/vhost/CGI staging: scripts/test_httpd_concurrent.sh
+# sets HAMNIX_HTTPD_VHOSTS=1 to plant a full web-server fixture in the
+# cpio:
+#   /etc/httpd.conf            — listen + cgi_dir + two vhost blocks
+#   /var/www/index.html        — default vhost (server_name localhost)
+#   /var/www/hello.txt         — a text/plain static file
+#   /var/www/style.css         — exercises Content-Type by extension
+#   /var/www/cgi-bin/echo      — the cgi_echo ELF (CGI dispatch target)
+#   /var/www2/index.html       — second vhost (server_name v2.test)
+# The cgi-bin binary is the freshly built build/user/cgi_echo.elf, the
+# same bytes that land at /bin/cgi_echo, copied to the docroot CGI path
+# so a "/cgi-bin/echo" URL resolves to an executable.
+if os.environ.get("HAMNIX_HTTPD_VHOSTS") == "1":
+    FILES.append(("/etc/httpd.conf",
+                  b"# Hamnix httpd test config\n"
+                  b"listen 8080\n"
+                  b"cgi_dir /cgi-bin\n"
+                  b"vhost {\n"
+                  b"    server_name localhost\n"
+                  b"    root /var/www\n"
+                  b"}\n"
+                  b"vhost {\n"
+                  b"    server_name v2.test\n"
+                  b"    root /var/www2\n"
+                  b"}\n"))
+    FILES.append(("/var/www/index.html",
+                  b"<html><body><h1>VHOST_DEFAULT</h1>"
+                  b"<p>default vhost (localhost)</p></body></html>\n"))
+    FILES.append(("/var/www/hello.txt",
+                  b"hello from hamnix httpd\n"))
+    FILES.append(("/var/www/style.css",
+                  b"body { color: rebeccapurple; }\n"))
+    FILES.append(("/var/www2/index.html",
+                  b"<html><body><h1>VHOST_SECOND</h1>"
+                  b"<p>second vhost (v2.test)</p></body></html>\n"))
+    _cgi_elf = Path(__file__).resolve().parent.parent / "build" / "user" / "cgi_echo.elf"
+    if _cgi_elf.is_file():
+        FILES.append(("/var/www/cgi-bin/echo", _cgi_elf.read_bytes()))
+    else:
+        print(f"[build_initramfs] WARNING: {_cgi_elf} missing; "
+              f"CGI route will 404")
+
 # sshd publickey auth: scripts/test_sshd_pubkey.sh generates a
 # throwaway ECDSA-P256 keypair on the host, points HAMNIX_SSH_AUTHKEYS
 # at the public-key file, and this block bakes it into the cpio

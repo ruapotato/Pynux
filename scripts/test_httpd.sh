@@ -227,16 +227,19 @@ assert_client() {
 }
 
 # A 200 for "/" with the index.html body + text/html content type.
-assert_client "GET / returned 200"        "status=HTTP/1.0 200 OK"
+# (httpd now speaks HTTP/1.1; the master+worker rewrite kept the same
+# default-vhost behaviour when no /etc/httpd.conf is present.)
+assert_client "GET / returned 200"        "status=HTTP/1.1 200 OK"
 assert_client "GET / body is index.html"  "Hamnix httpd"
 assert_client "index.html is text/html"   "content-type=text/html"
 # The .txt file: text/plain + the expected body.
 assert_client ".txt is text/plain"        "content-type=text/plain"
 assert_client ".txt body served"          "hello from hamnix httpd"
 # Missing path -> 404.
-assert_client "missing path -> 404"       "status=HTTP/1.0 404 Not Found"
-# Path-escape attempt -> 400 (must NOT leak /etc/hostname).
-assert_client ".. path -> 400"            "status=HTTP/1.0 400 Bad Request"
+assert_client "missing path -> 404"       "status=HTTP/1.1 404 Not Found"
+# Path-escape attempt -> 403 (must NOT leak /etc/hostname). The worker
+# rejects a ".." path-escape as Forbidden before touching the fs.
+assert_client ".. path -> 403"            "status=HTTP/1.1 403 Forbidden"
 
 if grep -F -q "TRAP: vector" "$LOG"; then
     echo "[test_httpd] DIAG: kernel reported a CPU exception"

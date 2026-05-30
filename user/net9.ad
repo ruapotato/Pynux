@@ -364,6 +364,56 @@ def net_accept(listen_handle: int32) -> int32:
     return sys_open_write(cast[Ptr[char]](&net9_path_buf[0]))
 
 
+def net_accept_conn(listen_handle: int32) -> int64:
+    # Like net_accept, but stops short of opening the accepted peer's
+    # `data` file: it returns the accepted CONNECTION NUMBER instead of
+    # a stream fd, or -1 on timeout / failure. The accepted conn sits in
+    # the kernel accept queue with refcount 0 (drivers/net/devnet.ad:
+    # "whoever opens /net/tcp/<M>/* picks up the references"), so the
+    # caller can hand the number to ANOTHER process which then calls
+    # net_open_conn_data(conn) to take ownership.
+    #
+    # This is the concurrency primitive user/httpd.ad uses: the master
+    # accept loop learns the peer's conn number and spawns a worker with
+    # it as argv, never opening the data file itself — so there is no
+    # cross-process /net fd dup (copy_fd_entry does NOT bump the conn
+    # refcount, only the close arm unrefs; re-opening in the worker keeps
+    # the ref accounting symmetric). The listener stays announced.
+    if net9_listen_conn < 0:
+        return -1
+    lu: uint64 = cast[uint64](net9_listen_conn)
+    _net9_build_path(lu, "ctl")
+    ctl_fd: int32 = sys_open_write(cast[Ptr[char]](&net9_path_buf[0]))
+    if ctl_fd < 0:
+        return -1
+    acmd: Ptr[uint8] = "accept"
+    ac: uint64 = 0
+    while acmd[ac] != 0:
+        net9_cmd_buf[ac] = acmd[ac]
+        ac = ac + 1
+    awn: int64 = sys_write(ctl_fd, &net9_cmd_buf[0], ac)
+    if awn < 0:
+        sys_close(ctl_fd)
+        return -1
+    sys_close(ctl_fd)
+    ctl_rfd: int32 = sys_open(cast[Ptr[char]](&net9_path_buf[0]))
+    if ctl_rfd < 0:
+        return -1
+    accN: int64 = _net9_read_conn(ctl_rfd)
+    sys_close(ctl_rfd)
+    return accN
+
+
+def net_open_conn_data(conn: uint64) -> int32:
+    # Open /net/tcp/<conn>/data and return the stream fd — the worker
+    # side of net_accept_conn. The open takes a fresh reference on the
+    # accepted connection (which was sitting at refcount 0 in the accept
+    # queue), so closing the returned fd FIN-tears the connection down,
+    # exactly like net_dial / net_accept's data fd. Returns -1 on error.
+    _net9_build_path(conn, "data")
+    return sys_open_write(cast[Ptr[char]](&net9_path_buf[0]))
+
+
 # --- /net/icmp helpers ----------------------------------------------
 #
 # Same Plan-9 dance as net_dial, but on the /net/icmp file tree.

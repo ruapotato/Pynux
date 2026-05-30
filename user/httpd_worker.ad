@@ -1,0 +1,672 @@
+# user/httpd_worker.ad — per-connection worker for the Hamnix native
+# web server. The master (user/httpd.ad) runs the accept loop and
+# spawns one of these per inbound connection, so connections are served
+# CONCURRENTLY (two slow clients never serialise behind each other).
+#
+# Invocation (master -> worker):
+#   httpd_worker <conn>
+# where <conn> is the /net/tcp connection NUMBER of an already-accepted
+# peer (net_accept_conn handed it back without opening the data file).
+# The worker opens /net/tcp/<conn>/data itself — taking the connection's
+# reference cleanly — serves exactly one HTTP request, and exits. This
+# re-open-in-the-worker model avoids cross-process /net fd dup, which
+# would skew the connection refcount (copy_fd_entry does not bump it).
+#
+# WHAT IT DOES (Apache/nginx-shaped, scaled to native Adder):
+#   * HTTP/1.x request parsing: method, request-target, and the full
+#     header block (so the Host: header is available for vhost routing).
+#   * Name-based virtual hosts: the Host: header selects a document root
+#     from /etc/httpd.conf's vhost blocks (user/httpdconf.ad). No Host /
+#     no match -> the first (default) vhost.
+#   * Static files: Content-Type by extension, directory index
+#     (index.html), 404 for a missing file, 403 for a path that escapes
+#     the docroot, 400 for a malformed request line.
+#   * CGI: a request whose path starts with the configured cgi_dir
+#     prefix is dispatched to a CGI binary at <docroot><path-without-
+#     query>. The worker pipes the request body to the script's stdin
+#     and streams its stdout back as the HTTP response body. The CGI
+#     environment is passed as argv NAME=VALUE pairs (the Hamnix-native
+#     CGI calling convention — see CGI ENVIRONMENT below), since native
+#     Adder binaries read argv, not a Linux environ[].
+#
+# CGI ENVIRONMENT (argv convention)
+# ---------------------------------
+# argv[0] = the script path; argv[1..] = "NAME=VALUE" CGI variables:
+#   REQUEST_METHOD, QUERY_STRING, CONTENT_LENGTH, SCRIPT_NAME,
+#   SERVER_NAME, SERVER_PROTOCOL, REMOTE_ADDR, PATH_INFO.
+# The script reads its request body (if any) from stdin (fd 0) and
+# writes its raw response body to stdout (fd 1). httpd_worker prepends
+# the HTTP status line + Content-Type + Content-Length and sends the
+# combined response. A CGI script that wants to set its own status /
+# headers is a future extension; V1 wraps stdout as a 200 text/html.
+#
+# Compiler-quirk discipline (memory/feedback_compiler_quirks.md U9):
+# every buffer is a top-level-BSS Array; literals inline at the use
+# site; no adjacent string concat.
+
+from user.net9 import net_open_conn_data
+from user.httpdconf import (
+    hcfg_load, hcfg_root_for_host, hcfg_is_cgi,
+)
+
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_close(fd: int32) -> int32
+extern def sys_pipe(fds: Ptr[int32]) -> int32
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_waitpid(pid: int32) -> int64
+extern def sys_yield() -> int32
+extern def sys_exit(code: uint64)
+
+
+# Sizes. The body cap bounds both a static file and CGI stdout.
+REQ_CAP:    uint64 = 8192            # inbound request (line + headers + body)
+BODY_CAP:   uint64 = 262144         # 256 KiB served-body arena
+PATH_CAP:   uint64 = 1024
+
+
+req_buf:    Array[8192, uint8]       # raw request bytes
+body_buf:   Array[262144, uint8]     # served file / CGI stdout
+hdr_buf:    Array[1024, uint8]       # response status line + headers
+
+# Parsed-request scratch.
+method_buf: Array[16, uint8]         # "GET" / "POST" / ...
+target_buf: Array[1024, uint8]       # request-target incl. query
+path_buf:   Array[1024, uint8]       # target minus the query string
+query_buf:  Array[1024, uint8]       # the query string (after '?')
+host_buf:   Array[256, uint8]        # Host: header value
+fs_buf:     Array[1280, uint8]       # docroot-joined filesystem path
+
+# Request framing offsets (set by parse_request).
+req_total:  uint64 = 0               # bytes in req_buf
+body_off:   uint64 = 0               # index in req_buf where body begins
+body_len:   uint64 = 0               # body byte count
+content_len: uint64 = 0              # Content-Length header value
+
+# CGI spawn scratch.
+cgi_argv:   Array[16, uint64]        # argv pointers for the CGI binary
+cgi_strs:   Array[2048, uint8]       # NAME=VALUE backing storage
+cgi_pipe_in:  Array[2, int32]        # worker -> cgi stdin
+cgi_pipe_out: Array[2, int32]        # cgi stdout -> worker
+
+
+def strlen_u8(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_str(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, strlen_u8(s))
+
+
+def put_dec_at(out: Ptr[uint8], at: uint64, v: uint64) -> uint64:
+    if v == 0:
+        out[at] = 48
+        return at + 1
+    digits: Array[24, uint8]
+    i: uint64 = 0
+    w: uint64 = v
+    while w != 0:
+        digits[i] = cast[uint8](w % 10) + 48
+        w = w / 10
+        i = i + 1
+    j: uint64 = 0
+    while j < i:
+        out[at + j] = digits[i - 1 - j]
+        j = j + 1
+    return at + i
+
+
+def put_str_at(out: Ptr[uint8], at: uint64, s: Ptr[uint8]) -> uint64:
+    i: uint64 = 0
+    while s[i] != 0:
+        out[at + i] = s[i]
+        i = i + 1
+    return at + i
+
+
+# Write `count` bytes fully (looping on short writes).
+def write_full(fd: int32, buf: Ptr[uint8], count: uint64) -> int64:
+    written: uint64 = 0
+    while written < count:
+        ptr: Ptr[uint8] = cast[Ptr[uint8]](cast[uint64](buf) + written)
+        rc: int64 = sys_write(fd, ptr, count - written)
+        if rc < 0:
+            return rc
+        if rc == 0:
+            return cast[int64](written)
+        written = written + cast[uint64](rc)
+    return cast[int64](written)
+
+
+# Log one request line on stderr (fd 2 -> kernel console). Diagnostics
+# go to fd 2 so they never pollute the served HTTP on the connection.
+def log_line(method: Ptr[uint8], target: Ptr[uint8], status: uint64):
+    write_str(2, "httpd: ")
+    write_str(2, method)
+    write_str(2, " ")
+    write_str(2, target)
+    write_str(2, " -> ")
+    line: Array[8, uint8]
+    end: uint64 = put_dec_at(&line[0], 0, status)
+    line[end] = 10
+    sys_write(2, &line[0], end + 1)
+
+
+# Content-Type by file extension. Matches the resolved fs path.
+def content_type(path: Ptr[uint8]) -> Ptr[uint8]:
+    n: uint64 = strlen_u8(path)
+    if _ext_is(path, n, ".html") != 0:
+        return "text/html"
+    if _ext_is(path, n, ".htm") != 0:
+        return "text/html"
+    if _ext_is(path, n, ".css") != 0:
+        return "text/css"
+    if _ext_is(path, n, ".js") != 0:
+        return "application/javascript"
+    if _ext_is(path, n, ".json") != 0:
+        return "application/json"
+    if _ext_is(path, n, ".png") != 0:
+        return "image/png"
+    if _ext_is(path, n, ".jpg") != 0:
+        return "image/jpeg"
+    if _ext_is(path, n, ".jpeg") != 0:
+        return "image/jpeg"
+    if _ext_is(path, n, ".gif") != 0:
+        return "image/gif"
+    if _ext_is(path, n, ".svg") != 0:
+        return "image/svg+xml"
+    if _ext_is(path, n, ".txt") != 0:
+        return "text/plain"
+    if _ext_is(path, n, ".xml") != 0:
+        return "application/xml"
+    if _ext_is(path, n, ".ico") != 0:
+        return "image/x-icon"
+    return "application/octet-stream"
+
+
+# Case-insensitive suffix test: does path[0..n) end with ext (NUL-term)?
+def _ext_is(path: Ptr[uint8], n: uint64, ext: Ptr[uint8]) -> int32:
+    el: uint64 = strlen_u8(ext)
+    if n < el:
+        return 0
+    i: uint64 = 0
+    while i < el:
+        pc: uint8 = path[n - el + i]
+        if pc >= 65 and pc <= 90:
+            pc = pc + 32
+        if pc != ext[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+# Send a status line + headers + body. ctype/code/reason form the head;
+# body[0..blen) is the payload.
+def send_response(cfd: int32, code: uint64, reason: Ptr[uint8],
+                  ctype: Ptr[uint8], body: Ptr[uint8], blen: uint64):
+    at: uint64 = 0
+    at = put_str_at(&hdr_buf[0], at, "HTTP/1.1 ")
+    at = put_dec_at(&hdr_buf[0], at, code)
+    at = put_str_at(&hdr_buf[0], at, " ")
+    at = put_str_at(&hdr_buf[0], at, reason)
+    at = put_str_at(&hdr_buf[0], at, "\r\nContent-Type: ")
+    at = put_str_at(&hdr_buf[0], at, ctype)
+    at = put_str_at(&hdr_buf[0], at, "\r\nContent-Length: ")
+    at = put_dec_at(&hdr_buf[0], at, blen)
+    at = put_str_at(&hdr_buf[0], at, "\r\nConnection: close\r\n\r\n")
+    write_full(cfd, &hdr_buf[0], at)
+    if blen > 0:
+        write_full(cfd, body, blen)
+
+
+def send_error(cfd: int32, code: uint64, reason: Ptr[uint8],
+               body: Ptr[uint8]):
+    send_response(cfd, code, reason, "text/html", body, strlen_u8(body))
+
+
+# Read the whole HTTP request off the connection: the request line, all
+# headers (up to the blank-line terminator), and any body bytes already
+# buffered. Sets req_total / body_off / body_len. Returns 0 on success,
+# -1 on a read error / empty request.
+def read_request(cfd: int32) -> int32:
+    req_total = 0
+    hdr_end: uint64 = 0
+    idle: uint32 = 0
+    # Read until we have the header terminator "\r\n\r\n" (or the buffer
+    # fills, or the peer goes idle/EOF).
+    while req_total < REQ_CAP - 1:
+        room: uint64 = REQ_CAP - 1 - req_total
+        n: int64 = sys_read(cfd, cast[Ptr[uint8]](
+            cast[uint64](&req_buf[0]) + req_total), room)
+        if n < 0:
+            return -1
+        if n == 0:
+            idle = idle + 1
+            if idle > 8:
+                break
+            sys_yield()
+            continue
+        idle = 0
+        req_total = req_total + cast[uint64](n)
+        # Scan for the header terminator.
+        if _find_hdr_end(&hdr_end) != 0:
+            break
+    req_buf[req_total] = 0
+    if req_total == 0:
+        return -1
+    if hdr_end == 0:
+        # No terminator seen — tolerate a header-only request that the
+        # peer closed after; treat the whole buffer as headers.
+        hdr_end = req_total
+    body_off = hdr_end
+    body_len = req_total - hdr_end
+    return 0
+
+
+# Locate "\r\n\r\n" in req_buf[0..req_total). On success store the index
+# just past it in *out and return 1; else return 0.
+def _find_hdr_end(out: Ptr[uint64]) -> int32:
+    if req_total < 4:
+        return 0
+    p: uint64 = 0
+    while p + 3 < req_total:
+        if req_buf[p] == 13 and req_buf[p + 1] == 10 \
+                and req_buf[p + 2] == 13 and req_buf[p + 3] == 10:
+            out[0] = p + 4
+            return 1
+        p = p + 1
+    return 0
+
+
+# Parse the request line into method_buf / target_buf, split target into
+# path_buf + query_buf, and extract the Host: header into host_buf.
+# Returns:  0 ok
+#          -1 malformed request line (-> 400)
+#          -2 unsafe path: missing leading '/' or contains ".." (-> 403)
+def parse_request() -> int32:
+    # Method: up to the first space.
+    i: uint64 = 0
+    mi: uint64 = 0
+    while i < req_total and req_buf[i] != 32 and mi < 15:
+        if req_buf[i] == 13 or req_buf[i] == 10:
+            return -1
+        method_buf[mi] = req_buf[i]
+        mi = mi + 1
+        i = i + 1
+    method_buf[mi] = 0
+    if mi == 0:
+        return -1
+    # Skip the space(s).
+    while i < req_total and req_buf[i] == 32:
+        i = i + 1
+    # Target: up to the next space / CR / LF.
+    ti: uint64 = 0
+    while i < req_total and ti < PATH_CAP - 1:
+        c: uint8 = req_buf[i]
+        if c == 32 or c == 13 or c == 10 or c == 0:
+            break
+        target_buf[ti] = c
+        ti = ti + 1
+        i = i + 1
+    target_buf[ti] = 0
+    if ti == 0 or target_buf[0] != 47:               # must start with '/'
+        return -2
+    # Split target into path (before '?') and query (after).
+    qi: int64 = -1
+    k: uint64 = 0
+    while target_buf[k] != 0:
+        if target_buf[k] == 63:                      # '?'
+            qi = cast[int64](k)
+            break
+        k = k + 1
+    if qi < 0:
+        # No query.
+        p: uint64 = 0
+        while target_buf[p] != 0:
+            path_buf[p] = target_buf[p]
+            p = p + 1
+        path_buf[p] = 0
+        query_buf[0] = 0
+    else:
+        qu: uint64 = cast[uint64](qi)
+        p: uint64 = 0
+        while p < qu:
+            path_buf[p] = target_buf[p]
+            p = p + 1
+        path_buf[p] = 0
+        q: uint64 = 0
+        src: uint64 = qu + 1
+        while target_buf[src] != 0:
+            query_buf[q] = target_buf[src]
+            q = q + 1
+            src = src + 1
+        query_buf[q] = 0
+    # Path safety: reject any ".." segment.
+    j: uint64 = 0
+    while path_buf[j] != 0:
+        if path_buf[j] == 46 and path_buf[j + 1] == 46:
+            return -2
+        j = j + 1
+    # Extract Host: + Content-Length from the header block.
+    _parse_headers()
+    return 0
+
+
+# Walk the header lines (req_buf, between the request line and hdr end),
+# filling host_buf and content_len. Case-insensitive header names.
+def _parse_headers():
+    host_buf[0] = 0
+    content_len = 0
+    # Start after the request line (first CRLF or LF).
+    p: uint64 = 0
+    while p < req_total and req_buf[p] != 10:
+        p = p + 1
+    p = p + 1
+    while p < req_total:
+        ls: uint64 = p
+        # End of this header line.
+        le: uint64 = p
+        while le < req_total and req_buf[le] != 10:
+            le = le + 1
+        p = le + 1
+        # Trim trailing CR.
+        ce: uint64 = le
+        if ce > ls and req_buf[ce - 1] == 13:
+            ce = ce - 1
+        if ce <= ls:
+            break                                    # blank line: headers end
+        if _hdr_name_is(ls, ce, "host") != 0:
+            _hdr_value_copy(ls, ce, &host_buf[0], 256)
+        elif _hdr_name_is(ls, ce, "content-length") != 0:
+            content_len = _hdr_value_dec(ls, ce)
+
+
+# Does the header line req_buf[ls..ce) have name `nm` (case-insensitive)?
+def _hdr_name_is(ls: uint64, ce: uint64, nm: Ptr[uint8]) -> int32:
+    nl: uint64 = strlen_u8(nm)
+    if ls + nl >= ce:
+        return 0
+    i: uint64 = 0
+    while i < nl:
+        c: uint8 = req_buf[ls + i]
+        if c >= 65 and c <= 90:
+            c = c + 32
+        if c != nm[i]:
+            return 0
+        i = i + 1
+    if req_buf[ls + nl] != 58:                       # ':'
+        return 0
+    return 1
+
+
+# Copy a header value (after "name:") trimmed of leading spaces into dst.
+def _hdr_value_copy(ls: uint64, ce: uint64, dst: Ptr[uint8], cap: uint64):
+    v: uint64 = ls
+    while v < ce and req_buf[v] != 58:
+        v = v + 1
+    v = v + 1                                        # past ':'
+    while v < ce and (req_buf[v] == 32 or req_buf[v] == 9):
+        v = v + 1
+    o: uint64 = 0
+    while v < ce and o + 1 < cap:
+        dst[o] = req_buf[v]
+        o = o + 1
+        v = v + 1
+    dst[o] = 0
+
+
+def _hdr_value_dec(ls: uint64, ce: uint64) -> uint64:
+    v: uint64 = ls
+    while v < ce and req_buf[v] != 58:
+        v = v + 1
+    v = v + 1
+    while v < ce and (req_buf[v] == 32 or req_buf[v] == 9):
+        v = v + 1
+    out: uint64 = 0
+    while v < ce and req_buf[v] >= 48 and req_buf[v] <= 57:
+        out = out * 10 + cast[uint64](req_buf[v] - 48)
+        v = v + 1
+    return out
+
+
+# Join docroot + path into fs_buf. A trailing "/" path appends
+# /index.html. docroot has no trailing slash; path always starts '/'.
+def resolve_path(docroot: Ptr[uint8]):
+    at: uint64 = 0
+    at = put_str_at(&fs_buf[0], at, docroot)
+    if path_buf[0] == 47 and path_buf[1] == 0:
+        at = put_str_at(&fs_buf[0], at, "/index.html")
+    else:
+        # If path ends in '/', append index.html.
+        pl: uint64 = strlen_u8(&path_buf[0])
+        at = put_str_at(&fs_buf[0], at, &path_buf[0])
+        if pl > 0 and path_buf[pl - 1] == 47:
+            at = put_str_at(&fs_buf[0], at, "index.html")
+    fs_buf[at] = 0
+
+
+# Load fs_buf into body_buf; return byte count or -1 if unopenable.
+def load_file() -> int64:
+    fd: int32 = sys_open(cast[Ptr[char]](&fs_buf[0]))
+    if fd < 0:
+        return -1
+    total: uint64 = 0
+    while total < BODY_CAP:
+        room: uint64 = BODY_CAP - total
+        n: int64 = sys_read(fd, cast[Ptr[uint8]](
+            cast[uint64](&body_buf[0]) + total), room)
+        if n <= 0:
+            break
+        total = total + cast[uint64](n)
+    sys_close(fd)
+    return cast[int64](total)
+
+
+# Append a "NAME=VALUE" string into cgi_strs and register a pointer to it
+# in cgi_argv[idx]. Returns the new cgi_strs write offset.
+def _cgi_put_env(off: uint64, idx: uint64, name: Ptr[uint8],
+                 value: Ptr[uint8]) -> uint64:
+    cgi_argv[idx] = cast[uint64](&cgi_strs[off])
+    o: uint64 = off
+    i: uint64 = 0
+    while name[i] != 0 and o + 1 < 2048:
+        cgi_strs[o] = name[i]
+        o = o + 1
+        i = i + 1
+    if o + 1 < 2048:
+        cgi_strs[o] = 61                             # '='
+        o = o + 1
+    j: uint64 = 0
+    while value[j] != 0 and o + 1 < 2048:
+        cgi_strs[o] = value[j]
+        o = o + 1
+        j = j + 1
+    cgi_strs[o] = 0
+    o = o + 1
+    return o
+
+
+# Render content_len as a NUL-terminated decimal into dst.
+def _u64_to_str(v: uint64, dst: Ptr[uint8]):
+    end: uint64 = put_dec_at(dst, 0, v)
+    dst[end] = 0
+
+
+# Dispatch a CGI request: spawn the script at fs_buf, feed it the request
+# body, stream its stdout back as the response. Returns 0 on success,
+# -1 if the script could not be spawned (caller -> 404/500).
+def serve_cgi(cfd: int32, server_name: Ptr[uint8]) -> int32:
+    # The CGI binary lives at <docroot><path> (resolve_path already
+    # built fs_buf with the query stripped, since resolve_path uses
+    # path_buf not target_buf).
+    sfd: int32 = sys_open(cast[Ptr[char]](&fs_buf[0]))
+    if sfd < 0:
+        return -1
+    sys_close(sfd)
+
+    # Build the CGI argv: argv[0] = script path, then NAME=VALUE env.
+    cgi_argv[0] = cast[uint64](&fs_buf[0])
+    off: uint64 = 0
+    clstr: Array[24, uint8]
+    _u64_to_str(content_len, &clstr[0])
+    off = _cgi_put_env(off, 1, "REQUEST_METHOD", &method_buf[0])
+    off = _cgi_put_env(off, 2, "QUERY_STRING", &query_buf[0])
+    off = _cgi_put_env(off, 3, "CONTENT_LENGTH", &clstr[0])
+    off = _cgi_put_env(off, 4, "SCRIPT_NAME", &path_buf[0])
+    off = _cgi_put_env(off, 5, "SERVER_NAME", server_name)
+    off = _cgi_put_env(off, 6, "SERVER_PROTOCOL", "HTTP/1.1")
+    off = _cgi_put_env(off, 7, "REMOTE_ADDR", "127.0.0.1")
+    cgi_argv[8] = 0
+
+    # Two pipes: worker -> cgi stdin, cgi stdout -> worker.
+    if sys_pipe(&cgi_pipe_in[0]) != 0:
+        return -1
+    if sys_pipe(&cgi_pipe_out[0]) != 0:
+        sys_close(cgi_pipe_in[0])
+        sys_close(cgi_pipe_in[1])
+        return -1
+    pid: int32 = sys_spawn(cast[Ptr[char]](&fs_buf[0]), &cgi_argv[0],
+                           cgi_pipe_in[0], cgi_pipe_out[1],
+                           cast[Ptr[uint64]](0))
+    if pid < 0:
+        sys_close(cgi_pipe_in[0])
+        sys_close(cgi_pipe_in[1])
+        sys_close(cgi_pipe_out[0])
+        sys_close(cgi_pipe_out[1])
+        return -1
+    # Close the ends the child now owns.
+    sys_close(cgi_pipe_in[0])
+    sys_close(cgi_pipe_out[1])
+
+    # Feed the request body (already buffered in req_buf) to the script.
+    if body_len > 0:
+        write_full(cgi_pipe_in[1], cast[Ptr[uint8]](
+            cast[uint64](&req_buf[0]) + body_off), body_len)
+    sys_close(cgi_pipe_in[1])                         # EOF to the script
+
+    # Drain the script's stdout into body_buf.
+    total: uint64 = 0
+    idle: uint32 = 0
+    while total < BODY_CAP:
+        room: uint64 = BODY_CAP - total
+        n: int64 = sys_read_nb(cgi_pipe_out[0], cast[Ptr[uint8]](
+            cast[uint64](&body_buf[0]) + total), room)
+        if n > 0:
+            total = total + cast[uint64](n)
+            idle = 0
+        elif n == 0:
+            # Nothing ready — yield and retry a bounded number of times.
+            idle = idle + 1
+            if idle > 40000:
+                break
+            sys_yield()
+        else:
+            break                                    # EOF / closed
+    sys_close(cgi_pipe_out[0])
+    sys_waitpid(pid)
+
+    log_line(&method_buf[0], &target_buf[0], 200)
+    send_response(cfd, 200, "OK", "text/html", &body_buf[0], total)
+    return 0
+
+
+# Serve one request on connection fd cfd. Closes nothing — caller owns
+# the fd lifetime.
+def serve(cfd: int32):
+    if read_request(cfd) != 0:
+        return
+    rc: int32 = parse_request()
+    if rc == -1:
+        log_line("?", "(malformed)", 400)
+        send_error(cfd, 400, "Bad Request",
+                   "<html><body><h1>400 Bad Request</h1></body></html>\n")
+        return
+    if rc == -2:
+        log_line(&method_buf[0], &target_buf[0], 403)
+        send_error(cfd, 403, "Forbidden",
+                   "<html><body><h1>403 Forbidden</h1></body></html>\n")
+        return
+
+    # Route by Host: header to a vhost docroot.
+    docroot: Ptr[uint8] = hcfg_root_for_host(&host_buf[0])
+    resolve_path(docroot)
+
+    # CGI dispatch (path prefix matches cgi_dir)?
+    if hcfg_is_cgi(&path_buf[0]) != 0:
+        if serve_cgi(cfd, &host_buf[0]) == 0:
+            return
+        log_line(&method_buf[0], &target_buf[0], 404)
+        send_error(cfd, 404, "Not Found",
+                   "<html><body><h1>404 Not Found</h1></body></html>\n")
+        return
+
+    # Static file. Only GET / HEAD are served; other methods -> 405.
+    if _method_is("GET") == 0 and _method_is("HEAD") == 0:
+        log_line(&method_buf[0], &target_buf[0], 405)
+        send_error(cfd, 405, "Method Not Allowed",
+                   "<html><body><h1>405 Method Not Allowed</h1></body></html>\n")
+        return
+
+    length: int64 = load_file()
+    if length < 0:
+        log_line(&method_buf[0], &target_buf[0], 404)
+        send_error(cfd, 404, "Not Found",
+                   "<html><body><h1>404 Not Found</h1></body></html>\n")
+        return
+    log_line(&method_buf[0], &target_buf[0], 200)
+    if _method_is("HEAD") != 0:
+        send_response(cfd, 200, "OK", content_type(&fs_buf[0]),
+                      &body_buf[0], 0)
+    else:
+        send_response(cfd, 200, "OK", content_type(&fs_buf[0]),
+                      &body_buf[0], cast[uint64](length))
+
+
+def _method_is(m: Ptr[uint8]) -> int32:
+    i: uint64 = 0
+    while m[i] != 0:
+        if method_buf[i] != m[i]:
+            return 0
+        i = i + 1
+    if method_buf[i] != 0:
+        return 0
+    return 1
+
+
+# Parse a base-10 string (NUL-terminated) into a uint64. 0 on empty.
+def parse_u64(s: Ptr[uint8]) -> uint64:
+    v: uint64 = 0
+    i: uint64 = 0
+    while s[i] != 0:
+        c: uint8 = s[i]
+        if c < 48 or c > 57:
+            return v
+        v = v * 10 + cast[uint64](c - 48)
+        i = i + 1
+    return v
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_str(2, "httpd_worker: usage: httpd_worker <conn>\n")
+        return 1
+    conn: uint64 = parse_u64(cast[Ptr[uint8]](argv[1]))
+
+    # Load the vhost config (each worker reads it independently).
+    hcfg_load()
+
+    # Take ownership of the accepted connection.
+    cfd: int32 = net_open_conn_data(conn)
+    if cfd < 0:
+        write_str(2, "httpd_worker: could not open connection data\n")
+        return 1
+    serve(cfd)
+    sys_close(cfd)                                   # FIN-tears the conn down
+    return 0

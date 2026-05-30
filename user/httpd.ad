@@ -1,68 +1,67 @@
-# user/httpd.ad — Hamnix userland static-file HTTP/1.0 server daemon.
+# user/httpd.ad — Hamnix native concurrent HTTP server (master).
 #
-# `httpd <port> <docroot>` — a minimal native-Adder HTTP server. It
-# generalises user/u_server.ad's single-shot socket()/bind()/listen()/
-# accept() smoke into a real accept loop: every accepted connection has
-# its HTTP request line parsed, the requested path resolved against
-# <docroot>, and the file (or an error page) written back HTTP/1.0
-# style — Content-Length + Content-Type, Connection: close, one request
-# per connection.
+# `httpd` is the master process of the Hamnix web server. It is now
+# Apache/nginx-shaped rather than the original single-shot toy:
 #
-# Build (mirrors u_server, added to scripts/build_user.sh):
+#   * CONCURRENCY — the master runs ONLY the accept loop. Every accepted
+#     connection is handed to a fresh worker process (/bin/httpd_worker)
+#     via sys_spawn; the master immediately loops back to accept the
+#     next peer WITHOUT waiting. So N clients are served by N concurrent
+#     workers and a slow request never blocks a fast one. The worker
+#     re-opens the connection by number (net_accept_conn hands back the
+#     /net/tcp conn number, net_open_conn_data opens it in the worker),
+#     so there is no cross-process /net fd dup to skew the connection
+#     refcount.
+#   * NAME-BASED VIRTUAL HOSTS — driven by /etc/httpd.conf (vhost blocks
+#     with server_name + root). The worker routes each request by its
+#     Host: header. See user/httpdconf.ad for the config format.
+#   * STATIC FILES — correct Content-Type by extension, directory index
+#     (index.html), 404 for missing, 403 for a docroot-escaping path.
+#   * CGI — a request whose path begins with the configured cgi_dir
+#     prefix is dispatched to a CGI binary, with the standard CGI
+#     variables passed as argv NAME=VALUE pairs and the request body fed
+#     to the script's stdin; its stdout is streamed back as the body.
+#   (The static-serving + CGI logic lives in user/httpd_worker.ad.)
+#
+# CONFIG: /etc/httpd.conf (user/httpdconf.ad documents the full grammar).
+#   listen 8080
+#   cgi_dir /cgi-bin
+#   vhost { server_name localhost   root /var/www  }
+#   vhost { server_name v2.test      root /var/www2 }
+# With no config file the master falls back to port 8080 + a single
+# vhost "localhost" -> /var/www, so a bare boot still serves.
+#
+# Build (scripts/build_user.sh builds httpd + httpd_worker):
 #   python3 -m compiler.adder compile --target=x86_64-adder-user \
 #       user/httpd.ad -o build/user/httpd.elf
 #
-# Run from a shell:
-#   httpd 8080 /var/www
-# Run as /init (the kernel hands /init no argv): with no args httpd
-# falls back to DEFAULT_PORT (8080) + DEFAULT_DOCROOT (/var/www) — the
-# path scripts/test_httpd.sh exercises. The test's QEMU hostfwd
-# (-netdev user,hostfwd=tcp::HOST-:8080) maps a host port onto guest
-# port 8080; a host `curl` then drives real HTTP requests through the
-# in-kernel TCP stack into this daemon.
+# Run from a shell:  httpd            (reads /etc/httpd.conf)
+#                    httpd <port>     (override the listen port)
+# Run as /init (the kernel hands /init no argv): the bare invocation
+# reads /etc/httpd.conf or the built-in defaults — the path
+# scripts/test_httpd_concurrent.sh drives.
 #
-# SCOPE (V0): GET only (405 for anything else); static files only — no
-# CGI, no chunked encoding, no ranges, no keep-alive, no HTTPS. A path
-# containing ".." or not starting with "/" is rejected 400 before it
-# can touch the filesystem. One connection served at a time (no fork /
-# thread per connection). See the V1 backlog in scripts/test_httpd.sh.
-#
-# Compiler-quirk notes (memory/feedback_compiler_quirks.md):
-#  * Every buffer is a top-level-BSS Array — the U9 nested-frame-Array
-#    miscompile only bites struct-typed arrays inside nested frames;
-#    flat byte arrays at module scope are safe.
-#  * The x86_64 user backend rejects string-literal globals — every
-#    literal is materialised inline at its write_str use site.
-#  * No string concat — each literal goes through write_str separately.
-#
-# FILE-SIZE CAP: FILE_CAP (256 KiB). A document larger than the cap is
-# served truncated to FILE_CAP bytes (Content-Length still reports only
-# what was read). The static-file buffer is a single top-level BSS
-# arena, so the cap is just its size — bump FILE_CAP if you need more.
+# Compiler-quirk discipline (memory/feedback_compiler_quirks.md U9):
+# every buffer is a top-level BSS Array; string literals materialise
+# inline at the use site; no adjacent string concat.
 
 # ARCH §10: httpd serves over the Plan-9-shaped /net file tree —
-# net_announce a port, net_accept connections — NOT a socket() syscall.
-from user.net9 import net_announce, net_accept
+# net_announce a port, accept connections by number — NOT a socket().
+from user.net9 import net_announce, net_accept_conn
+from user.httpdconf import hcfg_load, hcfg_port_get
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
-extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
-extern def sys_open(path: Ptr[char]) -> int32
 extern def sys_close(fd: int32) -> int32
+extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
+                     stdin_fd: int32, stdout_fd: int32,
+                     envp: Ptr[uint64]) -> int32
+extern def sys_yield() -> int32
 
 
-# Top-level BSS arenas (U9: flat module-scope byte arrays are safe).
-FILE_CAP:  uint64 = 262144          # 256 KiB static-file size cap
-REQ_CAP:   uint64 = 4096            # inbound HTTP request scratch
-PATH_CAP:  uint64 = 1024            # resolved docroot-relative path
-
-# Defaults used when httpd runs as /init (the kernel passes no argv).
-DEFAULT_PORT: uint64 = 8080
-
-req_buf:  Array[4096, uint8]        # raw request bytes
-path_buf: Array[256, uint8]         # parsed request-target ("/foo.txt")
-fs_buf:   Array[1024, uint8]        # docroot-joined filesystem path
-file_buf: Array[262144, uint8]      # the served file's bytes
-hdr_buf:  Array[512, uint8]         # response status line + headers
+# argv staging for each spawned worker: argv[0]="/bin/httpd_worker",
+# argv[1] = the connection number as a decimal string, argv[2]=NULL.
+worker_argv:  Array[3, uint64]
+conn_str:     Array[24, uint8]
 
 
 def strlen_u8(s: Ptr[uint8]) -> uint64:
@@ -76,7 +75,6 @@ def write_str(fd: int32, s: Ptr[uint8]):
     sys_write(fd, s, strlen_u8(s))
 
 
-# Append a decimal rendering of v into out[at..]; return the new index.
 def put_dec_at(out: Ptr[uint8], at: uint64, v: uint64) -> uint64:
     if v == 0:
         out[at] = 48
@@ -95,182 +93,6 @@ def put_dec_at(out: Ptr[uint8], at: uint64, v: uint64) -> uint64:
     return at + i
 
 
-# Append the NUL-terminated string s into out[at..]; return new index.
-def put_str_at(out: Ptr[uint8], at: uint64, s: Ptr[uint8]) -> uint64:
-    i: uint64 = 0
-    while s[i] != 0:
-        out[at + i] = s[i]
-        i = i + 1
-    return at + i
-
-
-# Log one request line: "httpd: GET <path> -> <status>\n".
-def log_request(target: Ptr[uint8], status: uint64):
-    write_str(1, "httpd: GET ")
-    write_str(1, target)
-    write_str(1, " -> ")
-    line: Array[8, uint8]
-    end: uint64 = put_dec_at(&line[0], 0, status)
-    line[end] = 10
-    sys_write(1, &line[0], end + 1)
-
-
-# Pick a Content-Type from the path's extension. Returns a literal
-# pointer materialised inline (no string-literal globals on x86_64).
-def content_type(path: Ptr[uint8]) -> Ptr[uint8]:
-    n: uint64 = strlen_u8(path)
-    # .html
-    if n >= 5:
-        if path[n - 5] == 46 and path[n - 4] == 104 and path[n - 3] == 116:
-            if path[n - 2] == 109 and path[n - 1] == 108:
-                return "text/html"
-    # .json
-    if n >= 5:
-        if path[n - 5] == 46 and path[n - 4] == 106 and path[n - 3] == 115:
-            if path[n - 2] == 111 and path[n - 1] == 110:
-                return "application/json"
-    # .txt
-    if n >= 4:
-        if path[n - 4] == 46 and path[n - 3] == 116 and path[n - 2] == 120:
-            if path[n - 1] == 116:
-                return "text/plain"
-    return "application/octet-stream"
-
-
-# Send a minimal error response (status line + headers + HTML body).
-# `code` and `reason` form the status line; `body` is the HTML page.
-def send_error(cfd: int32, code: uint64, reason: Ptr[uint8],
-               body: Ptr[uint8]):
-    blen: uint64 = strlen_u8(body)
-    at: uint64 = 0
-    at = put_str_at(&hdr_buf[0], at, "HTTP/1.0 ")
-    at = put_dec_at(&hdr_buf[0], at, code)
-    at = put_str_at(&hdr_buf[0], at, " ")
-    at = put_str_at(&hdr_buf[0], at, reason)
-    at = put_str_at(&hdr_buf[0], at, "\r\nContent-Type: text/html\r\n")
-    at = put_str_at(&hdr_buf[0], at, "Content-Length: ")
-    at = put_dec_at(&hdr_buf[0], at, blen)
-    at = put_str_at(&hdr_buf[0], at, "\r\nConnection: close\r\n\r\n")
-    sys_write(cfd, &hdr_buf[0], at)
-    sys_write(cfd, body, blen)
-
-
-# Send a 200 OK with the file bytes already loaded in file_buf[0..len].
-def send_ok(cfd: int32, ctype: Ptr[uint8], length: uint64):
-    at: uint64 = 0
-    at = put_str_at(&hdr_buf[0], at, "HTTP/1.0 200 OK\r\nContent-Type: ")
-    at = put_str_at(&hdr_buf[0], at, ctype)
-    at = put_str_at(&hdr_buf[0], at, "\r\nContent-Length: ")
-    at = put_dec_at(&hdr_buf[0], at, length)
-    at = put_str_at(&hdr_buf[0], at, "\r\nConnection: close\r\n\r\n")
-    sys_write(cfd, &hdr_buf[0], at)
-    if length > 0:
-        sys_write(cfd, &file_buf[0], length)
-
-
-# Parse the request-target out of the HTTP request line into path_buf.
-# Returns:  0 on success (path_buf holds a NUL-terminated "/..." path)
-#          -1 if the method is not GET (caller -> 405)
-#          -2 if the target is unsafe: missing leading '/' or has ".."
-#             (caller -> 400)
-def parse_request(req: Ptr[uint8], rlen: uint64) -> int32:
-    # Method must be exactly "GET ".
-    if rlen < 5:
-        return -1
-    if req[0] != 71 or req[1] != 69 or req[2] != 84 or req[3] != 32:
-        return -1
-    # Target runs from index 4 up to the next space (or CR/LF/NUL).
-    i: uint64 = 4
-    n: uint64 = 0
-    while i < rlen and n < PATH_CAP - 1:
-        c: uint8 = req[i]
-        if c == 32 or c == 13 or c == 10 or c == 0:
-            break
-        path_buf[n] = c
-        n = n + 1
-        i = i + 1
-    path_buf[n] = 0
-    # Path safety: must start with '/' and must not contain "..".
-    if n == 0 or path_buf[0] != 47:
-        return -2
-    k: uint64 = 0
-    while k + 1 < n:
-        if path_buf[k] == 46 and path_buf[k + 1] == 46:
-            return -2
-        k = k + 1
-    return 0
-
-
-# Join docroot + request-target into fs_buf. "/" maps to the docroot's
-# index.html; "/foo.txt" maps to "<docroot>/foo.txt". docroot is taken
-# verbatim (a trailing slash would double up; callers pass it without).
-def resolve_path(docroot: Ptr[uint8]):
-    at: uint64 = 0
-    at = put_str_at(&fs_buf[0], at, docroot)
-    # path_buf always starts with '/'. If it is just "/", serve
-    # <docroot>/index.html; otherwise append path_buf as-is.
-    if path_buf[0] == 47 and path_buf[1] == 0:
-        at = put_str_at(&fs_buf[0], at, "/index.html")
-    else:
-        at = put_str_at(&fs_buf[0], at, &path_buf[0])
-    fs_buf[at] = 0
-
-
-# Read the resolved file into file_buf; return byte count, or -1 if the
-# file could not be opened. Truncates at FILE_CAP.
-def load_file() -> int64:
-    fd: int32 = sys_open(cast[Ptr[char]](&fs_buf[0]))
-    if fd < 0:
-        return -1
-    total: uint64 = 0
-    while total < FILE_CAP:
-        room: uint64 = FILE_CAP - total
-        n: int64 = sys_read(fd, cast[Ptr[uint8]](
-            cast[uint64](&file_buf[0]) + total), room)
-        if n <= 0:
-            break
-        total = total + cast[uint64](n)
-    sys_close(fd)
-    return cast[int64](total)
-
-
-# Service one accepted connection: read the request, parse it, resolve
-# and serve the file (or an error), then close the socket. HTTP/1.0
-# Connection: close — exactly one request per connection.
-def serve_one(cfd: int32, docroot: Ptr[uint8]):
-    rn: int64 = sys_read(cfd, &req_buf[0], REQ_CAP - 1)
-    if rn <= 0:
-        sys_close(cfd)
-        return
-    req_buf[cast[uint64](rn)] = 0
-    rc: int32 = parse_request(&req_buf[0], cast[uint64](rn))
-    if rc == -1:
-        log_request("(non-GET)", 405)
-        send_error(cfd, 405, "Method Not Allowed",
-                   "<html><body><h1>405 Method Not Allowed</h1></body></html>\n")
-        sys_close(cfd)
-        return
-    if rc == -2:
-        log_request(&path_buf[0], 400)
-        send_error(cfd, 400, "Bad Request",
-                   "<html><body><h1>400 Bad Request</h1></body></html>\n")
-        sys_close(cfd)
-        return
-    resolve_path(docroot)
-    length: int64 = load_file()
-    if length < 0:
-        log_request(&path_buf[0], 404)
-        send_error(cfd, 404, "Not Found",
-                   "<html><body><h1>404 Not Found</h1></body></html>\n")
-        sys_close(cfd)
-        return
-    log_request(&path_buf[0], 200)
-    # Content-Type is derived from the *resolved* filesystem path
-    # (fs_buf) so "GET /" picks up index.html's .html extension.
-    send_ok(cfd, content_type(&fs_buf[0]), cast[uint64](length))
-    sys_close(cfd)
-
-
 # Parse a base-10 port string. Returns 0 on malformed input.
 def parse_port(s: Ptr[uint8]) -> uint64:
     v: uint64 = 0
@@ -286,53 +108,65 @@ def parse_port(s: Ptr[uint8]) -> uint64:
     return v
 
 
+# Spawn one worker for the accepted connection number `conn`. The worker
+# is fully detached — we do NOT waitpid it (the kernel reaps it on
+# exit), so the accept loop returns to accepting immediately and the
+# next connection is served by a SEPARATE concurrent worker.
+def spawn_worker(conn: uint64) -> int32:
+    end: uint64 = put_dec_at(&conn_str[0], 0, conn)
+    conn_str[end] = 0
+    worker_argv[0] = cast[uint64](&"/bin/httpd_worker"[0])
+    worker_argv[1] = cast[uint64](&conn_str[0])
+    worker_argv[2] = 0
+    # The worker opens its own connection data fd by number, so it does
+    # not need any inherited fd from us. We pass -1/-1 for stdin/stdout
+    # (the worker writes diagnostics to fd 2 -> console) and let the
+    # kernel install the default console stdio.
+    pid: int32 = sys_spawn(cast[Ptr[char]]("/bin/httpd_worker"),
+                           &worker_argv[0], -1, -1,
+                           cast[Ptr[uint64]](0))
+    return pid
+
+
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    # Two run modes:
-    #  * `httpd <port> <docroot>` — explicit args from a shell.
-    #  * `httpd` with no args — the kernel hands /init no argv, so a
-    #    bare invocation falls back to DEFAULT_PORT + "/var/www". This
-    #    is what scripts/test_httpd.sh drives (httpd runs as /init).
-    port: uint64 = DEFAULT_PORT
-    docroot: Ptr[uint8] = "/var/www"
-    if argc == 2:
-        write_str(2, "httpd: usage: httpd <port> <docroot>\n")
-        return 1
-    if argc >= 3:
-        port = parse_port(cast[Ptr[uint8]](argv[1]))
-        docroot = cast[Ptr[uint8]](argv[2])
+    # Load /etc/httpd.conf (or built-in defaults).
+    hcfg_load()
+    port: uint64 = hcfg_port_get()
+    # An explicit port arg overrides the config's `listen`.
+    if argc >= 2:
+        p: uint64 = parse_port(cast[Ptr[uint8]](argv[1]))
+        if p != 0:
+            port = p
     if port == 0 or port > 65535:
         write_str(2, "httpd: bad port\n")
         return 1
 
-    # ARCH §10: announce the port on the /net file tree. net_announce
-    # opens /net/tcp/clone + writes an `announce` ctl command and
-    # returns a listener handle. INADDR_ANY is implicit — a /net
-    # announce binds the port on every interface.
+    # ARCH §10: announce the port on the /net file tree.
     lfd: int32 = net_announce(port)
     if lfd < 0:
         write_str(2, "httpd: net_announce() failed\n")
         return 1
-    # Report the bound config, then the listener marker the test
-    # harness waits for before issuing its requests.
-    write_str(1, "httpd: serving ")
-    write_str(1, docroot)
-    write_str(1, " on port ")
+
+    write_str(1, "httpd: concurrent server on port ")
     portline: Array[8, uint8]
     pend: uint64 = put_dec_at(&portline[0], 0, port)
     portline[pend] = 10
     sys_write(1, &portline[0], pend + 1)
     write_str(1, "httpd: listening\n")
 
-    # Accept loop — one connection served at a time, forever (until
-    # killed). net_accept writes a `accept` ctl command to the listener
-    # and returns a stream fd for the accepted connection; the listener
-    # stays announced for the next iteration.
+    # Accept loop: learn each peer's connection NUMBER (no data open
+    # here) and spawn a detached worker for it. Loop forever.
     while True:
-        cfd: int32 = net_accept(lfd)
-        if cfd < 0:
+        conn: int64 = net_accept_conn(lfd)
+        if conn < 0:
             # accept can time out / fail transiently; keep looping.
+            sys_yield()
             continue
-        serve_one(cfd, docroot)
+        rc: int32 = spawn_worker(cast[uint64](conn))
+        if rc < 0:
+            write_str(2, "httpd: spawn worker failed\n")
+            # Yield to let workers drain before retrying.
+            sys_yield()
 
     sys_close(lfd)
     return 0

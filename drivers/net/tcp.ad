@@ -175,6 +175,15 @@ tcp_ephemeral_cur:  uint16 = 0
 tcp_ephemeral_init: uint8  = 0
 
 tcp_slot_state:    Array[8, uint32]      # TCP_CLOSED..TCP_TIME_WAIT
+# Concurrent-accept guard: 1 once tcp_accept has handed this slot back
+# to a caller, 0 otherwise. tcp_accept scans for an ESTABLISHED slot on
+# the listener's port and returns the FIRST match; without this flag a
+# second tcp_accept call (the httpd master accepting its next peer)
+# would re-return a slot already owned by an earlier worker — every
+# concurrent connection past the first would alias the same TCB. The
+# flag is cleared when a slot is (re)allocated for a fresh SYN and when
+# a slot resets to CLOSED, so a recycled TCB starts un-accepted.
+tcp_slot_accepted: Array[8, uint32]      # 1 = already returned by tcp_accept
 tcp_slot_local_p:  Array[8, uint16]      # local port (host order)
 tcp_slot_remote_p: Array[8, uint16]      # remote port (host order)
 # Remote IPv4 stored as flat 32-byte array, slot*4 + byte (network
@@ -431,9 +440,23 @@ def _tcp_alloc_slot() -> int32:
     # Find a free TCB. Returns slot index 0..7 or -1 if all slots
     # are in use (no eviction — tcp_connect callers must close
     # their connections to free slots).
+    #
+    # First pass: a truly CLOSED slot. Second pass: a TIME_WAIT slot —
+    # we don't enforce the 2*MSL quiet period (see the state-machine
+    # comment at the top of the file: "TIME_WAIT --(skip 2*MSL)-->
+    # CLOSED"), and with only 8 TCBs a concurrent server (httpd's
+    # per-connection workers) would otherwise wedge once a handful of
+    # short-lived connections piled up in TIME_WAIT. Reclaiming a
+    # TIME_WAIT slot for a fresh connection is the pragmatic Plan-9-ish
+    # choice here; the new SYN_RECV init fully reinitialises the TCB.
     i: uint64 = 0
     while i < TCP_NUM_SLOTS:
         if tcp_slot_state[i] == TCP_CLOSED:
+            return cast[int32](i)
+        i = i + 1
+    i = 0
+    while i < TCP_NUM_SLOTS:
+        if tcp_slot_state[i] == TCP_TIME_WAIT:
             return cast[int32](i)
         i = i + 1
     return -1
@@ -821,6 +844,7 @@ def tcp_rx(payload: Ptr[uint8], length: uint64,
                 # we send carries seq=ISN and bumps snd_nxt to ISN+1
                 # afterwards (mirrors the active-open SYN dance).
                 tcp_slot_state[new_slot] = TCP_SYN_RECV
+                tcp_slot_accepted[new_slot] = 0    # fresh peer, not yet accepted
                 tcp_slot_local_p[new_slot] = dst_port
                 tcp_slot_remote_p[new_slot] = src_port
                 nb: uint64 = new_slot * 4
@@ -1604,8 +1628,14 @@ def tcp_accept(listener_slot: int32, timeout_jiffies: uint64) -> int32:
             if i != lslot:
                 if tcp_slot_state[i] == TCP_ESTABLISHED:
                     if tcp_slot_local_p[i] == listen_port:
-                        printk1("[tcp] accept returning slot=%d\n", i)
-                        return cast[int32](i)
+                        if tcp_slot_accepted[i] == 0:
+                            # Hand this slot out exactly once. Marking it
+                            # accepted keeps a subsequent tcp_accept (the
+                            # master's next loop iteration) from aliasing
+                            # the same TCB onto another worker.
+                            tcp_slot_accepted[i] = 1
+                            printk1("[tcp] accept returning slot=%d\n", i)
+                            return cast[int32](i)
             i = i + 1
         # Preempt-class wedge-fix. This is THE site sshd's net_accept
         # hits: without kernel_cond_resched a sshd `while served < 64`
