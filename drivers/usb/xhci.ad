@@ -457,6 +457,24 @@ class XhciState:
     # 4=address-device 5=desc-device 6=desc-cfg9 7=desc-cfgfull+eps 8=enabled.
     ms_attach_stage: uint32
     ms_attach_port:  uint32
+    # Best (furthest) attach milestone across ALL attempts this boot, with
+    # the port that reached it. ms_attach_* gets clobbered by each later
+    # attempt (so a USB2 port that fails early hides the SuperSpeed port's
+    # real progress); ms_best_* survives so one photo shows how far the
+    # most-successful attempt got.
+    ms_best_stage: uint32
+    ms_best_port:  uint32
+
+    # Command-engine health counters (real-HW diagnosis). On the GAEMS rig
+    # Enable Slot — a port-independent controller command — times out, so
+    # NOTHING enumerates even though ports read enabled. These distinguish
+    # "controller posts no events at all" (cmd_evt_seen==0 -> event-ring /
+    # interrupter / DMA-blocked, e.g. IOMMU) from "events arrive but wrong"
+    # (cmd_evt_seen>0, last_cmd_cc!=success). Printed late in port_report.
+    cmd_submit_count: uint32      # _xhci_cmd_submit calls (doorbells rung)
+    evt_seen_count:   uint32      # any Event-Ring TRB consumed
+    cmd_evt_seen:     uint32      # Command Completion Events specifically
+    last_cmd_cc:      uint32      # completion code of the last command
 
     # Idempotency latch: set to 1 the moment xhci_init() makes its
     # init/skip decision (whether it brought the controller fully up,
@@ -801,6 +819,29 @@ def xhci_port_report():
             cast[uint64](xhci.ms_attach_port),
             cast[uint64](xhci.ms_attach_stage))
     printk1(" slot=%d\n", cast[uint64](xhci.ms_slot_id))
+    printk2("[xhci-ports] ms_best port=%d stage=%d\n",
+            cast[uint64](xhci.ms_best_port),
+            cast[uint64](xhci.ms_best_stage))
+    # Command-engine health. cmd_evt=0 with submit>0 = the controller rang
+    # the doorbell but posted NO completion event -> event-ring/interrupter
+    # setup or DMA blocked (IOMMU). USBSTS bit2 HSE = host-system (DMA)
+    # error. CRR (CRCR bit3) = command ring actually running.
+    usbsts: uint32 = 0
+    crcr_lo: uint32 = 0
+    if xhci.op_base != 0:
+        usbsts = _xhci_r32(xhci.op_base + XHCI_OP_USBSTS)
+        crcr_lo = _xhci_r32(xhci.op_base + XHCI_OP_CRCR)
+    hse: uint32 = (usbsts >> 2) & 1
+    hch: uint32 = usbsts & 1
+    crr: uint32 = (crcr_lo >> 3) & 1
+    printk2("[xhci-cmd] submit=%d evt_any=%d",
+            cast[uint64](xhci.cmd_submit_count),
+            cast[uint64](xhci.evt_seen_count))
+    printk2(" cmd_evt=%d last_cc=%d",
+            cast[uint64](xhci.cmd_evt_seen),
+            cast[uint64](xhci.last_cmd_cc))
+    printk2(" USBSTS=%x HSE=%d", cast[uint64](usbsts), cast[uint64](hse))
+    printk2(" HCH=%d CRR=%d\n", cast[uint64](hch), cast[uint64](crr))
     xhci_proto_report()
 
 
@@ -1281,6 +1322,7 @@ def _xhci_cmd_submit(param_lo: uint32, param_hi: uint32,
     # Ring DB[0] with value 0.
     _xhci_w32(xhci.db_base + cast[uint64](XHCI_DB_HC) \
               * XHCI_DB_STRIDE, 0)
+    xhci.cmd_submit_count = xhci.cmd_submit_count + 1
 
 
 def _xhci_evt_peek(slot_param: Ptr[uint64], status_out: Ptr[uint32],
@@ -1340,11 +1382,14 @@ def _xhci_wait_cmd_completion(out_slot: Ptr[uint32]) -> int32:
         if _xhci_evt_peek(cast[Ptr[uint64]](&p),
                           cast[Ptr[uint32]](&s),
                           cast[Ptr[uint32]](&c)) != 0:
+            xhci.evt_seen_count = xhci.evt_seen_count + 1
             ev_type: uint32 = (c >> TRB_TYPE_SHIFT) & 0x3F
             if ev_type == TRB_TYPE_COMMAND_EVT:
                 cc: uint32 = (s >> 24) & 0xFF
                 slot_id: uint32 = (c >> 24) & 0xFF
                 out_slot[0] = slot_id
+                xhci.cmd_evt_seen = xhci.cmd_evt_seen + 1
+                xhci.last_cmd_cc = cc
                 _xhci_evt_advance()
                 return cast[int32](cc)
             # Anything else — port-status-change, transfer event from a
@@ -2266,6 +2311,17 @@ def xhci_force_bulk_out_stall_selftest() -> int32:
 # 0 on any failure. Called from xhci_attach_mass_storage() which the
 # storage driver invokes; kept here because it pokes ring internals.
 
+def _xhci_set_stage(stage: uint32):
+    # Record the current attach milestone AND latch the best (furthest)
+    # one seen this boot, so a later USB2 attempt that fails early can't
+    # hide how far the SuperSpeed attempt actually got. ms_attach_port is
+    # set at attempt start, so it names the port that reached this stage.
+    xhci.ms_attach_stage = stage
+    if stage > xhci.ms_best_stage:
+        xhci.ms_best_stage = stage
+        xhci.ms_best_port  = xhci.ms_attach_port
+
+
 def _xhci_attach_mass_storage_locked(target_port: uint32,
                                      target_speed: uint32) -> uint32:
     printk2("[usbms] attaching storage at port=%d speed=%d\n",
@@ -2283,7 +2339,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
     if _xhci_port_reset(target_port) != 0:
         printk0("[usbms] port reset failed\n")
         return 0
-    xhci.ms_attach_stage = 1
+    _xhci_set_stage(1)
 
     # The PORTSC speed field is only valid AFTER reset (before reset a
     # real-HW USB2 port sits at PLS=Polling with a meaningless speed).
@@ -2313,7 +2369,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
        or xhci.ms_out_ring == 0 or xhci.cfg_buf == 0:
         printk0("[usbms] per-slot alloc failed\n")
         return 0
-    xhci.ms_attach_stage = 2
+    _xhci_set_stage(2)
     xhci.ms_ep0_enqueue = 0
     xhci.ms_ep0_cycle   = 1
     xhci.ms_in_enqueue  = 0
@@ -2330,7 +2386,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
         printk0("[usbms] Enable Slot failed\n")
         return 0
     xhci.ms_slot_id = slot
-    xhci.ms_attach_stage = 3
+    _xhci_set_stage(3)
 
     # Redirect the ep0 control machinery (kbd_*) at this slot. The
     # keyboard attach has not run yet at the point storage probes (the
@@ -2356,7 +2412,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
                                max_pkt0, xhci.ms_ep0_ring) != 0:
         printk0("[usbms] Address Device failed\n")
         return 0
-    xhci.ms_attach_stage = 4
+    _xhci_set_stage(4)
     printk1("[usbms] slot %d addressed\n", cast[uint64](slot))
 
     # GET_DESCRIPTOR(DEVICE, 18).
@@ -2365,7 +2421,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
         cast[uint16](USB_DT_DEVICE) << 8, 0, 18, xhci.cfg_buf) < 0:
         printk0("[usbms] GET_DESCRIPTOR(device) failed\n")
         return 0
-    xhci.ms_attach_stage = 5
+    _xhci_set_stage(5)
 
     # GET_DESCRIPTOR(CONFIG, 9) then full config.
     if xhci_control_transfer(
@@ -2373,7 +2429,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
         cast[uint16](USB_DT_CONFIG) << 8, 0, 9, xhci.cfg_buf) < 0:
         printk0("[usbms] GET_DESCRIPTOR(config-9) failed\n")
         return 0
-    xhci.ms_attach_stage = 6
+    _xhci_set_stage(6)
     total: uint16 = usb_cfg_total_length(cast[Ptr[uint8]](xhci.cfg_buf))
     if total > 256:
         total = 256
@@ -2382,7 +2438,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
         cast[uint16](USB_DT_CONFIG) << 8, 0, total, xhci.cfg_buf) < 0:
         printk0("[usbms] GET_DESCRIPTOR(config-full) failed\n")
         return 0
-    xhci.ms_attach_stage = 7
+    _xhci_set_stage(7)
     xhci.ms_cfg_value = usb_cfg_value(cast[Ptr[uint8]](xhci.cfg_buf))
 
     # Walk descriptors: find the mass-storage interface + its bulk
@@ -2462,7 +2518,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
         return 0
 
     xhci.ms_enabled = 1
-    xhci.ms_attach_stage = 8
+    _xhci_set_stage(8)
     printk1("[usbms] mass-storage slot %d ready\n", cast[uint64](slot))
     return slot
 
