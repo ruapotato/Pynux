@@ -528,6 +528,23 @@ class XhciState:
     # once per mass-storage bring-up.
     stall_selftest_done: uint32
 
+    # Bulk transfer real-HW diagnostics + dead-endpoint latch. On real
+    # silicon the bulk Normal TRBs were observed to never complete (cc=0
+    # poll timeout), and the per-sector retry of a failing write turned
+    # into an infinite esp_log feedback loop (Photo #22). bulk_dead is
+    # set after BULK_FAIL_LIMIT consecutive failures so _xhci_bulk_xfer
+    # fast-fails (no doorbell, no 5e6 spin, no per-failure spam) and the
+    # boot can reach a clean halt frame instead of scrolling forever.
+    # bulk_diag_done gates a ONE-SHOT detailed dump on the first failure.
+    # last_evt_seen / last_evt_p are filled by the transfer-event wait so
+    # the dump can report whether events were posted-but-skipped (TRB-PA
+    # mismatch) vs never posted (controller not executing the TRB).
+    bulk_fail_count: uint32
+    bulk_dead:       uint32
+    bulk_diag_done:  uint32
+    last_evt_seen:   uint32
+    last_evt_p:      uint64
+
 
 xhci: XhciState
 
@@ -1945,12 +1962,21 @@ def _xhci_wait_transfer_event_trb(out_status: Ptr[uint32],
     s:   uint32 = 0
     c:   uint32 = 0
     out_status[0] = 0
+    # Real-HW diagnostics: remember how many Transfer Events we saw (and
+    # the last one's TRB Pointer) so a failing bulk transfer can report
+    # whether the controller posted an event we then SKIPPED on the
+    # expect_trb_pa match (a TRB-PA mismatch bug) vs never posted one at
+    # all (the controller isn't executing our Normal TRB). Reset per call.
+    xhci.last_evt_seen = 0
+    xhci.last_evt_p = 0
     while spin < 5000000:
         if _xhci_evt_peek(cast[Ptr[uint64]](&p),
                           cast[Ptr[uint32]](&s),
                           cast[Ptr[uint32]](&c)) != 0:
             ev_type: uint32 = (c >> TRB_TYPE_SHIFT) & 0x3F
             if ev_type == TRB_TYPE_TRANSFER_EVT:
+                xhci.last_evt_seen = xhci.last_evt_seen + 1
+                xhci.last_evt_p = p
                 # The event's parameter field (p) is the TRB Pointer of
                 # the completed TRB. If the caller told us which TRB it
                 # enqueued, require a match; otherwise skip this stale
@@ -2267,6 +2293,38 @@ def xhci_bulk_in(slot: uint32, ep: uint32,
                            buf, length, 1)
 
 
+def _xhci_bulk_note_failure(ep_id: uint32, db_addr: uint64,
+                            trb_pa: uint64, is_in: int32):
+    # Bounded real-HW bulk-failure handling. Dumps a ONE-SHOT detailed
+    # diagnostic on the FIRST failure (so it lands in a stable frame
+    # before the dead latch silences the rest), then counts consecutive
+    # failures and latches xhci.bulk_dead so the per-sector retry can't
+    # spin into the infinite esp_log feedback loop seen in Photo #22.
+    # The decisive field is evt_seen: >0 means the controller POSTED a
+    # Transfer Event we then skipped on the expect_trb_pa match (TRB-PA
+    # mismatch — compare last_evt_p vs expect_trb); ==0 means no event
+    # was ever posted (the controller isn't executing our Normal TRB:
+    # cycle-bit / doorbell / EP-state / DMA-reach problem).
+    xhci.bulk_fail_count = xhci.bulk_fail_count + 1
+    if xhci.bulk_diag_done == 0:
+        xhci.bulk_diag_done = 1
+        usbsts: uint32 = 0
+        if xhci.op_base != 0:
+            usbsts = _xhci_r32(xhci.op_base + XHCI_OP_USBSTS)
+        printk2("[xhci-bulk] FAIL dir_in=%d ep_id=%d\n",
+                cast[uint64](is_in), cast[uint64](ep_id))
+        printk2("[xhci-bulk] db=%p dbval=%d\n",
+                db_addr, cast[uint64](ep_id))
+        printk2("[xhci-bulk] expect_trb=%p evt_seen=%d\n",
+                trb_pa, cast[uint64](xhci.last_evt_seen))
+        printk2("[xhci-bulk] last_evt_p=%p usbsts=%x\n",
+                xhci.last_evt_p, cast[uint64](usbsts))
+    if xhci.bulk_fail_count >= 4:
+        if xhci.bulk_dead == 0:
+            printk0("[xhci-bulk] endpoint declared DEAD; suppressing further bulk I/O\n")
+        xhci.bulk_dead = 1
+
+
 def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
                     enqueue: Ptr[uint32], cycle: Ptr[uint32],
                     buf: uint64, length: uint32,
@@ -2276,6 +2334,14 @@ def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
     # for the matching Transfer Event. On cc=6 (STALL) run the
     # halted-endpoint recovery (Reset Endpoint + Set TR Dequeue) and
     # retry once. Returns bytes moved, or -1.
+    #
+    # Real-HW safety: once the bulk endpoint has failed BULK_FAIL_LIMIT
+    # times in a row, fast-fail without ringing the doorbell, spinning
+    # the 5e6-iteration event wait, or printing per-attempt spam — that
+    # spam was being re-flushed into esp_log and feeding an infinite
+    # write-retry loop on real silicon (Photo #22).
+    if xhci.bulk_dead != 0:
+        return -1
     db_addr: uint64 = xhci.db_base + cast[uint64](slot) * XHCI_DB_STRIDE
     attempt: int32 = 0
     while attempt < 2:
@@ -2289,6 +2355,7 @@ def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
            or cc == cast[int32](TRB_CC_SHORT_PACKET):
             if resid > length:
                 resid = length
+            xhci.bulk_fail_count = 0
             return cast[int32](length - resid)
         if cc == cast[int32](TRB_CC_STALL_ERROR) and attempt == 0:
             # Endpoint halted. Recover the ring and retry the transfer.
@@ -2299,6 +2366,7 @@ def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
             if _xhci_recover_stalled_ep(slot, ep_id, ring,
                                         enqueue, cycle) != 0:
                 printk0("[xhci] STALL recovery failed\n")
+                _xhci_bulk_note_failure(ep_id, db_addr, trb_pa, is_in)
                 return -1
             attempt = attempt + 1
             continue
@@ -2306,7 +2374,9 @@ def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
             printk1("[xhci] bulk-in cc=%d\n", cast[uint64](cc))
         else:
             printk1("[xhci] bulk-out cc=%d\n", cast[uint64](cc))
+        _xhci_bulk_note_failure(ep_id, db_addr, trb_pa, is_in)
         return -1
+    _xhci_bulk_note_failure(ep_id, db_addr, 0, is_in)
     return -1
 
 
