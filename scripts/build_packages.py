@@ -316,7 +316,7 @@ COREUTILS_BINS = (
     "preempt_hog", "printf", "ps", "pwd", "reboot", "rev", "rm",
     "rmmod", "sed", "seq", "sleep", "sort", "strings", "su", "tail",
     "tee", "test", "top", "touch", "tr", "true", "uname", "uptime",
-    "u_server", "u_tlstest", "watch", "wc", "whatis", "which",
+    "u_server", "u_tlstest", "vi", "watch", "wc", "whatis", "which",
     "whoami", "xargs", "yes",
 )
 

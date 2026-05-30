@@ -1,0 +1,833 @@
+# user/vi.ad
+#
+# Hamnix `vi` — a modal, vi-shape full-screen text editor. This is the
+# OS's first interactive editor (sed is non-interactive; ed never
+# landed beyond a stub). It is deliberately a focused subset of real vi,
+# but a genuinely usable one.
+#
+#   vi foo.txt        # edit an existing file (or start an empty buffer
+#                     # named foo.txt if it does not yet exist)
+#
+# INPUT MODEL
+#   vi owns the raw console. When hamsh spawns a child, fd 0/1/2 are
+#   already bound to DEVFD_CONS — the raw console with NO kernel-side
+#   line cooking and NO echo (same path hamsh's own ed_readline uses).
+#   So vi reads one keystroke at a time off fd 0 with sys_read_nb +
+#   sys_yield, owns all echo/cursor motion itself, and repaints the
+#   screen with ANSI escape sequences. Escape sequences (arrow keys)
+#   arrive a byte at a time and are reassembled by a tiny state machine,
+#   exactly like ed_readline does.
+#
+# MODES
+#   NORMAL  — movement + edit commands. The editor starts here.
+#   INSERT  — typed bytes are inserted at the cursor; Esc returns to
+#             NORMAL.
+#   CMDLINE — the `:` ex command line (:w :q :wq :q!).
+#
+# NORMAL commands
+#   h j k l   cursor left / down / up / right
+#   0  $      line start / line end
+#   gg  G     top of file / bottom of file
+#   w         next word
+#   x         delete char under cursor
+#   dd        delete the current line
+#   i  a      insert before / append after the cursor
+#   o  O      open a new line below / above and enter INSERT
+#   :         enter the ex command line
+#
+# INSERT keys: printable bytes insert; Backspace deletes left (joining
+#   lines at column 0); Enter splits the line; Esc -> NORMAL.
+#
+# EX commands: :w (write) :q (quit, refused if modified) :wq (write+quit)
+#   :q! (force quit) :x (write if modified, then quit).
+#
+# This is an in-memory editor: the whole file is held in a fixed line
+# pool (MAX_LINES x MAX_COLS). Files larger than that are truncated to
+# fit (and flagged), which is plenty for editing config/source files on
+# a small OS.
+
+extern def sys_read_nb(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_open(path: Ptr[char]) -> int32
+extern def sys_open_write(path: Ptr[char]) -> int32
+extern def sys_read(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_close(fd: int32) -> int32
+extern def sys_yield() -> int32
+
+
+# --- editor capacity -------------------------------------------------
+MAX_LINES: uint64 = 4096        # lines the buffer can hold
+MAX_COLS:  uint64 = 1024        # bytes per line
+SCREEN_ROWS: uint64 = 24        # visible text rows (status line is +1)
+SCREEN_COLS: uint64 = 80        # visible columns (for horizontal clamp)
+
+# Line storage: lines[i][0..len[i]) is the live content of line i.
+# Flattened into one big buffer so the global stays a simple Array.
+# 4096 * 1024 = 4 MiB of .bss — sized for editing real source files.
+lines: Array[4194304, uint8]    # MAX_LINES * MAX_COLS, flattened
+line_len: Array[4096, uint64]   # live byte count of each line
+num_lines: uint64 = 1           # number of lines in the buffer (>=1)
+
+# Cursor + viewport.
+cur_row: uint64 = 0             # cursor line index, 0..num_lines-1
+cur_col: uint64 = 0             # cursor column, 0..line_len[cur_row]
+top_row: uint64 = 0             # first buffer line shown on screen
+
+# Editor state.
+MODE_NORMAL: int32 = 0
+MODE_INSERT: int32 = 1
+MODE_CMDLINE: int32 = 2
+mode: int32 = 0
+dirty: int32 = 0                # 1 once the buffer has unsaved changes
+running: int32 = 1             # cleared by :q to exit the main loop
+truncated: int32 = 0           # file was bigger than the buffer
+
+# Pending-operator state for two-key commands (g, d).
+pending: uint8 = 0              # last 'g' or 'd' awaiting its second key
+
+# The filename from argv[1].
+fname: Ptr[char]
+
+# Ex command-line accumulator (the text after ':').
+cmd_buf: Array[256, uint8]
+cmd_len: uint64 = 0
+
+# A short status message shown on the status line (errors, save count).
+status_msg: Array[128, uint8]
+status_len: uint64 = 0
+
+# Escape-parser state: 0 ground, 1 saw ESC, 2 saw ESC[ (CSI).
+esc_state: int32 = 0
+
+
+# ====================================================================
+# Small string / byte helpers
+# ====================================================================
+def cstr_len(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def write_cstr(fd: int32, s: Ptr[uint8]):
+    sys_write(fd, s, cstr_len(s))
+
+
+# Shared decimal-render scratch (render then immediately consume).
+num_buf: Array[24, uint8]
+
+
+def render_uint(v: uint64) -> Ptr[uint8]:
+    digs: Array[24, uint8]
+    di: uint64 = 0
+    if v == 0:
+        digs[0] = 48
+        di = 1
+    else:
+        while v > 0:
+            digs[di] = cast[uint8]((v % 10) + 48)
+            v = v / 10
+            di = di + 1
+    oi: uint64 = 0
+    while di > 0:
+        di = di - 1
+        num_buf[oi] = digs[di]
+        oi = oi + 1
+    num_buf[oi] = 0
+    return &num_buf[0]
+
+
+# Pointer to the first byte of line `i` inside the flattened pool.
+def line_ptr(i: uint64) -> Ptr[uint8]:
+    return cast[Ptr[uint8]](cast[uint64](&lines[0]) + i * MAX_COLS)
+
+
+# ====================================================================
+# Status message
+# ====================================================================
+def set_status(s: Ptr[uint8]):
+    n: uint64 = cstr_len(s)
+    if n > 127:
+        n = 127
+    i: uint64 = 0
+    while i < n:
+        status_msg[i] = s[i]
+        i = i + 1
+    status_len = n
+
+
+def clear_status():
+    status_len = 0
+
+
+# ====================================================================
+# File load
+# ====================================================================
+def load_file(path: Ptr[char]):
+    # Read the whole file into the line pool, splitting on '\n'. A file
+    # that does not exist (sys_open < 0) leaves a single empty line —
+    # the canonical "new file" behaviour.
+    num_lines = 1
+    line_len[0] = 0
+    fd: int32 = sys_open(path)
+    if fd < 0:
+        set_status(cast[Ptr[uint8]]("\"new file\""))
+        return
+    chunk: Array[1024, uint8]
+    li: uint64 = 0              # current line being filled
+    col: uint64 = 0            # column within that line
+    line_len[0] = 0
+    while True:
+        n: int64 = sys_read(fd, &chunk[0], 1024)
+        if n <= 0:
+            break
+        nu: uint64 = cast[uint64](n)
+        i: uint64 = 0
+        while i < nu:
+            c: uint8 = chunk[i]
+            if c == 10:                       # newline -> next line
+                line_len[li] = col
+                if li + 1 >= MAX_LINES:
+                    truncated = 1
+                    sys_close(fd)
+                    num_lines = li + 1
+                    return
+                li = li + 1
+                col = 0
+                line_len[li] = 0
+            else:
+                if col + 1 < MAX_COLS:
+                    line_ptr(li)[col] = c
+                    col = col + 1
+                else:
+                    truncated = 1
+            i = i + 1
+    line_len[li] = col
+    num_lines = li + 1
+    sys_close(fd)
+
+
+# ====================================================================
+# File save
+# ====================================================================
+def save_file(path: Ptr[char]) -> int32:
+    # Write every line back out, '\n'-terminated. Returns total bytes
+    # written, or -1 on open failure.
+    fd: int32 = sys_open_write(path)
+    if fd < 0:
+        return -1
+    nl: Array[1, uint8]
+    nl[0] = 10
+    total: int64 = 0
+    i: uint64 = 0
+    while i < num_lines:
+        ll: uint64 = line_len[i]
+        if ll > 0:
+            wr: int64 = sys_write(fd, line_ptr(i), ll)
+            if wr > 0:
+                total = total + wr
+        wn: int64 = sys_write(fd, &nl[0], 1)
+        if wn > 0:
+            total = total + wn
+        i = i + 1
+    sys_close(fd)
+    return cast[int32](total)
+
+
+# ====================================================================
+# Buffer mutation primitives
+# ====================================================================
+def clamp_col():
+    # In NORMAL mode the cursor sits ON a character, so the rightmost
+    # valid column is line_len-1 (or 0 on an empty line). In INSERT mode
+    # the cursor may sit one past the last char.
+    ll: uint64 = line_len[cur_row]
+    if mode == MODE_INSERT:
+        if cur_col > ll:
+            cur_col = ll
+    else:
+        if ll == 0:
+            cur_col = 0
+        else:
+            if cur_col >= ll:
+                cur_col = ll - 1
+
+
+def insert_char(c: uint8):
+    # Insert byte c at cur_col on the current line, shifting the tail
+    # right, then advance the cursor.
+    ll: uint64 = line_len[cur_row]
+    if ll + 1 >= MAX_COLS:
+        return
+    p: Ptr[uint8] = line_ptr(cur_row)
+    i: uint64 = ll
+    while i > cur_col:
+        p[i] = p[i - 1]
+        i = i - 1
+    p[cur_col] = c
+    line_len[cur_row] = ll + 1
+    cur_col = cur_col + 1
+    dirty = 1
+
+
+def delete_char_at():
+    # Delete the byte at cur_col (used by 'x' and INSERT-mode forward
+    # joins). No-op on an empty line.
+    ll: uint64 = line_len[cur_row]
+    if ll == 0 or cur_col >= ll:
+        return
+    p: Ptr[uint8] = line_ptr(cur_row)
+    i: uint64 = cur_col
+    while i + 1 < ll:
+        p[i] = p[i + 1]
+        i = i + 1
+    line_len[cur_row] = ll - 1
+    dirty = 1
+
+
+def open_line_below():
+    # Insert a fresh empty line after cur_row, shifting lines down.
+    if num_lines + 1 > MAX_LINES:
+        return
+    i: uint64 = num_lines
+    while i > cur_row + 1:
+        # Copy line (i-1) -> i.
+        src: Ptr[uint8] = line_ptr(i - 1)
+        dst: Ptr[uint8] = line_ptr(i)
+        ll: uint64 = line_len[i - 1]
+        j: uint64 = 0
+        while j < ll:
+            dst[j] = src[j]
+            j = j + 1
+        line_len[i] = ll
+        i = i - 1
+    line_len[cur_row + 1] = 0
+    num_lines = num_lines + 1
+    dirty = 1
+
+
+def delete_line():
+    # Delete the current line (dd). Shifts the tail up. A buffer always
+    # keeps at least one (possibly empty) line.
+    if num_lines == 1:
+        line_len[0] = 0
+        cur_col = 0
+        dirty = 1
+        return
+    i: uint64 = cur_row
+    while i + 1 < num_lines:
+        src: Ptr[uint8] = line_ptr(i + 1)
+        dst: Ptr[uint8] = line_ptr(i)
+        ll: uint64 = line_len[i + 1]
+        j: uint64 = 0
+        while j < ll:
+            dst[j] = src[j]
+            j = j + 1
+        line_len[i] = ll
+        i = i + 1
+    num_lines = num_lines - 1
+    if cur_row >= num_lines:
+        cur_row = num_lines - 1
+    dirty = 1
+
+
+def split_line():
+    # Enter in INSERT mode: split the current line at cur_col. The tail
+    # (cur_col..end) becomes a new line below; the cursor moves to its
+    # start.
+    if num_lines + 1 > MAX_LINES:
+        return
+    # Make room for one new line below cur_row.
+    i: uint64 = num_lines
+    while i > cur_row + 1:
+        src: Ptr[uint8] = line_ptr(i - 1)
+        dst: Ptr[uint8] = line_ptr(i)
+        ll: uint64 = line_len[i - 1]
+        j: uint64 = 0
+        while j < ll:
+            dst[j] = src[j]
+            j = j + 1
+        line_len[i] = ll
+        i = i - 1
+    num_lines = num_lines + 1
+    # Move the tail of cur_row into the new line cur_row+1.
+    cur: Ptr[uint8] = line_ptr(cur_row)
+    nxt: Ptr[uint8] = line_ptr(cur_row + 1)
+    cl: uint64 = line_len[cur_row]
+    k: uint64 = cur_col
+    w: uint64 = 0
+    while k < cl:
+        nxt[w] = cur[k]
+        w = w + 1
+        k = k + 1
+    line_len[cur_row + 1] = w
+    line_len[cur_row] = cur_col
+    cur_row = cur_row + 1
+    cur_col = 0
+    dirty = 1
+
+
+def join_prev():
+    # Backspace at column 0 in INSERT mode: append the current line to
+    # the end of the previous line, then delete the current line. The
+    # cursor lands at the old end of the previous line.
+    if cur_row == 0:
+        return
+    prev: Ptr[uint8] = line_ptr(cur_row - 1)
+    cur: Ptr[uint8] = line_ptr(cur_row)
+    pl: uint64 = line_len[cur_row - 1]
+    cl: uint64 = line_len[cur_row]
+    new_col: uint64 = pl
+    j: uint64 = 0
+    while j < cl and pl + j < MAX_COLS - 1:
+        prev[pl + j] = cur[j]
+        j = j + 1
+    line_len[cur_row - 1] = pl + j
+    # Now delete the (now-merged-from) current line by shifting up.
+    i: uint64 = cur_row
+    while i + 1 < num_lines:
+        s2: Ptr[uint8] = line_ptr(i + 1)
+        d2: Ptr[uint8] = line_ptr(i)
+        ll: uint64 = line_len[i + 1]
+        m: uint64 = 0
+        while m < ll:
+            d2[m] = s2[m]
+            m = m + 1
+        line_len[i] = ll
+        i = i + 1
+    num_lines = num_lines - 1
+    cur_row = cur_row - 1
+    cur_col = new_col
+    dirty = 1
+
+
+# ====================================================================
+# Movement
+# ====================================================================
+def move_word():
+    # 'w': advance to the start of the next word. A word is a maximal run
+    # of non-space bytes. Skips the current word's remaining chars, then
+    # any spaces, possibly wrapping to following lines.
+    ll: uint64 = line_len[cur_row]
+    p: Ptr[uint8] = line_ptr(cur_row)
+    # Skip the rest of the current word.
+    while cur_col < ll and p[cur_col] != 32 and p[cur_col] != 9:
+        cur_col = cur_col + 1
+    # Skip spaces; wrap lines if we hit end-of-line.
+    while True:
+        ll = line_len[cur_row]
+        p = line_ptr(cur_row)
+        while cur_col < ll and (p[cur_col] == 32 or p[cur_col] == 9):
+            cur_col = cur_col + 1
+        if cur_col < ll:
+            return
+        # End of line: move to next line's first non-space, if any.
+        if cur_row + 1 >= num_lines:
+            clamp_col()
+            return
+        cur_row = cur_row + 1
+        cur_col = 0
+        ll = line_len[cur_row]
+        if ll == 0:
+            return                            # empty line is a word stop
+
+
+# ====================================================================
+# Screen rendering
+# ====================================================================
+def emit_uint(v: uint64):
+    write_cstr(1, render_uint(v))
+
+
+def scroll_to_cursor():
+    # Keep cur_row within [top_row, top_row + SCREEN_ROWS).
+    if cur_row < top_row:
+        top_row = cur_row
+    else:
+        if cur_row >= top_row + SCREEN_ROWS:
+            top_row = cur_row - SCREEN_ROWS + 1
+
+
+def redraw():
+    scroll_to_cursor()
+    # Home cursor, hide it while we paint.
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[?25l\x1b[H"))
+    r: uint64 = 0
+    while r < SCREEN_ROWS:
+        bl: uint64 = top_row + r           # buffer line for screen row r
+        # CR + clear-to-end-of-line so stale text never lingers.
+        write_cstr(1, cast[Ptr[uint8]]("\r\x1b[K"))
+        if bl < num_lines:
+            ll: uint64 = line_len[bl]
+            if ll > SCREEN_COLS:
+                ll = SCREEN_COLS
+            if ll > 0:
+                sys_write(1, line_ptr(bl), ll)
+        else:
+            # Past end-of-buffer: vi shows a '~'.
+            sys_write(1, cast[Ptr[uint8]]("~"), 1)
+        write_cstr(1, cast[Ptr[uint8]]("\r\n"))
+        r = r + 1
+    draw_status()
+    place_cursor()
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[?25h"))
+
+
+def draw_status():
+    # Status line below the text region: filename, mode, line:col, and
+    # any pending status message / cmdline. Rendered in reverse video.
+    write_cstr(1, cast[Ptr[uint8]]("\r\x1b[K\x1b[7m"))
+    if mode == MODE_CMDLINE:
+        # The ex command line replaces the status while it's active.
+        write_cstr(1, cast[Ptr[uint8]](":"))
+        if cmd_len > 0:
+            sys_write(1, &cmd_buf[0], cmd_len)
+        write_cstr(1, cast[Ptr[uint8]]("\x1b[0m"))
+        return
+    write_cstr(1, cast[Ptr[uint8]]("\""))
+    write_cstr(1, cast[Ptr[uint8]](fname))
+    write_cstr(1, cast[Ptr[uint8]]("\" "))
+    if mode == MODE_INSERT:
+        write_cstr(1, cast[Ptr[uint8]]("-- INSERT -- "))
+    if dirty != 0:
+        write_cstr(1, cast[Ptr[uint8]]("[+] "))
+    write_cstr(1, cast[Ptr[uint8]]("L"))
+    emit_uint(cur_row + 1)
+    write_cstr(1, cast[Ptr[uint8]](":C"))
+    emit_uint(cur_col + 1)
+    if status_len > 0:
+        write_cstr(1, cast[Ptr[uint8]]("  "))
+        sys_write(1, &status_msg[0], status_len)
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[0m"))
+
+
+def place_cursor():
+    # Position the terminal cursor at the editing position. ESC[<row>;<col>H
+    # is 1-based. In CMDLINE mode the cursor lives on the status line.
+    if mode == MODE_CMDLINE:
+        write_cstr(1, cast[Ptr[uint8]]("\x1b["))
+        emit_uint(SCREEN_ROWS + 1)
+        write_cstr(1, cast[Ptr[uint8]](";"))
+        emit_uint(cmd_len + 2)             # after the ':'
+        write_cstr(1, cast[Ptr[uint8]]("H"))
+        return
+    screen_row: uint64 = cur_row - top_row + 1
+    screen_col: uint64 = cur_col + 1
+    if screen_col > SCREEN_COLS:
+        screen_col = SCREEN_COLS
+    write_cstr(1, cast[Ptr[uint8]]("\x1b["))
+    emit_uint(screen_row)
+    write_cstr(1, cast[Ptr[uint8]](";"))
+    emit_uint(screen_col)
+    write_cstr(1, cast[Ptr[uint8]]("H"))
+
+
+# ====================================================================
+# Ex command line (:w :q :wq :q! :x)
+# ====================================================================
+def cmd_eq(s: Ptr[uint8]) -> int32:
+    # Compare cmd_buf[0..cmd_len) against the NUL-terminated literal s.
+    n: uint64 = cstr_len(s)
+    if n != cmd_len:
+        return 0
+    i: uint64 = 0
+    while i < n:
+        if cmd_buf[i] != s[i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def do_write() -> int32:
+    wrote: int32 = save_file(fname)
+    if wrote < 0:
+        set_status(cast[Ptr[uint8]]("E: write failed"))
+        return -1
+    dirty = 0
+    set_status(cast[Ptr[uint8]]("written"))
+    return 0
+
+
+def run_cmdline():
+    # Execute the accumulated ex command, then leave CMDLINE mode.
+    if cmd_eq(cast[Ptr[uint8]]("w")) != 0:
+        do_write()
+    elif cmd_eq(cast[Ptr[uint8]]("q")) != 0:
+        if dirty != 0:
+            set_status(cast[Ptr[uint8]]("E: no write since last change (:q! overrides)"))
+        else:
+            running = 0
+    elif cmd_eq(cast[Ptr[uint8]]("q!")) != 0:
+        running = 0
+    elif cmd_eq(cast[Ptr[uint8]]("wq")) != 0:
+        if do_write() == 0:
+            running = 0
+    elif cmd_eq(cast[Ptr[uint8]]("x")) != 0:
+        if dirty != 0:
+            if do_write() == 0:
+                running = 0
+        else:
+            running = 0
+    else:
+        set_status(cast[Ptr[uint8]]("E: not an editor command"))
+    mode = MODE_NORMAL
+    cmd_len = 0
+
+
+# ====================================================================
+# Key dispatch
+# ====================================================================
+def handle_normal(c: uint8):
+    clear_status()
+    # Two-key commands: a pending 'g' or 'd' consumes the next key.
+    if pending == 103:                       # pending 'g' (expecting gg)
+        pending = 0
+        if c == 103:                         # 'g' -> gg: top of file
+            cur_row = 0
+            cur_col = 0
+            clamp_col()
+        return
+    if pending == 100:                       # pending 'd' (expecting dd)
+        pending = 0
+        if c == 100:                         # 'd' -> dd: delete line
+            delete_line()
+            clamp_col()
+        return
+
+    if c == 104:                             # 'h' — left
+        if cur_col > 0:
+            cur_col = cur_col - 1
+    elif c == 108:                           # 'l' — right
+        ll: uint64 = line_len[cur_row]
+        if ll > 0 and cur_col + 1 < ll:
+            cur_col = cur_col + 1
+    elif c == 106:                           # 'j' — down
+        if cur_row + 1 < num_lines:
+            cur_row = cur_row + 1
+            clamp_col()
+    elif c == 107:                           # 'k' — up
+        if cur_row > 0:
+            cur_row = cur_row - 1
+            clamp_col()
+    elif c == 48:                            # '0' — line start
+        cur_col = 0
+    elif c == 36:                            # '$' — line end
+        ll2: uint64 = line_len[cur_row]
+        if ll2 == 0:
+            cur_col = 0
+        else:
+            cur_col = ll2 - 1
+    elif c == 71:                            # 'G' — bottom of file
+        cur_row = num_lines - 1
+        clamp_col()
+    elif c == 103:                           # 'g' — start of gg
+        pending = 103
+    elif c == 119:                           # 'w' — next word
+        move_word()
+    elif c == 120:                           # 'x' — delete char
+        delete_char_at()
+        clamp_col()
+    elif c == 100:                           # 'd' — start of dd
+        pending = 100
+    elif c == 105:                           # 'i' — insert before cursor
+        mode = MODE_INSERT
+    elif c == 97:                            # 'a' — append after cursor
+        if line_len[cur_row] > 0:
+            cur_col = cur_col + 1
+        mode = MODE_INSERT
+        clamp_col()
+    elif c == 65:                            # 'A' — append at line end
+        cur_col = line_len[cur_row]
+        mode = MODE_INSERT
+    elif c == 73:                            # 'I' — insert at line start
+        cur_col = 0
+        mode = MODE_INSERT
+    elif c == 111:                           # 'o' — open line below
+        open_line_below()
+        cur_row = cur_row + 1
+        cur_col = 0
+        mode = MODE_INSERT
+    elif c == 79:                            # 'O' — open line above
+        if cur_row == 0:
+            # Open above the first line: insert below an imaginary -1 by
+            # opening below current then swapping — simplest: shift down
+            # from row 0.
+            open_line_above_first()
+        else:
+            cur_row = cur_row - 1
+            open_line_below()
+            cur_row = cur_row + 1
+        cur_col = 0
+        mode = MODE_INSERT
+    elif c == 58:                            # ':' — ex command line
+        mode = MODE_CMDLINE
+        cmd_len = 0
+    # Anything else is ignored in NORMAL mode.
+
+
+def open_line_above_first():
+    # 'O' on the first line: shift every line down by one and clear row 0.
+    if num_lines + 1 > MAX_LINES:
+        return
+    i: uint64 = num_lines
+    while i > 0:
+        src: Ptr[uint8] = line_ptr(i - 1)
+        dst: Ptr[uint8] = line_ptr(i)
+        ll: uint64 = line_len[i - 1]
+        j: uint64 = 0
+        while j < ll:
+            dst[j] = src[j]
+            j = j + 1
+        line_len[i] = ll
+        i = i - 1
+    line_len[0] = 0
+    num_lines = num_lines + 1
+    cur_row = 0
+    dirty = 1
+
+
+def handle_insert(c: uint8):
+    if c == 27:                              # ESC — back to NORMAL
+        mode = MODE_NORMAL
+        if cur_col > 0:
+            cur_col = cur_col - 1            # vi parks one left on exit
+        clamp_col()
+        return
+    if c == 13 or c == 10:                   # Enter — split line
+        split_line()
+        return
+    if c == 8 or c == 127:                   # Backspace
+        if cur_col > 0:
+            cur_col = cur_col - 1
+            delete_char_at()
+        else:
+            join_prev()
+        return
+    if c < 32:
+        return                                # ignore other control bytes
+    insert_char(c)
+
+
+def handle_cmdline(c: uint8):
+    if c == 27:                              # ESC — abort the command
+        mode = MODE_NORMAL
+        cmd_len = 0
+        clear_status()
+        return
+    if c == 13 or c == 10:                   # Enter — run it
+        run_cmdline()
+        return
+    if c == 8 or c == 127:                   # Backspace
+        if cmd_len > 0:
+            cmd_len = cmd_len - 1
+        else:
+            mode = MODE_NORMAL                # backspacing past ':' exits
+        return
+    if c < 32:
+        return
+    if cmd_len + 1 < 256:
+        cmd_buf[cmd_len] = c
+        cmd_len = cmd_len + 1
+
+
+def dispatch(c: uint8):
+    # Route one fully-decoded keystroke to the active mode handler.
+    if mode == MODE_INSERT:
+        handle_insert(c)
+    elif mode == MODE_CMDLINE:
+        handle_cmdline(c)
+    else:
+        handle_normal(c)
+
+
+# ====================================================================
+# Main loop
+# ====================================================================
+def feed_byte(c: uint8):
+    # Escape-sequence reassembly (arrow keys -> movement) layered over
+    # the mode dispatch. Arrow keys map onto h/j/k/l so they work in
+    # NORMAL and as cursor motion. In INSERT mode an ESC that is NOT the
+    # start of a recognised CSI sequence falls through as a real Esc.
+    if esc_state == 1:
+        if c == 91:                          # '[' — CSI
+            esc_state = 2
+            return
+        # Lone ESC: deliver it as a real Esc keystroke, then reprocess c.
+        esc_state = 0
+        dispatch(27)
+        dispatch(c)
+        return
+    if esc_state == 2:
+        esc_state = 0
+        if c == 65:                          # Up
+            feed_movement_key(107)
+        elif c == 66:                        # Down
+            feed_movement_key(106)
+        elif c == 67:                        # Right
+            feed_movement_key(108)
+        elif c == 68:                        # Left
+            feed_movement_key(104)
+        # Other CSI finals (Home/End/Del param keys) are ignored.
+        return
+    if c == 27:                              # ESC — maybe a CSI prefix
+        esc_state = 1
+        return
+    dispatch(c)
+
+
+def feed_movement_key(hjkl: uint8):
+    # Arrow keys move the cursor in every mode. In NORMAL they are just
+    # h/j/k/l; in INSERT we move without leaving INSERT.
+    if mode == MODE_NORMAL:
+        handle_normal(hjkl)
+        return
+    if mode == MODE_INSERT:
+        if hjkl == 104:                      # left
+            if cur_col > 0:
+                cur_col = cur_col - 1
+        elif hjkl == 108:                    # right
+            if cur_col < line_len[cur_row]:
+                cur_col = cur_col + 1
+        elif hjkl == 106:                    # down
+            if cur_row + 1 < num_lines:
+                cur_row = cur_row + 1
+                clamp_col()
+        elif hjkl == 107:                    # up
+            if cur_row > 0:
+                cur_row = cur_row - 1
+                clamp_col()
+
+
+def main(argc: int32, argv: Ptr[uint64]) -> int32:
+    if argc < 2:
+        write_cstr(2, cast[Ptr[uint8]]("vi: usage: vi FILE\n"))
+        return 1
+    fname = cast[Ptr[char]](argv[1])
+    load_file(fname)
+    cur_row = 0
+    cur_col = 0
+    top_row = 0
+    mode = MODE_NORMAL
+    if truncated != 0:
+        set_status(cast[Ptr[uint8]]("(truncated to fit buffer)"))
+
+    # Clear the screen once on entry, then paint.
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[2J\x1b[H"))
+    redraw()
+
+    rb: Array[1, uint8]
+    while running != 0:
+        n: int64 = sys_read_nb(0, &rb[0], 1)
+        if n < 0:
+            break                             # EOF / error -> bail out
+        if n == 0:
+            sys_yield()                       # idle — cooperate, then retry
+            continue
+        feed_byte(rb[0])
+        if running != 0:
+            redraw()
+
+    # Restore a sane terminal: clear screen, home, show cursor.
+    write_cstr(1, cast[Ptr[uint8]]("\x1b[2J\x1b[H\x1b[?25h"))
+    return 0
