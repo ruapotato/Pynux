@@ -356,9 +356,14 @@ def open_selected():
         set_cur_path(cast[Ptr[uint8]](&full_path[0]))
         status_len = 0
         load_dir()
+        # State marker (see HAMFM_READY): a driving test polls for this
+        # before sending the next navigation key, so each step syncs on
+        # readiness rather than a fixed sleep.
+        write_cstr(1, cast[Ptr[uint8]]("HAMFM_DESCEND\n"))
     else:
         load_view(cursor)
         mode = MODE_VIEW
+        write_cstr(1, cast[Ptr[uint8]]("HAMFM_VIEW\n"))
 
 
 def cursor_down():
@@ -461,6 +466,14 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
 
     load_dir()
     mode = MODE_LIST
+
+    # Readiness banner: emit a stable one-line marker to stdout BEFORE the
+    # first repaint so a driving test can poll the serial log and only send
+    # navigation keys once hamfm owns the raw console. Without this gate a
+    # slow (cold) boot lets the launch + first keystrokes race hamsh's REPL
+    # and the keys fall through to the shell prompt. The marker is a plain
+    # ASCII line with NO ANSI so it survives screen clears in the log.
+    write_cstr(1, cast[Ptr[uint8]]("HAMFM_READY\n"))
 
     write_cstr(1, cast[Ptr[uint8]]("\x1b[2J\x1b[H"))
     redraw()

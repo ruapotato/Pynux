@@ -9,6 +9,23 @@
 # live), drives hamfm over the serial console with scripted keystrokes,
 # and asserts deterministic markers in the captured screen output.
 #
+# DETERMINISM ON COLD BUILDS
+#   A cold (rm -rf build) boot is much slower than a warm one. The old
+#   version of this test gated every step on a FIXED `sleep N`, so on a
+#   cold boot the `hamfm` launch command and the navigation keys arrived
+#   before hamsh's REPL was ready to read them — the well-known early-
+#   keystroke-eating race. The keys fell through to the `hamsh$` prompt
+#   and QEMU hung to timeout (rc=124).
+#
+#   This version drives QEMU over a FIFO and POLLS the serial log for
+#   readiness markers before EVERY keystroke (model: test_img_uefi_boot):
+#     - wait for hamsh's first-readline marker before typing `hamfm`
+#     - wait for hamfm's `HAMFM_READY` banner before any navigation key
+#     - wait for `HAMFM_DESCEND` after entering /etc
+#     - wait for `HAMFM_VIEW` after opening /etc/hostname
+#   Each wait has a generous bounded timeout so a slow cold boot still
+#   passes. No step is timed; every step is synchronized on readiness.
+#
 # COVERAGE (the four required assertions)
 #   (a) LIST a directory: launch `hamfm /`; the root listing shows the
 #       known directory `bin/` and `etc/` (dirs render with a trailing
@@ -48,56 +65,53 @@ python3 -m compiler.adder compile \
     -o "$ELF" >/dev/null
 
 LOG=$(mktemp)
-trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
+INFIFO=$(mktemp -u)
+mkfifo "$INFIFO"
 
+QEMU_PID=""
+cleanup() {
+    [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
+    rm -f "$LOG" "$INFIFO"
+    INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1
+}
+trap cleanup EXIT
+
+# Hold the FIFO open r/w from this shell so QEMU's stdin never sees EOF
+# until we are done driving it (an EOF on -serial stdio would quit QEMU).
+exec 4<>"$INFIFO"
+exec 3>"$INFIFO"
+
+# wait_for MARKER TIMEOUT_SECS LABEL
+#   Poll the serial log until MARKER (a fixed string) appears, or until
+#   the timeout elapses, or until QEMU dies. Returns 0 on success, 1 on
+#   timeout/death. Generous timeouts keep slow COLD boots deterministic.
+wait_for() {
+    local marker="$1" timeout="$2" label="$3"
+    local i
+    for ((i = 0; i < timeout; i++)); do
+        if grep -F -a -q -- "$marker" "$LOG"; then
+            echo "[test_hamfm] ready: $label (saw '$marker' after ${i}s)"
+            return 0
+        fi
+        if [ -n "${QEMU_PID:-}" ] && ! kill -0 "$QEMU_PID" 2>/dev/null; then
+            echo "[test_hamfm] WARN: qemu exited while waiting for $label ('$marker')"
+            return 1
+        fi
+        sleep 1
+    done
+    echo "[test_hamfm] WARN: timeout (${timeout}s) waiting for $label ('$marker')"
+    return 1
+}
+
+send() {
+    printf '%s' "$1" >&3
+}
+
+# Boot hamsh-as-/init under -nographic. _build_lock.sh's GRUB-ISO shim is
+# already sourced; we boot the kernel ELF directly, the same way the old
+# test did, but feed stdin from the FIFO so we can react to the log.
 set +e
-(
-    # Generous settle before the FIRST command: keystrokes typed before
-    # hamsh finishes its first-prompt startup get EATEN under loaded
-    # interactive QEMU.
-    sleep 6
-
-    # --- Launch hamfm on the root directory (assertion a) ------------
-    printf '/bin/hamfm /\n'
-    # hamfm must fully take over the raw console from hamsh before the
-    # navigation keys arrive; otherwise hamsh eats them. Settle long.
-    sleep 5
-
-    # Root listing order (alphabetical-ish, dirs + files):
-    #   0:init 1:bin/ 2:etc/ 3:usr/ 4:var/ 5:lib/ 6:motd 7:version
-    # Move the cursor down to `etc` (init -> bin -> etc): two 'j'.
-    printf 'j'
-    sleep 1
-    printf 'j'
-    sleep 1
-    # Enter: descend into /etc (assertion b — /etc listing appears).
-    printf '\n'
-    sleep 3
-
-    # /etc listing order:
-    #   0:debian_version 1:fstab 2:group 3:host.conf 4:hostname ...
-    # Move the cursor down to `hostname`: four 'j'.
-    printf 'j'
-    sleep 1
-    printf 'j'
-    sleep 1
-    printf 'j'
-    sleep 1
-    printf 'j'
-    sleep 1
-    # Enter: VIEW /etc/hostname inline (assertion c — `hamnix` appears).
-    printf '\n'
-    sleep 3
-    # Any key returns to the listing.
-    printf ' '
-    sleep 1
-    # Quit hamfm back to the shell (assertion d).
-    printf 'q'
-    sleep 2
-
-    printf 'exit\n'
-    sleep 1
-) | timeout 150s qemu-system-x86_64 \
+timeout 240s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -105,8 +119,70 @@ set +e
     -m 256M \
     -monitor none \
     -serial stdio \
-    > "$LOG" 2>&1
+    <&4 > "$LOG" 2>&1 &
+QEMU_PID=$!
+
+# --- Step 0: wait for hamsh's REPL to be ready --------------------------
+# stage-08 (ed-readline-first) prints right before hamsh enters its first
+# interactive readline. After it, hamsh runs a short getty-style stale-
+# input flush; type the launch command a beat later so it isn't drained.
+wait_for "[hamsh:stage-08] ed-readline-first" 120 "hamsh REPL"
+sleep 3
+
+# --- Step 1: launch hamfm on the root directory (assertion a) -----------
+send '/bin/hamfm /
+'
+# hamfm must take over the raw console from hamsh and print its readiness
+# banner before any navigation key arrives; otherwise hamsh eats them.
+wait_for "HAMFM_READY" 90 "hamfm started"
+
+# --- Step 2: descend into /etc (assertion b) ----------------------------
+# Root listing order (dirs + files):
+#   0:init 1:bin/ 2:etc/ 3:usr/ ...
+# Move the cursor down to `etc` (init -> bin -> etc): two 'j', then Enter.
+send 'j'
+sleep 1
+send 'j'
+sleep 1
+send '
+'
+wait_for "HAMFM_DESCEND" 60 "/etc listed"
+
+# --- Step 3: VIEW /etc/hostname inline (assertion c) --------------------
+# /etc listing order:
+#   0:debian_version 1:fstab 2:group 3:host.conf 4:hostname ...
+# Move the cursor down to `hostname`: four 'j', then Enter.
+send 'j'
+sleep 1
+send 'j'
+sleep 1
+send 'j'
+sleep 1
+send 'j'
+sleep 1
+send '
+'
+wait_for "HAMFM_VIEW" 60 "file view"
+
+# Any key returns to the listing, then quit hamfm back to the shell.
+sleep 1
+send ' '
+sleep 1
+send 'q'
+sleep 2
+
+# --- Step 4: exit the shell cleanly (assertion d) -----------------------
+send 'exit
+'
+# Wait for the kernel's clean-shutdown marker before tearing QEMU down.
+wait_for "no live tasks" 60 "shell exited"
+
+sleep 1
+kill "$QEMU_PID" 2>/dev/null
+wait "$QEMU_PID" 2>/dev/null
 rc=$?
+exec 3>&-
+exec 4>&-
 set -e
 
 echo "[test_hamfm] --- captured output ---"
