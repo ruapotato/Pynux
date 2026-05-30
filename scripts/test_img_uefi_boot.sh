@@ -143,6 +143,14 @@ if [ "$booted" -ne 1 ]; then
 fi
 echo "[test_img_uefi] prompt reached; typing commands at the shell."
 
+# The prompt MARKER printing is not the same as the shell being ready to
+# read input: on first prompt hamsh runs a getty-style stale-input flush
+# and the service supervisor/heartbeat settle. Typing the very first
+# command at that instant races that startup and the keystrokes can be
+# eaten (the bytes never reach the REPL). Give it a settle so the first
+# command lands — the gap to readiness grows with initramfs size.
+sleep 6
+
 type_cmd() {
     printf '%s\n' "$1" >&3
     sleep 4
