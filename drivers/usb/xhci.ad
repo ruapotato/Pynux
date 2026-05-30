@@ -555,6 +555,15 @@ class XhciState:
     diag_expect_trb: uint64
     diag_db:         uint64
     diag_usbsts:     uint32
+    # Bulk endpoint's OUTPUT device-context state, latched at first failure.
+    # ep_state (dword0 bits[2:0]): 1=Running 2=Halted 3=Stopped 0=Disabled.
+    # ep_deq = the TR Dequeue Pointer the controller has cached for this ep
+    # (+ DCS in bit0); ep_dw1 = the ep-info dword the controller accepted
+    # (EP type / CErr / Max Burst / Max Packet). Distinguishes evt_seen==0
+    # causes: Running+our-TRB-ignored (cycle/DCS) vs never-started vs halted.
+    diag_ep_state:   uint32
+    diag_ep_deq:     uint64
+    diag_ep_dw1:     uint32
 
 
 xhci: XhciState
@@ -2322,12 +2331,29 @@ def _xhci_bulk_note_failure(ep_id: uint32, db_addr: uint64,
         usbsts: uint32 = 0
         if xhci.op_base != 0:
             usbsts = _xhci_r32(xhci.op_base + XHCI_OP_USBSTS)
+        # Read the endpoint's OUTPUT device-context state the controller
+        # actually committed (DCI ep_id at offset ep_id*32 in the output
+        # context; output ctx has NO Input Control prefix). ep_state in
+        # dword0[2:0]; TR Dequeue Pointer in dword2/3; ep-info in dword1.
+        ep_state: uint32 = 0
+        ep_deq:   uint64 = 0
+        ep_dw1:   uint32 = 0
+        if xhci.kbd_output_ctx != 0:
+            octx: Ptr[uint32] = cast[Ptr[uint32]](
+                xhci.kbd_output_ctx + cast[uint64](ep_id) * 32)
+            ep_state = octx[0] & 0x7
+            ep_dw1   = octx[1]
+            ep_deq   = cast[uint64](octx[2]) \
+                     | (cast[uint64](octx[3]) << 32)
         # Latch the snapshot so the late telemetry frame can reprint it.
         xhci.diag_evt_seen   = xhci.last_evt_seen
         xhci.diag_last_evt_p = xhci.last_evt_p
         xhci.diag_expect_trb = trb_pa
         xhci.diag_db         = db_addr
         xhci.diag_usbsts     = usbsts
+        xhci.diag_ep_state   = ep_state
+        xhci.diag_ep_deq     = ep_deq
+        xhci.diag_ep_dw1     = ep_dw1
         printk2("[xhci-bulk] FAIL dir_in=%d ep_id=%d\n",
                 cast[uint64](is_in), cast[uint64](ep_id))
         printk2("[xhci-bulk] db=%p dbval=%d\n",
@@ -2336,6 +2362,10 @@ def _xhci_bulk_note_failure(ep_id: uint32, db_addr: uint64,
                 trb_pa, cast[uint64](xhci.last_evt_seen))
         printk2("[xhci-bulk] last_evt_p=%p usbsts=%x\n",
                 xhci.last_evt_p, cast[uint64](usbsts))
+        printk2("[xhci-bulk] ep_state=%d ep_deq=%p\n",
+                cast[uint64](ep_state), ep_deq)
+        printk2("[xhci-bulk] ep_dw1=%x my_deq=%p\n",
+                cast[uint64](ep_dw1), trb_pa)
     if xhci.bulk_fail_count >= 4:
         if xhci.bulk_dead == 0:
             printk0("[xhci-bulk] endpoint declared DEAD; suppressing further bulk I/O\n")
@@ -2364,6 +2394,10 @@ def xhci_bulk_diag_report():
             xhci.diag_last_evt_p, xhci.diag_db)
     printk2("[xhci-bulk] (late) usbsts=%x dead=%d\n",
             cast[uint64](xhci.diag_usbsts), cast[uint64](xhci.bulk_dead))
+    printk2("[xhci-bulk] (late) ep_state=%d ep_deq=%p\n",
+            cast[uint64](xhci.diag_ep_state), xhci.diag_ep_deq)
+    printk2("[xhci-bulk] (late) ep_dw1=%x my_deq=%p\n",
+            cast[uint64](xhci.diag_ep_dw1), xhci.diag_expect_trb)
 
 
 def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
