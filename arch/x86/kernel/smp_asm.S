@@ -109,6 +109,8 @@ __ap_landing_addr_addr_word:
     .quad ap_landing_addr
 __ap_stack_top_addr_word:
     .quad ap_stack_top
+__ap_cpu_id_addr_word:
+    .quad ap_cpu_id_slot
 
     .section .text, "ax"
 
@@ -144,6 +146,13 @@ ap_landing_addr_addr:
     .globl ap_stack_top_addr
 ap_stack_top_addr:
     leaq    __ap_stack_top_addr_word(%rip), %rax
+    movq    (%rax), %rax
+    ret
+
+    .align 16
+    .globl ap_cpu_id_slot_addr
+ap_cpu_id_slot_addr:
+    leaq    __ap_cpu_id_addr_word(%rip), %rax
     movq    (%rax), %rax
     ret
 

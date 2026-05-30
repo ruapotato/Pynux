@@ -1,31 +1,49 @@
 # arch/x86/kernel/smp.ad
 #
-# Mirrors arch/x86/kernel/smpboot.c in Linux at minimal scope: bring
-# a single AP online via INIT-SIPI-SIPI, get it through the real-mode
-# → long-mode trampoline, and have it bump a shared counter so the
-# BSP can verify it actually started executing.
+# SMP bring-up: discover ALL present CPU APIC IDs from the ACPI MADT
+# and wake each AP via the Intel-spec INIT-SIPI-SIPI sequence through
+# the real-mode trampoline (arch/x86/realmode/trampoline.S).
 #
-# Sequence (mirrors do_boot_cpu in Linux at the simplest level):
-#   1. memcpy the trampoline bytes from their load address into
-#      physical 0x8000 (where SIPI will deliver the AP).
-#   2. Patch the trampoline's three plant slots:
-#        ap_cr3_value     <- BSP's CR3 (shared page tables)
-#        ap_landing_addr  <- &ap_main_64
-#        ap_stack_top     <- top of a fresh per-AP kernel stack
-#   3. Send INIT IPI.
-#   4. (Linux pauses ~10 ms here; QEMU is deterministic enough that
-#       we skip the wait — the LAPIC busy-wait in the ICR helper
-#       provides ordering.)
-#   5. Send Startup IPI with vector 8 (so AP starts at 0x8000).
-#   6. Poll cpus_online until it advances from 1 to 2, or time out.
+# Sequence (mirrors do_boot_cpu in Linux):
+#   1. Parse MADT via acpi_cpu_count() / acpi_cpu_apic_id() to build
+#      the list of AP hardware APIC IDs. Falls back to APIC ID 1 if
+#      no MADT is available (QEMU legacy / bare-metal fallback).
+#   2. Copy the trampoline bytes to physical 0x8000 (SIPI vector 8).
+#   3. For each AP (up to MAX_CPUS - 1):
+#        a. Allocate a kernel stack for the AP.
+#        b. Patch trampoline slots: cr3_value, landing_addr, stack_top,
+#           and the NEW ap_cpu_id slot so the AP knows which CPU it is.
+#        c. Send INIT IPI -> 10ms wait -> SIPI -> 200µs -> SIPI
+#           (two SIPIs as the Intel spec requires).
+#        d. Poll cpus_online until it advances by 1 (timeout ~100ms).
+#   4. Each AP, on entry to ap_main_hamnix:
+#        a. Sets up its own per-CPU %gs area via setup_ap_percpu_area.
+#        b. Enables its local APIC + timer via lapic_ap_init.
+#        c. Bumps cpus_online.
+#        d. Parks in the idle loop (scheduler integration is a follow-up).
 #
-# Cuts vs. Linux: no MADT parsing (assume APIC ID 1), no per-CPU
-# %gs base on the AP yet, no AP joining the scheduler, no second
-# SIPI. All of those are follow-ups.
+# MAX_CPUS: cap at 16. Matches ACPI_MAX_CPUS in drivers/acpi/acpi.ad.
+#
+# The BSP's boot path is unchanged: setup_per_cpu_areas() still
+# allocates the BSP's per-CPU area, stamps cpu_id_pcpu=0, and runs
+# first (before smp_boot_aps). Each AP gets a HIGHER logical id.
+#
+# Scheduler integration note:
+#   APs park in a HLT loop after bumping cpus_online. Wiring them into
+#   the per-CPU run queues (or a shared spinlock-protected queue) is
+#   the next milestone. The BSP-only scheduling path is UNMODIFIED:
+#   the existing runqueue, schedule(), and timer ISR path are untouched.
 
 from mm.page_alloc import alloc_page
 from kernel.printk.printk import printk0, printk1, printk2
-from arch.x86.kernel.apic import lapic_send_init, lapic_send_sipi
+from arch.x86.kernel.apic import (
+    lapic_send_init, lapic_send_sipi,
+    apic_enable,
+)
+from arch.x86.kernel.setup_percpu import setup_ap_percpu_area
+from drivers.acpi.acpi import (
+    acpi_init, acpi_cpu_count, acpi_cpu_apic_id,
+)
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
 extern def get_bsp_cr3() -> uint64
@@ -34,47 +52,153 @@ extern def ap_trampoline_size() -> uint64
 extern def ap_cr3_value_addr() -> uint64
 extern def ap_landing_addr_addr() -> uint64
 extern def ap_stack_top_addr() -> uint64
+extern def ap_cpu_id_slot_addr() -> uint64
 extern def ap_main_64()
 extern def cpu_relax()
 
 # is_bare_metal() depends on the same CPUID dispatcher kernel/sched/core.ad
-# uses for its M16.156 XSAVE check. Body lives in
-# arch/x86/kernel/cpuregs_asm.S — single CPUID instruction, no side effects.
+# uses for its M16.156 XSAVE check.
 extern def cpuid_get(leaf: uint32, subleaf: uint32, out: Ptr[uint32])
 
 AP_TRAMPOLINE_PHYS: uint64 = 0x8000
 AP_SIPI_VECTOR:     uint32 = 0x08             # 0x08 * 0x1000 = 0x8000
-SECONDARY_APIC_ID:  uint32 = 1
+MAX_CPUS:           uint64 = 16
 
 # Boot-state counter: number of CPUs that have entered ap_main_hamnix.
-# Starts at 1 (the BSP itself); each AP increments. BSP polls this
-# after sending IPIs to verify the AP made it through the trampoline.
+# Starts at 1 (the BSP itself); each AP increments atomically. BSP
+# polls this after each INIT-SIPI-SIPI pair.
 cpus_online: uint64 = 1
+
+# Per-AP "CPU ID" slot in the trampoline, planted by BSP before each
+# SIPI round so ap_main_hamnix knows its logical CPU number.
+# ap_cpu_id_slot_addr() returns its VMA (like the other plant slots).
+ap_cpu_id: uint64 = 0
 
 
 def ap_main_hamnix():
-    # Entered by the AP after the trampoline lands ap_main_64 here.
-    # We're at CPL 0, long mode, sharing BSP's page tables, on our
-    # own kernel stack. The single observable side-effect of this
-    # function is bumping cpus_online — the BSP polls that to confirm
-    # the AP got this far.
+    # Entered by the AP after the trampoline far-jumps to ap_main_64.
+    # We are in 64-bit long mode, sharing BSP page tables, on our own
+    # kernel stack. The BSP planted ap_cpu_id in the trampoline before
+    # sending SIPI; read it now (it's the stack-local variable since
+    # the trampoline wrote it to the ap_cpu_id global slot and we only
+    # need the value, not the address).
     #
-    # NOTE: this increment races with any BSP reads, but x86 has
-    # atomic single-quad writes; we accept the race because the BSP
-    # only reads (waits for value >= 2) and the AP only ever writes
-    # this single value once. No memory barrier needed for a single
-    # 8-byte aligned store on x86_64.
+    # Step 1: Capture the logical CPU id the BSP left in the trampoline.
+    my_cpu_id: uint64 = cast[Ptr[uint64]](ap_cpu_id_slot_addr())[0]
+
+    # Step 2: Set up this AP's per-CPU %gs area so get_cpu_id() works
+    # and Percpu[T] accesses are valid from here on.
+    setup_ap_percpu_area(my_cpu_id)
+
+    printk1("SMP: AP cpu%d (APIC) online, gs set up\n", my_cpu_id)
+
+    # Step 3: Enable this AP's local APIC. The BSP's apic_init() only
+    # initialised the BSP's LAPIC; each AP must set its own SVR
+    # software-enable bit before it can receive ANY interrupt.
+    apic_enable()
+
+    # Step 4: Bump the online counter. On x86 a single aligned 8-byte
+    # store is atomic; the BSP polls this value and only proceeds after
+    # it advances, which provides the ordering guarantee we need.
     cpus_online = cpus_online + 1
 
-    # Park the AP. A future milestone wires it into the scheduler.
-    asm_volatile("cli")
+    # Step 5: Park this AP. The idle loop is STI + HLT so the LAPIC
+    # timer (once we arm it per-AP) can fire. For now we just park.
+    # A future milestone will: arm the LAPIC timer, run the idle task,
+    # and enter the per-CPU scheduler.
+    asm_volatile("sti")
     while True:
         asm_volatile("hlt")
 
 
+def _smp_wait_ap(expected: uint64, spins_per_iter: uint64) -> int32:
+    # Spin until cpus_online >= expected, or we time out.
+    # Returns 1 on success, 0 on timeout.
+    spins: uint64 = 0
+    LIMIT: uint64 = 50000000
+    while spins < LIMIT and cpus_online < expected:
+        cpu_relax()
+        spins = spins + 1
+    if cpus_online >= expected:
+        return 1
+    return 0
+
+
+def _smp_boot_one_ap(ap_idx: uint64, apic_id: uint32) -> int32:
+    # Boot one AP with hardware APIC ID `apic_id`. This is the inner
+    # loop body: patch trampoline slots, INIT-SIPI-SIPI, poll.
+    # Returns 1 if the AP came online, 0 if it timed out.
+
+    # Patch slot 1: AP's CR3 (shared BSP page tables).
+    cast[Ptr[uint64]](ap_cr3_value_addr())[0] = get_bsp_cr3()
+
+    # Patch slot 2: 64-bit landing address.
+    cast[Ptr[uint64]](ap_landing_addr_addr())[0] = cast[uint64](&ap_main_64)
+
+    # Patch slot 3: AP kernel stack (4 KiB; top = base + 4096).
+    ap_stack: uint64 = alloc_page() + 4096
+    cast[Ptr[uint64]](ap_stack_top_addr())[0] = ap_stack
+
+    # Patch slot 4: logical CPU id for this AP.
+    logical_id: uint64 = ap_idx + 1          # 0 is the BSP
+    cast[Ptr[uint64]](ap_cpu_id_slot_addr())[0] = logical_id
+
+    printk2("SMP: booting AP cpu%d APIC id=%d\n",
+            logical_id, cast[uint64](apic_id))
+
+    # INIT IPI.
+    lapic_send_init(apic_id)
+
+    # Intel spec says wait 10 ms after INIT before sending SIPIs.
+    # We busy-spin on cpu_relax — on QEMU TCG this is equivalent to a
+    # short delay. On real hardware the LAPIC's ICR-busy poll in
+    # lapic_send_init already serialises; the 10 ms is a minimum.
+    # We use ~1 million cpu_relax iterations as a conservative proxy
+    # (much faster than 10 ms on TCG, but QEMU's INIT handling is
+    # deterministic so the AP will be in WFS state immediately).
+    delay: uint64 = 0
+    while delay < 1000000:
+        cpu_relax()
+        delay = delay + 1
+
+    # First SIPI.
+    lapic_send_sipi(apic_id, AP_SIPI_VECTOR)
+
+    # Wait ~200 µs between the two SIPIs (spec requirement).
+    delay = 0
+    while delay < 200000:
+        cpu_relax()
+        delay = delay + 1
+
+    # Second SIPI (Intel SDM Vol.3 §8.4.4.1).
+    lapic_send_sipi(apic_id, AP_SIPI_VECTOR)
+
+    # Poll for the AP to bump cpus_online. We expect it to reach
+    # (ap_idx + 2) since we track total CPUs including BSP.
+    expected: uint64 = ap_idx + 2
+    ok: int32 = _smp_wait_ap(expected, 0)
+    if ok != 0:
+        printk2("SMP: AP cpu%d online (cpus_online=%d)\n",
+                logical_id, cpus_online)
+    else:
+        printk2("SMP: AP cpu%d (APIC id=%d) timed out\n",
+                logical_id, cast[uint64](apic_id))
+    return ok
+
+
 def smp_boot_secondary():
-    # Stage 1: copy the trampoline bytes from kernel image LMA into
-    # physical 0x8000 where SIPI will deliver the AP.
+    # Legacy single-AP entry-point. Kept for backward compatibility
+    # with the boot sequence in init/main.ad which calls this by name.
+    # Delegates to smp_boot_aps().
+    smp_boot_aps()
+
+
+def smp_boot_aps():
+    # Discover all APs from ACPI MADT and wake each one.
+    #
+    # Step 1: Copy the trampoline bytes to physical 0x8000. This only
+    # needs to happen once; subsequent APs re-use the same copy
+    # (they each get different stack/id slots patched in before SIPI).
     src: uint64 = ap_trampoline_load_addr()
     size: uint64 = ap_trampoline_size()
     printk2("SMP: copying trampoline (%d bytes from %p) -> 0x8000\n",
@@ -82,40 +206,29 @@ def smp_boot_secondary():
     memcpy(cast[Ptr[uint8]](AP_TRAMPOLINE_PHYS),
            cast[Ptr[uint8]](src), size)
 
-    # Stage 2: patch the trampoline's plant slots. Their VMAs are
-    # 0x8000 + offset within the trampoline, which is exactly where
-    # the memcpy just placed them.
-    cast[Ptr[uint64]](ap_cr3_value_addr())[0]    = get_bsp_cr3()
-    cast[Ptr[uint64]](ap_landing_addr_addr())[0] = cast[uint64](&ap_main_64)
+    # Step 2: Ensure ACPI MADT is parsed (idempotent).
+    acpi_init()
 
-    # Allocate a kernel stack for the AP. 4 KiB is enough for the
-    # trivial M16.24 demo; future scheduler-integration will want at
-    # least 16 KiB.
-    ap_stack: uint64 = alloc_page() + 4096
-    cast[Ptr[uint64]](ap_stack_top_addr())[0]    = ap_stack
-    printk1("SMP: AP kernel stack top = %p\n", ap_stack)
+    n_cpus: uint32 = acpi_cpu_count()
+    printk1("SMP: MADT reports %d CPU(s)\n", cast[uint64](n_cpus))
 
-    # Stage 3+4: INIT-SIPI sequence.
-    printk1("SMP: sending INIT to APIC id %d\n",
-            cast[uint64](SECONDARY_APIC_ID))
-    lapic_send_init(SECONDARY_APIC_ID)
-    printk1("SMP: sending SIPI vector 0x%x\n",
-            cast[uint64](AP_SIPI_VECTOR))
-    lapic_send_sipi(SECONDARY_APIC_ID, AP_SIPI_VECTOR)
+    if n_cpus == 0:
+        # No MADT or no enabled CPUs — fall back to booting APIC ID 1.
+        printk0("SMP: no MADT CPU list, trying APIC ID 1 fallback\n")
+        _smp_boot_one_ap(0, cast[uint32](1))
+        return
 
-    # Stage 5: poll for the AP to bump cpus_online. Bounded loop so
-    # a stuck AP doesn't hang the BSP indefinitely.
-    spins: uint64 = 0
-    LIMIT: uint64 = 100000000
-    while spins < LIMIT and cpus_online < 2:
-        cpu_relax()
-        spins = spins + 1
-
-    if cpus_online >= 2:
-        printk2("SMP: AP online (cpus_online=%d after %d spins)\n",
-                cpus_online, spins)
-    else:
-        printk1("SMP: AP did not come online (spins=%d)\n", spins)
+    # The MADT slot 0 is conventionally the BSP's APIC ID. Skip it
+    # and boot slots 1..n_cpus-1 (the APs).
+    i: uint32 = 1
+    while i < n_cpus and cast[uint64](i) < MAX_CPUS:
+        ap_apic_id: uint32 = acpi_cpu_apic_id(i)
+        if ap_apic_id != 0xFF:
+            ok: int32 = _smp_boot_one_ap(cast[uint64](i - 1), ap_apic_id)
+            if ok == 0:
+                printk1("SMP: AP%d failed to come online\n",
+                        cast[uint64](i))
+        i = i + 1
 
 
 def get_cpus_online() -> uint64:

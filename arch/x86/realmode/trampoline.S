@@ -166,6 +166,9 @@ ap_landing_addr:
     .globl ap_stack_top
 ap_stack_top:
     .quad   0
+    .globl ap_cpu_id_slot
+ap_cpu_id_slot:
+    .quad   0
 
     .globl ap_trampoline_end
 ap_trampoline_end:

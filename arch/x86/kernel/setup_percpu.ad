@@ -86,3 +86,37 @@ def get_cpu_id() -> uint64:
     # smp_processor_id() equivalent. Reads via the Percpu[uint64]
     # global — codegen lowers this to `mov %gs:cpu_id_pcpu, %rax`.
     return cpu_id_pcpu
+
+
+def setup_ap_percpu_area(logical_cpu_id: uint64):
+    # Called by each AP from ap_main_hamnix() to set up its own
+    # per-CPU area. Mirrors setup_per_cpu_areas() but uses
+    # memblock_alloc for the area (which is BSP-safe since the AP
+    # hasn't entered the scheduler yet and memblock is lock-free
+    # by construction — the BSP has finished using it for the heap
+    # before smp_boot_aps() is called).
+    #
+    # After this returns %gs points at the AP's private area, and
+    # cpu_id_pcpu holds `logical_cpu_id`, so get_cpu_id() works on
+    # the AP exactly as on the BSP.
+    size: uint64 = get_per_cpu_size()
+    if size < 4096:
+        size = 4096
+    area: uint64 = memblock_alloc(size, 4096)
+    if area == 0:
+        # OOM: the AP cannot continue; park it here.
+        asm_volatile("cli")
+        while True:
+            asm_volatile("hlt")
+
+    # Copy the master template into this CPU's per-CPU area.
+    load: uint64 = get_per_cpu_load()
+    memcpy(cast[Ptr[uint8]](area),
+           cast[Ptr[uint8]](load),
+           get_per_cpu_size())
+
+    # Point %gs at this AP's private area.
+    wrmsr_gsbase(area)
+
+    # Stamp the logical CPU id into slot 0.
+    cpu_id_pcpu = logical_cpu_id

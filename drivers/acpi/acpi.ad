@@ -78,6 +78,19 @@ ACPI_MADT_TYPE_LOCAL_APIC: uint32 = 0
 ACPI_MADT_TYPE_IO_APIC:    uint32 = 1
 ACPI_MADT_HEADER_SIZE:     uint64 = 44
 
+# --- Cached LAPIC (CPU) APIC-ID list --------------------------------
+#
+# Populated by acpi_parse_lapics() (called from acpi_init). Each slot
+# holds the hardware APIC ID from the MADT type-0 entry for one
+# enabled CPU. The BSP's APIC ID is always slot 0 (MADT guarantees it
+# is the first enabled entry on every real machine and QEMU). APs are
+# slots 1..N-1. MAX_CPUS=16 covers everything from a laptop to a
+# mid-range server; raise as needed.
+ACPI_MAX_CPUS: uint64 = 16
+
+acpi_lapic_n:     uint32 = 0
+acpi_lapic_ids:   Array[16, uint32]
+
 
 # --- Cached IOAPIC list (MADT type-1 entries) ----------------------
 #
@@ -103,6 +116,63 @@ acpi_ioapic_n:        uint32 = 0
 acpi_ioapic_ids:      Array[8, uint32]
 acpi_ioapic_addrs:    Array[8, uint64]
 acpi_ioapic_gsibase:  Array[8, uint32]
+
+
+def acpi_parse_lapics():
+    # Walk the MADT type-0 (Local APIC) entries and cache each enabled
+    # CPU's hardware APIC ID into acpi_lapic_ids[]. The BSP APIC ID is
+    # conventionally the first entry in the MADT; APs follow in
+    # enumeration order. Idempotent: resets the count first.
+    acpi_lapic_n = 0
+    if acpi_madt_phys == 0:
+        return
+
+    total_len: uint32 = cast[Ptr[uint32]](acpi_madt_phys + 4)[0]
+    if total_len <= cast[uint32](ACPI_MADT_HEADER_SIZE):
+        return
+
+    end_off: uint64 = cast[uint64](total_len)
+    off: uint64 = ACPI_MADT_HEADER_SIZE
+
+    while off + 2 <= end_off:
+        ent: uint64 = acpi_madt_phys + off
+        etype: uint8 = cast[Ptr[uint8]](ent)[0]
+        elen:  uint8 = cast[Ptr[uint8]](ent + 1)[0]
+
+        if cast[uint32](elen) < 2:
+            return
+        if off + cast[uint64](elen) > end_off:
+            return
+
+        if cast[uint32](etype) == ACPI_MADT_TYPE_LOCAL_APIC:
+            # Layout: type(1) + length(1) + acpi_id(1) + apic_id(1) + flags(4)
+            if cast[uint32](elen) >= 8:
+                flags: uint32 = cast[Ptr[uint32]](ent + 4)[0]
+                if (flags & 1) == 1:
+                    if cast[uint64](acpi_lapic_n) < ACPI_MAX_CPUS:
+                        n: uint32 = acpi_lapic_n
+                        apic_id: uint8 = cast[Ptr[uint8]](ent + 3)[0]
+                        acpi_lapic_ids[n] = cast[uint32](apic_id)
+                        acpi_lapic_n = n + 1
+                        printk2("acpi: CPU #%d APIC id=%d\n",
+                                cast[uint64](n), cast[uint64](apic_id))
+
+        off = off + cast[uint64](elen)
+
+
+def acpi_cpu_count() -> uint32:
+    # Number of enabled CPUs found in the MADT (0 if no MADT).
+    return acpi_lapic_n
+
+
+def acpi_cpu_apic_id(i: uint32) -> uint32:
+    # Return the hardware APIC ID of CPU slot `i`, or 0xFF (invalid)
+    # if out of range. Slot 0 is the BSP, slots 1..N-1 are APs.
+    if cast[uint64](i) >= ACPI_MAX_CPUS:
+        return 0xFF
+    if i >= acpi_lapic_n:
+        return 0xFF
+    return acpi_lapic_ids[i]
 
 
 def acpi_parse_ioapics():
@@ -415,6 +485,12 @@ def acpi_init() -> int32:
 
     cpus: uint32 = acpi_count_cpus()
     printk1("acpi: %u enabled CPU(s) in MADT\n", cast[uint64](cpus))
+
+    # Cache the per-CPU LAPIC ID list. smp_boot_aps() reads this to
+    # discover which APIC IDs to target for INIT-SIPI-SIPI.
+    acpi_parse_lapics()
+    printk1("acpi: %u CPU(s) cached from MADT\n",
+            cast[uint64](acpi_cpu_count()))
 
     # Cache the MADT IOAPIC list so GSI routing can pick the correct
     # IOAPIC by GSI range on a multi-IOAPIC machine.
