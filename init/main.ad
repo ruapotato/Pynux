@@ -172,7 +172,7 @@ from drivers.usb.storage import usbms_init, usbms_read_sectors
 # standard enumeration through SET_CONFIGURATION, and a periodic
 # interrupt-IN QH that feeds boot-keyboard reports into the shared
 # kbd FIFO. ehci_v1_selftest is the synthetic transfer-engine proof.
-from drivers.usb.ehci import ehci_init, ehci_v1_selftest
+from drivers.usb.ehci import ehci_init, ehci_v1_selftest, ehci_kbd_enabled
 from drivers.net.netfilter import (
     netfilter_init, register_netfilter_hook, nf_run_hooks,
     NF_HOOK_ACCEPT,
@@ -3758,13 +3758,25 @@ def start_kernel():
     # EHCI V1 USB HID — synthetic interrupt-IN round-trip. Forges the
     # retired-qTD state the controller leaves behind for a completed
     # 8-byte boot report ('a'), drives ehci_poll(), and asserts the
-    # report reached the shared kbd FIFO via hid_kbd_report. Runs
-    # unconditionally: it is self-contained (allocates its own scratch
-    # page if the live attach never armed a keyboard) and never polls
-    # MMIO, so it cannot wedge on a PS/2-only machine the way the xHCI
-    # synthetic path could. PASS: `[ehci_v1] transfer-engine PASS`.
-    printk0("[boot:08] ehci_v1_selftest\n")
-    ehci_v1_selftest()
+    # report reached the shared kbd FIFO via hid_kbd_report.
+    #
+    # GATED (same marker pattern as the xHCI selftests above): the
+    # synthetic 'a' is pushed into the SHARED kbd FIFO that /dev/cons and
+    # hamsh's read_line() drain for LIVE keystrokes. On a normal boot with
+    # no USB keyboard (e.g. the root-on-USB image test) that synthetic
+    # byte has no legitimate consumer and would otherwise leak into the
+    # first real REPL command typed at the prompt ("aecho ..." instead of
+    # "echo ..."). ehci_v1_selftest() drains the FIFO afterward, but the
+    # robust fix is to not inject at all unless we are actually testing
+    # the EHCI keyboard path: run ONLY when either the /etc/xhci-selftest
+    # cpio marker is present (QEMU keyboard smoke) OR a real EHCI boot
+    # keyboard enumerated (ehci_kbd_enabled). Default real-hw / USB-boot
+    # lands in neither branch and skips the synthetic injection entirely.
+    if xhci_marker_found == 1 or ehci_kbd_enabled() != 0:
+        printk0("[boot:08] ehci_v1_selftest\n")
+        ehci_v1_selftest()
+    else:
+        printk0("[boot:08] ehci_v1_selftest SKIPPED (no kbd / no marker)\n")
     printk0("[boot:09] time_init\n")
     time_init()
     printk0("[boot:10] i8259_disable\n")

@@ -83,6 +83,7 @@ from arch.x86.kernel.apic import ioapic_redirect
 from arch.x86.kernel.irq import register_irq_handler
 from mm.page_alloc import alloc_pages
 from drivers.usb.hid import hid_init, hid_kbd_report
+from drivers.input.atkbd import kbd_rx_pop
 from drivers.usb.usb import (
     USB_SPEED_UNKNOWN, USB_SPEED_FULL, USB_SPEED_LOW, USB_SPEED_HIGH,
     USB_RT_GET_DESCRIPTOR, USB_REQ_GET_DESCRIPTOR,
@@ -1920,6 +1921,14 @@ def ehci_v1_selftest():
     # The synthetic 'a' tripped the "live key-down" one-shot; clear it
     # so the marker is reserved for a genuine wire keystroke.
     ehci.kbd_keydowns = 0
+    # CRITICAL: ehci_poll pushed the synthetic 'a' into the SHARED kbd
+    # FIFO (hid_kbd_report -> kbd_rx_push), the same FIFO /dev/cons and
+    # hamsh's read_line() drain for live keystrokes. Left in place it
+    # leaks into the first real REPL command (e.g. "aecho ..." instead
+    # of "echo ..."). Drain the FIFO so the self-test byte never reaches
+    # userspace — mirrors hid_self_test()'s post-test FIFO flush.
+    while kbd_rx_pop() >= 0:
+        pass
 
 
 # =====================================================================
