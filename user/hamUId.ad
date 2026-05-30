@@ -53,6 +53,7 @@ extern def sys_spawn(path: Ptr[char], argv: Ptr[uint64],
                      envp: Ptr[uint64]) -> int32
 extern def sys_kill(pid: int32, sig: int32) -> int32
 extern def sys_wsys_alloc(pid: uint64) -> int32
+extern def sys_wsys_free(wid: int32) -> int32
 extern def sys_pipe(fds: Ptr[int32]) -> int32
 
 
@@ -1822,6 +1823,14 @@ WIN_BORDER_B: uint8 = 250
 TITLE_H: int64 = 18                      # window title-bar height (px)
 DRAG_MIN: int64 = 12                     # min swept extent to spawn a win
 
+# Close-box ([x]) colours: a red square with a white X glyph.
+CLOSE_R: uint8 = 210
+CLOSE_G: uint8 = 60
+CLOSE_B: uint8 = 60
+CLOSE_X_R: uint8 = 255
+CLOSE_X_G: uint8 = 255
+CLOSE_X_B: uint8 = 255
+
 SIGTERM_D: int32 = 15
 
 # ---- daemon window model -------------------------------------------
@@ -1875,6 +1884,24 @@ DRAG_X0: int64 = 0
 DRAG_Y0: int64 = 0
 PREV_BTN_L: int32 = 0                     # previous-iteration left button
 
+# ---- window-management gesture state -------------------------------
+# A left-button-press is classified at the down-edge into one of three
+# gestures, tracked by GESTURE:
+#   0 = create  (press landed on empty desktop) — rubber-band + spawn
+#   1 = move    (press landed on a window title bar) — relocate window
+#   2 = close   (press landed on a window's close box) — destroy on up
+GESTURE: int32 = 0
+# For move: which window slot is being dragged + the cursor-to-window
+# offset captured at the down-edge so the window tracks under the grab.
+MOVE_SLOT: int64 = -1
+MOVE_OFF_X: int64 = 0
+MOVE_OFF_Y: int64 = 0
+# For close: the slot the press landed on (the release must land on the
+# SAME slot's close box to actually destroy it — rio-style).
+CLOSE_SLOT: int64 = -1
+# Close-box geometry: a square at the right end of the title bar.
+CLOSE_BOX: int64 = 14                      # close-box side length (px)
+
 # Small mouse read buffer ("<dx> <dy> <buttons>\n" lines).
 mouse_buf: Array[256, uint8]
 
@@ -1897,6 +1924,57 @@ def imax(a: int64, b: int64) -> int64:
     if a > b:
         return a
     return b
+
+
+# ---- window-management hit-testing ---------------------------------
+# The close box is a CLOSE_BOX-square inset 2px from the title bar's
+# top-right corner. Returns its top-left (cx,cy) for window `slot`.
+def close_box_x(slot: uint64) -> int64:
+    return DWIN_X[slot] + DWIN_W[slot] - 2 - CLOSE_BOX
+
+
+def close_box_y(slot: uint64) -> int64:
+    return DWIN_Y[slot] + 2
+
+
+# 1 if (px,py) is inside window slot's close box, else 0.
+def in_close_box(slot: uint64, px: int64, py: int64) -> int32:
+    cx: int64 = close_box_x(slot)
+    cy: int64 = close_box_y(slot)
+    if px >= cx and px < cx + CLOSE_BOX and py >= cy and py < cy + CLOSE_BOX:
+        return 1
+    return 0
+
+
+# 1 if (px,py) is on window slot's title bar (the band below the top
+# border, above the body) — EXCLUDING the close box. Used to start a
+# move-drag.
+def in_title_bar(slot: uint64, px: int64, py: int64) -> int32:
+    wx: int64 = DWIN_X[slot]
+    wy: int64 = DWIN_Y[slot]
+    ww: int64 = DWIN_W[slot]
+    if px < wx + 2 or px >= wx + ww - 2:
+        return 0
+    if py < wy + 2 or py >= wy + TITLE_H:
+        return 0
+    if in_close_box(slot, px, py) != 0:
+        return 0
+    return 1
+
+
+# Topmost window slot whose rectangle contains (px,py), or -1. Windows
+# paint back-to-front (slot 0 lowest), so the highest slot wins the
+# hit-test.
+def window_at(px: int64, py: int64) -> int64:
+    wi: int64 = cast[int64](DWIN_COUNT) - 1
+    while wi >= 0:
+        s: uint64 = cast[uint64](wi)
+        wx: int64 = DWIN_X[s]
+        wy: int64 = DWIN_Y[s]
+        if px >= wx and px < wx + DWIN_W[s] and py >= wy and py < wy + DWIN_H[s]:
+            return wi
+        wi = wi - 1
+    return -1
 
 
 # ---- per-window terminal emulator ----------------------------------
@@ -2050,6 +2128,24 @@ def daemon_pixel(x: int64, y: int64,
                     r = WIN_TITLE_R
                     g = WIN_TITLE_G
                     b = WIN_TITLE_B
+                    # Close box overlay at the title bar's right end.
+                    cbx: int64 = close_box_x(wi)
+                    cby: int64 = close_box_y(wi)
+                    if x >= cbx and x < cbx + CLOSE_BOX and y >= cby and y < cby + CLOSE_BOX:
+                        r = CLOSE_R
+                        g = CLOSE_G
+                        b = CLOSE_B
+                        # Draw an 'X': the two diagonals of the box (2px
+                        # inset) in white.
+                        lxp: int64 = x - cbx
+                        lyp: int64 = y - cby
+                        inset: int64 = 2
+                        span: int64 = CLOSE_BOX - 1
+                        if lxp >= inset and lxp <= span - inset and lyp >= inset and lyp <= span - inset:
+                            if lxp == lyp or lxp == span - lyp:
+                                r = CLOSE_X_R
+                                g = CLOSE_X_G
+                                b = CLOSE_X_B
                 else:
                     r = WIN_BODY_R
                     g = WIN_BODY_G
@@ -2250,6 +2346,147 @@ def daemon_spawn_window(rx: int64, ry: int64, rw: int64, rh: int64):
             sys_close(cf)
 
 
+# Copy ALL per-slot window state (geometry, terminal fds/state, and the
+# character grid) from slot `src` to slot `dst`. Used to compact the
+# window table when a window is destroyed and to reorder for raise.
+def slot_copy(dst: uint64, src: uint64):
+    if dst == src:
+        return
+    DWIN_X[dst]      = DWIN_X[src]
+    DWIN_Y[dst]      = DWIN_Y[src]
+    DWIN_W[dst]      = DWIN_W[src]
+    DWIN_H[dst]      = DWIN_H[src]
+    DWIN_WID[dst]    = DWIN_WID[src]
+    DWIN_PID[dst]    = DWIN_PID[src]
+    DWIN_IN_FD[dst]  = DWIN_IN_FD[src]
+    DWIN_OUT_FD[dst] = DWIN_OUT_FD[src]
+    DWIN_COLS[dst]   = DWIN_COLS[src]
+    DWIN_ROWS[dst]   = DWIN_ROWS[src]
+    DWIN_CUR_C[dst]  = DWIN_CUR_C[src]
+    DWIN_CUR_R[dst]  = DWIN_CUR_R[src]
+    DWIN_VT[dst]     = DWIN_VT[src]
+    # Move the character grid wholesale (GRID_CELLS bytes).
+    sb: uint64 = src * GRID_CELLS
+    db: uint64 = dst * GRID_CELLS
+    i: uint64 = 0
+    while i < GRID_CELLS:
+        term_grid[db + i] = term_grid[sb + i]
+        i = i + 1
+
+
+# Raise window `slot` to the topmost paint position (last slot). The
+# windows above it slide down one slot so paint/hit-test order stays a
+# simple back-to-front array walk. MOVE_SLOT is rebased to the new
+# position so an in-flight move keeps tracking the right window.
+def daemon_raise_slot(slot: int64) -> int64:
+    if slot < 0:
+        return slot
+    last: uint64 = DWIN_COUNT - 1
+    s: uint64 = cast[uint64](slot)
+    if s >= DWIN_COUNT or s == last:
+        return cast[int64](s)
+    # Stash the window being raised in the spare slot just past the
+    # table (DMAX-sized arrays always have room: DWIN_COUNT <= DMAX, and
+    # we hold the raised window aside while shifting), using slot DMAX-1
+    # is unsafe when full — instead shift up then place at `last`.
+    # Save raised window into temporaries via the spawn scratch grid is
+    # complex; simplest correct approach: bubble it up with swaps.
+    cur: uint64 = s
+    while cur < last:
+        slot_swap(cur, cur + 1)
+        cur = cur + 1
+    return cast[int64](last)
+
+
+# Swap two slots' full state. Implemented via a scratch slot would need
+# extra grid storage; instead swap field-by-field and the grid cell-by-
+# cell (bounded: GRID_CELLS per call, DMAX small).
+def slot_swap(a: uint64, b: uint64):
+    if a == b:
+        return
+    t0: int64 = DWIN_X[a]
+    DWIN_X[a] = DWIN_X[b]
+    DWIN_X[b] = t0
+    t1: int64 = DWIN_Y[a]
+    DWIN_Y[a] = DWIN_Y[b]
+    DWIN_Y[b] = t1
+    t2: int64 = DWIN_W[a]
+    DWIN_W[a] = DWIN_W[b]
+    DWIN_W[b] = t2
+    t3: int64 = DWIN_H[a]
+    DWIN_H[a] = DWIN_H[b]
+    DWIN_H[b] = t3
+    i0: int32 = DWIN_WID[a]
+    DWIN_WID[a] = DWIN_WID[b]
+    DWIN_WID[b] = i0
+    i1: int32 = DWIN_PID[a]
+    DWIN_PID[a] = DWIN_PID[b]
+    DWIN_PID[b] = i1
+    i2: int32 = DWIN_IN_FD[a]
+    DWIN_IN_FD[a] = DWIN_IN_FD[b]
+    DWIN_IN_FD[b] = i2
+    i3: int32 = DWIN_OUT_FD[a]
+    DWIN_OUT_FD[a] = DWIN_OUT_FD[b]
+    DWIN_OUT_FD[b] = i3
+    t4: int64 = DWIN_COLS[a]
+    DWIN_COLS[a] = DWIN_COLS[b]
+    DWIN_COLS[b] = t4
+    t5: int64 = DWIN_ROWS[a]
+    DWIN_ROWS[a] = DWIN_ROWS[b]
+    DWIN_ROWS[b] = t5
+    t6: int64 = DWIN_CUR_C[a]
+    DWIN_CUR_C[a] = DWIN_CUR_C[b]
+    DWIN_CUR_C[b] = t6
+    t7: int64 = DWIN_CUR_R[a]
+    DWIN_CUR_R[a] = DWIN_CUR_R[b]
+    DWIN_CUR_R[b] = t7
+    i4: int32 = DWIN_VT[a]
+    DWIN_VT[a] = DWIN_VT[b]
+    DWIN_VT[b] = i4
+    ab: uint64 = a * GRID_CELLS
+    bb: uint64 = b * GRID_CELLS
+    i: uint64 = 0
+    while i < GRID_CELLS:
+        g: uint8 = term_grid[ab + i]
+        term_grid[ab + i] = term_grid[bb + i]
+        term_grid[bb + i] = g
+        i = i + 1
+
+
+# Destroy window `slot`: tear down its hamsh child + pipes, free the wid
+# binding, then compact the table so paint order stays contiguous. Any
+# in-flight move/close referencing a shifted slot is reset by the caller.
+def daemon_close_slot(slot: int64):
+    if slot < 0:
+        return
+    s: uint64 = cast[uint64](slot)
+    if s >= DWIN_COUNT:
+        return
+    # Tear down the child shell + the daemon's pipe ends so we don't leak
+    # the process or the fds. SIGTERM the bound pid (best-effort), free
+    # the wsys slot, and close both parent pipe ends.
+    pid: int32 = DWIN_PID[s]
+    if pid > 0:
+        sys_kill(pid, SIGTERM_D)
+    wid: int32 = DWIN_WID[s]
+    if wid >= 2:
+        sys_wsys_free(wid)
+    infd: int32 = DWIN_IN_FD[s]
+    if infd >= 0:
+        sys_close(infd)
+    outfd: int32 = DWIN_OUT_FD[s]
+    if outfd >= 0:
+        sys_close(outfd)
+    # Compact: slide every higher slot down by one so paint order stays
+    # a contiguous 0..DWIN_COUNT-1 back-to-front walk.
+    last: uint64 = DWIN_COUNT - 1
+    j: uint64 = s
+    while j < last:
+        slot_copy(j, j + 1)
+        j = j + 1
+    DWIN_COUNT = DWIN_COUNT - 1
+
+
 # Consume all currently-available mouse packets, updating CUR_X/CUR_Y
 # and tracking the left-button edge for the drag gesture. Returns 1 if
 # anything changed (cursor moved or button edge), else 0. The /dev/mouse
@@ -2295,15 +2532,109 @@ def daemon_apply_packet(ls: uint64, le: uint64,
     lbtn: int32 = 0
     if (btn & 1) != 0:
         lbtn = 1
-    # Edge detection for the drag gesture.
+    # Drive the gesture state machine off the integrated cursor + button
+    # state. wm_button() handles the press/drag/release edges (move,
+    # close, create) using CUR_X/CUR_Y and PREV_BTN_L.
+    wm_button(lbtn, scr_w, scr_h)
+    PREV_BTN_L = lbtn
+    return 1
+
+
+# Gesture state machine, driven by the current left-button level (lbtn:
+# 0/1) and the absolute cursor at CUR_X/CUR_Y. Detects the press edge
+# (against PREV_BTN_L), tracks an in-flight move while held, and resolves
+# move/close/create on the release edge. Factored out so the daemon
+# self-test can drive it directly with absolute coordinates (no /dev/mouse
+# packet round-trip).
+def wm_button(lbtn: int32, scr_w: int64, scr_h: int64):
+    # --- left-button DOWN edge: classify the gesture ---
     if lbtn != 0 and PREV_BTN_L == 0:
-        # left-button DOWN -> begin a drag at the cursor.
-        DRAG_ACTIVE = 1
-        DRAG_X0 = CUR_X
-        DRAG_Y0 = CUR_Y
+        # Hit-test the topmost window under the cursor. A press on a
+        # window's close box arms a close; a press on its title bar
+        # starts a move (and raises it on top); anything else (empty
+        # desktop, or a window body) begins a rubber-band create drag.
+        hit: int64 = window_at(CUR_X, CUR_Y)
+        GESTURE = 0
+        MOVE_SLOT = -1
+        CLOSE_SLOT = -1
+        DRAG_ACTIVE = 0
+        started_wm: int32 = 0
+        if hit >= 0:
+            hs: uint64 = cast[uint64](hit)
+            if in_close_box(hs, CUR_X, CUR_Y) != 0:
+                GESTURE = 2                  # close: confirm on the up-edge
+                CLOSE_SLOT = hit
+                started_wm = 1
+            elif in_title_bar(hs, CUR_X, CUR_Y) != 0:
+                GESTURE = 1                  # move
+                # Raise the grabbed window to the top so it tracks above
+                # the others, then capture the cursor->origin offset.
+                hit = daemon_raise_slot(hit)
+                hs = cast[uint64](hit)
+                MOVE_SLOT = hit
+                MOVE_OFF_X = CUR_X - DWIN_X[hs]
+                MOVE_OFF_Y = CUR_Y - DWIN_Y[hs]
+                started_wm = 1
+                m1: Ptr[uint8] = "WM move start\n"
+                sys_write(1, m1, strlen_u8(m1))
+        if started_wm == 0:
+            # No window-management gesture -> the empty-desktop / body
+            # rubber-band create drag (unchanged behaviour).
+            GESTURE = 0
+            DRAG_ACTIVE = 1
+            DRAG_X0 = CUR_X
+            DRAG_Y0 = CUR_Y
+    # --- button held: a move tracks the window under the grab ---
+    if lbtn != 0 and GESTURE == 1 and MOVE_SLOT >= 0:
+        ms: uint64 = cast[uint64](MOVE_SLOT)
+        nx: int64 = CUR_X - MOVE_OFF_X
+        ny: int64 = CUR_Y - MOVE_OFF_Y
+        # Clamp so the window stays on-screen and never draws outside the
+        # framebuffer.
+        nx = iclamp(nx, 0, scr_w - DWIN_W[ms])
+        ny = iclamp(ny, 0, scr_h - DWIN_H[ms])
+        if nx < 0:
+            nx = 0
+        if ny < 0:
+            ny = 0
+        DWIN_X[ms] = nx
+        DWIN_Y[ms] = ny
+    # --- left-button UP edge: resolve the gesture ---
     if lbtn == 0 and PREV_BTN_L != 0:
-        # left-button UP -> end the drag; maybe create a window.
-        if DRAG_ACTIVE != 0:
+        if GESTURE == 2:
+            # Close only if the release lands in the SAME window's close
+            # box (rio-style click cancellation on drag-off).
+            if CLOSE_SLOT >= 0:
+                cs: uint64 = cast[uint64](CLOSE_SLOT)
+                if cs < DWIN_COUNT and in_close_box(cs, CUR_X, CUR_Y) != 0:
+                    daemon_close_slot(CLOSE_SLOT)
+                    m2: Ptr[uint8] = "WM close window\n"
+                    sys_write(1, m2, strlen_u8(m2))
+        elif GESTURE == 1 and MOVE_SLOT >= 0:
+            # Move finished — log the window's final origin so a
+            # non-pixel test can assert it relocated.
+            mvs: uint64 = cast[uint64](MOVE_SLOT)
+            mline: Array[64, uint8]
+            mp: uint64 = 0
+            mpfx: Ptr[uint8] = "WM move done x="
+            mk: uint64 = 0
+            while mpfx[mk] != 0:
+                mline[mp] = mpfx[mk]
+                mp = mp + 1
+                mk = mk + 1
+            mp = mp + u64_to_dec(cast[uint64](DWIN_X[mvs]), &mline[mp])
+            # drop u64_to_dec's trailing newline, append " y="
+            mp = mp - 1
+            ysfx: Ptr[uint8] = " y="
+            yk: uint64 = 0
+            while ysfx[yk] != 0:
+                mline[mp] = ysfx[yk]
+                mp = mp + 1
+                yk = yk + 1
+            mp = mp + u64_to_dec(cast[uint64](DWIN_Y[mvs]), &mline[mp])
+            sys_write(1, &mline[0], mp)
+        elif GESTURE == 0 and DRAG_ACTIVE != 0:
+            # Empty-desktop drag -> maybe spawn a window.
             rx0: int64 = imin(DRAG_X0, CUR_X)
             ry0: int64 = imin(DRAG_Y0, CUR_Y)
             rx1: int64 = imax(DRAG_X0, CUR_X)
@@ -2312,9 +2643,11 @@ def daemon_apply_packet(ls: uint64, le: uint64,
             rh: int64 = ry1 - ry0
             if rw >= DRAG_MIN and rh >= DRAG_MIN:
                 daemon_spawn_window(rx0, ry0, rw, rh)
+        # Reset all gesture state.
         DRAG_ACTIVE = 0
-    PREV_BTN_L = lbtn
-    return 1
+        GESTURE = 0
+        MOVE_SLOT = -1
+        CLOSE_SLOT = -1
 
 
 def next_signed(buf: Ptr[uint8], pos: Ptr[uint64], total: uint64) -> int64:
@@ -2334,6 +2667,46 @@ def next_signed(buf: Ptr[uint8], pos: Ptr[uint64], total: uint64) -> int64:
     if neg != 0:
         return 0 - v
     return v
+
+
+# Mouse-free WM self-test: drive a title-bar drag-move then a close-box
+# click on the just-created autowin by calling the real gesture machine
+# (wm_button) directly with ABSOLUTE cursor coordinates. This exercises
+# the identical move/close/raise code paths a /dev/mouse packet would,
+# but skips the packet string encode/decode round-trip entirely so the
+# coordinates are exact and the result is deterministic.
+def daemon_wm_selftest(scr_w: int64, scr_h: int64):
+    if DWIN_COUNT == 0:
+        return
+    s: uint64 = DWIN_COUNT - 1
+    PREV_BTN_L = 0
+    # --- title-bar press: position the cursor inside the title bar (not
+    # on the close box) and assert the left button down-edge. ---
+    CUR_X = iclamp(DWIN_X[s] + 30, 0, scr_w - 1)
+    CUR_Y = iclamp(DWIN_Y[s] + TITLE_H / 2, 0, scr_h - 1)
+    wm_button(1, scr_w, scr_h)
+    PREV_BTN_L = 1
+    # --- drag: relocate the cursor LEFT 200 / UP 30 with the button held;
+    # wm_button tracks the grabbed window to follow. ---
+    CUR_X = iclamp(CUR_X - 200, 0, scr_w - 1)
+    CUR_Y = iclamp(CUR_Y - 30, 0, scr_h - 1)
+    wm_button(1, scr_w, scr_h)
+    PREV_BTN_L = 1
+    # --- release: finalise the move (emits "WM move done x= y="). ---
+    wm_button(0, scr_w, scr_h)
+    PREV_BTN_L = 0
+    # The move raised the grabbed window to the top, so re-resolve its
+    # slot (raise_slot bubbles it to DWIN_COUNT-1).
+    cs: uint64 = DWIN_COUNT - 1
+    # --- close: move the cursor onto the (relocated) window's close box,
+    # then press+release inside it to destroy the window. ---
+    CUR_X = iclamp(close_box_x(cs) + CLOSE_BOX / 2, 0, scr_w - 1)
+    CUR_Y = iclamp(close_box_y(cs) + CLOSE_BOX / 2, 0, scr_h - 1)
+    wm_button(1, scr_w, scr_h)       # press in close box -> arm close
+    PREV_BTN_L = 1
+    wm_button(0, scr_w, scr_h)       # release in close box -> destroy
+    PREV_BTN_L = 0
+    write_str(1, "DAEMON wm selftest done\n")
 
 
 # Focused window = the most-recently-created one (topmost). Returns its
@@ -2427,6 +2800,13 @@ def cmd_daemon_auto(autoflag: int32) -> int32:
     if autoflag != 0:
         daemon_spawn_window(720, 80, 480, 320)
         write_str(1, "DAEMON autowin created\n")
+        daemon_present()
+    # WM self-test (autoflag == 2): drive a title-drag move + close-box
+    # click through synthetic packets so the gestures are exercised
+    # deterministically without QEMU mouse injection.
+    if autoflag == 2:
+        daemon_wm_selftest(scr_w, scr_h)
+        daemon_present()
     # Main loop. Cooperative: yield every idle iteration so we never
     # monopolise the CPU and the spawned hamsh tasks still run.
     prev_wins: uint64 = DWIN_COUNT
@@ -2500,6 +2880,9 @@ def main(argc: int32, argv: Ptr[uint64]) -> int32:
             a2: Ptr[uint8] = cast[Ptr[uint8]](argv[2])
             if cstr_eq(a2, "autowin") != 0:
                 autoflag = 1
+            # `wmselftest` => autowin + a mouse-free move+close self-test.
+            if cstr_eq(a2, "wmselftest") != 0:
+                autoflag = 2
         return cmd_daemon_auto(autoflag)
     usage(2)
     return 1
