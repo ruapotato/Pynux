@@ -2870,22 +2870,25 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
     printk2("[usbms] ... bulk-out ep=%d in_mps=%d\n",
             cast[uint64](bulk_out), cast[uint64](in_mps))
 
-    # SET_CONFIGURATION.
-    setcfg_rc: int32 = xhci_control_transfer(
-        USB_RT_SET_CONFIGURATION, USB_REQ_SET_CONFIGURATION,
-        cast[uint16](xhci.ms_cfg_value), 0, 0, 0)
-    xhci.ms_dbg_setcfg = setcfg_rc
-    if setcfg_rc < 0:
-        printk0("[usbms] SET_CONFIGURATION failed\n")
-        return 0
-    _xhci_set_stage(9)
-
-    # Configure BOTH bulk endpoints in a single Configure Endpoint
-    # command. _xhci_v1_configure_endpoint adds one endpoint per call
-    # and zeroes the input context each time, so call it twice — the
-    # second call re-adds only its own endpoint, but xHCI keeps
-    # previously-added endpoints in the device context across Configure
-    # Endpoint commands (Add flags are additive on the OUTPUT context).
+    # Configure BOTH bulk endpoints on the HOST CONTROLLER first (xHCI
+    # Configure Endpoint command), THEN tell the DEVICE to enter the
+    # configured state with SET_CONFIGURATION. This is the order Linux's
+    # usb_set_configuration() uses: alloc_bandwidth (Configure Endpoint)
+    # BEFORE the SET_CONFIGURATION control request.
+    #
+    # Real-HW (SuperSpeed) bug this fixes: our old order did
+    # SET_CONFIGURATION first, so the DEVICE enabled its bulk endpoints
+    # and brought their SuperSpeed flow-control state machines live while
+    # the HOST endpoint context did not yet exist. The device then
+    # NRDY/NAK-looped every CBW forever — EP Running, controller parked at
+    # TRB[0], ZERO Transfer Events (Photos #25–#27). QEMU's stateless
+    # emulation tolerated either order, hiding the gap in the VM.
+    #
+    # _xhci_v1_configure_endpoint adds one endpoint per call and zeroes
+    # the input context each time, so call it twice — the second call
+    # re-adds only its own endpoint, but xHCI keeps previously-added
+    # endpoints in the device context across Configure Endpoint commands
+    # (Add flags are additive on the OUTPUT context).
     in_dci:  uint32 = (bulk_in * 2) + 1
     out_dci: uint32 = bulk_out * 2
     # Both Configure Endpoint commands must declare Context Entries = the
@@ -2903,13 +2906,23 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
     if cfgout_rc != 0:
         printk0("[usbms] Configure bulk-OUT failed\n")
         return 0
-    _xhci_set_stage(10)
+    _xhci_set_stage(9)
     cfgin_rc: int32 = _xhci_v1_configure_endpoint(
         slot, in_dci, EP_TYPE_BULK_IN, in_mps, 0, xhci.ms_in_ring,
         max_dci, in_burst)
     xhci.ms_dbg_cfgin = cfgin_rc
     if cfgin_rc != 0:
         printk0("[usbms] Configure bulk-IN failed\n")
+        return 0
+    _xhci_set_stage(10)
+
+    # SET_CONFIGURATION — device side, now that the host endpoints exist.
+    setcfg_rc: int32 = xhci_control_transfer(
+        USB_RT_SET_CONFIGURATION, USB_REQ_SET_CONFIGURATION,
+        cast[uint16](xhci.ms_cfg_value), 0, 0, 0)
+    xhci.ms_dbg_setcfg = setcfg_rc
+    if setcfg_rc < 0:
+        printk0("[usbms] SET_CONFIGURATION failed\n")
         return 0
 
     xhci.ms_enabled = 1
