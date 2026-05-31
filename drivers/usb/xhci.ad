@@ -634,6 +634,8 @@ class XhciState:
     diag_evt_slot_ctl: uint32
     diag_total_evt:   uint32
     diag_iman:        uint32
+    diag_erdp_lo:     uint32
+    diag_erdp_hi:     uint32
 
 
 xhci: XhciState
@@ -655,6 +657,16 @@ def _xhci_r32(addr: uint64) -> uint32:
 
 def _xhci_w32(addr: uint64, value: uint32):
     cast[Ptr[uint32]](addr)[0] = value
+
+
+def _xhci_w64(addr: uint64, value: uint64):
+    # Single naturally-aligned 64-bit MMIO store. Real Intel xHCI latches
+    # the Event Ring Dequeue Pointer (and its EHB ack) on a true 64-bit
+    # write; split 32-bit half-writes to ERDP do NOT advance the
+    # controller's cached dequeue on this silicon (NUC #37-#39: stuck at
+    # base, Event Ring Full after one lap). xHCI 1.2 §5.2 guarantees these
+    # registers are naturally aligned so a qword store is legal.
+    cast[Ptr[uint64]](addr)[0] = value
 
 
 def _xhci_r8(addr: uint64) -> uint32:
@@ -1564,11 +1576,11 @@ def _xhci_evt_advance():
     # set it so the controller knows we acknowledged the interrupt.
     new_erdp: uint64 = xhci.event_ring + cast[uint64](xhci.evt_dequeue) \
                                        * cast[uint64](TRB_SIZE)
-    erdp_lo: uint32 = cast[uint32](new_erdp & 0xFFFFFFF8) | 0x8
-    erdp_hi: uint32 = cast[uint32]((new_erdp >> 32) & 0xFFFFFFFF)
+    # Single 64-bit write: pointer bits[63:4] = the aligned dequeue addr,
+    # bit3 = EHB (RW1C, set to 1 to ack), bits[2:0] = DESI (0, one segment).
+    erdp64: uint64 = (new_erdp & 0xFFFFFFFFFFFFFFF0) | 0x8
     ir0: uint64 = xhci.rt_base + XHCI_RT_IR0
-    _xhci_w32(ir0 + XHCI_IR_ERDP,     erdp_lo)
-    _xhci_w32(ir0 + XHCI_IR_ERDP + 4, erdp_hi)
+    _xhci_w64(ir0 + XHCI_IR_ERDP, erdp64)
     # Acknowledge the interrupter. IMAN.IP (bit0) is RW1C and is set by
     # the xHC every time it posts an event + asserts an interrupt. On real
     # Intel silicon the controller will NOT keep posting events past one
@@ -1716,10 +1728,7 @@ def _xhci_v1_bringup() -> int32:
     # Program interrupter #0: ERSTSZ=1, ERSTBA=&erst, ERDP=&event_ring.
     ir0: uint64 = xhci.rt_base + XHCI_RT_IR0
     _xhci_w32(ir0 + XHCI_IR_ERSTSZ, 1)
-    _xhci_w32(ir0 + XHCI_IR_ERDP,
-              cast[uint32](xhci.event_ring & 0xFFFFFFF0))
-    _xhci_w32(ir0 + XHCI_IR_ERDP + 4,
-              cast[uint32]((xhci.event_ring >> 32) & 0xFFFFFFFF))
+    _xhci_w64(ir0 + XHCI_IR_ERDP, xhci.event_ring & 0xFFFFFFFFFFFFFFF0)
     _xhci_w32(ir0 + XHCI_IR_ERSTBA,
               cast[uint32](xhci.erst & 0xFFFFFFF0))
     _xhci_w32(ir0 + XHCI_IR_ERSTBA + 4,
@@ -2487,6 +2496,15 @@ def _xhci_bulk_note_failure(ep_id: uint32, db_addr: uint64,
         if xhci.rt_base != 0:
             xhci.diag_iman = _xhci_r32(xhci.rt_base + XHCI_RT_IR0 \
                                        + XHCI_IR_IMAN)
+            # Read ERDP back: if it reflects our last-written dequeue
+            # (event_ring + 255*16), the register ACCEPTS writes and the
+            # controller is ignoring the dequeue advance (deeper issue); if
+            # it reads back as the base (index 0), our writes aren't landing
+            # in the register at all (addressing / write-width).
+            xhci.diag_erdp_lo = _xhci_r32(xhci.rt_base + XHCI_RT_IR0 \
+                                          + XHCI_IR_ERDP)
+            xhci.diag_erdp_hi = _xhci_r32(xhci.rt_base + XHCI_RT_IR0 \
+                                          + XHCI_IR_ERDP + 4)
         # Latch the snapshot so the late telemetry frame can reprint it.
         xhci.diag_evt_seen   = xhci.last_evt_seen
         xhci.diag_last_evt_p = xhci.last_evt_p
@@ -2549,7 +2567,7 @@ def xhci_bulk_diag_report():
         return
     # Image-identity marker so a NUC photo unambiguously tells us which
     # build booted (each reflash is expensive). Bump on every diag/fix ship.
-    printk0("[xhci-bulk] (late) diag-rev=4 IMAN.IE=on\n")
+    printk0("[xhci-bulk] (late) diag-rev=5 ERDP-w64\n")
     printk2("[xhci-bulk] (late) expect_trb=%p evt_seen=%d\n",
             xhci.diag_expect_trb, cast[uint64](xhci.diag_evt_seen))
     printk2("[xhci-bulk] (late) last_evt_p=%p db=%p\n",
@@ -2605,6 +2623,13 @@ def xhci_bulk_diag_report():
     printk2("[xhci-bulk] (late) total_evt=%d iman=%x\n",
             cast[uint64](xhci.diag_total_evt),
             cast[uint64](xhci.diag_iman))
+    # ERDP read-back: low dword holds the dequeue ptr bits[31:4] + EHB(bit3).
+    # Compare against event_ring + evt_deq*16: equal => register accepts our
+    # write, controller ignores the advance; ==event_ring base => write never
+    # landed (addressing/width).
+    printk2("[xhci-bulk] (late) erdp_lo=%x erdp_hi=%x\n",
+            cast[uint64](xhci.diag_erdp_lo),
+            cast[uint64](xhci.diag_erdp_hi))
     # Did the CBW (bulk-OUT) actually deliver? cc=1 & moved=31 => the device
     # received the 31-byte command, so an IN stall is the device NAKing (it
     # rejected the CBW), NOT the host failing to send. cc/moved=-1 => no OUT
