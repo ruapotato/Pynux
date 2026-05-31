@@ -1174,6 +1174,60 @@ sys_link:
     .size sys_link, .-sys_link
 
 
+    /* --- sys_clock_gettime(clockid, tp) -> int64 ----------------------
+     * §146: native clock_gettime syscall (SYS_CLOCK_GETTIME = 307).
+     * Renumbered from 305 — VFS §links owns 305/306.
+     * clockid in %edi (a0), struct timespec* in %rsi (a1).
+     * SysV registers align with syscall ABI a0..a1 — no shuffle. */
+    .globl sys_clock_gettime
+    .type sys_clock_gettime, @function
+sys_clock_gettime:
+    movq    $307, %rax              /* SYS_CLOCK_GETTIME */
+    syscall
+    ret
+    .size sys_clock_gettime, .-sys_clock_gettime
+
+
+    /* --- sys_nanosleep(req, rem) -> int64 -----------------------------
+     * §146: native nanosleep syscall (SYS_NANOSLEEP = 308).
+     * Renumbered from 306 — VFS §links owns 305/306.
+     * req (struct timespec*) in %rdi (a0), rem (struct timespec*) in
+     * %rsi (a1). SysV registers align directly — no shuffle. */
+    .globl sys_nanosleep
+    .type sys_nanosleep, @function
+sys_nanosleep:
+    movq    $308, %rax              /* SYS_NANOSLEEP */
+    syscall
+    ret
+    .size sys_nanosleep, .-sys_nanosleep
+
+
+    /* --- sys_timerfd_create(clockid, flags) -> int64 ------------------
+     * §146: native timerfd_create syscall (SYS_TIMERFD_CREATE = 309).
+     * clockid in %edi (a0), flags in %esi (a1). Returns fd or -errno. */
+    .globl sys_timerfd_create
+    .type sys_timerfd_create, @function
+sys_timerfd_create:
+    movq    $309, %rax              /* SYS_TIMERFD_CREATE */
+    syscall
+    ret
+    .size sys_timerfd_create, .-sys_timerfd_create
+
+
+    /* --- sys_timerfd_settime(fd, flags, new, old) -> int64 ------------
+     * §146: native timerfd_settime syscall (SYS_TIMERFD_SETTIME = 310).
+     * fd in %edi (a0), flags in %esi (a1), new in %rdx (a2), old in
+     * %rcx (a3) — %rcx must move to %r10 for syscall ABI. */
+    .globl sys_timerfd_settime
+    .type sys_timerfd_settime, @function
+sys_timerfd_settime:
+    movq    %rcx, %r10              /* old (a3): rcx -> r10 */
+    movq    $310, %rax              /* SYS_TIMERFD_SETTIME */
+    syscall
+    ret
+    .size sys_timerfd_settime, .-sys_timerfd_settime
+
+
     /* --- syscall6(nr, a0, a1, a2, a3, a4, a5) -> int64 ---------------
      * Generic 6-arg syscall trampoline. SysV passes nr in %rdi, a0..a5
      * in %rsi/%rdx/%rcx/%r8/%r9/[stack]; the kernel syscall ABI wants

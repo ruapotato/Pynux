@@ -169,7 +169,7 @@ from kernel.sched.core import (
     current_task_pid, task_lookup_by_pid, task_exit_current,
     signal_post, signal_pending, get_cwd_buf, set_task_cwd, current_idx_get,
     set_task_fs_base, set_task_clear_child_tid,
-    count_live_linux_peers, yield_to_others,
+    count_live_linux_peers, yield_to_others, kernel_cond_resched,
     get_task_sig_handler, set_task_sig_handler,
     get_task_sig_mask, set_task_sig_mask,
     get_task_sig_flags, set_task_sig_flags,
@@ -3599,7 +3599,31 @@ def _u_unimpl_msync(a0: uint64, a1: uint64, a2: uint64,
 
 def _u_unimpl_nanosleep(a0: uint64, a1: uint64, a2: uint64,
                         a3: uint64, a4: uint64, a5: uint64) -> int64:
-    return ELINUX_NOSYS
+    # int nanosleep(const struct timespec *req, struct timespec *rem)
+    # §146: real cooperative sleep. Reads {tv_sec, tv_nsec} from *a0,
+    # spins-with-yield via kernel_cond_resched until the TSC deadline,
+    # then writes {0,0} to *a1 (rem) if non-null. Jiffy-rounded accuracy
+    # (10 ms at HZ=100). Does NOT busy-spin — each loop iteration does
+    # sti+hlt+cli so other tasks run and the LAPIC timer fires.
+    if a0 == 0:
+        return ELINUX_INVAL
+    ns_req_sec:  uint64 = cast[Ptr[uint64]](a0)[0]
+    ns_req_nsec: uint64 = cast[Ptr[uint64]](a0 + 8)[0]
+    ns_dur_ns: uint64 = ns_req_sec * 1000000000 + ns_req_nsec
+    if ns_dur_ns == 0:
+        yield_to_others()
+        if a1 != 0:
+            cast[Ptr[uint64]](a1)[0]     = 0
+            cast[Ptr[uint64]](a1 + 8)[0] = 0
+        return 0
+    ns_start: uint64 = tsc_monotonic_ns()
+    ns_dl: uint64 = ns_start + ns_dur_ns
+    while tsc_monotonic_ns() < ns_dl:
+        kernel_cond_resched()
+    if a1 != 0:
+        cast[Ptr[uint64]](a1)[0]     = 0
+        cast[Ptr[uint64]](a1 + 8)[0] = 0
+    return 0
 
 
 def _u_clone(a0: uint64, a1: uint64, a2: uint64,

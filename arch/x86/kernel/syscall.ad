@@ -25,7 +25,7 @@
 
 from drivers.tty.serial.early_8250 import early_putc_user
 from kernel.printk.printk import printk0, printk1, printk2
-from arch.x86.kernel.time import get_jiffies
+from arch.x86.kernel.time import get_jiffies, tsc_monotonic_ns
 from kernel.sched.core import (
     TaskStruct, current_task,
     create_user_task, create_user_task_argv, create_user_thread,
@@ -82,6 +82,8 @@ from kernel.sched.core import (
     # detached so hamUI exiting doesn't strand it as a zombie. Same
     # accessors rfork(RFNOWAIT) uses.
     set_task_detached, set_task_parent_pid,
+    # §146: nanosleep cooperative blocking loop (sti+hlt+cli per jiffy).
+    kernel_cond_resched,
 )
 from fs.vfs import (
     vfs_open, vfs_open_write, vfs_pipe, vfs_read, vfs_read_nb, vfs_write,
@@ -117,6 +119,10 @@ from fs.vfs import (
     # M16.x §links: symlink create + hardlink create with namespace /
     # file-server boundary enforcement.
     vfs_symlink, vfs_link, EXDEV_LINK,
+    # §146: Layer-2 fd allocation for timerfd. vfs_alloc_l2_fd creates an
+    # fd-table entry with a special marker; vfs_fd_marker reads it back;
+    # vfs_l2_fd_{set,get}_buf stores/retrieves the associated object slot.
+    vfs_alloc_l2_fd, vfs_fd_marker, vfs_l2_fd_set_buf, vfs_l2_fd_get_buf,
 )
 from sys.src.port9.port.devauth import (
     devauth_verified_uid, devauth_verified_gid,
@@ -273,7 +279,18 @@ from sys.src.port9.port.devsrv import (
 # (ntpd writes here after an NTP exchange). The setter mutates
 # rtc_boot_epoch in cmos.ad so that base + TSC-delta = caller-supplied
 # Unix epoch from this instant forward.
-from drivers.rtc.cmos import rtc_boot_epoch_set_now
+from drivers.rtc.cmos import rtc_boot_epoch_set_now, rtc_boot_epoch_get
+# SYS_CLOCK_GETTIME / SYS_NANOSLEEP: tsc_monotonic_ns already imported above.
+# SYS_NANOSLEEP / SYS_TIMERFD_*: cooperative task blocking and timerfd pool
+# from the Linux ABI layer (u_epoll.ad). Same objects back both the Linux-ABI
+# timerfd_create/settime and the native SYS_TIMERFD_CREATE/SETTIME — there is
+# only one timer pool. Native code reaching Layer-2 timers is intentional and
+# consistent with the two-tier (Adder + hamsh) app-language model.
+from linux_abi.u_epoll import (
+    FD_TIMERFD_MARK,
+    utfd_alloc, utfd_valid, utfd_arm, utfd_read, utfd_readable,
+    utfd_gettime_remaining, utfd_gettime_interval,
+)
 # Power control: reboot(2)=169 funnels into the SAME kernel routine the
 # native /dev/reboot cdev uses. Importing power here also pulls power.ad
 # into the kernel compilation unit so namec.ad's extern reference to
@@ -541,6 +558,17 @@ SYS_SYMLINK:  uint64 = 305
 #   hardlink. Rejects cross-file-server links with -EXDEV (-18). Returns
 #   0 / -errno. Boundary check is namespace/file-server, NOT POSIX mode bits.
 SYS_LINK:     uint64 = 306
+# §146: high-resolution time — TSC-based clock, cooperative sleep, timer fds.
+# Renumbered to 307–310 (VFS §links owns 305/306).
+SYS_CLOCK_GETTIME:   uint64 = 307  # a0=clockid, a1=Ptr[timespec]; returns 0/-errno
+SYS_NANOSLEEP:       uint64 = 308  # a0=Ptr[timespec req], a1=Ptr[timespec rem] (may be 0); blocks cooperatively; returns 0/-errno
+SYS_TIMERFD_CREATE:  uint64 = 309  # a0=clockid, a1=flags; returns fd / -errno
+SYS_TIMERFD_SETTIME: uint64 = 310  # a0=fd, a1=flags, a2=Ptr[itimerspec new], a3=Ptr[itimerspec old] (may be 0); returns 0/-errno
+
+# §146: clockid constants for SYS_CLOCK_GETTIME / SYS_TIMERFD_CREATE.
+# Values match POSIX / Linux so userland can use the same literals.
+CLOCK_REALTIME:  uint64 = 0
+CLOCK_MONOTONIC: uint64 = 1
 # HAMSH §7: sys_spawn's stdin_fd / stdout_fd sentinel. When the caller
 # passes SPAWN_STDIO_NS, the child's standard streams are NAMES in its
 # namespace (/fd/0,1,2 via the `#d` device), not dup'd integer fds —
@@ -3198,6 +3226,146 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         elif lnk_res < 0:
             set_current_errstr("link: cannot create link")
         return cast[uint64](lnk_res)
+    # §146: SYS_CLOCK_GETTIME — write struct timespec {i64 tv_sec; i64 tv_nsec}
+    # to user pointer a1. Resolution: TSC nanoseconds (calibrated at boot);
+    # falls back to 10 ms jiffies before TSC calibration completes.
+    #
+    # clockid 0 = CLOCK_REALTIME:  wall clock = RTC boot epoch + monotonic delta.
+    # clockid 1 = CLOCK_MONOTONIC: nanoseconds since tsc_init() (boot).
+    if nr == SYS_CLOCK_GETTIME:
+        if a1 == 0:
+            set_current_errstr("clock_gettime: null timespec")
+            return cast[uint64](cast[int64](-22))     # -EINVAL
+        cgt_clk: uint64 = a0
+        if cgt_clk != CLOCK_REALTIME and cgt_clk != CLOCK_MONOTONIC:
+            set_current_errstr("clock_gettime: unknown clockid")
+            return cast[uint64](cast[int64](-22))     # -EINVAL
+        if access_ok(a1, 16) == 0:
+            set_current_errstr("clock_gettime: bad timespec pointer")
+            return cast[uint64](cast[int64](-14))     # -EFAULT
+        cgt_mono_ns: uint64 = tsc_monotonic_ns()
+        cgt_sec:  uint64 = 0
+        cgt_nsec: uint64 = 0
+        if cgt_clk == CLOCK_REALTIME:
+            cgt_base: uint64 = rtc_boot_epoch_get()
+            cgt_sec  = cgt_base + (cgt_mono_ns / 1000000000)
+            cgt_nsec = cgt_mono_ns % 1000000000
+        else:
+            cgt_sec  = cgt_mono_ns / 1000000000
+            cgt_nsec = cgt_mono_ns % 1000000000
+        cast[Ptr[uint64]](a1)[0]     = cgt_sec
+        cast[Ptr[uint64]](a1 + 8)[0] = cgt_nsec
+        return 0
+    # §146: SYS_NANOSLEEP — cooperative sleep for the duration in *a0.
+    # Reads struct timespec {i64 tv_sec; i64 tv_nsec} from user pointer a0.
+    # On return, *a1 (if non-zero) holds the remaining time (always zero on
+    # normal completion — we never deliver partial-sleep semantics at this
+    # scale). Accuracy: jiffy-granular (10 ms at HZ=100). The task yields
+    # cooperatively via kernel_cond_resched (sti+hlt+cli per loop iteration)
+    # so other tasks run during the sleep — it does NOT busy-spin.
+    if nr == SYS_NANOSLEEP:
+        if a0 == 0:
+            set_current_errstr("nanosleep: null req")
+            return cast[uint64](cast[int64](-22))     # -EINVAL
+        if access_ok(a0, 16) == 0:
+            set_current_errstr("nanosleep: bad req pointer")
+            return cast[uint64](cast[int64](-14))     # -EFAULT
+        ns_req_sec:  uint64 = cast[Ptr[uint64]](a0)[0]
+        ns_req_nsec: uint64 = cast[Ptr[uint64]](a0 + 8)[0]
+        # Convert request to nanoseconds for TSC-based deadline.
+        ns_dur_ns: uint64 = ns_req_sec * 1000000000 + ns_req_nsec
+        if ns_dur_ns == 0:
+            # Zero duration — yield once, return immediately.
+            yield_to_others()
+            if a1 != 0 and access_ok(a1, 16) != 0:
+                cast[Ptr[uint64]](a1)[0]     = 0
+                cast[Ptr[uint64]](a1 + 8)[0] = 0
+            return 0
+        ns_start: uint64 = tsc_monotonic_ns()
+        ns_deadline: uint64 = ns_start + ns_dur_ns
+        # Spin-with-yield: each iteration does sti+hlt+cli (at most 10 ms)
+        # then re-checks the TSC. The hlt ensures the CPU idles and the LAPIC
+        # timer fires, advancing jiffies and allowing other tasks to schedule.
+        while tsc_monotonic_ns() < ns_deadline:
+            kernel_cond_resched()
+        if a1 != 0 and access_ok(a1, 16) != 0:
+            cast[Ptr[uint64]](a1)[0]     = 0
+            cast[Ptr[uint64]](a1 + 8)[0] = 0
+        return 0
+    # §146: SYS_TIMERFD_CREATE — allocate a timerfd from the u_epoll.ad
+    # pool and return a real fd. clockid 0 (CLOCK_REALTIME) and 1
+    # (CLOCK_MONOTONIC) are both accepted; both use the same jiffy-clock
+    # backend (10 ms resolution). The fd becomes readable after the timer
+    # set by SYS_TIMERFD_SETTIME expires; read(8) returns the expiry count.
+    if nr == SYS_TIMERFD_CREATE:
+        tfd_clk: uint64 = a0
+        if tfd_clk != CLOCK_REALTIME and tfd_clk != CLOCK_MONOTONIC:
+            set_current_errstr("timerfd_create: unsupported clockid")
+            return cast[uint64](cast[int64](-22))     # -EINVAL
+        tfd_ts: int32 = utfd_alloc()
+        if tfd_ts < 0:
+            set_current_errstr("timerfd_create: object pool exhausted")
+            return cast[uint64](cast[int64](-24))     # -EMFILE
+        tfd_fd: int32 = vfs_alloc_l2_fd(FD_TIMERFD_MARK)
+        if tfd_fd < 0:
+            set_current_errstr("timerfd_create: out of fd slots")
+            return cast[uint64](cast[int64](-24))     # -EMFILE
+        if vfs_l2_fd_set_buf(tfd_fd, cast[uint64](tfd_ts + 1)) != 0:
+            vfs_close(tfd_fd)
+            return cast[uint64](cast[int64](-9))      # -EBADF
+        return cast[uint64](tfd_fd)
+    # §146: SYS_TIMERFD_SETTIME — arm or disarm a timerfd.
+    # a0=fd, a1=flags (ignored at this scale), a2=Ptr[itimerspec new],
+    # a3=Ptr[itimerspec old] (may be 0; receives the previous setting).
+    # struct itimerspec { struct timespec it_interval; struct timespec it_value; }
+    # — it_interval at offset 0 (16 bytes), it_value at offset 16.
+    # One-shot: it_interval = {0,0}. Periodic: it_interval = repeat period.
+    # Disarm: it_value = {0,0}.
+    if nr == SYS_TIMERFD_SETTIME:
+        tst_fd: int32 = cast[int32](a0)
+        if vfs_fd_marker(tst_fd) != FD_TIMERFD_MARK:
+            set_current_errstr("timerfd_settime: not a timerfd")
+            return cast[uint64](cast[int64](-9))      # -EBADF
+        tst_ts: int32 = cast[int32](vfs_l2_fd_get_buf(tst_fd)) - 1
+        if utfd_valid(tst_ts) == 0:
+            set_current_errstr("timerfd_settime: bad timerfd slot")
+            return cast[uint64](cast[int64](-9))      # -EBADF
+        if a2 == 0:
+            set_current_errstr("timerfd_settime: null itimerspec")
+            return cast[uint64](cast[int64](-22))     # -EINVAL
+        if access_ok(a2, 32) == 0:
+            set_current_errstr("timerfd_settime: bad new pointer")
+            return cast[uint64](cast[int64](-14))     # -EFAULT
+        # it_interval: offset 0 = sec (8 bytes), offset 8 = nsec (8 bytes)
+        tst_iv_sec:  uint64 = cast[Ptr[uint64]](a2)[0]
+        tst_iv_nsec: uint64 = cast[Ptr[uint64]](a2 + 8)[0]
+        # it_value: offset 16 = sec, offset 24 = nsec
+        tst_vl_sec:  uint64 = cast[Ptr[uint64]](a2 + 16)[0]
+        tst_vl_nsec: uint64 = cast[Ptr[uint64]](a2 + 24)[0]
+        # Convert timespec -> jiffies (HZ=100 -> 1 jiffy = 10 ms).
+        # Sub-jiffy durations round up to 1 jiffy so even a tiny delay fires.
+        tst_iv_j: uint64 = tst_iv_sec * 100 + tst_iv_nsec / 10000000
+        if tst_iv_j == 0:
+            if tst_iv_sec != 0 or tst_iv_nsec != 0:
+                tst_iv_j = 1
+        tst_vl_j: uint64 = tst_vl_sec * 100 + tst_vl_nsec / 10000000
+        if tst_vl_j == 0:
+            if tst_vl_sec != 0 or tst_vl_nsec != 0:
+                tst_vl_j = 1
+        # If caller wants the old setting, write it before arming.
+        if a3 != 0 and access_ok(a3, 32) != 0:
+            tst_old_iv: uint64 = utfd_gettime_interval(tst_ts)
+            tst_old_rm: uint64 = utfd_gettime_remaining(tst_ts)
+            # it_interval (old)
+            cast[Ptr[uint64]](a3)[0]      = tst_old_iv / 100
+            cast[Ptr[uint64]](a3 + 8)[0]  = (tst_old_iv % 100) * 10000000
+            # it_value (old remaining)
+            cast[Ptr[uint64]](a3 + 16)[0] = tst_old_rm / 100
+            cast[Ptr[uint64]](a3 + 24)[0] = (tst_old_rm % 100) * 10000000
+        tst_rc: int64 = utfd_arm(tst_ts, tst_vl_j, tst_iv_j)
+        if tst_rc < 0:
+            set_current_errstr("timerfd_settime: arm failed")
+        return cast[uint64](tst_rc)
     printk2("Hamnix: unknown syscall nr=%d a0=%x\n", nr, a0)
     set_current_errstr("unknown syscall")
     return cast[uint64](-1)
