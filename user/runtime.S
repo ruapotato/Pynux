@@ -1146,6 +1146,34 @@ sys_munmap:
     .size sys_munmap, .-sys_munmap
 
 
+    /* --- sys_symlink(target, linkpath) -> int32 -----------------------
+     * M16.x §links: create a symbolic link at `linkpath` whose content
+     * is `target` (SYS_SYMLINK = 305). 2-arg call; SysV a0=target in
+     * %rdi, a1=linkpath in %rsi — both align directly with the syscall
+     * ABI, so no shuffle needed. Returns 0 on success or -errno. */
+    .globl sys_symlink
+    .type sys_symlink, @function
+sys_symlink:
+    movq    $305, %rax              /* SYS_SYMLINK */
+    syscall
+    ret
+    .size sys_symlink, .-sys_symlink
+
+
+    /* --- sys_link(oldpath, newpath) -> int32 --------------------------
+     * M16.x §links: create a hard link (SYS_LINK = 306). 2-arg call;
+     * SysV a0=oldpath in %rdi, a1=newpath in %rsi. Returns 0 on success,
+     * -EXDEV (-18) when oldpath and newpath are on different file servers
+     * (Plan 9 / namespace boundary rejection), or other -errno. */
+    .globl sys_link
+    .type sys_link, @function
+sys_link:
+    movq    $306, %rax              /* SYS_LINK */
+    syscall
+    ret
+    .size sys_link, .-sys_link
+
+
     /* --- syscall6(nr, a0, a1, a2, a3, a4, a5) -> int64 ---------------
      * Generic 6-arg syscall trampoline. SysV passes nr in %rdi, a0..a5
      * in %rsi/%rdx/%rcx/%r8/%r9/[stack]; the kernel syscall ABI wants

@@ -238,7 +238,7 @@ from fs.ext4 import (
     ext4_init, ext4_read_inode, ext4_inode_mode, ext4_inode_size_lo,
     ext4_dir_dump, ext4_bitmap_smoke_test, ext4_create_smoke_test,
     ext4_rename_smoke_test, ext4_truncate_smoke_test,
-    ext4_fsync_smoke_test,
+    ext4_fsync_smoke_test, ext4_links_smoke_test,
     ext4_resolve_file, ext4_read_file, ext4_read_root_file,
     ext4_resize_check, ext4_resize_grow, ext4_create_file,
     ext4_dir_lookup, ext4_enable_mkfs_selftest,
@@ -456,6 +456,7 @@ def block_smoke_test():
             ext4_rename_smoke_test()
             ext4_truncate_smoke_test()
             ext4_fsync_smoke_test()
+            ext4_links_smoke_test()
 
     # M16.60: block write path. Round-trips a unique marker through
     # blk_write_sectors → blk_read_sectors on whichever device we

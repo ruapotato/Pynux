@@ -23,7 +23,7 @@
 # FMASK = 0x0200 (only IF) so SYSCALL entry runs with interrupts off.
 # Linux additionally clears DF and a few others; we'll add as needed.
 
-from drivers.tty.serial.early_8250 import early_putc, early_putc_user
+from drivers.tty.serial.early_8250 import early_putc_user
 from kernel.printk.printk import printk0, printk1, printk2
 from arch.x86.kernel.time import get_jiffies
 from kernel.sched.core import (
@@ -114,6 +114,9 @@ from fs.vfs import (
     # fd to its devauth slot index so the kernel can flip identity to
     # the slot's verified uid.
     vfs_fd_auth_slot,
+    # M16.x §links: symlink create + hardlink create with namespace /
+    # file-server boundary enforcement.
+    vfs_symlink, vfs_link, EXDEV_LINK,
 )
 from sys.src.port9.port.devauth import (
     devauth_verified_uid, devauth_verified_gid,
@@ -530,6 +533,14 @@ SYS_RESOLVE_PTR: uint64 = 301  # a0=packed IPv4 (octet0 high), a1=out name buf, 
 SYS_MMAP:     uint64 = 302  # void* mmap(addr,len,prot,flags,fd,off); returns mapped addr / -errno
 SYS_MPROTECT: uint64 = 303  # int mprotect(addr,len,prot); returns 0 / -errno
 SYS_MUNMAP:   uint64 = 304  # int munmap(addr,len); returns 0 / -errno
+# M16.x §links: namespace-aware link syscalls.
+# SYS_SYMLINK: a0=target (Ptr[char]), a1=linkpath (Ptr[char]); creates a
+#   symlink at linkpath whose content is target. Returns 0 / -errno.
+SYS_SYMLINK:  uint64 = 305
+# SYS_LINK: a0=oldpath (Ptr[char]), a1=newpath (Ptr[char]); creates a
+#   hardlink. Rejects cross-file-server links with -EXDEV (-18). Returns
+#   0 / -errno. Boundary check is namespace/file-server, NOT POSIX mode bits.
+SYS_LINK:     uint64 = 306
 # HAMSH §7: sys_spawn's stdin_fd / stdout_fd sentinel. When the caller
 # passes SPAWN_STDIO_NS, the child's standard streams are NAMES in its
 # namespace (/fd/0,1,2 via the `#d` device), not dup'd integer fds —
@@ -3135,6 +3146,58 @@ def do_syscall(nr: uint64, a0: uint64, a1: uint64, a2: uint64,
         if munmap_rc < 0:
             set_current_errstr("munmap: failed")
         return cast[uint64](munmap_rc)
+    # M16.x §links: symlink(2) — create a symbolic link.
+    # a0 = target string (content of the symlink, what it points to)
+    # a1 = linkpath (where the symlink is created in the namespace)
+    # Both must be user-readable NUL-terminated strings.
+    if nr == SYS_SYMLINK:
+        if access_ok_str(a0) == 0:
+            set_current_errstr("symlink: bad target address")
+            return cast[uint64](-14)             # -EFAULT
+        if access_ok_str(a1) == 0:
+            set_current_errstr("symlink: bad linkpath address")
+            return cast[uint64](-14)             # -EFAULT
+        sym_abs: Array[256, uint8]
+        sym_rc: int32 = resolve_path(cast[Ptr[char]](a1), &sym_abs[0], 256)
+        if sym_rc != 0:
+            set_current_errstr("symlink: linkpath too long")
+            return cast[uint64](sym_rc)
+        sym_res: int32 = vfs_symlink(cast[Ptr[char]](a0),
+                                      cast[Ptr[char]](&sym_abs[0]))
+        if sym_res < 0:
+            set_current_errstr("symlink: cannot create symlink")
+        return cast[uint64](sym_res)
+    # M16.x §links: link(2) — create a hard link with namespace/file-server
+    # boundary enforcement.
+    # a0 = oldpath (the existing file)
+    # a1 = newpath (the new name to create)
+    # Rejects cross-file-server links with -EXDEV (-18). The rejection
+    # is based on the file SERVER in the caller's namespace (Plan 9 model),
+    # NOT on POSIX uid/gid/mode bits.
+    if nr == SYS_LINK:
+        if access_ok_str(a0) == 0:
+            set_current_errstr("link: bad oldpath address")
+            return cast[uint64](-14)             # -EFAULT
+        if access_ok_str(a1) == 0:
+            set_current_errstr("link: bad newpath address")
+            return cast[uint64](-14)             # -EFAULT
+        lnk_old: Array[256, uint8]
+        lnk_new: Array[256, uint8]
+        lnk_rc: int32 = resolve_path(cast[Ptr[char]](a0), &lnk_old[0], 256)
+        if lnk_rc != 0:
+            set_current_errstr("link: oldpath too long")
+            return cast[uint64](lnk_rc)
+        lnk_rc = resolve_path(cast[Ptr[char]](a1), &lnk_new[0], 256)
+        if lnk_rc != 0:
+            set_current_errstr("link: newpath too long")
+            return cast[uint64](lnk_rc)
+        lnk_res: int32 = vfs_link(cast[Ptr[char]](&lnk_old[0]),
+                                    cast[Ptr[char]](&lnk_new[0]))
+        if lnk_res == EXDEV_LINK:
+            set_current_errstr("link: cross-server link not permitted")
+        elif lnk_res < 0:
+            set_current_errstr("link: cannot create link")
+        return cast[uint64](lnk_res)
     printk2("Hamnix: unknown syscall nr=%d a0=%x\n", nr, a0)
     set_current_errstr("unknown syscall")
     return cast[uint64](-1)

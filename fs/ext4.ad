@@ -2764,6 +2764,219 @@ def ext4_fsync_smoke_test() -> int32:
     return 0
 
 
+# --- ext4 symlink create (M16.x §links) ---------------------------
+#
+# A symlink inode uses i_mode = 0xA1FF (S_IFLNK | 0777) and encodes
+# the target string one of two ways:
+#
+#   * "fast" link (target length <= 60 bytes): target stored INLINE in
+#     i_block (the same 60-byte region as the extent tree). i_size_lo
+#     holds the target length; i_blocks_lo = 0 (no data blocks).
+#     Linux's ext4_inode_is_fast_symlink() uses this test; the read path
+#     in _ext4_read_symlink_target() already handles it.
+#
+#   * "slow" link (target > 60 bytes): target in the first data block,
+#     same as a regular file. We only support fast links here because
+#     real symlink targets on Hamnix are short (device paths, relative
+#     links). Slow-link paths that overflow return -1.
+#
+# Returns the new inode number on success, 0 on failure.
+
+def ext4_create_symlink(parent_inum: uint64, name: Ptr[char],
+                        target: Ptr[char]) -> uint32:
+    # Validate target length first.
+    tlen: uint64 = _ext4_strlen(target)
+    if tlen == 0:
+        return 0
+    if tlen > 60:
+        # Slow-symlink path not yet implemented; callers should use
+        # short targets (all Hamnix use sites qualify).
+        printk0("ext4: create_symlink: target > 60 bytes unsupported\n")
+        return 0
+    if ext4_blockdev_slot < 0:
+        return 0
+    new_inum: uint32 = ext4_alloc_inode()
+    if new_inum == 0:
+        printk0("ext4: create_symlink FAIL (alloc_inode)\n")
+        return 0
+
+    # Build the symlink inode in ext4_new_inode_buf.
+    p: Ptr[uint8] = &ext4_new_inode_buf[0]
+    _ext4_zero(p, ext4_inode_size)
+    # i_mode: S_IFLNK | 0777 = 0xA1FF
+    _ext4_write_u16(p, 0xA1FF)
+    _ext4_inode_stamp_creator(p)
+    # i_size_lo = target length (NOT counting the NUL terminator).
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 4),
+                    cast[uint32](tlen))
+    # i_links_count = 1
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](p) + 26), 1)
+    # i_blocks_lo = 0 (fast symlink, no data blocks allocated).
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 28), 0)
+    # i_flags = 0 (no EXT4_EXTENTS_FL — fast symlinks don't use extents).
+    _ext4_write_u32(cast[Ptr[uint8]](cast[uint64](p) + 32), 0)
+    # Write the target into i_block (offset 0x28 = 40).
+    dst: uint64 = cast[uint64](p) + INODE_I_BLOCK_OFFSET
+    k: uint64 = 0
+    while k < tlen:
+        cast[Ptr[uint8]](dst + k)[0] = cast[uint8](target[k])
+        k = k + 1
+    # Stamp timestamps.
+    _ext4_stamp_all_times(p)
+
+    if ext4_write_inode(cast[uint64](new_inum), p) != 0:
+        printk0("ext4: create_symlink FAIL (write inode)\n")
+        ext4_free_inode(new_inum)
+        return 0
+    # Insert directory entry. EXT4_FT_SYMLINK = 7.
+    if ext4_dir_insert(parent_inum, name, new_inum, 7) != 0:
+        printk0("ext4: create_symlink FAIL (dir_insert)\n")
+        ext4_free_inode(new_inum)
+        return 0
+    return new_inum
+
+
+# --- ext4 hardlink (M16.x §links) ---------------------------------
+#
+# A hardlink is just a second directory entry pointing at the same
+# inode — no data block is allocated, the inode's i_links_count is
+# bumped, and the directory gets a new dirent with the same inum.
+#
+# The NAMESPACE / FILE-SERVER boundary check is done at the VFS layer
+# (vfs_link) BEFORE this function is called.  ext4_hardlink only sees
+# paths that have already been confirmed to be on the same file server.
+#
+# Returns 0 on success, -1 on failure (source not found, dir full,
+# inum out of range).
+
+def ext4_hardlink(src_path: Ptr[char], dst_name: Ptr[char],
+                  dst_parent_inum: uint64) -> int32:
+    # Resolve the source to its inode.
+    src_inum: uint32 = 0
+    src_size: uint64 = 0
+    if ext4_resolve_file(src_path, &src_inum, &src_size) == 0:
+        # Try directory resolution too (hardlinks to directories are
+        # rejected below, but we want to give the right error).
+        r: Ext4ResolveResult
+        if _resolve_with_symlinks(src_path, &r) == 0:
+            printk0("ext4: hardlink: source not found\n")
+            return -1
+        if r.is_dir != 0:
+            # POSIX: hardlinks to directories are not permitted
+            # (would create cycles in the directory tree).
+            printk0("ext4: hardlink: source is a directory\n")
+            return -1
+        src_inum = r.inum
+    # Read the source inode to bump its i_links_count.
+    inode: Array[256, uint8]
+    if ext4_read_inode(cast[uint64](src_inum), &inode[0]) != 0:
+        printk0("ext4: hardlink: read inode failed\n")
+        return -1
+    # Increment i_links_count (u16 at offset 26).
+    lc_off: uint64 = 26
+    old_lc: uint16 = _ext4_read_u16(
+        cast[Ptr[uint8]](cast[uint64](&inode[0]) + lc_off))
+    if old_lc >= 0xFFFF:
+        printk0("ext4: hardlink: i_links_count overflow\n")
+        return -1
+    new_lc: uint16 = old_lc + 1
+    _ext4_write_u16(cast[Ptr[uint8]](cast[uint64](&inode[0]) + lc_off),
+                    new_lc)
+    # Stamp ctime (inode metadata changed).
+    _ext4_stamp_mtime(&inode[0])
+    if ext4_write_inode(cast[uint64](src_inum), &inode[0]) != 0:
+        printk0("ext4: hardlink: write inode failed\n")
+        return -1
+    # Insert the new dirent. EXT4_FT_REG_FILE = 1.
+    if ext4_dir_insert(dst_parent_inum, dst_name, src_inum, 1) != 0:
+        printk0("ext4: hardlink: dir_insert failed\n")
+        # Roll back the link count.
+        _ext4_write_u16(
+            cast[Ptr[uint8]](cast[uint64](&inode[0]) + lc_off), old_lc)
+        ext4_write_inode(cast[uint64](src_inum), &inode[0])
+        return -1
+    return 0
+
+
+# --- ext4 link smoke test (M16.x §links) --------------------------
+
+def ext4_links_smoke_test() -> int32:
+    # (a) Create a regular file, create a symlink to it, read the file
+    #     via the symlink name — verifies symlink create + resolve.
+    # (b) Hardlink the same file under a second name — both names must
+    #     deliver the same bytes and the same inode number.
+    # Clean up all test files at the end.
+    if ext4_blockdev_slot < 0:
+        return 0
+    body: Ptr[uint8] = "LINKS_PAYLOAD ext4 links test body\n"
+    blen: uint64 = _ext4_strlen(cast[Ptr[char]](body))
+
+    # --- (a) symlink ---
+    orig_inum: uint32 = ext4_create_file(2, "LNKORIG.TXT", body, blen)
+    if orig_inum == 0:
+        printk0("ext4: links smoke FAIL (create LNKORIG)\n")
+        return -1
+    sym_inum: uint32 = ext4_create_symlink(2, "LNKSYM.TXT", "LNKORIG.TXT")
+    if sym_inum == 0:
+        printk0("ext4: links smoke FAIL (create_symlink)\n")
+        ext4_unlink("LNKORIG.TXT")
+        return -1
+    # Read via the symlink: ext4_resolve_file follows symlinks.
+    via_sym_inum: uint32 = 0
+    via_sym_size: uint64 = 0
+    if ext4_resolve_file("LNKSYM.TXT", &via_sym_inum, &via_sym_size) == 0:
+        printk0("ext4: links smoke FAIL (symlink not followed)\n")
+        ext4_unlink("LNKORIG.TXT")
+        ext4_unlink("LNKSYM.TXT")
+        return -1
+    if via_sym_inum != orig_inum:
+        printk0("ext4: links smoke FAIL (symlink resolves to wrong inode)\n")
+        ext4_unlink("LNKORIG.TXT")
+        ext4_unlink("LNKSYM.TXT")
+        return -1
+    # Data must match.
+    if _ext4_read_back_eq(via_sym_inum, body, blen) == 0:
+        printk0("ext4: links smoke FAIL (data via symlink wrong)\n")
+        ext4_unlink("LNKORIG.TXT")
+        ext4_unlink("LNKSYM.TXT")
+        return -1
+
+    # --- (b) hardlink ---
+    if ext4_hardlink("LNKORIG.TXT", "LNKHARD.TXT", 2) != 0:
+        printk0("ext4: links smoke FAIL (hardlink create)\n")
+        ext4_unlink("LNKORIG.TXT")
+        ext4_unlink("LNKSYM.TXT")
+        return -1
+    # Both names must resolve to the same inode.
+    hard_inum: uint32 = 0
+    hard_size: uint64 = 0
+    if ext4_resolve_file("LNKHARD.TXT", &hard_inum, &hard_size) == 0:
+        printk0("ext4: links smoke FAIL (hardlink not found)\n")
+        ext4_unlink("LNKORIG.TXT")
+        ext4_unlink("LNKSYM.TXT")
+        return -1
+    if hard_inum != orig_inum:
+        printk0("ext4: links smoke FAIL (hardlink inode mismatch)\n")
+        ext4_unlink("LNKORIG.TXT")
+        ext4_unlink("LNKSYM.TXT")
+        ext4_unlink("LNKHARD.TXT")
+        return -1
+    # Data via hardlink must match.
+    if _ext4_read_back_eq(hard_inum, body, blen) == 0:
+        printk0("ext4: links smoke FAIL (data via hardlink wrong)\n")
+        ext4_unlink("LNKORIG.TXT")
+        ext4_unlink("LNKSYM.TXT")
+        ext4_unlink("LNKHARD.TXT")
+        return -1
+
+    # Cleanup.
+    ext4_unlink("LNKORIG.TXT")
+    ext4_unlink("LNKSYM.TXT")
+    ext4_unlink("LNKHARD.TXT")
+    printk0("ext4: links smoke PASS\n")
+    return 0
+
+
 # --- ext4 blob save / load (distrofs persistent backing) ----------
 #
 # distrofs (user/distrofs.ad) is a userland 9P file-server whose node

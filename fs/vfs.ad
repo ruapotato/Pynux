@@ -41,7 +41,8 @@ from drivers.tty.serial.early_8250 import (
     console_set_interactive,
 )
 from drivers.input.atkbd import kbd_rx_pop
-from kernel.printk.printk import printk0, printk1, printk2
+from kernel.printk.printk import printk0, printk1, printk2, printk_set_level
+from drivers.tty.serial.early_8250 import PRINTK_LEVEL_WARN
 from kernel.sched.core import (
     TaskStruct, current_task,
     FD_CLOSED_MARK, FD_STDIN_MARK, FD_STDOUT_MARK, FD_STDERR_MARK,
@@ -302,6 +303,8 @@ from fs.ext4 import (
     ext4_mkdir_live, ext4_resolve_dir,
     # docs/security.md Phase 5: ext4 inode owner/group/mode accessor.
     ext4_inode_owner_at,
+    # M16.x §links: symlink create + hardlink create.
+    ext4_create_symlink, ext4_hardlink,
 )
 from mm.slab import kmalloc, kfree
 
@@ -2096,6 +2099,128 @@ def vfs_rename(oldname: Ptr[char], newname: Ptr[char]) -> int32:
             return EROFS
         return ext4_rename(strip_ext_prefix(oldname),
                            strip_ext_prefix(newname))
+    return EROFS
+
+
+def vfs_symlink(target: Ptr[char], linkpath: Ptr[char]) -> int32:
+    # Create a symlink at `linkpath` whose content (target) is `target`.
+    # The existing resolver (_lookup_name / _resolve_with_symlinks) will
+    # follow the link transparently when a process opens `linkpath`.
+    #
+    # Routing:
+    #   /ext/*  → ext4_create_symlink (the only writable FS with on-disk
+    #             symlink support right now; tmpfs symlinks are a follow-up)
+    #   else    → -EROFS
+    if _vfs_check_perm(linkpath, PERM_W) != 0:
+        return EPERM_PERM
+    if is_ext_path(linkpath) != 0:
+        parent_inum: uint64 = 2           # root dir — single-level scope
+        leaf: Ptr[char] = strip_ext_prefix(linkpath)
+        inum: uint32 = ext4_create_symlink(parent_inum, leaf, target)
+        if inum == 0:
+            return ENOENT
+        return 0
+    return EROFS
+
+
+# _vfs_file_server_id: return an opaque "file server identity" for a
+# resolved absolute path.  The identity is used by vfs_link's cross-
+# file-server rejection gate.
+#
+# Identity encoding:
+#   * A path that resolves through a 9P SRV mount entry in the caller's
+#     Pgrp has identity == the srvfd (positive integer unique per server).
+#   * A path served by the LOCAL kernel (ext4 / tmpfs / cpio / devfs /
+#     procfs) has identity == 0.
+#
+# Two paths are on the same file server iff their identities are equal.
+# Specifically:
+#   * Both local  (0 == 0)    → same server: allowed.
+#   * Both 9P but same srvfd  → same server: allowed (unusual but valid
+#     if a link across two mount points covers the same 9P session).
+#   * Different srvfds        → different servers: rejected (-EXDEV).
+#   * One local, one 9P       → different servers: rejected (-EXDEV).
+#
+# This is the Plan-9 namespace / file-server boundary check.  It does NOT
+# consult POSIX mode bits — it asks "is this path on the same file server?"
+
+# -EXDEV: cross-device link (Linux errno 18, Plan 9 cross-server link).
+# The kernel uses small negative integers for errno; EXDEV maps to -18.
+# Placed before vfs_link and exported so syscall.ad can distinguish it.
+EXDEV_LINK: int32 = -18
+
+
+def _vfs_file_server_id(path: Ptr[uint8]) -> int32:
+    # Walk the calling task's Pgrp mount table. If the longest-prefix
+    # CHAN_KIND_SRV entry covers `path`, return its srvfd. Otherwise
+    # the path is on the local kernel: return 0.
+    srvfd: int32 = 0
+    root_fid: int32 = 0
+    prefix_len: uint64 = 0
+    if chan_find_srv_prefix(path, &srvfd, &root_fid, &prefix_len) != 0:
+        # A 9P SRV mount covers this path.  The srvfd is the unique
+        # identity of the remote file server for this Pgrp.
+        return srvfd
+    return 0           # local kernel path
+
+
+def vfs_link(oldpath: Ptr[char], newpath: Ptr[char]) -> int32:
+    # Create a hard link: `newpath` is a second name for the same
+    # underlying file object as `oldpath`.  Both paths MUST resolve
+    # within the SAME file server in the caller's namespace — this is
+    # Hamnix's primary link-permission boundary.
+    #
+    # The check is a Plan 9 / namespace-based boundary test:
+    #   If oldpath resolves via a different file server than newpath,
+    #   reject with -EXDEV (errno 18, "cross-device link"), regardless
+    #   of whether both paths happen to live on the same physical disk.
+    #   The boundary is the file SERVER in the caller's namespace, NOT
+    #   the physical device.
+    #
+    # After passing the boundary check, route to the local ext4 backend
+    # (the only writable FS with inode-level hardlink support right now).
+    # tmpfs hardlinks are a follow-up.
+    #
+    # Access permission check: caller must have write permission on the
+    # directory containing newpath (conservative: we check newpath's
+    # prefix path). This is the defense-in-depth POSIX fallback; the
+    # namespace/file-server check above is the primary gate.
+    if _vfs_check_perm(newpath, PERM_W) != 0:
+        return EPERM_PERM
+
+    # --- NAMESPACE / FILE-SERVER BOUNDARY CHECK ---
+    # Compute identity for both paths.  We cast the Ptr[char] to
+    # Ptr[uint8] for chan_find_srv_prefix (same bytes, different type).
+    old_id: int32 = _vfs_file_server_id(cast[Ptr[uint8]](oldpath))
+    new_id: int32 = _vfs_file_server_id(cast[Ptr[uint8]](newpath))
+    if old_id != new_id:
+        # Cross-file-server: reject with -EXDEV.  This is the headline
+        # feature: a hardlink MUST NOT cross a namespace/file-server
+        # boundary even when both paths sit on the same physical disk.
+        printk_set_level(PRINTK_LEVEL_WARN)
+        printk0("vfs_link: EXDEV: cross-9P-server link rejected\n")
+        return EXDEV_LINK
+    # Both paths are on the same file server.  Now route to the
+    # backing store.
+    ext_old: int32 = is_ext_path(oldpath)
+    ext_new: int32 = is_ext_path(newpath)
+    if ext_old != 0:
+        if ext_new == 0:
+            # Both resolved to local (id==0) but one is ext4 and the
+            # other is a different local backend (tmpfs, cpio …).
+            # Local backends are distinct per-mount-point "file servers"
+            # in the Plan 9 sense — reject with -EXDEV.
+            printk_set_level(PRINTK_LEVEL_WARN)
+            printk0("vfs_link: EXDEV: cross-backend link rejected\n")
+            return EXDEV_LINK
+        src_leaf: Ptr[char] = strip_ext_prefix(oldpath)
+        dst_leaf: Ptr[char] = strip_ext_prefix(newpath)
+        # We only support root-directory hardlinks (parent_inum = 2).
+        # This matches the single-level scope of ext4_create_file.
+        if ext4_hardlink(src_leaf, dst_leaf, 2) != 0:
+            return ENOENT
+        return 0
+    # tmpfs / cpio / other local backends: hardlinks not implemented.
     return EROFS
 
 

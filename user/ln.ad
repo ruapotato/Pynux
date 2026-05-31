@@ -1,12 +1,25 @@
 # user/ln.ad
 #
-# Hamnix `ln`: placeholder for the GNU ln surface. Neither hard
-# links nor symlinks are supported by tmpfs/ext4-r-o today, so the
-# binary exists only to make `command -v ln` succeed and to give a
-# specific error rather than "command not found". When sys_symlink
-# lands this is the file that grows real behavior.
+# Hamnix `ln`: create a hardlink or symbolic link.
+#
+# Usage:
+#   ln [-s] OLDPATH NEWPATH
+#       Without -s: create a hardlink (SYS_LINK = 306).
+#                   Returns -EXDEV when OLDPATH and NEWPATH are on
+#                   different file servers (Plan 9 / namespace boundary).
+#       With -s:    create a symlink at NEWPATH pointing to OLDPATH
+#                   (SYS_SYMLINK = 305).
+#
+# The file-server boundary enforcement in vfs_link ensures that
+# a hardlink request spanning two different file servers (e.g. /ext/
+# → /tmp/) is rejected with "cross-server link not permitted" —
+# even if both happen to sit on the same physical device. This is the
+# Plan 9 namespace model: the file SERVER is the permission boundary,
+# not Unix POSIX mode bits.
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
+extern def sys_symlink(target: Ptr[char], linkpath: Ptr[char]) -> int32
+extern def sys_link(oldpath: Ptr[char], newpath: Ptr[char]) -> int32
 
 
 def strlen_u8(s: Ptr[uint8]) -> uint64:
@@ -21,12 +34,38 @@ def write_str(fd: int32, s: Ptr[uint8]):
 
 
 def main(argc: int32, argv: Ptr[uint64]) -> int32:
-    if argc < 2:
-        write_str(2, "ln: -s required (no hard links yet)\n")
+    symlink: int32 = 0
+    arg_base: int32 = 1
+
+    # Parse optional -s flag.
+    if argc >= 2:
+        flag: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
+        # Check for "-s"
+        if flag[0] == 45 and flag[1] == 115 and flag[2] == 0:
+            symlink = 1
+            arg_base = 2
+
+    # Need exactly 2 path arguments after any flags.
+    if argc < arg_base + 2:
+        write_str(2, "ln: usage: ln [-s] OLDPATH NEWPATH\n")
         return 1
-    flag: Ptr[uint8] = cast[Ptr[uint8]](argv[1])
-    if flag[0] != 45 or flag[1] != 115 or flag[2] != 0:
-        write_str(2, "ln: -s required (no hard links yet)\n")
-        return 1
-    write_str(2, "ln: symlinks not supported on this filesystem\n")
-    return 1
+
+    oldpath: Ptr[char] = cast[Ptr[char]](argv[cast[uint64](arg_base)])
+    newpath: Ptr[char] = cast[Ptr[char]](argv[cast[uint64](arg_base) + 1])
+
+    if symlink != 0:
+        # SYS_SYMLINK: target=OLDPATH (what the symlink points to),
+        # linkpath=NEWPATH (where the symlink is created).
+        rc: int32 = sys_symlink(oldpath, newpath)
+        if rc < 0:
+            write_str(2, "ln: cannot create symlink\n")
+            return 1
+    else:
+        # SYS_LINK: oldpath=OLDPATH, newpath=NEWPATH.
+        # vfs_link checks the file-server boundary: returns -EXDEV
+        # when oldpath and newpath are on different file servers.
+        rc: int32 = sys_link(oldpath, newpath)
+        if rc < 0:
+            write_str(2, "ln: cannot create link\n")
+            return 1
+    return 0
