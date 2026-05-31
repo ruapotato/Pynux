@@ -28,6 +28,40 @@
 from linux_abi.exports import _add_export
 from kernel.printk.printk import printk1
 
+# --- BSS data exports (zeroed tracepoint structs) ---
+
+_auto___tracepoint_dma_fence_signaled: Array[64, uint8]
+_auto___tracepoint_mmap_lock_acquire_returned: Array[64, uint8]
+_auto___tracepoint_mmap_lock_released: Array[64, uint8]
+_auto___tracepoint_mmap_lock_start_locking: Array[64, uint8]
+
+# --- x86 retpoline thunks ---
+
+def _auto___x86_indirect_thunk_rsi():
+    # Retpoline replacement for `call *%rsi`. Adder emits a
+    # `push %rbp; mov %rsp, %rbp` prologue we must undo before the
+    # indirect jump — otherwise the callee returns into the saved
+    # %rbp slot rather than the caller's return address.
+    asm_volatile("""
+        popq %rbp
+        jmpq *%rsi
+    """)
+
+
+# --- no-op function stubs ---
+
+def _auto___SCK__tp_func_dma_fence_signaled():
+    # static_call_key — never dereferenced at runtime
+    return
+
+
+# --- ret-0 function stubs ---
+
+def _auto___SCT__tp_func_dma_fence_signaled() -> int32:
+    # tracepoint static-call trampoline — ret 0
+    return 0
+
+
 # --- registration --------------------------------------
 
 def linux_abi_register_autostubs():
@@ -36,5 +70,23 @@ def linux_abi_register_autostubs():
     # that isn't already covered by a hand-written api_*.ad.
     # The printk at the end prints the count actually
     # added — useful for spotting catalog drift over time.
-    n_total: uint64 = 0
+    n_total: uint64 = 7
+    # BSS data exports (tracepoint structs)
+    _add_export("__tracepoint_dma_fence_signaled",
+                cast[uint64](&_auto___tracepoint_dma_fence_signaled[0]))
+    _add_export("__tracepoint_mmap_lock_acquire_returned",
+                cast[uint64](&_auto___tracepoint_mmap_lock_acquire_returned[0]))
+    _add_export("__tracepoint_mmap_lock_released",
+                cast[uint64](&_auto___tracepoint_mmap_lock_released[0]))
+    _add_export("__tracepoint_mmap_lock_start_locking",
+                cast[uint64](&_auto___tracepoint_mmap_lock_start_locking[0]))
+    # x86 retpoline thunks
+    _add_export("__x86_indirect_thunk_rsi",
+                cast[uint64](_auto___x86_indirect_thunk_rsi))
+    # no-op function stubs
+    _add_export("__SCK__tp_func_dma_fence_signaled",
+                cast[uint64](&_auto___SCK__tp_func_dma_fence_signaled))
+    # ret-0 function stubs
+    _add_export("__SCT__tp_func_dma_fence_signaled",
+                cast[uint64](&_auto___SCT__tp_func_dma_fence_signaled))
     printk1("linux_abi_register_autostubs registered %d symbols\n", n_total)

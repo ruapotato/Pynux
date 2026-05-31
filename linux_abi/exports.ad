@@ -104,6 +104,7 @@ from linux_abi.api_alx import linux_abi_register_alx
 from linux_abi.api_atlantic import linux_abi_register_atlantic
 from linux_abi.api_sky2 import linux_abi_register_sky2
 from linux_abi.api_tg3 import linux_abi_register_tg3
+from linux_abi.api_drm import linux_abi_register_drm
 from linux_abi.api_autostubs import linux_abi_register_autostubs
 
 extern def memcpy(dst: Ptr[uint8], src: Ptr[uint8], n: uint64) -> Ptr[uint8]
@@ -1125,6 +1126,13 @@ def linux_abi_exports_init():
     linux_abi_register_atlantic()
     linux_abi_register_sky2()
     linux_abi_register_tg3()
+
+    # DRM/KMS (graphics) core. drm.ko's 316 UND minus the existing
+    # L1..L68 + api_*.ad surface (and the autostub thunk) leaves a
+    # bounded 101-symbol gap, closed in api_drm.ad so drm.ko links with
+    # skipped=0 and its init_module runs. The last un-probed subsystem
+    # class (after e1000e, libata+scsi, ahci, snd_hda, wifi, xhci/ehci).
+    linux_abi_register_drm()
 
     # Autostub safety net (scripts/gen_autostubs.py). Called LAST so
     # hand-rolled shims always win the linear-scan lookup; autostub

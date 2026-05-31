@@ -1,0 +1,760 @@
+# linux_abi/api_drm.ad
+#
+# DRM/KMS (graphics) subsystem L-shim leg — the drm.ko core framework.
+# The stock Debian 6.1.0-32 drm.ko (the DRM core: drm_drv, drm_ioctl,
+# drm_gem, drm_mode_object, the GEM/PRIME buffer machinery, the atomic
+# modeset core, ...) has 316 UND symbols. 214 are already exported by
+# L1..L68 + the existing api_*.ad shims (slab, strings, sysfs, pci,
+# kthread, irq, sync, timer, ...) plus the autostub generator (which
+# covers drm's lone __x86_indirect_thunk_rsi). This file closes the
+# remaining 101-symbol gap so drm.ko links with skipped=0 and its
+# init_module runs.
+#
+# This is a LOAD-ONLY harvest (the L-series coverage-probe bar):
+# "relocations skipped=0 + init_module returns". Under QEMU's emulated
+# VGA there is no real GPU, so drm.ko's init registers its chrdev /
+# debugfs scaffolding and returns — exactly like snd_hda landing at
+# -ENXIO. None of the closers below is on the hot path of any real
+# mode-set; they exist so the relocation pass resolves every UND to a
+# non-zero address.
+#
+# Symbol categories (101 closers):
+#   * ACPI glue           acpi_disabled (data), acpi_evaluate_integer,
+#                         acpi_get_devices, register/unregister already
+#                         in L-shims
+#   * aperture/fbdev      aperture_remove_conflicting_*, fb_get_options,
+#                         devm_aperture_acquire_for_platform_device
+#   * dma-buf / PRIME     dma_buf_* (8) — GEM<->dma-buf import/export
+#   * dma-fence           dma_fence_* (14) — the fence/sync primitives
+#   * dma-resv            dma_resv_* (3) — reservation objects
+#   * ww_mutex            ww_mutex_* (4) + reservation_ww_class (data)
+#   * anon-inode / pseudo-fs   alloc_anon_inode, init_pseudo,
+#                         kill_anon_super, simple_pin_fs/release_fs, ...
+#   * fd table            fd_install, get_unused_fd_flags, put_unused_fd
+#   * shmem / GEM pages    shmem_file_setup, shmem_read_mapping_page_gfp,
+#                         set_page_dirty, mark_page_accessed, ...
+#   * kthread_worker      kthread_create_worker/destroy/queue/flush (6)
+#   * idr / rbtree / sg   idr_preload/replace, __rb_*, sg_*, list_sort
+#   * HDMI infoframe      hdmi_avi/vendor_infoframe_init
+#   * misc data globals   oops_in_progress, platform_bus_type,
+#                         xen_domain_type, dma_fence_chain_ops
+#   * leaf helpers        cc_platform_has, simple_strtol, strscpy_pad,
+#                         wbinvd_on_all_cpus, vga_switcheroo_*_ddc, ...
+#
+# Stub philosophy: each closer returns a benign default (0 / NULL /
+# -ENODEV-ish) so the framework's init scaffolding completes. Data
+# symbols resolve to a small zeroed buffer (Linux reads/writes them but
+# the values are inert on a GPU-less host). Prefix: "_drm_".
+
+from linux_abi.exports import _add_export
+from kernel.printk.printk import printk0
+from mm.slab import kmalloc, kfree, kzalloc
+
+
+# =====================================================================
+# Data-symbol backing buffers
+# =====================================================================
+#
+# A handful of drm.ko UND are DATA, not functions: the relocation must
+# resolve to a real (zeroed) global so a `mov sym(%rip),%rax` lands on
+# valid memory. None is meaningfully consumed on a GPU-less host.
+#
+#   * acpi_disabled        int — 0 means "ACPI is enabled". drm only
+#                          reads it to gate ACPI lid/backlight probing.
+#   * oops_in_progress     int — 0 (we are never mid-oops at insmod).
+#   * xen_domain_type      enum — 0 (XEN_NATIVE; we are bare metal).
+#   * platform_bus_type    struct bus_type — drm registers a platform
+#                          driver for vgem/udl; a zeroed bus is inert.
+#   * reservation_ww_class struct ww_class — the global ww_class every
+#                          dma_resv uses; zeroed is fine for our no-op
+#                          ww_mutex stubs.
+#   * dma_fence_chain_ops  struct dma_fence_ops — vtable for fence
+#                          chains; never invoked (we never signal a
+#                          real chain).
+acpi_disabled_buf:          Array[8, uint8]
+oops_in_progress_buf:       Array[8, uint8]
+xen_domain_type_buf:        Array[8, uint8]
+platform_bus_type_buf:      Array[256, uint8]
+reservation_ww_class_buf:   Array[128, uint8]
+dma_fence_chain_ops_buf:    Array[128, uint8]
+
+# A shared 4 KiB scratch page handed back where a driver expects a
+# kernel object pointer it will poke at (anon inode, dma_buf, fence
+# stub, ...). Zeroed; absorbs reads/writes harmlessly on a host where
+# the object is never actually consumed.
+_drm_scratch_buf:           Array[4096, uint8]
+
+
+# =====================================================================
+# Group 1: ACPI glue
+# =====================================================================
+#
+# drm probes ACPI for lid state, backlight and _DSM video methods.
+# With ACPI present but no GPU, every query returns "not found" so
+# drm falls back to its non-ACPI defaults.
+
+def _drm_acpi_evaluate_integer(handle: uint64, pathname: uint64,
+                               arguments: uint64, data: uint64) -> int32:
+    # acpi_status acpi_evaluate_integer(acpi_handle, acpi_string,
+    #   struct acpi_object_list *, unsigned long long *);
+    # AE_NOT_FOUND (0x05) — drm treats any non-AE_OK as "absent".
+    return 5
+
+def _drm_acpi_get_devices(hid: uint64, callback: uint64,
+                          context: uint64, return_value: uint64) -> int32:
+    # acpi_status acpi_get_devices(char *HID, acpi_walk_callback,
+    #   void *context, void **return_value);
+    # AE_OK with the callback never invoked — no matching device.
+    return 0
+
+
+# =====================================================================
+# Group 2: aperture / fbdev handover
+# =====================================================================
+#
+# On a real boot drm kicks the firmware framebuffer (efifb/vesafb)
+# before taking over the aperture. With no conflicting fb device these
+# are no-ops that return success.
+
+def _drm_aperture_remove_conflicting_devices(base: uint64, size: uint64,
+                                             name: uint64) -> int32:
+    # int aperture_remove_conflicting_devices(resource_size_t base,
+    #   resource_size_t size, const char *name);
+    return 0
+
+def _drm_aperture_remove_conflicting_pci_devices(pdev: uint64,
+                                                 name: uint64) -> int32:
+    # int aperture_remove_conflicting_pci_devices(struct pci_dev *,
+    #   const char *name);
+    return 0
+
+def _drm_devm_aperture_acquire_for_platform_device(pdev: uint64,
+                                                   base: uint64,
+                                                   size: uint64) -> int32:
+    # int devm_aperture_acquire_for_platform_device(struct platform_device *,
+    #   resource_size_t base, resource_size_t size);
+    return 0
+
+def _drm_fb_get_options(name: uint64, option: uint64) -> int32:
+    # int fb_get_options(const char *name, char **option);
+    # 1 == "this fbdev is disabled on the kernel cmdline" → drm skips
+    # the legacy fbdev path entirely. Safest for a load-only probe.
+    return 1
+
+
+# =====================================================================
+# Group 3: dma-buf (PRIME import/export)
+# =====================================================================
+#
+# dma_buf is the cross-driver buffer-sharing object. On a GPU-less
+# host nothing ever imports/exports a real buffer; the export path is
+# only reached by an ioctl we never issue. All NULL/0/-ENODEV.
+
+def _drm_dma_buf_attach(dmabuf: uint64, dev: uint64) -> uint64:
+    # struct dma_buf_attachment *dma_buf_attach(struct dma_buf *,
+    #   struct device *); ERR_PTR(-ENODEV) == (uint64)(-19).
+    return cast[uint64](0) - 19
+
+def _drm_dma_buf_detach(dmabuf: uint64, attach: uint64):
+    return
+
+def _drm_dma_buf_export(exp_info: uint64) -> uint64:
+    # struct dma_buf *dma_buf_export(struct dma_buf_export_info *);
+    # ERR_PTR(-ENODEV).
+    return cast[uint64](0) - 19
+
+def _drm_dma_buf_fd(dmabuf: uint64, flags: int32) -> int32:
+    # int dma_buf_fd(struct dma_buf *, int flags); -ENODEV.
+    return cast[int32](0) - 19
+
+def _drm_dma_buf_get(fd: int32) -> uint64:
+    # struct dma_buf *dma_buf_get(int fd); ERR_PTR(-EBADF == -9).
+    return cast[uint64](0) - 9
+
+def _drm_dma_buf_map_attachment(attach: uint64, direction: int32) -> uint64:
+    # struct sg_table *dma_buf_map_attachment(...); ERR_PTR(-ENODEV).
+    return cast[uint64](0) - 19
+
+def _drm_dma_buf_put(dmabuf: uint64):
+    return
+
+def _drm_dma_buf_unmap_attachment(attach: uint64, sg_table: uint64,
+                                  direction: int32):
+    return
+
+
+# =====================================================================
+# Group 4: dma-fence (explicit sync primitives)
+# =====================================================================
+#
+# dma_fence is the GPU completion-signalling object. drm's GEM/atomic
+# core threads fences through every flip. On a load-only probe none is
+# ever waited on; the only init-time consumer is dma_fence_context_alloc
+# (called from drm_dev_init to seed a context id). Treat fences as
+# already-signalled so any (never-hit) wait returns immediately.
+
+def _drm_dma_fence_add_callback(fence: uint64, cb: uint64,
+                                func: uint64) -> int32:
+    # int dma_fence_add_callback(...); -ENOENT(-2) == "already signalled,
+    # callback not added" — the documented return for a signalled fence.
+    return cast[int32](0) - 2
+
+def _drm_dma_fence_allocate_private_stub(timestamp: uint64) -> uint64:
+    # struct dma_fence *dma_fence_allocate_private_stub(ktime_t);
+    # A pre-signalled stub fence. Hand back the scratch page.
+    return cast[uint64](&_drm_scratch_buf[0])
+
+def _drm_dma_fence_chain_find_seqno(pfence: uint64, seqno: uint64) -> int32:
+    return 0
+
+def _drm_dma_fence_chain_init(chain: uint64, prev: uint64, fence: uint64,
+                              seqno: uint64):
+    return
+
+def _drm_dma_fence_chain_walk(fence: uint64) -> uint64:
+    # struct dma_fence *dma_fence_chain_walk(struct dma_fence *); NULL
+    # == end of chain.
+    return 0
+
+def _drm_dma_fence_context_alloc(num: uint64) -> uint64:
+    # u64 dma_fence_context_alloc(unsigned num); a monotonically
+    # increasing context id. 1 is a fine seed (uniqueness across the
+    # never-fired fence paths doesn't matter for a load probe).
+    return 1
+
+def _drm_dma_fence_get_stub() -> uint64:
+    # struct dma_fence *dma_fence_get_stub(void); the singleton
+    # already-signalled fence. Scratch page.
+    return cast[uint64](&_drm_scratch_buf[0])
+
+def _drm_dma_fence_init(fence: uint64, ops: uint64, lock: uint64,
+                        context: uint64, seqno: uint64):
+    return
+
+def _drm_dma_fence_release(kref: uint64):
+    return
+
+def _drm_dma_fence_remove_callback(fence: uint64, cb: uint64) -> int32:
+    # bool dma_fence_remove_callback(...); false == "was already
+    # signalled / not pending".
+    return 0
+
+def _drm_dma_fence_signal(fence: uint64) -> int32:
+    return 0
+
+def _drm_dma_fence_signal_timestamp(fence: uint64, timestamp: uint64) -> int32:
+    return 0
+
+def _drm_dma_fence_unwrap_merge() -> uint64:
+    # struct dma_fence *__dma_fence_unwrap_merge(...); variadic in
+    # Linux. NULL == no merged fence produced.
+    return 0
+
+
+# =====================================================================
+# Group 5: dma-resv (reservation objects) + ww_mutex
+# =====================================================================
+#
+# dma_resv wraps a ww_mutex + a set of fences guarding a buffer. drm
+# inits one per GEM object. With no real contention the ww_mutex stubs
+# always "win" the lock immediately.
+
+def _drm_dma_resv_init(obj: uint64):
+    return
+
+def _drm_dma_resv_fini(obj: uint64):
+    return
+
+def _drm_dma_resv_wait_timeout(obj: uint64, usage: int32, intr: int32,
+                               timeout: uint64) -> int64:
+    # long dma_resv_wait_timeout(...); >0 == "fences signalled, time
+    # left". Return the full timeout so a (never-hit) wait succeeds.
+    return cast[int64](timeout)
+
+def _drm_ww_mutex_lock(lock: uint64, ctx: uint64) -> int32:
+    return 0
+
+def _drm_ww_mutex_lock_interruptible(lock: uint64, ctx: uint64) -> int32:
+    return 0
+
+def _drm_ww_mutex_trylock(lock: uint64, ctx: uint64) -> int32:
+    # bool ww_mutex_trylock(...); 1 == acquired.
+    return 1
+
+def _drm_ww_mutex_unlock(lock: uint64):
+    return
+
+def _drm_atomic_dec_and_mutex_lock(cnt: uint64, lock: uint64) -> int32:
+    # int atomic_dec_and_mutex_lock(atomic_t *, struct mutex *);
+    # 0 == "decremented but didn't hit zero, mutex not taken".
+    return 0
+
+def _drm_mutex_is_locked(lock: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 6: anon-inode / pseudo-fs (drm chrdev backing)
+# =====================================================================
+#
+# drm uses a private pseudo-filesystem (drm_fs) to back its GEM mmap
+# inodes. init_pseudo/alloc_anon_inode mount it; on our host the mount
+# is inert (no GEM mmap is ever serviced).
+
+def _drm_alloc_anon_inode(sb: uint64) -> uint64:
+    # struct inode *alloc_anon_inode(struct super_block *); scratch.
+    return cast[uint64](&_drm_scratch_buf[0])
+
+def _drm_anon_inode_getfile(name: uint64, fops: uint64, priv: uint64,
+                            flags: int32) -> uint64:
+    # struct file *anon_inode_getfile(...); ERR_PTR(-ENODEV).
+    return cast[uint64](0) - 19
+
+def _drm_init_pseudo(fc: uint64, magic: uint64) -> uint64:
+    # struct pseudo_fs_context *init_pseudo(struct fs_context *,
+    #   unsigned long magic); scratch context.
+    return cast[uint64](&_drm_scratch_buf[0])
+
+def _drm_kill_anon_super(sb: uint64):
+    return
+
+def _drm_simple_pin_fs(type: uint64, mount: uint64, count: uint64) -> int32:
+    return 0
+
+def _drm_simple_release_fs(mount: uint64, count: uint64):
+    return
+
+
+# =====================================================================
+# Group 7: fd table (DRM_IOCTL_PRIME_HANDLE_TO_FD etc.)
+# =====================================================================
+#
+# Installing a dma-buf into the caller's fd table only happens on a
+# PRIME export ioctl we never issue. Stub the path so it links.
+
+def _drm_get_unused_fd_flags(flags: uint64) -> int32:
+    # int get_unused_fd_flags(unsigned flags); -EMFILE(-24).
+    return cast[int32](0) - 24
+
+def _drm_put_unused_fd(fd: int32):
+    return
+
+def _drm_fd_install(fd: int32, file: uint64):
+    return
+
+
+# =====================================================================
+# Group 8: shmem / GEM page backing
+# =====================================================================
+#
+# drm_gem_shmem objects are backed by tmpfs (shmem) pages. The backing
+# store is allocated on first fault — never hit on a load-only probe.
+
+def _drm_shmem_file_setup(name: uint64, size: uint64, flags: uint64) -> uint64:
+    # struct file *shmem_file_setup(...); ERR_PTR(-ENODEV).
+    return cast[uint64](0) - 19
+
+def _drm_shmem_read_mapping_page_gfp(mapping: uint64, index: uint64,
+                                     gfp: uint64) -> uint64:
+    # struct page *shmem_read_mapping_page_gfp(...); ERR_PTR(-ENODEV).
+    return cast[uint64](0) - 19
+
+def _drm_set_page_dirty(page: uint64) -> int32:
+    return 0
+
+def _drm_mark_page_accessed(page: uint64):
+    return
+
+def _drm_check_move_unevictable_pages(pvec: uint64):
+    return
+
+def _drm_pagevec_release(pvec: uint64):
+    return
+
+def _drm_unmap_mapping_range(mapping: uint64, holebegin: uint64,
+                            holelen: uint64, even_cows: int32):
+    return
+
+
+# =====================================================================
+# Group 9: kthread_worker (drm flip / vblank work queues)
+# =====================================================================
+#
+# drm_vblank_work and the atomic commit tail use a kthread_worker. With
+# no display nothing is ever queued; create returns a scratch worker so
+# the (never-driven) queue/flush calls are no-ops.
+
+def _drm_kthread_create_worker(flags: uint64, fmt: uint64) -> uint64:
+    # struct kthread_worker *kthread_create_worker(unsigned, const char
+    #   fmt, ...); scratch.
+    return cast[uint64](&_drm_scratch_buf[0])
+
+def _drm_kthread_destroy_worker(worker: uint64):
+    return
+
+def _drm_kthread_queue_work(worker: uint64, work: uint64) -> int32:
+    # bool kthread_queue_work(...); 1 == queued.
+    return 1
+
+def _drm_kthread_flush_work(work: uint64):
+    return
+
+def _drm_kthread_flush_worker(worker: uint64):
+    return
+
+def _drm_kthread_cancel_work_sync(work: uint64) -> int32:
+    # bool kthread_cancel_work_sync(...); 0 == "was not pending".
+    return 0
+
+def _drm_sched_set_fifo(p: uint64):
+    return
+
+
+# =====================================================================
+# Group 10: idr / rbtree / sg-table / list helpers
+# =====================================================================
+
+def _drm_idr_preload(gfp: uint64):
+    return
+
+def _drm_idr_replace(idr: uint64, ptr: uint64, id: uint64) -> uint64:
+    # void *idr_replace(struct idr *, void *ptr, unsigned long id);
+    # Return the new ptr (the documented "old value" isn't consumed on
+    # the paths drm uses at init).
+    return ptr
+
+def _drm_rb_erase_color(parent: uint64, root: uint64):
+    return
+
+def _drm_rb_insert_augmented(node: uint64, root: uint64, augment: uint64):
+    return
+
+def _drm_rb_prev(node: uint64) -> uint64:
+    # struct rb_node *rb_prev(const struct rb_node *); NULL == none.
+    return 0
+
+def _drm_rb_replace_node(victim: uint64, new: uint64, root: uint64):
+    return
+
+def _drm_radix_tree_tagged(root: uint64, tag: uint32) -> int32:
+    return 0
+
+def _drm_list_sort(priv: uint64, head: uint64, cmp: uint64):
+    return
+
+def _drm_llist_add_batch(new_first: uint64, new_last: uint64,
+                         head: uint64) -> int32:
+    # bool llist_add_batch(...); 1 == "list was empty before add".
+    return 1
+
+def _drm_sg_alloc_table_from_pages_segment(sgt: uint64, pages: uint64,
+                                           n_pages: uint64, offset: uint64,
+                                           size: uint64, max_segment: uint64,
+                                           gfp: uint64) -> int32:
+    # int ...; -ENOMEM(-12) — drm's GEM->sg path bails cleanly. Never
+    # hit on a load probe (no real GEM object exists).
+    return cast[int32](0) - 12
+
+def _drm_sg_free_table(sgt: uint64):
+    return
+
+
+# =====================================================================
+# Group 11: HDMI infoframe builders
+# =====================================================================
+#
+# Pure CPU-side helpers that zero-init an infoframe struct. drm exports
+# wrappers around them; the bridge/connector code calls them at modeset
+# time (never on a load probe). Return success with the struct left
+# zeroed (the caller memsets first anyway).
+
+def _drm_hdmi_avi_infoframe_init(frame: uint64) -> int32:
+    return 0
+
+def _drm_hdmi_vendor_infoframe_init(frame: uint64) -> int32:
+    return 0
+
+
+# =====================================================================
+# Group 12: sync_file (DRM_IOCTL_*_FENCE)
+# =====================================================================
+
+def _drm_sync_file_create(fence: uint64) -> uint64:
+    # struct sync_file *sync_file_create(struct dma_fence *); NULL ==
+    # allocation failed (caller handles).
+    return 0
+
+def _drm_sync_file_get_fence(fd: int32) -> uint64:
+    # struct dma_fence *sync_file_get_fence(int fd); NULL == no fence.
+    return 0
+
+
+# =====================================================================
+# Group 13: class / sysfs string attrs + backlight + i2c + acpi-bus
+# =====================================================================
+
+def _drm_class_create_file_ns(cls: uint64, attr: uint64, ns: uint64) -> int32:
+    return 0
+
+def _drm_class_remove_file_ns(cls: uint64, attr: uint64, ns: uint64):
+    return
+
+def _drm_show_class_attr_string(cls: uint64, attr: uint64, buf: uint64) -> int64:
+    # ssize_t show_class_attr_string(...); 0 bytes emitted.
+    return 0
+
+def _drm_devm_of_find_backlight(dev: uint64) -> uint64:
+    # struct backlight_device *devm_of_find_backlight(struct device *);
+    # NULL == no backlight in DT (the common case on x86).
+    return 0
+
+def _drm_i2c_transfer(adap: uint64, msgs: uint64, num: int32) -> int32:
+    # int i2c_transfer(struct i2c_adapter *, struct i2c_msg *, int);
+    # -ENXIO(-6) — no DDC/EDID i2c device answers on our host.
+    return cast[int32](0) - 6
+
+def _drm_drm_get_panel_orientation_quirk(width: int32, height: int32) -> int32:
+    # int drm_get_panel_orientation_quirk(int width, int height);
+    # DRM_MODE_PANEL_ORIENTATION_UNKNOWN == -1.
+    return cast[int32](0) - 1
+
+def _drm_vga_switcheroo_lock_ddc(pdev: uint64) -> int32:
+    # int vga_switcheroo_lock_ddc(struct pci_dev *); -1 == no muxed DDC.
+    return cast[int32](0) - 1
+
+def _drm_vga_switcheroo_unlock_ddc(pdev: uint64) -> int32:
+    return cast[int32](0) - 1
+
+
+# =====================================================================
+# Group 14: leaf helpers (cc/string/sched/pid/fwnode/static_key/...)
+# =====================================================================
+
+def _drm_cc_platform_has(attr: uint32) -> int32:
+    # bool cc_platform_has(enum cc_attr); 0 == no confidential-compute
+    # features (we're not SEV/TDX).
+    return 0
+
+def _drm_cc_mkdec(val: uint64) -> uint64:
+    # u64 cc_mkdec(u64); strip the C-bit. No CC → identity.
+    return val
+
+def _drm_wbinvd_on_all_cpus():
+    # void wbinvd_on_all_cpus(void); cache flush — no-op is safe under
+    # emulation (the L-shim doesn't model coherency the driver worries
+    # about). drm calls it from the write-combining setup path.
+    return
+
+def _drm_static_key_enable(key: uint64):
+    return
+
+def _drm_simple_strtol(cp: uint64, endp: uint64, base: uint32) -> int64:
+    return 0
+
+def _drm_strscpy_pad(dst: uint64, src: uint64, count: uint64) -> int64:
+    # ssize_t strscpy_pad(char *dest, const char *src, size_t count);
+    # Copy src into dst up to count-1, NUL-pad the rest. Implemented for
+    # real since drm dev_set_name-style paths read it back. Returns the
+    # copied length (excluding NUL), or -E2BIG. Minimal byte loop.
+    if count == 0:
+        return 0
+    d: Ptr[uint8] = cast[Ptr[uint8]](dst)
+    s: Ptr[uint8] = cast[Ptr[uint8]](src)
+    i: uint64 = 0
+    # copy until NUL or count-1
+    while i < count - 1:
+        c: uint8 = s[i]
+        d[i] = c
+        if c == 0:
+            break
+        i = i + 1
+    copied: uint64 = i
+    # NUL + pad remainder
+    while i < count:
+        d[i] = 0
+        i = i + 1
+    return cast[int64](copied)
+
+def _drm_kstrdup_const(s: uint64, gfp: uint64) -> uint64:
+    # const char *kstrdup_const(const char *s, gfp_t gfp);
+    # The "_const" variant returns the original pointer if it lives in
+    # .rodata. We can't tell, so return the input unchanged (drm never
+    # kfree_const's it back on the load-only path). NULL-safe.
+    return s
+
+def _drm_memdup_user_nul(src: uint64, len: uint64) -> uint64:
+    # void *memdup_user_nul(const void __user *, size_t); ERR_PTR(-EFAULT
+    # == -14) — no userspace blob is copied at init.
+    return cast[uint64](0) - 14
+
+def _drm_fwnode_handle_put(fwnode: uint64):
+    return
+
+def _drm_pid_task(pid: uint64, type: int32) -> uint64:
+    # struct task_struct *pid_task(struct pid *, enum pid_type);
+    # NULL == no task (drm's debugfs client list is empty at init).
+    return 0
+
+def _drm_task_pid_nr_ns(task: uint64, type: int32, ns: uint64) -> int32:
+    return 0
+
+def _drm_nsecs_to_jiffies64(n: uint64) -> uint64:
+    # u64 nsecs_to_jiffies64(u64 n); HZ=250 → /4_000_000 ns per jiffy.
+    return n / 4000000
+
+def _drm_kmalloc_node_track_caller(size: uint64, gfp: uint64,
+                                   node: int32) -> uint64:
+    # void *__kmalloc_node_track_caller(size_t, gfp_t, int node, unsigned
+    #   long caller); node-aware kmalloc. We have one node — plain
+    # kmalloc. NULL on size 0 mirrors the kernel.
+    if size == 0:
+        return 0
+    return kmalloc(size)
+
+
+# =====================================================================
+# Registration
+# =====================================================================
+
+def linux_abi_register_drm():
+    # 101 closers beyond the L1..L68 + api_*.ad surface (the autostub
+    # generator covers drm's lone __x86_indirect_thunk_rsi). Together
+    # they take drm.ko's relocation pass to skipped=0.
+    printk0("linux_abi_register_drm: closing drm.ko UND gap\n")
+
+    # --- data symbols ---
+    _add_export("acpi_disabled",        cast[uint64](&acpi_disabled_buf[0]))
+    _add_export("oops_in_progress",     cast[uint64](&oops_in_progress_buf[0]))
+    _add_export("xen_domain_type",      cast[uint64](&xen_domain_type_buf[0]))
+    _add_export("platform_bus_type",    cast[uint64](&platform_bus_type_buf[0]))
+    _add_export("reservation_ww_class", cast[uint64](&reservation_ww_class_buf[0]))
+    _add_export("dma_fence_chain_ops",  cast[uint64](&dma_fence_chain_ops_buf[0]))
+
+    # --- ACPI glue ---
+    _add_export("acpi_evaluate_integer", cast[uint64](&_drm_acpi_evaluate_integer))
+    _add_export("acpi_get_devices",      cast[uint64](&_drm_acpi_get_devices))
+
+    # --- aperture / fbdev ---
+    _add_export("aperture_remove_conflicting_devices",
+                cast[uint64](&_drm_aperture_remove_conflicting_devices))
+    _add_export("aperture_remove_conflicting_pci_devices",
+                cast[uint64](&_drm_aperture_remove_conflicting_pci_devices))
+    _add_export("devm_aperture_acquire_for_platform_device",
+                cast[uint64](&_drm_devm_aperture_acquire_for_platform_device))
+    _add_export("fb_get_options", cast[uint64](&_drm_fb_get_options))
+
+    # --- dma-buf ---
+    _add_export("dma_buf_attach",           cast[uint64](&_drm_dma_buf_attach))
+    _add_export("dma_buf_detach",           cast[uint64](&_drm_dma_buf_detach))
+    _add_export("dma_buf_export",           cast[uint64](&_drm_dma_buf_export))
+    _add_export("dma_buf_fd",               cast[uint64](&_drm_dma_buf_fd))
+    _add_export("dma_buf_get",              cast[uint64](&_drm_dma_buf_get))
+    _add_export("dma_buf_map_attachment",   cast[uint64](&_drm_dma_buf_map_attachment))
+    _add_export("dma_buf_put",              cast[uint64](&_drm_dma_buf_put))
+    _add_export("dma_buf_unmap_attachment", cast[uint64](&_drm_dma_buf_unmap_attachment))
+
+    # --- dma-fence ---
+    _add_export("dma_fence_add_callback",        cast[uint64](&_drm_dma_fence_add_callback))
+    _add_export("dma_fence_allocate_private_stub", cast[uint64](&_drm_dma_fence_allocate_private_stub))
+    _add_export("dma_fence_chain_find_seqno",    cast[uint64](&_drm_dma_fence_chain_find_seqno))
+    _add_export("dma_fence_chain_init",          cast[uint64](&_drm_dma_fence_chain_init))
+    _add_export("dma_fence_chain_walk",          cast[uint64](&_drm_dma_fence_chain_walk))
+    _add_export("dma_fence_context_alloc",       cast[uint64](&_drm_dma_fence_context_alloc))
+    _add_export("dma_fence_get_stub",            cast[uint64](&_drm_dma_fence_get_stub))
+    _add_export("dma_fence_init",                cast[uint64](&_drm_dma_fence_init))
+    _add_export("dma_fence_release",             cast[uint64](&_drm_dma_fence_release))
+    _add_export("dma_fence_remove_callback",     cast[uint64](&_drm_dma_fence_remove_callback))
+    _add_export("dma_fence_signal",              cast[uint64](&_drm_dma_fence_signal))
+    _add_export("dma_fence_signal_timestamp",    cast[uint64](&_drm_dma_fence_signal_timestamp))
+    _add_export("__dma_fence_unwrap_merge",      cast[uint64](&_drm_dma_fence_unwrap_merge))
+
+    # --- dma-resv + ww_mutex ---
+    _add_export("dma_resv_init",                 cast[uint64](&_drm_dma_resv_init))
+    _add_export("dma_resv_fini",                 cast[uint64](&_drm_dma_resv_fini))
+    _add_export("dma_resv_wait_timeout",         cast[uint64](&_drm_dma_resv_wait_timeout))
+    _add_export("ww_mutex_lock",                 cast[uint64](&_drm_ww_mutex_lock))
+    _add_export("ww_mutex_lock_interruptible",   cast[uint64](&_drm_ww_mutex_lock_interruptible))
+    _add_export("ww_mutex_trylock",              cast[uint64](&_drm_ww_mutex_trylock))
+    _add_export("ww_mutex_unlock",               cast[uint64](&_drm_ww_mutex_unlock))
+    _add_export("atomic_dec_and_mutex_lock",     cast[uint64](&_drm_atomic_dec_and_mutex_lock))
+    _add_export("mutex_is_locked",               cast[uint64](&_drm_mutex_is_locked))
+
+    # --- anon-inode / pseudo-fs ---
+    _add_export("alloc_anon_inode",     cast[uint64](&_drm_alloc_anon_inode))
+    _add_export("anon_inode_getfile",   cast[uint64](&_drm_anon_inode_getfile))
+    _add_export("init_pseudo",          cast[uint64](&_drm_init_pseudo))
+    _add_export("kill_anon_super",      cast[uint64](&_drm_kill_anon_super))
+    _add_export("simple_pin_fs",        cast[uint64](&_drm_simple_pin_fs))
+    _add_export("simple_release_fs",    cast[uint64](&_drm_simple_release_fs))
+
+    # --- fd table ---
+    _add_export("get_unused_fd_flags",  cast[uint64](&_drm_get_unused_fd_flags))
+    _add_export("put_unused_fd",        cast[uint64](&_drm_put_unused_fd))
+    _add_export("fd_install",           cast[uint64](&_drm_fd_install))
+
+    # --- shmem / GEM pages ---
+    _add_export("shmem_file_setup",             cast[uint64](&_drm_shmem_file_setup))
+    _add_export("shmem_read_mapping_page_gfp",  cast[uint64](&_drm_shmem_read_mapping_page_gfp))
+    _add_export("set_page_dirty",               cast[uint64](&_drm_set_page_dirty))
+    _add_export("mark_page_accessed",           cast[uint64](&_drm_mark_page_accessed))
+    _add_export("check_move_unevictable_pages", cast[uint64](&_drm_check_move_unevictable_pages))
+    _add_export("__pagevec_release",            cast[uint64](&_drm_pagevec_release))
+    _add_export("unmap_mapping_range",          cast[uint64](&_drm_unmap_mapping_range))
+
+    # --- kthread_worker ---
+    _add_export("kthread_create_worker",     cast[uint64](&_drm_kthread_create_worker))
+    _add_export("kthread_destroy_worker",    cast[uint64](&_drm_kthread_destroy_worker))
+    _add_export("kthread_queue_work",        cast[uint64](&_drm_kthread_queue_work))
+    _add_export("kthread_flush_work",        cast[uint64](&_drm_kthread_flush_work))
+    _add_export("kthread_flush_worker",      cast[uint64](&_drm_kthread_flush_worker))
+    _add_export("kthread_cancel_work_sync",  cast[uint64](&_drm_kthread_cancel_work_sync))
+    _add_export("sched_set_fifo",            cast[uint64](&_drm_sched_set_fifo))
+
+    # --- idr / rbtree / sg / list ---
+    _add_export("idr_preload",       cast[uint64](&_drm_idr_preload))
+    _add_export("idr_replace",       cast[uint64](&_drm_idr_replace))
+    _add_export("__rb_erase_color",  cast[uint64](&_drm_rb_erase_color))
+    _add_export("__rb_insert_augmented", cast[uint64](&_drm_rb_insert_augmented))
+    _add_export("rb_prev",           cast[uint64](&_drm_rb_prev))
+    _add_export("rb_replace_node",   cast[uint64](&_drm_rb_replace_node))
+    _add_export("radix_tree_tagged", cast[uint64](&_drm_radix_tree_tagged))
+    _add_export("list_sort",         cast[uint64](&_drm_list_sort))
+    _add_export("llist_add_batch",   cast[uint64](&_drm_llist_add_batch))
+    _add_export("sg_alloc_table_from_pages_segment",
+                cast[uint64](&_drm_sg_alloc_table_from_pages_segment))
+    _add_export("sg_free_table",     cast[uint64](&_drm_sg_free_table))
+
+    # --- HDMI infoframe ---
+    _add_export("hdmi_avi_infoframe_init",    cast[uint64](&_drm_hdmi_avi_infoframe_init))
+    _add_export("hdmi_vendor_infoframe_init", cast[uint64](&_drm_hdmi_vendor_infoframe_init))
+
+    # --- sync_file ---
+    _add_export("sync_file_create",     cast[uint64](&_drm_sync_file_create))
+    _add_export("sync_file_get_fence",  cast[uint64](&_drm_sync_file_get_fence))
+
+    # --- class / sysfs / backlight / i2c / acpi-bus / switcheroo ---
+    _add_export("class_create_file_ns",   cast[uint64](&_drm_class_create_file_ns))
+    _add_export("class_remove_file_ns",   cast[uint64](&_drm_class_remove_file_ns))
+    _add_export("show_class_attr_string", cast[uint64](&_drm_show_class_attr_string))
+    _add_export("devm_of_find_backlight", cast[uint64](&_drm_devm_of_find_backlight))
+    _add_export("i2c_transfer",           cast[uint64](&_drm_i2c_transfer))
+    _add_export("drm_get_panel_orientation_quirk",
+                cast[uint64](&_drm_drm_get_panel_orientation_quirk))
+    _add_export("vga_switcheroo_lock_ddc",   cast[uint64](&_drm_vga_switcheroo_lock_ddc))
+    _add_export("vga_switcheroo_unlock_ddc", cast[uint64](&_drm_vga_switcheroo_unlock_ddc))
+
+    # --- leaf helpers ---
+    _add_export("cc_platform_has",   cast[uint64](&_drm_cc_platform_has))
+    _add_export("cc_mkdec",          cast[uint64](&_drm_cc_mkdec))
+    _add_export("wbinvd_on_all_cpus", cast[uint64](&_drm_wbinvd_on_all_cpus))
+    _add_export("static_key_enable", cast[uint64](&_drm_static_key_enable))
+    _add_export("simple_strtol",     cast[uint64](&_drm_simple_strtol))
+    _add_export("strscpy_pad",       cast[uint64](&_drm_strscpy_pad))
+    _add_export("kstrdup_const",     cast[uint64](&_drm_kstrdup_const))
+    _add_export("memdup_user_nul",   cast[uint64](&_drm_memdup_user_nul))
+    _add_export("fwnode_handle_put", cast[uint64](&_drm_fwnode_handle_put))
+    _add_export("pid_task",          cast[uint64](&_drm_pid_task))
+    _add_export("__task_pid_nr_ns",  cast[uint64](&_drm_task_pid_nr_ns))
+    _add_export("nsecs_to_jiffies64", cast[uint64](&_drm_nsecs_to_jiffies64))
+    _add_export("__kmalloc_node_track_caller",
+                cast[uint64](&_drm_kmalloc_node_track_caller))
