@@ -715,6 +715,15 @@ class XhciState:
     fu2_demoted:           uint32
     fu2_comp_port:         uint32
     fu2_comp_speed:        uint32
+    # diag-rev=15: highest speed any USB2 (non-SS) root port actually TRAINED
+    # at after reset, and how many HS-reset retries it took to get there. This
+    # is the genuine post-reset train (unlike fu2_comp_speed which the demote
+    # samples pre-reset and reads as junk). best_usb2_speed=3 in the late frame
+    # => a device reached HighSpeed on USB2 (the boot stick fell back as hoped);
+    # ==1 across all ports => only FullSpeed devices (keyboards) are on USB2 and
+    # the stick never re-presented there (force-usb2 is a dead end on this HW).
+    fu2_best_usb2_speed:   uint32
+    fu2_hs_retries:        uint32
 
 
 xhci: XhciState
@@ -1972,11 +1981,45 @@ def _xhci_port_reset(port: uint32) -> int32:
                               XHCI_PORTSC_WRC)
 
     # USB2 port: a hot reset (PR) enables it and is the only reset QEMU's
-    # emulated controller ever needs.
-    if _xhci_do_reset(port_addr, port, XHCI_PORTSC_PR, XHCI_PORTSC_PRC) == 0:
+    # emulated controller ever needs. On real Intel silicon, a USB3 stick
+    # that just fell back onto its USB2 companion (force-usb2 demote) often
+    # mis-trains to FullSpeed: the HighSpeed chirp (device drives Chirp-K,
+    # host answers alternating K-J) is missed when reset is asserted before
+    # the just-fallen-back connection has settled, so both ends give up and
+    # default to FullSpeed. A re-reset on the now-stable connection lets the
+    # chirp complete and trains HighSpeed (Linux hub_port_reset retries the
+    # same way, up to PORT_RESET_TRIES). So retry the hot reset until the
+    # port trains HighSpeed, bounded at 3 tries. A genuinely Full/Low-speed
+    # device (e.g. a boot keyboard) simply re-trains the same speed each
+    # time and we accept it after the retries; only the HS chirp benefits.
+    tries: uint32 = 0
+    last_rc: int32 = -1
+    while tries < 3:
+        last_rc = _xhci_do_reset(port_addr, port, XHCI_PORTSC_PR,
+                                 XHCI_PORTSC_PRC)
+        if last_rc == 0:
+            post: uint32 = _xhci_r32(port_addr)
+            sp: uint32 = (post >> XHCI_PORTSC_SPEED_SHIFT) \
+                       & XHCI_PORTSC_SPEED_MASK
+            # Record the best speed any USB2 port trains at (decisive late
+            # telemetry: did the boot stick reach HS on USB2 at all?).
+            if sp > xhci.fu2_best_usb2_speed:
+                xhci.fu2_best_usb2_speed = sp
+            if sp == USB_SPEED_HIGH:
+                xhci.fu2_hs_retries = tries
+                return 0
+            printk2("[xhci] port %d trained speed=%d; re-reset for HS chirp\n",
+                    cast[uint64](port), cast[uint64](sp))
+            # Settle on the stable connection before re-resetting so the
+            # next chirp window lines up (~20 ms equiv in spin cycles).
+            inter: uint64 = 0
+            while inter < 2000000:
+                inter = inter + 1
+        tries = tries + 1
+    if last_rc == 0:
         return 0
 
-    # Hot reset did not enable the USB2 port. Fall back to a warm reset
+    # Hot reset never enabled the USB2 port. Fall back to a warm reset
     # (WPR is RsvdZ on USB2 ports, so it's a harmless last resort).
     printk1("[xhci] port %d hot-reset PED=0; trying warm reset (WPR)\n",
             cast[uint64](port))
@@ -2765,7 +2808,7 @@ def xhci_bulk_diag_report():
     # (the win condition); ms_speed is the speed the storage slot enumerated at
     # (4=SuperSpeed still wedged, 3=HighSpeed = forced over).
     if xhci.fu2_active != 0:
-        printk0("[xhci-fu2] (late) diag-rev=14 portsc-demote\n")
+        printk0("[xhci-fu2] (late) diag-rev=15 hs-reset-retry\n")
         printk2("[xhci-fu2] (late) XUSB2PR=%x PSSEN=%x\n",
                 cast[uint64](xhci.fu2_xusb2pr),
                 cast[uint64](xhci.fu2_pssen))
@@ -2775,11 +2818,14 @@ def xhci_bulk_diag_report():
         printk2("[xhci-fu2] (late) comp_speed=%d ms_speed=%d\n",
                 cast[uint64](xhci.fu2_comp_speed),
                 cast[uint64](xhci.ms_speed))
+        printk2("[xhci-fu2] (late) best_usb2_speed=%d hs_retries=%d\n",
+                cast[uint64](xhci.fu2_best_usb2_speed),
+                cast[uint64](xhci.fu2_hs_retries))
     if xhci.bulk_diag_done == 0:
         return
     # Image-identity marker so a NUC photo unambiguously tells us which
     # build booted (each reflash is expensive). Bump on every diag/fix ship.
-    printk0("[xhci-bulk] (late) diag-rev=14 portsc-demote\n")
+    printk0("[xhci-bulk] (late) diag-rev=15 hs-reset-retry\n")
     printk2("[xhci-bulk] (late) expect_trb=%p evt_seen=%d\n",
             xhci.diag_expect_trb, cast[uint64](xhci.diag_evt_seen))
     printk2("[xhci-bulk] (late) last_evt_p=%p db=%p\n",
