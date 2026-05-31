@@ -71,13 +71,35 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null 2>&1 || true' EXIT
 
 set +e
+FIFO=$(mktemp -u)
+mkfifo "$FIFO"
+
+# Deterministic input driver. A blind `sleep 6; type` pipe races the
+# shell's readline window: on a slow/contended TCG host the boot takes
+# longer than the sleep, so the command is typed before hamsh is reading
+# and gets swallowed (only the later `exit` lands). Instead, watch $LOG
+# and type the command only once hamsh signals ready, then type `exit`
+# only once the selftest has printed its PASS/FAIL verdict.
 (
-    sleep 6
-    printf '/bin/lex_selftest\n'
-    sleep 10
-    printf 'exit\n'
-    sleep 2
-) | timeout 55s qemu-system-x86_64 \
+    exec 3>"$FIFO"          # blocks until qemu opens the FIFO for reading
+    for _ in $(seq 1 600); do
+        grep -q "shell ready" "$LOG" 2>/dev/null && break
+        sleep 0.1
+    done
+    sleep 1
+    printf '/bin/lex_selftest\n' >&3
+    for _ in $(seq 1 400); do
+        grep -Eq '\[lex_selftest\] (PASS|FAIL)' "$LOG" 2>/dev/null && break
+        sleep 0.1
+    done
+    sleep 1
+    printf 'exit\n' >&3
+    sleep 1
+    exec 3>&-
+) &
+driver_pid=$!
+
+timeout 90s qemu-system-x86_64 \
     -kernel "$ELF" \
     -smp 2 \
     -nographic \
@@ -85,8 +107,12 @@ set +e
     -m 256M \
     -monitor none \
     -serial stdio \
+    < "$FIFO" \
     > "$LOG" 2>&1
 qemu_rc=$?
+kill "$driver_pid" 2>/dev/null
+wait "$driver_pid" 2>/dev/null || true
+rm -f "$FIFO"
 set -e
 
 # --- (6/6) Assert sentinels -----------------------------------------
