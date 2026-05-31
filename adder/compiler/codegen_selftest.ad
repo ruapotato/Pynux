@@ -42,6 +42,10 @@ from compiler.codegen import (
     code_len,
     gen_program_first_function,
     gen_program_all_functions,
+    gen_program_with_globals,
+    gdata,
+    gdata_len,
+    DATA_BASE,
 )
 
 extern def sys_write(fd: int32, buf: Ptr[uint8], count: uint64) -> int64
@@ -136,11 +140,30 @@ EMU_STACK: uint32 = 4096
 emu_mem: Array[8192, uint8]
 
 
+# The emulated address space is split: [0, DATA_BASE) is the stack window
+# (emu_mem); [DATA_BASE, DATA_BASE + gdata_len) is the codegen data section
+# (gdata). All real frame offsets stay below EMU_STACK (4096) < DATA_BASE
+# (8192), and every global address comes from a RIP-relative leaq that lands
+# at DATA_BASE + data_off — so a single threshold cleanly routes each byte
+# access. These two primitives do that routing for everything below.
+def emu_read_byte(addr: uint32) -> uint32:
+    if addr >= DATA_BASE:
+        return cast[uint32](gdata[addr - DATA_BASE])
+    return cast[uint32](emu_mem[addr])
+
+
+def emu_write_byte(addr: uint32, b: uint32):
+    if addr >= DATA_BASE:
+        gdata[addr - DATA_BASE] = cast[uint8](b & 255)
+    else:
+        emu_mem[addr] = cast[uint8](b & 255)
+
+
 def emu_load64(addr: uint32) -> uint64:
     v: uint64 = 0
     i: uint32 = 0
     while i < 8:
-        v = v | (cast[uint64](emu_mem[addr + i]) << (i * 8))
+        v = v | (cast[uint64](emu_read_byte(addr + i)) << (i * 8))
         i = i + 1
     return v
 
@@ -149,7 +172,7 @@ def emu_store64(addr: uint32, val: uint64):
     i: uint32 = 0
     v: uint64 = val
     while i < 8:
-        emu_mem[addr + i] = cast[uint8](v & 255)
+        emu_write_byte(addr + i, cast[uint32](v & 255))
         v = v >> 8
         i = i + 1
 
@@ -160,7 +183,7 @@ def emu_load_sized(addr: uint32, size: uint32) -> uint64:
     v: uint64 = 0
     i: uint32 = 0
     while i < size:
-        v = v | (cast[uint64](emu_mem[addr + i]) << (i * 8))
+        v = v | (cast[uint64](emu_read_byte(addr + i)) << (i * 8))
         i = i + 1
     return v
 
@@ -171,7 +194,7 @@ def emu_store_sized(addr: uint32, size: uint32, val: uint64):
     i: uint32 = 0
     v: uint64 = val
     while i < size:
-        emu_mem[addr + i] = cast[uint8](v & 255)
+        emu_write_byte(addr + i, cast[uint32](v & 255))
         v = v >> 8
         i = i + 1
 
@@ -509,6 +532,18 @@ def emu_run_at(start_pc: uint32, arg0: uint64, arg1: uint64) -> uint64:
                 disp: uint32 = cast[uint32](code[pc + 3])
                 rax = cast[uint64](rbp + sext8_to_idx(disp))
                 pc = pc + 4
+                continue
+            # leaq rel32(%rip),%rax: 48 8D 05 rel32  (global/string address).
+            # The RIP-relative displacement is taken from the END of the
+            # 7-byte instruction; the resolved target is an absolute address
+            # in the data window (>= DATA_BASE), so the load/store routing
+            # picks gdata[]. rip_end + rel32 reproduces the codegen's
+            # patch_rel32(target = DATA_BASE + data_off) arithmetic.
+            if b1 == 0x8D and cast[uint32](code[pc + 2]) == 0x05:
+                rel: uint64 = emu_rel32(pc + 3)
+                ripend: uint32 = pc + 7
+                rax = cast[uint64](ripend + cast[uint32](rel))
+                pc = pc + 7
                 continue
             # cmpq %rcx,%rax: 48 39 C8  (sets the compare flag for setcc)
             if b1 == 0x39 and cast[uint32](code[pc + 2]) == 0xC8:
@@ -989,6 +1024,94 @@ def main() -> int32:
     check_eq("emu acc(7,5)==12", cast[uint32](emu_run(7, 5)), 12)
     check_eq("emu acc(100,1)==101", cast[uint32](emu_run(100, 1)), 101)
 
+    # ===================================================================
+    # Module-level GLOBALS + a relocatable DATA SECTION (this milestone).
+    # Globals/strings are laid out into gdata[]; references are RIP-relative
+    # leaq's resolved by a data fixup. The emulator routes addresses
+    # >= DATA_BASE into gdata[], so these verify BOTH the emitted opcodes
+    # (RIP-lea + sized load/store) AND real data-section semantics.
+    # ===================================================================
+
+    # --- (M) global counter mutated across two function calls -----------
+    # `go` is written FIRST so it begins at code offset 0 (the emu entry).
+    #   counter: int32 = 0
+    #   def go(a: int32, b: int32) -> int32:
+    #       bump(a, 0)
+    #       bump(b, 0)
+    #       return counter
+    #   def bump(x: int32, y: int32) -> int32:
+    #       counter = counter + x
+    #       return counter
+    # go(3,4): counter 0 ->3 ->7, returns 7. The state PERSISTS in gdata[]
+    # across both calls — proving the global lives in the data section, not
+    # a frame slot.
+    build_globals("counter: int32 = 0\ndef go(a: int32, b: int32) -> int32:\n    bump(a, 0)\n    bump(b, 0)\n    return counter\ndef bump(x: int32, y: int32) -> int32:\n    counter = counter + x\n    return counter\n")
+    check_eq("global counter codegen err", cg_err, 0)
+    # The leaq is RIP-relative (48 8D 05 ...) somewhere in the stream; spot
+    # check that the opcode form was emitted at least once.
+    check_eq("global rip-lea emitted", has_rip_lea(), 1)
+    check_eq("emu go(3,4) counter==7", cast[uint32](emu_run(3, 4)), 7)
+
+    # An int initialiser lands in the data section. Verify the initialiser
+    # byte is present in gdata[] BEFORE running (emulation mutates it).
+    build_globals("counter: int32 = 5\ndef go(a: int32, b: int32) -> int32:\n    inc(a, 0)\n    return counter\ndef inc(x: int32, y: int32) -> int32:\n    counter = counter + x\n    return counter\n")
+    check_eq("global init codegen err", cg_err, 0)
+    # Verify the initialiser byte sits in the data section (LE, slot 0).
+    check_eq("gdata[0]==5 (initialiser)", cast[uint32](gdata[0]), 5)
+    # initialiser 5 + a(10) = 15
+    check_eq("emu init counter 5+10==15", cast[uint32](emu_run(10, 0)), 15)
+
+    # --- (N) global array written in a loop then summed -----------------
+    #   tbl: Array[8, uint32]
+    #   def fillsum(n: int32, k: int32) -> int32:
+    #       i: int32 = 0
+    #       while i < n:
+    #           tbl[i] = i + 1
+    #           i = i + 1
+    #       s: int32 = 0
+    #       j: int32 = 0
+    #       while j < n:
+    #           s = s + tbl[j]
+    #           j = j + 1
+    #       return s
+    # fillsum(n): tbl = 1..n; sum = n*(n+1)/2.
+    build_globals("tbl: Array[8, uint32]\ndef fillsum(n: int32, k: int32) -> int32:\n    i: int32 = 0\n    while i < n:\n        tbl[i] = i + 1\n        i = i + 1\n    s: int32 = 0\n    j: int32 = 0\n    while j < n:\n        s = s + tbl[j]\n        j = j + 1\n    return s\n")
+    check_eq("global array codegen err", cg_err, 0)
+    check_eq("emu fillsum(5)==15", cast[uint32](emu_run(5, 0)), 15)
+    check_eq("emu fillsum(8)==36", cast[uint32](emu_run(8, 0)), 36)
+    # The written values persist in the data section: after fillsum(8),
+    # tbl[0]==1 and tbl[7]==8 (uint32, 4-byte stride) in gdata[].
+    check_eq("gdata tbl[0]==1", cast[uint32](gdata[0]), 1)
+    check_eq("gdata tbl[7]==8", cast[uint32](gdata[28]), 8)
+
+    # --- (O) string literal: bytes interned NUL-terminated in the data
+    # section, indexed back via a string GLOBAL ------------------------
+    #   msg: Array[3, uint8] = "Hi"
+    #   def rd(a: int32, b: int32) -> int32:
+    #       return msg[1]
+    # The literal "Hi" is interned at msg's data slot; msg[1] reads 'i'
+    # (105). We assert BOTH the index opcode form (a RIP-lea appears) and
+    # the raw bytes that landed in gdata[].
+    build_globals("msg: Array[3, uint8] = \"Hi\"\ndef rd(a: int32, b: int32) -> int32:\n    return msg[1]\n")
+    check_eq("string global codegen err", cg_err, 0)
+    check_eq("string global rip-lea emitted", has_rip_lea(), 1)
+    check_eq("emu rd msg[1]=='i'(105)", cast[uint32](emu_run(0, 0)), 105)
+    check_eq("gdata[0]=='H'(72)", cast[uint32](gdata[0]), 72)
+    check_eq("gdata[1]=='i'(105)", cast[uint32](gdata[1]), 105)
+    check_eq("gdata[2]==NUL", cast[uint32](gdata[2]), 0)
+    check_eq("gdata has \"Hi\\0\"", find_hi(), 1)
+
+    # A bare string literal used as an expression yields its address, and
+    # the bytes are interned exactly once (dedup). Build a function that
+    # returns the first byte of a uint8 array initialised from the same
+    # literal twice — both share one data slot.
+    build_globals("a1: Array[3, uint8] = \"Hi\"\na2: Array[3, uint8] = \"Hi\"\ndef rd2(a: int32, b: int32) -> int32:\n    return a1[0] + a2[0]\n")
+    check_eq("dup-string codegen err", cg_err, 0)
+    # Both globals point at the same interned slot => 'H' + 'H' == 144.
+    check_eq("emu rd2 'H'+'H'==144", cast[uint32](emu_run(0, 0)), 144)
+    # Dedup: only one "Hi\0" (3 bytes) in the data section.
+    check_eq("gdata_len==3 (deduped)", gdata_len, 3)
+
     emit("[codegen_selftest] emitted ")
     put_u32(code_len)
     emit(" code bytes; ran ")
@@ -1033,6 +1156,21 @@ def build_all(src: Ptr[uint8]):
     gen_program_all_functions(prog)
 
 
+# Like build_all but ALSO lays out module-level globals + string literals
+# into the data section and resolves RIP-relative data fixups. The first
+# function emitted starts at offset 0 (emu entry point); globals live at
+# DATA_BASE+ in gdata[].
+def build_globals(src: Ptr[uint8]):
+    n: uint32 = cast[uint32](strlen(src))
+    lex_init(src, n)
+    lex_tokenize()
+    parser_init()
+    prog: uint32 = parse_program()
+    check_eq("build_globals parse err", p_err, 0)
+    cg_init()
+    gen_program_with_globals(prog)
+
+
 # Count the length of a sibling chain starting at `head` (0 = empty).
 def chain_len(head: uint32) -> uint32:
     n: uint32 = 0
@@ -1041,3 +1179,27 @@ def chain_len(head: uint32) -> uint32:
         n = n + 1
         cur = nd_next[cur]
     return n
+
+
+# Returns 1 if a RIP-relative leaq (48 8D 05) appears anywhere in the
+# emitted code stream — the byte-level proof that global references go
+# through the data section, not a frame slot.
+def has_rip_lea() -> uint32:
+    i: uint32 = 0
+    while i + 2 < code_len:
+        if cast[uint32](code[i]) == 0x48 and cast[uint32](code[i + 1]) == 0x8D and cast[uint32](code[i + 2]) == 0x05:
+            return 1
+        i = i + 1
+    return 0
+
+
+# Returns 1 if the bytes 'H','i',0 ("Hi\0") appear contiguously in the
+# data section — the proof that the string literal was interned into
+# gdata[] NUL-terminated.
+def find_hi() -> uint32:
+    i: uint32 = 0
+    while i + 2 < gdata_len:
+        if cast[uint32](gdata[i]) == 72 and cast[uint32](gdata[i + 1]) == 105 and cast[uint32](gdata[i + 2]) == 0:
+            return 1
+        i = i + 1
+    return 0

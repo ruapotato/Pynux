@@ -55,10 +55,13 @@ if grep -q "^gen_function:" "$BOOT_S" && \
    grep -q "^gen_expr:" "$BOOT_S" && \
    grep -q "^gen_program_first_function:" "$BOOT_S" && \
    grep -q "^gen_program_all_functions:" "$BOOT_S" && \
+   grep -q "^gen_program_with_globals:" "$BOOT_S" && \
+   grep -q "^layout_globals:" "$BOOT_S" && \
+   grep -q "^intern_string:" "$BOOT_S" && \
    grep -q "^gen_call:" "$BOOT_S" && \
    grep -q "^gen_if:" "$BOOT_S" && \
    grep -q "^gen_while:" "$BOOT_S"; then
-    echo "[selfhost_codegen] OK: codegen.ad assembles — gen_function + gen_expr + gen_program_first_function + gen_program_all_functions + gen_call + gen_if + gen_while symbols present"
+    echo "[selfhost_codegen] OK: codegen.ad assembles — gen_function + gen_expr + gen_program_first_function + gen_program_all_functions + gen_program_with_globals + layout_globals + intern_string + gen_call + gen_if + gen_while symbols present"
 else
     echo "[selfhost_codegen] FAIL: codegen.ad assembly missing expected symbols"
     head -20 "$BOOT_S" || true

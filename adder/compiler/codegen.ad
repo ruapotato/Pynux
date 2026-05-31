@@ -70,6 +70,7 @@ from compiler.parser import (
     ND_UNARY,
     ND_IDENT,
     ND_INT_LIT,
+    ND_STRING_LIT,
     ND_INDEX,
     ND_PARAM,
     ND_CALL,
@@ -170,6 +171,74 @@ fx_name_off: Array[256, uint32]
 fx_name_len: Array[256, uint32]
 fx_count: uint32 = 0
 
+# -----------------------------------------------------------------------
+# Data section: module-level (global) storage + interned string literals.
+#
+# codegen_x86.py keeps globals in named `.data`/`.bss` symbols and string
+# literals in `.rodata`, letting the assembler+linker resolve every
+# reference as RIP-relative (R_X86_64_PC32). Emitting raw bytes ourselves
+# we model BOTH the storage and the relocations:
+#
+#   * gdata[] — a flat byte buffer; every global scalar/array and every
+#     interned string is laid out into it at a stable byte offset.
+#   * The emulated/loaded address space places this data section at a
+#     fixed base DATA_BASE (== CODE_CAP) immediately past the code window,
+#     so an x86_64 RIP-relative `disp32 = DATA_BASE + g_off - rip_field_end`
+#     reaches the global. (On the real device the loader maps code and
+#     this data buffer into one image; DATA_BASE is the data buffer's
+#     virtual offset from the code base.)
+#   * Every global reference is a RIP-relative `lea` of the global's
+#     ADDRESS into %rax; scalars then dereference with the existing sized
+#     mem load/store, arrays compute &g[i] then a sized load/store — the
+#     SAME lowering the local path uses, only the base register changes
+#     from %rbp (frame) to %rip (data). This mirrors codegen_x86's scalar
+#     `leaq name(%rip),%rax ; movq (%rax),%rax` and aggregate
+#     `leaq name(%rip),%rax` decay.
+#   * Because a global may be referenced before its data slot's final
+#     position is fixed (and to keep one uniform resolution path), each
+#     RIP-lea records a data fixup; resolve_data_fixups() patches the
+#     rel32 after all functions are emitted, exactly like resolve_calls().
+# -----------------------------------------------------------------------
+
+GDATA_CAP: uint32 = 8192
+gdata: Array[8192, uint8]
+gdata_len: uint32 = 0
+
+# Data section base address in the emulated/loaded address space. Chosen
+# == CODE_CAP so [0,CODE_CAP) is code and [DATA_BASE, DATA_BASE+gdata_len)
+# is data — a clean, non-overlapping split the emulator can dispatch on.
+DATA_BASE: uint32 = 8192
+
+# Global symbol table: name (strbuf ref) -> data offset, element size and
+# slot byte-width. glob_elem_size is non-zero for an Array global (the
+# per-element width; glob_offset is element 0's address); 0 marks a scalar
+# whose load/store width is glob_scalar_size (1/2/4/8).
+MAX_GLOBALS: uint32 = 128
+glob_name_off: Array[128, uint32]
+glob_name_len: Array[128, uint32]
+glob_offset: Array[128, uint32]        # byte offset into gdata[]
+glob_elem_size: Array[128, uint32]     # 0 = scalar; else Array element width
+glob_scalar_size: Array[128, uint32]   # scalar load/store width (1/2/4/8)
+glob_count: uint32 = 0
+
+# Data-section RIP-relative relocations. Each records the rel32 field's
+# byte offset in code[] plus the target's data offset; resolve writes
+# (DATA_BASE + data_off) - (at + 4).
+MAX_DATA_FIXUPS: uint32 = 512
+df_at: Array[512, uint32]              # rel32 field offset in code[]
+df_data_off: Array[512, uint32]       # target offset into gdata[]
+df_count: uint32 = 0
+
+# Interned string-literal table: identical literals share one data slot,
+# mirroring codegen_x86.add_string's dedup. Each entry records the strbuf
+# source slice (off/len) and the data offset its NUL-terminated bytes were
+# placed at.
+MAX_STRINGS: uint32 = 256
+str_src_off: Array[256, uint32]
+str_src_len: Array[256, uint32]
+str_data_off: Array[256, uint32]
+str_count: uint32 = 0
+
 
 def cg_init():
     code_len = 0
@@ -178,6 +247,10 @@ def cg_init():
     cg_stack_size = 0
     fn_count = 0
     fx_count = 0
+    gdata_len = 0
+    glob_count = 0
+    df_count = 0
+    str_count = 0
 
 
 # Append one byte to the output buffer.
@@ -311,6 +384,112 @@ def resolve_calls():
             # Unknown callee — outside this subset (no extern linkage here).
             cg_err = 1
         i = i + 1
+
+
+# -----------------------------------------------------------------------
+# Data section management.
+# -----------------------------------------------------------------------
+
+# Reserve `n` bytes in gdata[], zero-initialised, returning the byte
+# offset of the reserved block.
+def gdata_reserve(n: uint32) -> uint32:
+    if gdata_len + n > GDATA_CAP:
+        cg_err = 1
+        return 0
+    off: uint32 = gdata_len
+    i: uint32 = 0
+    while i < n:
+        gdata[off + i] = 0
+        i = i + 1
+    gdata_len = gdata_len + n
+    return off
+
+
+# Append one byte to the data section, returning its offset.
+def gdata_emit_b(b: uint32) -> uint32:
+    if gdata_len >= GDATA_CAP:
+        cg_err = 1
+        return 0
+    off: uint32 = gdata_len
+    gdata[off] = cast[uint8](b & 255)
+    gdata_len = gdata_len + 1
+    return off
+
+
+# Register a global scalar (elem_size 0) or array (elem_size 1/2/4/8). The
+# data slot is reserved here. Returns the assigned data offset.
+def glob_define(name_off: uint32, name_len: uint32, data_off: uint32, elem_size: uint32, scalar_size: uint32) -> uint32:
+    if glob_count >= MAX_GLOBALS:
+        cg_err = 1
+        return 0
+    glob_name_off[glob_count] = name_off
+    glob_name_len[glob_count] = name_len
+    glob_offset[glob_count] = data_off
+    glob_elem_size[glob_count] = elem_size
+    glob_scalar_size[glob_count] = scalar_size
+    glob_count = glob_count + 1
+    return data_off
+
+
+# Resolve a name to a global table index. Returns the index+1 (so a 0
+# return means "not a global"); the caller subtracts 1.
+def glob_lookup(name_off: uint32, name_len: uint32) -> uint32:
+    i: uint32 = 0
+    while i < glob_count:
+        if name_match(glob_name_off[i], glob_name_len[i], name_off, name_len) != 0:
+            return i + 1
+        i = i + 1
+    return 0
+
+
+# Record a RIP-relative data relocation at rel32-field offset `at`,
+# targeting the data byte offset `data_off`.
+def add_data_fixup(at: uint32, data_off: uint32):
+    if df_count >= MAX_DATA_FIXUPS:
+        cg_err = 1
+        return
+    df_at[df_count] = at
+    df_data_off[df_count] = data_off
+    df_count = df_count + 1
+
+
+# Patch every recorded data relocation: disp32 = (DATA_BASE + data_off) -
+# (at + 4), the RIP-relative displacement from the instruction's end to
+# the global's address in the laid-out data section.
+def resolve_data_fixups():
+    i: uint32 = 0
+    while i < df_count:
+        target: uint32 = DATA_BASE + df_data_off[i]
+        patch_rel32(df_at[i], target)
+        i = i + 1
+
+
+# Intern a string literal whose bytes live in strbuf[src_off..src_off+len).
+# Returns its data-section offset. Identical literals (same strbuf slice
+# content) collapse to one slot. The bytes are copied into gdata[] and a
+# trailing NUL is appended (matching codegen_x86's `.asciz`).
+def intern_string(src_off: uint32, src_len: uint32) -> uint32:
+    # Dedup against already-interned strings by content equality.
+    i: uint32 = 0
+    while i < str_count:
+        if name_match(str_src_off[i], str_src_len[i], src_off, src_len) != 0:
+            return str_data_off[i]
+        i = i + 1
+    # Place the bytes + NUL into the data section.
+    base: uint32 = gdata_reserve(src_len + 1)
+    j: uint32 = 0
+    while j < src_len:
+        gdata[base + j] = strbuf[src_off + j]
+        j = j + 1
+    gdata[base + src_len] = 0
+    if str_count < MAX_STRINGS:
+        str_src_off[str_count] = src_off
+        str_src_len[str_count] = src_len
+        str_data_off[str_count] = base
+        str_count = str_count + 1
+    else:
+        cg_err = 1
+    return base
 
 
 # -----------------------------------------------------------------------
@@ -507,6 +686,20 @@ def emit_lea_local_rax(off: int32):
     emit_b(0x8D)
     emit_b(0x45)
     emit_b(disp)
+
+
+# leaq <data_off>(%rip), %rax  -> 48 8D 05 <rel32>   (address of a global /
+# string in the data section). The rel32 is a placeholder; a data fixup is
+# recorded against the global's data offset and patched after layout, so it
+# resolves to (DATA_BASE + data_off) - (rip_field_end). Mirrors
+# codegen_x86.py's `leaq name(%rip),%rax`.
+def emit_lea_global_rax(data_off: uint32):
+    emit_b(0x48)
+    emit_b(0x8D)
+    emit_b(0x05)
+    at: uint32 = code_len
+    emit_imm32(cast[uint64](0))
+    add_data_fixup(at, data_off)
 
 
 # Scale %rcx by a power-of-two element size via a shift (matches
@@ -778,9 +971,27 @@ def gen_expr(node: uint32):
         off: int32 = 0
         if lookup_local(nd_name_off[node], nd_name_len[node], &off) != 0:
             emit_load_local_rax(off)
-        else:
-            # Unknown identifier — out of this subset's scope.
-            cg_err = 1
+            return
+        # Global? Scalar globals load their value (leaq + sized deref,
+        # mirroring codegen_x86's `leaq name(%rip),%rax ; movq (%rax),%rax`).
+        # Array globals decay to their address (just the leaq), so callers
+        # that index or take their address get the base.
+        gi: uint32 = glob_lookup(nd_name_off[node], nd_name_len[node])
+        if gi != 0:
+            emit_lea_global_rax(glob_offset[gi - 1])
+            if glob_elem_size[gi - 1] == 0:
+                emit_load_mem_rax(glob_scalar_size[gi - 1])
+            return
+        # Unknown identifier — out of this subset's scope.
+        cg_err = 1
+        return
+
+    if k == ND_STRING_LIT:
+        # Intern the literal's bytes (NUL-terminated, like .asciz in
+        # codegen_x86.gen_rodata) into the data section; the expression
+        # yields the string's address via a RIP-relative leaq.
+        doff: uint32 = intern_string(nd_name_off[node], nd_name_len[node])
+        emit_lea_global_rax(doff)
         return
 
     if k == ND_BINARY:
@@ -916,40 +1127,55 @@ def gen_unary(node: uint32):
 # -----------------------------------------------------------------------
 
 # Element size for an `arr[i]` node: the declared element width of the
-# array local named by nd_a. Returns 1 if unknown (byte default).
+# array local OR array global named by nd_a. Returns 1 if unknown.
 def index_elem_size(node: uint32) -> uint32:
     base: uint32 = nd_a[node]
     if nd_kind[base] != ND_IDENT:
         cg_err = 1
         return 1
     es: uint32 = lookup_elem_size(nd_name_off[base], nd_name_len[base])
-    if es == 0:
-        # Not a known array local — outside this subset.
-        cg_err = 1
-        return 1
-    return es
+    if es != 0:
+        return es
+    # Fall back to a global array.
+    gi: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
+    if gi != 0 and glob_elem_size[gi - 1] != 0:
+        return glob_elem_size[gi - 1]
+    # Not a known array local or global — outside this subset.
+    cg_err = 1
+    return 1
 
 
-# Compute &arr[i] into %rax. Index in nd_b, array identifier in nd_a.
+# Compute &arr[i] into %rax. Index in nd_b, array identifier in nd_a. The
+# base may be a local Array slot (leaq off(%rbp)) or a global Array
+# (leaq data_off(%rip)). Both decay to a base address then add a scaled
+# index, exactly like codegen_x86.gen_index_address.
 def gen_index_addr(node: uint32):
     base: uint32 = nd_a[node]
     if nd_kind[base] != ND_IDENT:
         cg_err = 1
         return
+    # Resolve base + element size from the local table first, then globals.
     es: uint32 = lookup_elem_size(nd_name_off[base], nd_name_len[base])
-    if es == 0:
-        cg_err = 1
-        return
     off: int32 = 0
-    if lookup_local(nd_name_off[base], nd_name_len[base], &off) == 0:
-        cg_err = 1
-        return
+    is_local: uint32 = 0
+    if es != 0 and lookup_local(nd_name_off[base], nd_name_len[base], &off) != 0:
+        is_local = 1
+    if is_local == 0:
+        gi: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
+        if gi == 0 or glob_elem_size[gi - 1] == 0:
+            cg_err = 1
+            return
+        es = glob_elem_size[gi - 1]
     # Evaluate the index into %rax, move to %rcx, scale, then add the base
     # address (computed via leaq). Result address ends up in %rax.
     gen_expr(nd_b[node])
     emit_mov_rax_rcx()
     emit_scale_rcx(es)
-    emit_lea_local_rax(off)
+    if is_local != 0:
+        emit_lea_local_rax(off)
+    else:
+        gi2: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
+        emit_lea_global_rax(glob_offset[gi2 - 1])
     emit_add_rcx_rax()
 
 
@@ -1009,13 +1235,28 @@ def gen_block(head: uint32):
         s = nd_next[s]
 
 
-# Store the value currently in %rax into the slot for `name`, allocating
-# the slot on first assignment (mirrors VarDecl/Assignment to a fresh
-# local). Used by both ND_VAR_DECL and plain ND_ASSIGN to an identifier.
+# Store the value currently in %rax into the slot for `name`. A name that
+# resolves to a known global scalar stores through the data section (leaq
+# its address into %rcx-free path: address into %rax, value spilled), and
+# otherwise stores to a local slot, allocating it on first assignment
+# (mirrors VarDecl/Assignment to a fresh local). Used by ND_VAR_DECL and
+# plain ND_ASSIGN to an identifier.
 def store_to_named(name_off: uint32, name_len: uint32):
     off: int32 = 0
-    if lookup_local(name_off, name_len, &off) == 0:
-        off = alloc_local(name_off, name_len)
+    if lookup_local(name_off, name_len, &off) != 0:
+        emit_store_local_rax(off)
+        return
+    gi: uint32 = glob_lookup(name_off, name_len)
+    if gi != 0 and glob_elem_size[gi - 1] == 0:
+        # Scalar global store: value is in %rax. Move it to %rcx, leaq the
+        # global address into %rax, then a sized store %rcx -> (%rax),
+        # matching the local-array store lowering (and emulator opcodes).
+        emit_mov_rax_rcx()
+        emit_lea_global_rax(glob_offset[gi - 1])
+        emit_store_mem_rcx(glob_scalar_size[gi - 1])
+        return
+    # Not a global — fall back to a (possibly fresh) local slot.
+    off = alloc_local(name_off, name_len)
     emit_store_local_rax(off)
 
 
@@ -1244,7 +1485,11 @@ def gen_while(node: uint32):
 # -----------------------------------------------------------------------
 
 # Ensure a slot exists for `name`; allocate one if not already present.
+# A name that is a known module-level global is NOT given a frame slot —
+# its storage lives in the data section.
 def prescan_name(name_off: uint32, name_len: uint32):
+    if glob_lookup(name_off, name_len) != 0:
+        return
     off: int32 = 0
     if lookup_local(name_off, name_len, &off) == 0:
         alloc_local(name_off, name_len)
@@ -1347,6 +1592,60 @@ def gen_function(fn: uint32) -> uint32:
 # Generate code for the first function found in a parsed program. The
 # program node has its declaration chain on nd_b; we walk to the first
 # ND_FUNCTION and emit it. Returns that function's code start offset.
+# -----------------------------------------------------------------------
+# Module-level (global) variable layout.
+#
+# A top-level ND_VAR_DECL is a global. We reserve a data slot for it and,
+# for a constant initialiser we can resolve at layout time (an int literal
+# for a scalar, or a string literal for a `name: Array[N, uint8] = "..."`
+# global), write the initial bytes straight into gdata[]. Scalars with no
+# initialiser are zeroed (.bss-style). Non-constant initialisers are out
+# of this subset (codegen_x86 emits _init_* runtime fill there).
+# -----------------------------------------------------------------------
+
+# Lay out one module-level ND_VAR_DECL into the data section.
+def layout_global(decl: uint32):
+    tnode: uint32 = nd_a[decl]
+    val: uint32 = nd_b[decl]
+    if tnode != 0 and nd_kind[tnode] == ND_ARRAY_TYPE:
+        es: uint32 = prim_type_size(nd_a[tnode])
+        # String-initialised byte array: place the literal's NUL-terminated
+        # bytes and register the global at that data offset (mirrors
+        # codegen_x86's string-literal global path).
+        if val != 0 and nd_kind[val] == ND_STRING_LIT and es == 1:
+            doff: uint32 = intern_string(nd_name_off[val], nd_name_len[val])
+            glob_define(nd_name_off[decl], nd_name_len[decl], doff, es, 0)
+            return
+        count: uint32 = cast[uint32](nd_num[tnode])
+        bytes_: uint32 = count * es
+        base: uint32 = gdata_reserve(bytes_)
+        glob_define(nd_name_off[decl], nd_name_len[decl], base, es, 0)
+        return
+    # Scalar global. Reserve a slot of the type's width and store a constant
+    # int initialiser if present (little-endian); otherwise leave it zeroed.
+    sz: uint32 = prim_type_size(tnode)
+    base: uint32 = gdata_reserve(sz)
+    glob_define(nd_name_off[decl], nd_name_len[decl], base, 0, sz)
+    if val != 0 and nd_kind[val] == ND_INT_LIT:
+        v: uint64 = nd_num[val]
+        i: uint32 = 0
+        while i < sz:
+            gdata[base + i] = cast[uint8](v & 255)
+            v = v >> 8
+            i = i + 1
+
+
+# Walk the program's declaration chain and lay out every module-level
+# global BEFORE any function is emitted, so global references resolve
+# against a stable data offset.
+def layout_globals(prog: uint32):
+    cur: uint32 = nd_b[prog]
+    while cur != 0:
+        if nd_kind[cur] == ND_VAR_DECL:
+            layout_global(cur)
+        cur = nd_next[cur]
+
+
 def gen_program_first_function(prog: uint32) -> uint32:
     decls: uint32 = nd_b[prog]
     cur: uint32 = decls
@@ -1378,4 +1677,31 @@ def gen_program_all_functions(prog: uint32) -> uint32:
         cg_err = 1
         return 0
     resolve_calls()
+    return first
+
+
+# Full-program entry point WITH module-level globals + string literals.
+# Lays out every global into the data section first (so references resolve
+# against stable offsets), emits every function back-to-back, then resolves
+# both inter-function call fixups and RIP-relative data fixups. Returns the
+# first function's code start offset. This is the entry point a real
+# self-hosting build (lexer/parser holding state in globals) needs.
+def gen_program_with_globals(prog: uint32) -> uint32:
+    layout_globals(prog)
+    decls: uint32 = nd_b[prog]
+    cur: uint32 = decls
+    first: uint32 = 0
+    seen: uint32 = 0
+    while cur != 0:
+        if nd_kind[cur] == ND_FUNCTION:
+            off: uint32 = gen_function(cur)
+            if seen == 0:
+                first = off
+                seen = 1
+        cur = nd_next[cur]
+    if seen == 0:
+        cg_err = 1
+        return 0
+    resolve_calls()
+    resolve_data_fixups()
     return first
