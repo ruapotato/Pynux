@@ -62,12 +62,15 @@ from compiler.parser import (
     nd_b,
     nd_c,
     nd_d,
+    nd_num,
     nd_next,
     ND_FUNCTION,
     ND_RETURN,
     ND_BINARY,
+    ND_UNARY,
     ND_IDENT,
     ND_INT_LIT,
+    ND_INDEX,
     ND_PARAM,
     ND_CALL,
     ND_IF,
@@ -76,15 +79,30 @@ from compiler.parser import (
     ND_VAR_DECL,
     ND_ASSIGN,
     ND_EXPR_STMT,
+    ND_ARRAY_TYPE,
+    ND_TYPE,
     BINOP_ADD,
     BINOP_SUB,
     BINOP_MUL,
+    BINOP_DIV,
+    BINOP_IDIV,
+    BINOP_MOD,
     BINOP_EQ,
     BINOP_NEQ,
     BINOP_LT,
     BINOP_LTE,
     BINOP_GT,
     BINOP_GTE,
+    BINOP_AND,
+    BINOP_OR,
+    BINOP_BIT_OR,
+    BINOP_BIT_AND,
+    BINOP_BIT_XOR,
+    BINOP_SHL,
+    BINOP_SHR,
+    UNOP_NEG,
+    UNOP_NOT,
+    UNOP_BIT_NOT,
     AUGOP_NONE,
     AUGOP_ADD,
     AUGOP_SUB,
@@ -119,7 +137,12 @@ MAX_LOCALS: uint32 = 64
 
 loc_name_off: Array[64, uint32]
 loc_name_len: Array[64, uint32]
-loc_offset: Array[64, int32]      # negative %rbp-relative byte offset
+loc_offset: Array[64, int32]      # negative %rbp-relative byte offset (BASE)
+# Per-local element size: 0 means a plain 8-byte scalar slot; a non-zero
+# value (1/2/4/8) marks an Array local whose elements are that many bytes
+# wide. loc_offset is then the address of element 0 (the lowest address of
+# the reserved block); arr[i] lives at rbp + loc_offset + i*elem_size.
+loc_elem_size: Array[64, uint32]
 loc_count: uint32 = 0
 cg_stack_size: uint32 = 0
 
@@ -197,8 +220,44 @@ def alloc_local(name_off: uint32, name_len: uint32) -> int32:
     loc_name_off[loc_count] = name_off
     loc_name_len[loc_count] = name_len
     loc_offset[loc_count] = off
+    loc_elem_size[loc_count] = 0
     loc_count = loc_count + 1
     return off
+
+
+# Allocate an Array local of `count` elements, each `elem_size` bytes,
+# 8-byte-rounded so subsequent scalar slots stay 8-aligned (mirrors
+# alloc_local(size=...) in codegen_x86.py). Returns the BASE offset (the
+# address of element 0 = the lowest reserved address). disp8 addressing
+# limits the reachable frame to -128; overflow sets cg_err.
+def alloc_array_local(name_off: uint32, name_len: uint32, count: uint32, elem_size: uint32) -> int32:
+    if loc_count >= MAX_LOCALS:
+        cg_err = 1
+        return 0
+    bytes_: uint32 = count * elem_size
+    bytes_ = (bytes_ + 7) & cast[uint32](0xFFFFFFF8)
+    cg_stack_size = cg_stack_size + bytes_
+    off: int32 = 0 - cast[int32](cg_stack_size)
+    if off < (0 - 128):
+        # Beyond disp8 reach — this subset only emits disp8 frame access.
+        cg_err = 1
+    loc_name_off[loc_count] = name_off
+    loc_name_len[loc_count] = name_len
+    loc_offset[loc_count] = off
+    loc_elem_size[loc_count] = elem_size
+    loc_count = loc_count + 1
+    return off
+
+
+# Look up an identifier's array element size: returns the element size for
+# an Array local, or 0 for a scalar / unknown name.
+def lookup_elem_size(name_off: uint32, name_len: uint32) -> uint32:
+    i: uint32 = 0
+    while i < loc_count:
+        if name_match(loc_name_off[i], loc_name_len[i], name_off, name_len) != 0:
+            return loc_elem_size[i]
+        i = i + 1
+    return 0
 
 
 # Resolve an identifier name to its frame offset. Returns 1 on hit and
@@ -342,6 +401,185 @@ def emit_imul_rcx_rax():
     emit_b(0xC1)
 
 
+# andq %rcx, %rax  -> 48 21 C8
+def emit_and_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x21)
+    emit_b(0xC8)
+
+
+# orq %rcx, %rax  -> 48 09 C8
+def emit_or_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x09)
+    emit_b(0xC8)
+
+
+# xorq %rcx, %rax  -> 48 31 C8
+def emit_xor_rcx_rax():
+    emit_b(0x48)
+    emit_b(0x31)
+    emit_b(0xC8)
+
+
+# shlq %cl, %rax  -> 48 D3 E0   (shift count in %cl)
+def emit_shl_cl_rax():
+    emit_b(0x48)
+    emit_b(0xD3)
+    emit_b(0xE0)
+
+
+# shrq %cl, %rax  -> 48 D3 E8   (logical right shift; unsigned default,
+# matching gen_binary's all-unknown-type rule in codegen_x86.py)
+def emit_shr_cl_rax():
+    emit_b(0x48)
+    emit_b(0xD3)
+    emit_b(0xE8)
+
+
+# Unsigned 64/64 division: xorq %rdx,%rdx ; divq %rcx. Quotient -> %rax,
+# remainder -> %rdx. Mirrors gen_binary's unsigned DIV/MOD path (the
+# default when no operand type is statically known-signed, which is the
+# case for this type-erased subset).
+# xorq %rdx, %rdx  -> 48 31 D2
+def emit_xor_rdx_rdx():
+    emit_b(0x48)
+    emit_b(0x31)
+    emit_b(0xD2)
+
+
+# divq %rcx  -> 48 F7 F1
+def emit_div_rcx():
+    emit_b(0x48)
+    emit_b(0xF7)
+    emit_b(0xF1)
+
+
+# movq %rdx, %rax  -> 48 89 D0   (move remainder into %rax for MOD)
+def emit_mov_rdx_rax():
+    emit_b(0x48)
+    emit_b(0x89)
+    emit_b(0xD0)
+
+
+# movq %rax, %rcx  -> 48 89 C1
+def emit_mov_rax_rcx():
+    emit_b(0x48)
+    emit_b(0x89)
+    emit_b(0xC1)
+
+
+# negq %rax  -> 48 F7 D8
+def emit_neg_rax():
+    emit_b(0x48)
+    emit_b(0xF7)
+    emit_b(0xD8)
+
+
+# notq %rax  -> 48 F7 D0
+def emit_not_rax():
+    emit_b(0x48)
+    emit_b(0xF7)
+    emit_b(0xD0)
+
+
+# setz %al  -> 0F 94 C0  (alias of sete; used by logical NOT)
+# setne %al -> 0F 95 C0
+# setne %cl -> 0F 95 C1
+def emit_setne_cl():
+    emit_b(0x0F)
+    emit_b(0x95)
+    emit_b(0xC1)
+
+
+# movzbq %cl, %rcx  -> 48 0F B6 C9  (bool-ify %rcx for logical and/or)
+def emit_movzx_cl_rcx():
+    emit_b(0x48)
+    emit_b(0x0F)
+    emit_b(0xB6)
+    emit_b(0xC9)
+
+
+# leaq disp8(%rbp), %rax  -> 48 8D 45 <disp8>   (address of a frame slot)
+def emit_lea_local_rax(off: int32):
+    disp: uint32 = cast[uint32](off) & 255
+    emit_b(0x48)
+    emit_b(0x8D)
+    emit_b(0x45)
+    emit_b(disp)
+
+
+# Scale %rcx by a power-of-two element size via a shift (matches
+# codegen_x86._emit_scale_reg's 1/2/4/8 cases). elem_size==1 is a no-op.
+#   shlq $1, %rcx -> 48 D1 E1   (size 2)
+#   shlq $2, %rcx -> 48 C1 E1 02 (size 4)
+#   shlq $3, %rcx -> 48 C1 E1 03 (size 8)
+def emit_scale_rcx(elem_size: uint32):
+    if elem_size == 2:
+        emit_b(0x48)
+        emit_b(0xD1)
+        emit_b(0xE1)
+    elif elem_size == 4:
+        emit_b(0x48)
+        emit_b(0xC1)
+        emit_b(0xE1)
+        emit_b(0x02)
+    elif elem_size == 8:
+        emit_b(0x48)
+        emit_b(0xC1)
+        emit_b(0xE1)
+        emit_b(0x03)
+    # elem_size == 1: identity, no shift.
+
+
+# Sized load from (%rax) into %rax (zero-extending), mirroring
+# emit_load_sized in codegen_x86.py.
+#   movzbq (%rax),%rax -> 48 0F B6 00   (size 1)
+#   movzwq (%rax),%rax -> 48 0F B7 00   (size 2)
+#   movl   (%rax),%eax -> 8B 00         (size 4, auto-zero-extend)
+#   movq   (%rax),%rax -> 48 8B 00      (size 8)
+def emit_load_mem_rax(size: uint32):
+    if size == 1:
+        emit_b(0x48)
+        emit_b(0x0F)
+        emit_b(0xB6)
+        emit_b(0x00)
+    elif size == 2:
+        emit_b(0x48)
+        emit_b(0x0F)
+        emit_b(0xB7)
+        emit_b(0x00)
+    elif size == 4:
+        emit_b(0x8B)
+        emit_b(0x00)
+    else:
+        emit_b(0x48)
+        emit_b(0x8B)
+        emit_b(0x00)
+
+
+# Sized store of %rcx into (%rax), mirroring emit_store_sized.
+#   movb %cl,(%rax)  -> 88 08    (size 1)
+#   movw %cx,(%rax)  -> 66 89 08 (size 2)
+#   movl %ecx,(%rax) -> 89 08    (size 4)
+#   movq %rcx,(%rax) -> 48 89 08 (size 8)
+def emit_store_mem_rcx(size: uint32):
+    if size == 1:
+        emit_b(0x88)
+        emit_b(0x08)
+    elif size == 2:
+        emit_b(0x66)
+        emit_b(0x89)
+        emit_b(0x08)
+    elif size == 4:
+        emit_b(0x89)
+        emit_b(0x08)
+    else:
+        emit_b(0x48)
+        emit_b(0x89)
+        emit_b(0x08)
+
+
 # movq <arg-reg>, disp8(%rbp)   spill a parameter into its slot.
 #   movq %rdi, off(%rbp) -> 48 89 7D <disp8>
 #   movq %rsi, off(%rbp) -> 48 89 75 <disp8>
@@ -441,6 +679,13 @@ def emit_test_rax_rax():
     emit_b(0x48)
     emit_b(0x85)
     emit_b(0xC0)
+
+
+# testq %rcx, %rcx  -> 48 85 C9
+def emit_test_rcx_rcx():
+    emit_b(0x48)
+    emit_b(0x85)
+    emit_b(0xC9)
 
 
 # -----------------------------------------------------------------------
@@ -552,6 +797,27 @@ def gen_expr(node: uint32):
             emit_sub_rcx_rax()
         elif op == BINOP_MUL:
             emit_imul_rcx_rax()
+        elif op == BINOP_BIT_AND:
+            emit_and_rcx_rax()
+        elif op == BINOP_BIT_OR:
+            emit_or_rcx_rax()
+        elif op == BINOP_BIT_XOR:
+            emit_xor_rcx_rax()
+        elif op == BINOP_SHL:
+            # Shift count must sit in %cl; %rcx already holds the right operand.
+            emit_shl_cl_rax()
+        elif op == BINOP_SHR:
+            emit_shr_cl_rax()
+        elif op == BINOP_DIV:
+            emit_xor_rdx_rdx()
+            emit_div_rcx()
+        elif op == BINOP_IDIV:
+            emit_xor_rdx_rdx()
+            emit_div_rcx()
+        elif op == BINOP_MOD:
+            emit_xor_rdx_rdx()
+            emit_div_rcx()
+            emit_mov_rdx_rax()
         elif op == BINOP_EQ:
             emit_cmp_rcx_rax()
             emit_setcc_al(0x94)
@@ -576,8 +842,39 @@ def gen_expr(node: uint32):
             emit_cmp_rcx_rax()
             emit_setcc_al(0x9D)
             emit_movzx_al_rax()
+        elif op == BINOP_AND:
+            # Logical AND: bool-ify both operands then bitwise-and the 0/1s,
+            # exactly mirroring codegen_x86.gen_binary's AND/OR fold. After
+            # the pop, %rax = left, %rcx = right.
+            emit_test_rax_rax()
+            emit_setcc_al(0x95)        # setne %al
+            emit_movzx_al_rax()
+            emit_test_rcx_rcx()
+            emit_setne_cl()
+            emit_movzx_cl_rcx()
+            emit_and_rcx_rax()
+        elif op == BINOP_OR:
+            emit_test_rax_rax()
+            emit_setcc_al(0x95)        # setne %al
+            emit_movzx_al_rax()
+            emit_test_rcx_rcx()
+            emit_setne_cl()
+            emit_movzx_cl_rcx()
+            emit_or_rcx_rax()
         else:
             cg_err = 1
+        return
+
+    if k == ND_UNARY:
+        gen_unary(node)
+        return
+
+    if k == ND_INDEX:
+        # arr[i] value load: compute element address into %rax, then a
+        # sized load. Element size is the array local's declared width.
+        gen_index_addr(node)
+        es: uint32 = index_elem_size(node)
+        emit_load_mem_rax(es)
         return
 
     if k == ND_CALL:
@@ -586,6 +883,74 @@ def gen_expr(node: uint32):
 
     # Anything else is outside this milestone's subset.
     cg_err = 1
+
+
+# -----------------------------------------------------------------------
+# Unary operators (mirrors codegen_x86.gen_unary, integer subset): NEG,
+# BIT_NOT, NOT. Evaluate the operand into %rax, then apply in place.
+# (DEREF / ADDR are not in this subset.)
+# -----------------------------------------------------------------------
+
+def gen_unary(node: uint32):
+    op: uint32 = nd_aux[node]
+    gen_expr(nd_a[node])
+    if op == UNOP_NEG:
+        emit_neg_rax()
+    elif op == UNOP_BIT_NOT:
+        emit_not_rax()
+    elif op == UNOP_NOT:
+        # not x  ==  (x == 0) ? 1 : 0
+        emit_test_rax_rax()
+        emit_setcc_al(0x94)        # setz/sete %al
+        emit_movzx_al_rax()
+    else:
+        cg_err = 1
+
+
+# -----------------------------------------------------------------------
+# Array indexing (local Array slots). Mirrors codegen_x86.gen_index_address:
+# evaluate the index, scale it by the element size, add the array's base
+# address. The base is an Array local, so its "value" is its slot address
+# (a leaq), exactly how codegen_x86 decays an array-typed identifier.
+# Only bare-identifier array bases are in this subset.
+# -----------------------------------------------------------------------
+
+# Element size for an `arr[i]` node: the declared element width of the
+# array local named by nd_a. Returns 1 if unknown (byte default).
+def index_elem_size(node: uint32) -> uint32:
+    base: uint32 = nd_a[node]
+    if nd_kind[base] != ND_IDENT:
+        cg_err = 1
+        return 1
+    es: uint32 = lookup_elem_size(nd_name_off[base], nd_name_len[base])
+    if es == 0:
+        # Not a known array local — outside this subset.
+        cg_err = 1
+        return 1
+    return es
+
+
+# Compute &arr[i] into %rax. Index in nd_b, array identifier in nd_a.
+def gen_index_addr(node: uint32):
+    base: uint32 = nd_a[node]
+    if nd_kind[base] != ND_IDENT:
+        cg_err = 1
+        return
+    es: uint32 = lookup_elem_size(nd_name_off[base], nd_name_len[base])
+    if es == 0:
+        cg_err = 1
+        return
+    off: int32 = 0
+    if lookup_local(nd_name_off[base], nd_name_len[base], &off) == 0:
+        cg_err = 1
+        return
+    # Evaluate the index into %rax, move to %rcx, scale, then add the base
+    # address (computed via leaq). Result address ends up in %rax.
+    gen_expr(nd_b[node])
+    emit_mov_rax_rcx()
+    emit_scale_rcx(es)
+    emit_lea_local_rax(off)
+    emit_add_rcx_rax()
 
 
 # -----------------------------------------------------------------------
@@ -654,6 +1019,40 @@ def store_to_named(name_off: uint32, name_len: uint32):
     emit_store_local_rax(off)
 
 
+# Byte width of a primitive ND_TYPE node (nd_aux holds the type_keyword
+# code from parser.type_keyword_code): int8/uint8/char/bool=1, *16=2,
+# *32/int/float=4, *64=8. Returns 8 for anything else (pointer-ish).
+def prim_type_size(tnode: uint32) -> uint32:
+    if tnode == 0:
+        return 8
+    if nd_kind[tnode] != ND_TYPE:
+        return 8
+    code: uint32 = nd_aux[tnode]
+    if code == 2 or code == 6 or code == 12 or code == 13:
+        return 1
+    if code == 3 or code == 7:
+        return 2
+    if code == 4 or code == 8 or code == 10:
+        return 4
+    if code == 5 or code == 9 or code == 11:
+        return 8
+    return 8
+
+
+# Reserve a slot for a var-decl name, honouring an Array type. Returns 1 if
+# it allocated (or already present), leaving any error in cg_err.
+def declare_local(name_off: uint32, name_len: uint32, tnode: uint32):
+    off: int32 = 0
+    if lookup_local(name_off, name_len, &off) != 0:
+        return
+    if tnode != 0 and nd_kind[tnode] == ND_ARRAY_TYPE:
+        count: uint32 = cast[uint32](nd_num[tnode])
+        es: uint32 = prim_type_size(nd_a[tnode])
+        alloc_array_local(name_off, name_len, count, es)
+    else:
+        alloc_local(name_off, name_len)
+
+
 def gen_stmt(node: uint32):
     if node == 0:
         return
@@ -670,23 +1069,30 @@ def gen_stmt(node: uint32):
         return
 
     if k == ND_VAR_DECL:
-        # name = nd_name_off/len, a = type (ignored — slots are 8 bytes),
-        # b = optional initialiser value.
+        # name = nd_name_off/len, a = type, b = optional initialiser value.
+        # The prescan already reserved the slot (scalar or Array). An Array
+        # decl never carries a scalar initialiser in this subset; a scalar
+        # decl with an initialiser stores it into the slot.
+        tnode: uint32 = nd_a[node]
+        if tnode != 0 and nd_kind[tnode] == ND_ARRAY_TYPE:
+            # Array slot already reserved; no initialiser store.
+            declare_local(nd_name_off[node], nd_name_len[node], tnode)
+            return
         val: uint32 = nd_b[node]
         if val != 0:
             gen_expr(val)
             store_to_named(nd_name_off[node], nd_name_len[node])
         else:
-            # Reserve the slot so later loads/stores resolve.
-            off: int32 = 0
-            if lookup_local(nd_name_off[node], nd_name_len[node], &off) == 0:
-                alloc_local(nd_name_off[node], nd_name_len[node])
+            declare_local(nd_name_off[node], nd_name_len[node], tnode)
         return
 
     if k == ND_ASSIGN:
         tgt: uint32 = nd_a[node]
+        if nd_kind[tgt] == ND_INDEX:
+            gen_assign_index(node)
+            return
         if nd_kind[tgt] != ND_IDENT:
-            # Only identifier targets are in scope.
+            # Only identifier / index targets are in scope.
             cg_err = 1
             return
         aug: uint32 = nd_aux[node]
@@ -723,6 +1129,58 @@ def gen_stmt(node: uint32):
 
     # Other statement kinds not covered by this subset.
     cg_err = 1
+
+
+# Assign to an array element: `arr[i] = v` (and augmented `arr[i] OP= v`).
+# Strategy (matches codegen_x86.gen_assignment's indexed-target path):
+#   evaluate the RHS value, push it; compute &arr[i] into %rax, push it;
+#   pop address into %rcx-ish... — but our stack-machine only has %rax/%rcx,
+#   so we marshal carefully:
+#     1. eval value -> %rax ; push                       (value on stack)
+#     2. compute &arr[i] -> %rax ; push                  (addr on stack)
+#     3. (augmented only) reload value, load *addr, combine)
+#   Then pop addr into a scratch, pop value into %rcx, store %rcx -> (addr).
+# We keep it simple by computing the address LAST and storing immediately.
+def gen_assign_index(node: uint32):
+    tgt: uint32 = nd_a[node]            # ND_INDEX
+    es: uint32 = index_elem_size(tgt)
+    aug: uint32 = nd_aux[node]
+
+    if aug == AUGOP_NONE:
+        # Plain store. Evaluate value, push; compute address; pop value into
+        # %rcx; store %rcx -> (%rax).
+        gen_expr(nd_b[node])
+        emit_push_rax()
+        gen_index_addr(tgt)            # &arr[i] -> %rax
+        emit_pop_rcx()                 # value -> %rcx
+        emit_store_mem_rcx(es)
+        return
+
+    # Augmented `arr[i] OP= v`: new = (load arr[i]) OP v.
+    #   eval v -> %rax ; push                 [v]
+    #   load arr[i] -> %rax                   (old)
+    #   pop %rcx (=v) ; apply OP -> %rax      (new value)
+    #   push new -> stack                     [new]
+    #   compute &arr[i] -> %rax
+    #   pop new into %rcx ; store %rcx -> (%rax)
+    gen_expr(nd_b[node])
+    emit_push_rax()
+    gen_index_addr(tgt)               # &arr[i]
+    emit_load_mem_rax(es)            # old value -> %rax
+    emit_pop_rcx()                    # v -> %rcx
+    if aug == AUGOP_ADD:
+        emit_add_rcx_rax()
+    elif aug == AUGOP_SUB:
+        emit_sub_rcx_rax()
+    elif aug == AUGOP_MUL:
+        emit_imul_rcx_rax()
+    else:
+        cg_err = 1
+        return
+    emit_push_rax()                  # new value
+    gen_index_addr(tgt)              # &arr[i] again
+    emit_pop_rcx()                   # new -> %rcx
+    emit_store_mem_rcx(es)
 
 
 # if / elif* / else  (mirrors codegen_x86.gen_if). The parser stores the
@@ -797,11 +1255,12 @@ def prescan_block(head: uint32):
     while s != 0:
         k: uint32 = nd_kind[s]
         if k == ND_VAR_DECL:
-            prescan_name(nd_name_off[s], nd_name_len[s])
+            declare_local(nd_name_off[s], nd_name_len[s], nd_a[s])
         elif k == ND_ASSIGN:
             tgt: uint32 = nd_a[s]
             if nd_kind[tgt] == ND_IDENT:
                 prescan_name(nd_name_off[tgt], nd_name_len[tgt])
+            # ND_INDEX targets address an already-declared array; no slot.
         elif k == ND_IF:
             prescan_block(nd_b[s])
             e: uint32 = nd_c[s]
