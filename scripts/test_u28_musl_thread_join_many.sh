@@ -9,6 +9,7 @@
 # final "U28: jcounter=4 (expect 4)".
 
 . "$(dirname "$0")/_build_lock.sh"
+. "$(dirname "$0")/_qemu_drive.sh"
 . "$(dirname "$0")/_ensure_ubin.sh"
 
 set -euo pipefail
@@ -41,23 +42,15 @@ echo "[test_u28_musl_thread_join_many] (4/4) Boot QEMU + run binary"
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; INIT_ELF=build/user/init.elf python3 scripts/build_initramfs.py >/dev/null' EXIT
 
+# Prompt-aware drive: wait for hamsh's ready banner before sending
+# input. A fixed `sleep 3` races boot-time variance and drops the
+# command onto the 16550 RX FIFO before hamsh's readline is armed —
+# the binary then never runs (see _qemu_drive.sh).
 set +e
-(
-    sleep 3
-    printf 'u_musl_thread_join_many\n'
-    sleep 15
-    printf 'exit\n'
-    sleep 1
-) | timeout 50s qemu-system-x86_64 \
-    -kernel "$ELF" \
-    -smp 2 \
-    -nographic \
-    -no-reboot \
-    -m 256M \
-    -monitor none \
-    -serial stdio \
-    > "$LOG" 2>&1
-rc=$?
+qemu_drive "$LOG" "$ELF" "[hamsh] M16.35 shell ready" 50 \
+    -- "u_musl_thread_join_many" 15 \
+       "exit" 1
+rc="$QEMU_DRIVE_RC"
 set -e
 
 echo "[test_u28_musl_thread_join_many] --- captured output ---"
