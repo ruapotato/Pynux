@@ -1725,6 +1725,19 @@ def _xhci_v1_bringup() -> int32:
     _xhci_w32(ir0 + XHCI_IR_ERSTBA + 4,
               cast[uint32]((xhci.erst >> 32) & 0xFFFFFFFF))
 
+    # Enable interrupter #0 (IMAN.IE=1) and clear any latched IP. On real
+    # Intel silicon the xHC only re-latches the Event Ring Dequeue Pointer
+    # from our ERDP writes through the EHB (Event Handler Busy) machinery,
+    # which is armed by an ENABLED interrupter. With IE=0 the controller's
+    # cached Dequeue stays at base, so after one full 256-entry Event Ring
+    # lap it declares "Event Ring Full" and stops posting (NUC photo #37/#38:
+    # exactly 255 events, evt_deq=255, iman=1). QEMU never enforces this, so
+    # the VM path is unaffected. We POLL the Event Ring (no ISR); this is
+    # safe because the CPU runs this bring-up with IF=0 (interrupts masked,
+    # trap-diag flags=0x10002), so the asserted INTx is never delivered —
+    # only the controller's internal EHB latch is what we're after.
+    _xhci_w32(ir0 + XHCI_IR_IMAN, XHCI_IMAN_IE | XHCI_IMAN_IP)
+
     # Start the controller (RS=1). At this point the controller will
     # begin consuming TRBs from the Command Ring as the doorbell fires.
     cmd: uint32 = _xhci_r32(xhci.op_base + XHCI_OP_USBCMD)
@@ -2534,6 +2547,9 @@ def xhci_bulk_diag_report():
     # USB writes. No-op if no bulk failure was ever recorded.
     if xhci.bulk_diag_done == 0:
         return
+    # Image-identity marker so a NUC photo unambiguously tells us which
+    # build booted (each reflash is expensive). Bump on every diag/fix ship.
+    printk0("[xhci-bulk] (late) diag-rev=4 IMAN.IE=on\n")
     printk2("[xhci-bulk] (late) expect_trb=%p evt_seen=%d\n",
             xhci.diag_expect_trb, cast[uint64](xhci.diag_evt_seen))
     printk2("[xhci-bulk] (late) last_evt_p=%p db=%p\n",
