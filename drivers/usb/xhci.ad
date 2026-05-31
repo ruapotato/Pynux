@@ -796,6 +796,45 @@ def _xhci_pci_read_bar0_64(bdf: uint32) -> uint64:
     return base
 
 
+def _xhci_intel_force_usb2(bdf: uint32):
+    # Force the boot stick to enumerate at USB2 High-Speed on its USB2
+    # companion port instead of SuperSpeed. Intel xHCI exposes four
+    # vendor PCI-config port-routing registers (per the Intel 7/8/9-series
+    # PCH and NUC datasheets, also driven by Linux's xhci-pci quirk):
+    #   0xD0 XUSB2PR   USB 2.0 Port Routing   (1=route to this xHC)
+    #   0xD4 XUSB2PRM  USB 2.0 Port Routing Mask (RO: routable ports)
+    #   0xD8 USB3_PSSEN USB 3.0 SuperSpeed Enable (1=SS enabled)
+    #   0xDC USB3PRM   USB 3.0 Port Routing Mask (RO: SS-capable ports)
+    # Setting XUSB2PR=XUSB2PRM routes every USB2-capable companion port to
+    # us; clearing USB3_PSSEN disables SuperSpeed training so a plugged
+    # SS device falls back to High-Speed on its USB2 companion. This dodges
+    # the SuperSpeed-specific bulk-OUT flow-control wedge (real-Intel NUC:
+    # the SS device never completes the bulk CBW on the wire; the endpoint
+    # stays Running/Stopped, never Halts). Intel-only (vendor 0x8086) so
+    # qemu-xhci (Red Hat vendor 0x1b36) and other controllers are untouched.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    ident: uint32 = pci_config_read_dword(bus, dev, fn, 0x00)
+    vendor: uint32 = ident & 0xFFFF
+    if vendor != 0x8086:
+        printk1("[xhci] force-usb2: skip (vendor=%x not Intel)\n",
+                cast[uint64](vendor))
+        return
+    xusb2prm: uint32 = pci_config_read_dword(bus, dev, fn, 0xD4)
+    usb3prm:  uint32 = pci_config_read_dword(bus, dev, fn, 0xDC)
+    # Route all USB2-capable ports to this xHC.
+    pci_config_write_dword(bus, dev, fn, 0xD0, xusb2prm)
+    # Disable SuperSpeed on all USB3-capable ports -> HS fallback.
+    pci_config_write_dword(bus, dev, fn, 0xD8, 0)
+    xusb2pr_rb: uint32 = pci_config_read_dword(bus, dev, fn, 0xD0)
+    pssen_rb:   uint32 = pci_config_read_dword(bus, dev, fn, 0xD8)
+    printk2("[xhci] force-usb2: XUSB2PR=%x (mask=%x)\n",
+            cast[uint64](xusb2pr_rb), cast[uint64](xusb2prm))
+    printk2("[xhci] force-usb2: USB3_PSSEN=%x (mask=%x)\n",
+            cast[uint64](pssen_rb), cast[uint64](usb3prm))
+
+
 # --- Speed helpers -------------------------------------------------
 
 def _xhci_speed_str(speed: uint32) -> Ptr[char]:
@@ -1299,6 +1338,12 @@ def xhci_init_ex(force_bare_metal: int32) -> int32:
 
     printk0("[boot:01.b] xhci pci enable + bar0 read\n")
     _xhci_pci_enable_mem_and_master(bdf)
+
+    # diag-rev=13: force USB2 High-Speed enumeration on Intel silicon so the
+    # boot stick uses its USB2 companion port, dodging the SuperSpeed-only
+    # bulk-OUT wedge isolated across photos #46/#47 (host side fully healthy;
+    # the SS device never completes the bulk CBW on the wire).
+    _xhci_intel_force_usb2(bdf)
 
     bar0: uint64 = _xhci_pci_read_bar0_64(bdf)
     if bar0 == 0:
@@ -2702,7 +2747,7 @@ def xhci_bulk_diag_report():
         return
     # Image-identity marker so a NUC photo unambiguously tells us which
     # build booted (each reflash is expensive). Bump on every diag/fix ship.
-    printk0("[xhci-bulk] (late) diag-rev=12 recov-cascade\n")
+    printk0("[xhci-bulk] (late) diag-rev=13 force-usb2\n")
     printk2("[xhci-bulk] (late) expect_trb=%p evt_seen=%d\n",
             xhci.diag_expect_trb, cast[uint64](xhci.diag_evt_seen))
     printk2("[xhci-bulk] (late) last_evt_p=%p db=%p\n",
