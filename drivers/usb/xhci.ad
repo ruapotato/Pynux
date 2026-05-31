@@ -297,6 +297,21 @@ EP_TYPE_INT_IN:    uint32 = 7
 RING_TRBS:     uint32 = 256
 RING_USABLE:   uint32 = 255
 
+# Event Ring is sized independently of the command/transfer rings.
+# Real Intel xHC silicon parks at "Event Ring Full" after one full lap
+# when its INTERNAL cached dequeue pointer never advances past base —
+# our runtime ERDP register writes land (readback proves it) but the
+# controller refuses to consume them (NUC photos #37..#42: fills 0..254,
+# stops at index 254, never writes 255). A 256-entry ring therefore
+# wedges after exactly 255 events. Boot-time USB I/O is FINITE, so a
+# spec-max 4096-entry Event Ring (the ERST RingSegmentSize ceiling,
+# xHCI §6.5) buys ~16× the headroom: enough to complete the whole
+# USB-MSC boot read path before the ring could fill. 4096 × 16 = 64 KiB
+# = order-4 pages. QEMU is unaffected (it consumes ERDP immediately).
+EVT_RING_TRBS:  uint32 = 4096
+EVT_RING_ORDER: uint32 = 4
+EVT_RING_BYTES: uint64 = 65536
+
 
 # --- Driver state -------------------------------------------------
 #
@@ -327,7 +342,7 @@ class XhciState:
     # lazily when a device gets a slot ID.
     dcbaa:        uint64      # Device Context Base Array (4 KiB)
     cmd_ring:     uint64      # Command Ring (4 KiB, 256 × 16B)
-    event_ring:   uint64      # Event Ring segment (4 KiB, 256 × 16B)
+    event_ring:   uint64      # Event Ring segment (64 KiB, 4096 × 16B)
     erst:         uint64      # Event Ring Segment Table (1 entry × 16B)
 
     # Producer/consumer indices for the command + event ring. Cycle
@@ -1360,13 +1375,13 @@ def xhci_init_ex(force_bare_metal: int32) -> int32:
     # in mm.page_alloc surfaces here loudly, not silently at V1.
     dcbaa: uint64 = alloc_pages(0)
     cmdr:  uint64 = alloc_pages(0)
-    evtr:  uint64 = alloc_pages(0)
+    evtr:  uint64 = alloc_pages(EVT_RING_ORDER)
     if dcbaa == 0 or cmdr == 0 or evtr == 0:
         printk0("[xhci] scratch page allocation failed\n")
         return -1
     memset(cast[Ptr[uint8]](dcbaa), 0, 4096)
     memset(cast[Ptr[uint8]](cmdr),  0, 4096)
-    memset(cast[Ptr[uint8]](evtr),  0, 4096)
+    memset(cast[Ptr[uint8]](evtr),  0, EVT_RING_BYTES)
     xhci.dcbaa      = dcbaa
     xhci.cmd_ring   = cmdr
     xhci.event_ring = evtr
@@ -1593,7 +1608,7 @@ def _xhci_evt_advance():
     # TRB per xHCI §4.9.4; it's a single segment, wraps at segment
     # length per the ERST entry's RingSegmentSize field).
     xhci.evt_dequeue = xhci.evt_dequeue + 1
-    if xhci.evt_dequeue >= RING_TRBS:
+    if xhci.evt_dequeue >= EVT_RING_TRBS:
         xhci.evt_dequeue = 0
         xhci.evt_cycle = xhci.evt_cycle ^ 1
     # Tell the controller where the consumer is now. ERDP is 64-bit;
@@ -1685,7 +1700,7 @@ def _xhci_v1_bringup() -> int32:
     e: Ptr[uint32] = cast[Ptr[uint32]](erst)
     e[0] = cast[uint32](xhci.event_ring & 0xFFFFFFFF)
     e[1] = cast[uint32]((xhci.event_ring >> 32) & 0xFFFFFFFF)
-    e[2] = RING_TRBS                  # RingSegmentSize
+    e[2] = EVT_RING_TRBS              # RingSegmentSize
     e[3] = 0                          # reserved
 
     # Init the Command Ring + Event Ring producer/consumer state.
@@ -1694,7 +1709,7 @@ def _xhci_v1_bringup() -> int32:
     xhci.evt_dequeue = 0
     xhci.evt_cycle   = 1
     _xhci_ring_init(xhci.cmd_ring, 1)
-    memset(cast[Ptr[uint8]](xhci.event_ring), 0, 4096)
+    memset(cast[Ptr[uint8]](xhci.event_ring), 0, EVT_RING_BYTES)
 
     # Write CONFIG.MaxSlotsEn — has to be non-zero before commands
     # can address any slot. Use the controller's max_slots.
@@ -2541,7 +2556,7 @@ def _xhci_bulk_note_failure(ep_id: uint32, db_addr: uint64,
         scan_cyc1: uint32 = 0
         scan_hw:   uint32 = 0
         scan_i:    uint32 = 0
-        while scan_i < RING_TRBS:
+        while scan_i < EVT_RING_TRBS:
             sp: Ptr[uint32] = cast[Ptr[uint32]](xhci.event_ring \
                 + cast[uint64](scan_i) * cast[uint64](TRB_SIZE))
             sctl: uint32 = sp[3]
@@ -2551,7 +2566,7 @@ def _xhci_bulk_note_failure(ep_id: uint32, db_addr: uint64,
                 scan_hw = scan_i
             if scan_i == 0:
                 xhci.diag_evt0_ctl = sctl
-            if scan_i == 254:
+            if scan_i == EVT_RING_TRBS - 1:
                 xhci.diag_evt254_ctl = sctl
             scan_i = scan_i + 1
         xhci.diag_evt_cyc1   = scan_cyc1
@@ -2618,7 +2633,7 @@ def xhci_bulk_diag_report():
         return
     # Image-identity marker so a NUC photo unambiguously tells us which
     # build booted (each reflash is expensive). Bump on every diag/fix ship.
-    printk0("[xhci-bulk] (late) diag-rev=7 ringscan\n")
+    printk0("[xhci-bulk] (late) diag-rev=8 bigring4096\n")
     printk2("[xhci-bulk] (late) expect_trb=%p evt_seen=%d\n",
             xhci.diag_expect_trb, cast[uint64](xhci.diag_evt_seen))
     printk2("[xhci-bulk] (late) last_evt_p=%p db=%p\n",
