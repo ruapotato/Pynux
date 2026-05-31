@@ -636,6 +636,15 @@ class XhciState:
     diag_iman:        uint32
     diag_erdp_lo:     uint32
     diag_erdp_hi:     uint32
+    # Lost-doorbell experiment (Image #40 -> fix attempt 4). On real Intel
+    # xHCI a bulk transfer can wedge with a VALID controller-owned Normal
+    # TRB + ep Running + doorbell rung but NO Transfer Event ever posted
+    # (event ring empty, controller healthy) — a missed doorbell QEMU never
+    # reproduces. bulk_redoorbell = how many times we re-rang DB on a pure
+    # cc=0 timeout; bulk_redoorbell_ok = how many of those re-rings then
+    # produced a completion. ok>0 => lost-doorbell CONFIRMED + worked around.
+    bulk_redoorbell:    uint32
+    bulk_redoorbell_ok: uint32
 
 
 xhci: XhciState
@@ -2567,7 +2576,7 @@ def xhci_bulk_diag_report():
         return
     # Image-identity marker so a NUC photo unambiguously tells us which
     # build booted (each reflash is expensive). Bump on every diag/fix ship.
-    printk0("[xhci-bulk] (late) diag-rev=5 ERDP-w64\n")
+    printk0("[xhci-bulk] (late) diag-rev=6 redoorbell\n")
     printk2("[xhci-bulk] (late) expect_trb=%p evt_seen=%d\n",
             xhci.diag_expect_trb, cast[uint64](xhci.diag_evt_seen))
     printk2("[xhci-bulk] (late) last_evt_p=%p db=%p\n",
@@ -2637,6 +2646,14 @@ def xhci_bulk_diag_report():
     printk2("[xhci-bulk] (late) out_cbw cc=%d moved=%d\n",
             cast[uint64](xhci.diag_out_cc),
             cast[uint64](xhci.diag_out_moved))
+    # Lost-doorbell experiment (fix attempt 4). redoorbell = how many cc=0
+    # timeouts we re-rang the doorbell on; ok = how many of those re-rings
+    # then completed. ok>0 => MISSED DOORBELL confirmed + worked around (boot
+    # may now reach [boot:init]); redoorbell>0 & ok=0 => re-ring doesn't help,
+    # pivot off the lost-doorbell theory.
+    printk2("[xhci-bulk] (late) redoorbell=%d redoorbell_ok=%d\n",
+            cast[uint64](xhci.bulk_redoorbell),
+            cast[uint64](xhci.bulk_redoorbell_ok))
     # Committed OUTPUT Slot Context dword0: Speed = bits[23:20], CtxEntries =
     # bits[31:27]. Speed!=0 confirms the Configure-Endpoint Speed fix took on
     # the slot the IN endpoint hangs off (so the IN stall is not slot Speed).
@@ -2709,6 +2726,35 @@ def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
                 return -1
             attempt = attempt + 1
             continue
+        if cc == 0:
+            # Pure timeout: no Transfer Event was ever posted for a TRB the
+            # controller already owns (cycle matches DCS) while the endpoint
+            # is Running and the controller is healthy. On real Intel xHCI
+            # this is a MISSED DOORBELL — the endpoint's internal TR-cache
+            # went empty in a window around our enqueue, so the doorbell ring
+            # was dropped and the controller is idling on a non-empty ring.
+            # QEMU never reproduces this (it never times out), so this whole
+            # path is dead code in the VM. Re-ring the doorbell a bounded
+            # number of times; each re-ring nudges the controller to re-read
+            # the TR and pick up the pending TRB. Counters surface in the
+            # late diag so a NUC photo tells us whether the re-ring worked.
+            rr: int32 = 0
+            while rr < 8:
+                xhci.bulk_redoorbell = xhci.bulk_redoorbell + 1
+                _xhci_w32(db_addr, ep_id)
+                cc = _xhci_wait_transfer_event_trb(
+                         cast[Ptr[uint32]](&resid), trb_pa)
+                if cc == cast[int32](TRB_CC_SUCCESS) \
+                   or cc == cast[int32](TRB_CC_SHORT_PACKET):
+                    if resid > length:
+                        resid = length
+                    xhci.bulk_redoorbell_ok = xhci.bulk_redoorbell_ok + 1
+                    xhci.bulk_fail_count = 0
+                    if is_in == 0:
+                        xhci.diag_out_cc    = cc
+                        xhci.diag_out_moved = cast[int32](length - resid)
+                    return cast[int32](length - resid)
+                rr = rr + 1
         if is_in != 0:
             printk1("[xhci] bulk-in cc=%d\n", cast[uint64](cc))
         else:
