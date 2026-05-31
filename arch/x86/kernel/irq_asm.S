@@ -102,6 +102,14 @@ irq_stub_\n:
     IRQ_STUB 94
     IRQ_STUB 95
 
+/* ---------- IPI vector 240 (0xF0): TLB shootdown ---------------- *
+ * A dedicated stub for the cross-CPU TLB-flush IPI.  Lives outside
+ * the 32..95 legacy IRQ band to avoid colliding with any device
+ * vector.  Funnel through common_irq so do_irq() dispatches to the
+ * registered irq_handlers[240] handler (module_map_tlb_flush_ipi).
+ */
+    IRQ_STUB 240
+
 /* ---------- common IRQ dispatch ---------------------------------- */
     .align 16
     .globl common_irq

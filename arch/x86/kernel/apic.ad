@@ -267,6 +267,49 @@ def lapic_send_eoi():
     _lapic_write(LAPIC_EOI_REG, 0)
 
 
+# --- All-excluding-self IPI (TLB shootdown) -----------------------
+#
+# ICR shorthand bits 19:18 = 0b11 means "all CPUs EXCLUDING the
+# current one" (Intel SDM Vol.3A §10.6.2.1 "ICR Destination Shorthand").
+# We use delivery mode FIXED (bits 10:8 = 000), no level assert needed
+# for shorthand IPIs (bits 14:15 are ignored by the hardware when
+# shorthand != 00), and our TLB-flush vector in bits 7:0.
+#
+# With shorthand, the destination field in ICR_HIGH is ignored; we
+# write it as zero. Only ICR_LOW matters, and writing it fires the IPI.
+#
+# This is the same mechanism Linux uses for TLB invalidation IPIs
+# (arch/x86/mm/tlb.c::native_flush_tlb_others).
+
+ICR_SHORTHAND_ALL_EXCL_SELF: uint32 = 0x000C0000  # bits 19:18 = 11
+
+# IDT vector allocated for the TLB-flush IPI. Sits in the 128..255
+# band used by SMP IPIs (Linux uses 0xFC..0xFE; we use 0xF0 to stay
+# clear of the spurious-interrupt vector at 0xFF).
+TLB_FLUSH_IPI_VECTOR: uint32 = 0xF0
+
+
+def lapic_send_ipi_all_but_self(vector: uint32):
+    # Broadcast a fixed IPI to ALL CPUs except the calling one using
+    # the "all excluding self" ICR shorthand. With this shorthand the
+    # LAPIC ignores ICR_HIGH (destination field); only writing ICR_LOW
+    # fires the IPI. The write is a store to MMIO — the LAPIC delivers
+    # the IPI synchronously before the next instruction sees it, per the
+    # Intel SDM Note in §10.6.1: "the IPI is sent when software writes
+    # to the low doubleword of the ICR."
+    #
+    # PRECONDITION: the caller must have CPUs_ONLINE > 1 before calling
+    # (which `cpus_online` from smp.ad tracks); if only the BSP is live
+    # the shorthand no-ops silently on real hardware and on QEMU TCG.
+    _lapic_wait_icr_idle()
+    icr_low: uint32 = ICR_SHORTHAND_ALL_EXCL_SELF | (vector & 0xFF)
+    # ICR_HIGH first (per spec — but shorthand ignores it).
+    _lapic_write(LAPIC_ICR_HIGH, 0)
+    _lapic_write(LAPIC_ICR_LOW, icr_low)
+    # Spin until the LAPIC reports delivery complete (ICR busy bit clear).
+    _lapic_wait_icr_idle()
+
+
 # --- IPI sending ---------------------------------------------------
 #
 # The Interrupt Command Register lives at offsets 0x300 (low 32 bits)

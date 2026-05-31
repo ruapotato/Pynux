@@ -90,6 +90,10 @@
 
 from kernel.printk.printk import printk0, printk1, printk2
 from arch.x86.mm.pgtable import virt_to_phys
+from arch.x86.kernel.apic import (
+    lapic_send_ipi_all_but_self, TLB_FLUSH_IPI_VECTOR,
+)
+from arch.x86.kernel.irq import register_irq_handler
 
 extern def kernel_image_end() -> uint64
 extern def get_bsp_cr3() -> uint64
@@ -300,6 +304,35 @@ def _kmod_find_free_run(used_bitmap: Ptr[uint8], n_slots: uint64) -> int32:
     return -1
 
 
+# --- TLB shootdown IPI handler -------------------------------------
+#
+# Invoked on each AP when the BSP broadcasts TLB_FLUSH_IPI_VECTOR
+# (0xF0) after module_map_alloc() stamps new PD entries and flushes
+# its own TLB. Each AP must reload CR3 so its TLB reflects the newly
+# mapped module pages. Without this, an AP that picks up a newly
+# loaded module's init_module (or runs any code the module exports)
+# after the BSP's load_cr3() but before its own TLB is updated could
+# execute against a stale "not-present" translation and #GP/#UD.
+#
+# do_irq() sends the LAPIC EOI after this handler returns, so we must
+# NOT send EOI ourselves (that would be a second spurious EOI).
+
+def module_map_tlb_flush_ipi():
+    # Local TLB full-flush: reload CR3 with its current value.
+    # This evicts every non-global TLB entry on this CPU.
+    load_cr3(get_bsp_cr3())
+
+
+def module_map_tlb_init():
+    # Register the TLB-flush IPI handler (vector 0xF0 = 240). Called
+    # once from init/main.ad after idt_init() and apic_init() but
+    # before any kmod_linux_load(), so all AP TLBs are consistent from
+    # the very first module map.
+    register_irq_handler(cast[uint64](TLB_FLUSH_IPI_VECTOR),
+                         module_map_tlb_flush_ipi)
+    printk0("[module_map] TLB-flush IPI registered (vector 0xF0)\n")
+
+
 # --- public API ------------------------------------------------------
 
 def module_map_alloc(phys: uint64, span: uint64) -> uint64:
@@ -362,9 +395,22 @@ def module_map_alloc(phys: uint64, span: uint64) -> uint64:
         cast[Ptr[uint64]](pd_phys + slot_idx * 8)[0] = entry
         used[slot_idx] = 1
         k = k + 1
-    # TLB flush so subsequent reads/writes through the new virt range
-    # don't see a stale not-present cache from the BSS-zeroed PD entry.
+    # TLB flush: CR3 reload on THIS CPU evicts the stale not-present
+    # entry the BSS-zeroed PD had. This makes the new virtual range
+    # immediately accessible for the memset+memcpy (section copy) that
+    # the loader runs on the BSP after module_map_alloc returns.
     load_cr3(get_bsp_cr3())
+
+    # SMP TLB shootdown: broadcast TLB_FLUSH_IPI_VECTOR to ALL OTHER
+    # CPUs so their TLBs also see the newly stamped PD entries.
+    # Without this, an AP that later executes the module's init_module
+    # (or code the module exports) might fetch instructions through a
+    # stale "not-present" TLB entry, triggering a #GP or #UD.
+    #
+    # lapic_send_ipi_all_but_self() no-ops when no APs are online
+    # (cpus_online == 1), so this is safe in uniprocessor boots too.
+    lapic_send_ipi_all_but_self(TLB_FLUSH_IPI_VECTOR)
+
     virt: uint64 = virt_base + start_u * KMOD_2M
     printk2("[module_map] alloc: phys=%p span=%p\n", phys, span_rounded)
     printk2("[module_map]        -> virt=%p (PDPT[%d])\n", virt, pdpt_idx)
@@ -420,3 +466,8 @@ def module_map_free(virt: uint64, span: uint64):
         used[slot_idx] = 0
         k = k + 1
     load_cr3(get_bsp_cr3())
+    # Shootdown all other CPUs so they evict stale mappings for the
+    # freed module range. A subsequent load into the same virt slots
+    # would otherwise be visible only to the BSP until the next
+    # context switch that reloads CR3 on each AP.
+    lapic_send_ipi_all_but_self(TLB_FLUSH_IPI_VECTOR)

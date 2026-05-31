@@ -40,6 +40,7 @@ from arch.x86.kernel.trap_diag import (             # M16.154-trapdiag
 )
 from arch.x86.kernel.irq import do_irq, enable_uart_rx_irq  # do_irq for common_irq
 from arch.x86.mm.init import mem_init, himem_late_report
+from arch.x86.mm.module_map import module_map_tlb_init
 from arch.x86.kernel.setup_percpu import setup_per_cpu_areas, get_cpu_id
 from arch.x86.kernel.i8259 import i8259_init, i8259_disable
 from arch.x86.kernel.time import (
@@ -3895,6 +3896,14 @@ def start_kernel():
     printk0("[boot:15] smp_boot_secondary\n")
     smp_boot_secondary()
     printk1("Hamnix: cpus_online = %d\n", get_cpus_online())
+
+    # --- SMP TLB-flush IPI init ----------------------------------------
+    # Register the cross-CPU TLB-shootdown handler (vector 0xF0) so that
+    # module_map_alloc() can broadcast a full TLB flush to all APs after
+    # each new .ko is mapped. Must run after smp_boot_secondary() so that
+    # all APs are up and have loaded the kernel IDT (via lgdt + lidt in
+    # their trampoline landing). Must run before boot:34/35 (any insmod).
+    module_map_tlb_init()
 
     # --- TSC monotonic clock smoke test --------------------------------
     # Proves the high-resolution monotonic source brought up by
