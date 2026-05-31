@@ -78,6 +78,8 @@ from compiler.parser import (
     ND_UNARY,
     ND_IDENT,
     ND_INT_LIT,
+    ND_CHAR_LIT,
+    ND_BOOL_LIT,
     ND_STRING_LIT,
     ND_INDEX,
     ND_PARAM,
@@ -91,6 +93,10 @@ from compiler.parser import (
     ND_ARRAY_TYPE,
     ND_PTR_TYPE,
     ND_TYPE,
+    ND_CAST,
+    ND_BREAK,
+    ND_CONTINUE,
+    ND_PASS,
     BINOP_ADD,
     BINOP_SUB,
     BINOP_MUL,
@@ -264,6 +270,25 @@ str_src_len: Array[256, uint32]
 str_data_off: Array[256, uint32]
 str_count: uint32 = 0
 
+# -----------------------------------------------------------------------
+# Loop-label stack for break / continue.
+#
+# Each active `while` pushes one frame. `continue` jumps BACK to the loop's
+# condition test (a known earlier offset = loop_cont_target). `break` jumps
+# FORWARD to the loop exit, whose offset is not yet known when the break is
+# emitted; each break therefore records a forward rel32 fixup in the
+# per-loop break-fixup table, and gen_while backpatches them all to the exit
+# point once the body is done. The stack supports nesting: break/continue
+# always target the INNERMOST loop (the top frame).
+# -----------------------------------------------------------------------
+MAX_LOOPS: uint32 = 32
+loop_cont_target: Array[32, uint32]    # condition-test offset (continue dest)
+# Per-loop break-fixup list: a flat 2D table indexed [loop_depth*MAX_BRK + i].
+MAX_BRK: uint32 = 64
+loop_brk_at: Array[2048, uint32]       # 32 * 64 rel32-field offsets
+loop_brk_n: Array[32, uint32]          # number of pending break fixups
+loop_depth: uint32 = 0
+
 
 def cg_init():
     code_len = 0
@@ -276,6 +301,7 @@ def cg_init():
     glob_count = 0
     df_count = 0
     str_count = 0
+    loop_depth = 0
 
 
 # Append one byte to the output buffer.
@@ -1033,6 +1059,19 @@ def gen_expr(node: uint32):
         emit_mov_imm_rax(nd_num[node])
         return
 
+    if k == ND_CHAR_LIT:
+        # A char literal is just its code-point as an immediate, exactly
+        # like an int literal (codegen_x86 emits `movq $ord(v),%rax`). The
+        # parser already stored the value in nd_num.
+        emit_mov_imm_rax(nd_num[node])
+        return
+
+    if k == ND_BOOL_LIT:
+        # True / False -> 1 / 0 immediate (codegen_x86's BoolLiteral case);
+        # the parser stored 0/1 in nd_num.
+        emit_mov_imm_rax(nd_num[node])
+        return
+
     if k == ND_IDENT:
         off: int32 = 0
         if lookup_local(nd_name_off[node], nd_name_len[node], &off) != 0:
@@ -1156,6 +1195,17 @@ def gen_expr(node: uint32):
 
     if k == ND_CALL:
         gen_call(node)
+        return
+
+    if k == ND_CAST:
+        # cast[T](x) / int32(x) / Ptr[T](x): a pure reinterpretation in this
+        # ABI. All integer/pointer types occupy the same 64-bit %rax slot, so
+        # widening / narrowing is a no-op — we just evaluate the operand into
+        # %rax and leave it. This mirrors codegen_x86.py's
+        # `case CastExpr(expr=inner): self.gen_expr(inner)` exactly (callers
+        # that care about upper bits apply explicit masks). The cast type lives
+        # on nd_a; the operand on nd_b.
+        gen_expr(nd_b[node])
         return
 
     # Anything else is outside this milestone's subset.
@@ -1541,6 +1591,35 @@ def gen_stmt(node: uint32):
         gen_while(node)
         return
 
+    if k == ND_BREAK:
+        # Jump forward to the innermost loop's exit. The target is not yet
+        # known, so emit a placeholder `jmp rel32` and record its rel32-field
+        # offset as a break fixup on the top loop frame; gen_while patches it
+        # once the exit point is reached.
+        if loop_depth == 0:
+            cg_err = 1
+            return
+        d: uint32 = loop_depth - 1
+        if loop_brk_n[d] >= MAX_BRK:
+            cg_err = 1
+            return
+        at: uint32 = emit_jmp_fwd()
+        loop_brk_at[d * MAX_BRK + loop_brk_n[d]] = at
+        loop_brk_n[d] = loop_brk_n[d] + 1
+        return
+
+    if k == ND_CONTINUE:
+        # Jump back to the innermost loop's condition test (a known offset).
+        if loop_depth == 0:
+            cg_err = 1
+            return
+        emit_jmp_back(loop_cont_target[loop_depth - 1])
+        return
+
+    if k == ND_PASS:
+        # `pass` is a no-op placeholder statement; emit nothing.
+        return
+
     # Other statement kinds not covered by this subset.
     cg_err = 1
 
@@ -1645,12 +1724,28 @@ def gen_if(node: uint32):
 # exit jump, body, back-jump to the header, exit label.
 def gen_while(node: uint32):
     start: uint32 = code_len
+    # Push a loop frame: `continue` targets `start` (re-test the condition);
+    # `break` fixups accumulate in this frame's slot and patch to the exit.
+    if loop_depth >= MAX_LOOPS:
+        cg_err = 1
+        return
+    depth: uint32 = loop_depth
+    loop_cont_target[depth] = start
+    loop_brk_n[depth] = 0
+    loop_depth = loop_depth + 1
+
     gen_expr(nd_a[node])
     emit_test_rax_rax()
     exit_fix: uint32 = emit_jz_fwd()
     gen_block(nd_b[node])
     emit_jmp_back(start)
+    # Exit point: backpatch the condition-false jump AND every `break`.
     patch_rel32(exit_fix, code_len)
+    i: uint32 = 0
+    while i < loop_brk_n[depth]:
+        patch_rel32(loop_brk_at[depth * MAX_BRK + i], code_len)
+        i = i + 1
+    loop_depth = loop_depth - 1
 
 
 # -----------------------------------------------------------------------
