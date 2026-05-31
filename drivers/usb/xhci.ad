@@ -1922,7 +1922,8 @@ def _xhci_v1_configure_endpoint(slot: uint32, ep_id: uint32,
                                 max_pkt: uint32, interval: uint32,
                                 ep_ring: uint64,
                                 ctx_entries: uint32,
-                                max_burst: uint32) -> int32:
+                                max_burst: uint32,
+                                speed: uint32) -> int32:
     # Add an endpoint to the slot via Configure Endpoint. ep_id is
     # the xHCI endpoint ID (1=ep0, 2=ep1 OUT, 3=ep1 IN, ...). For
     # ep1-IN ep_id=3, context index = ep_id (matching xHCI table).
@@ -1947,7 +1948,14 @@ def _xhci_v1_configure_endpoint(slot: uint32, ep_id: uint32,
         ce = ep_id
     if ce > 31:
         ce = 31
-    ic[8] = (ce << 27)
+    # Slot Context dword0: Speed (bits 20..23) MUST be preserved alongside
+    # Context Entries. With A0 set, the controller overwrites the OUTPUT slot
+    # context's Speed with whatever the input carries; zeroing it leaves the
+    # slot with Speed=0, which real Intel xHCI cannot schedule transfers
+    # against (the CBW doorbell is honored but no transfer ever executes).
+    # QEMU ignores the Speed field, which is why every bulk test passed in VM
+    # while the NUC stalled. Mirror _xhci_v1_address_device's dword0.
+    ic[8] = (_xhci_speed_to_psi(speed) << 20) | (ce << 27)
     ic[9] = (xhci.kbd_port & 0xFF) << 16
     # Endpoint context for ep_id at offset (ep_id+1)*32.
     epoff: uint64 = cast[uint64](ep_id + 1) * 8     # 8 dwords per ctx
@@ -2985,7 +2993,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
             cast[uint64](in_burst), cast[uint64](out_burst))
     cfgout_rc: int32 = _xhci_v1_configure_endpoint(
         slot, out_dci, EP_TYPE_BULK_OUT, out_mps, 0, xhci.ms_out_ring,
-        max_dci, out_burst)
+        max_dci, out_burst, xhci.ms_speed)
     xhci.ms_dbg_cfgout = cfgout_rc
     if cfgout_rc != 0:
         printk0("[usbms] Configure bulk-OUT failed\n")
@@ -2993,7 +3001,7 @@ def _xhci_attach_mass_storage_locked(target_port: uint32,
     _xhci_set_stage(9)
     cfgin_rc: int32 = _xhci_v1_configure_endpoint(
         slot, in_dci, EP_TYPE_BULK_IN, in_mps, 0, xhci.ms_in_ring,
-        max_dci, in_burst)
+        max_dci, in_burst, xhci.ms_speed)
     xhci.ms_dbg_cfgin = cfgin_rc
     if cfgin_rc != 0:
         printk0("[usbms] Configure bulk-IN failed\n")
@@ -3575,7 +3583,8 @@ def _xhci_v1_attach_keyboard():
     ep_id: uint32 = (int_ep * 2) + 1
     if _xhci_v1_configure_endpoint(slot, ep_id, EP_TYPE_INT_IN,
                                    int_mps, int_intv,
-                                   xhci.kbd_int_ring, ep_id, 0) != 0:
+                                   xhci.kbd_int_ring, ep_id, 0,
+                                   xhci.kbd_speed) != 0:
         printk0("[xhci] live keyboard attach failed at Configure Endpoint (non-fatal)\n")
         printk0("[boot:01.f.z] xhci attach: failed at Configure Endpoint\n")
         return
