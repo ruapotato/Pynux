@@ -242,6 +242,39 @@ elf_last_interp_img_phys: uint64 = 0
 elf_last_interp_img_vlow: uint64 = 0
 elf_last_interp_img_vhigh:uint64 = 0
 
+# W^X Stage 1b: per-PT_LOAD-segment read-only enforcement on CODE pages.
+#
+# The whole image span [vlow, vhigh) is installed RW+executable first
+# (so userspace ld.so / glibc can write its GOT/.data during relocation
+# — those live in PF_W segments). Immediately afterward, before the
+# first user instruction runs, every NON-WRITABLE PT_LOAD segment
+# (PF_W clear: .text + .rodata) is flipped to READ-ONLY (PT_FLAG_RW
+# cleared) while staying executable. A userland WRITE into .text then
+# faults with a genuine (non-COW) protection #PF, which the page-fault
+# handler converts to SIGSEGV. This closes the self-modifying-code /
+# code-injection W^X hole left open by Stage 1a.
+#
+# A PT_LOAD-rich binary rarely has more than 2-3 segments; we record
+# up to ELF_MAX_RO_SPANS non-writable spans for the app and the same
+# for the interpreter. Each span is a page-aligned USER-vaddr range
+# (matching the coordinate space the image is installed in). Spans
+# beyond the cap are simply left RW (a missed hardening, never a
+# correctness bug); ELF_MAX_RO_SPANS=8 covers every real binary.
+ELF_MAX_RO_SPANS: uint64 = 8
+
+elf_last_app_ro_n:     uint64 = 0
+elf_last_app_ro_lo:    Array[8, uint64]
+elf_last_app_ro_hi:    Array[8, uint64]
+elf_last_interp_ro_n:  uint64 = 0
+elf_last_interp_ro_lo: Array[8, uint64]
+elf_last_interp_ro_hi: Array[8, uint64]
+
+# PF_* — PT_LOAD p_flags bits (ELF program-header flags, offset 4 of a
+# 64-bit phdr). PF_X=exec, PF_W=write, PF_R=read.
+PF_X_FLAG: uint32 = 0x1
+PF_W_FLAG: uint32 = 0x2
+PF_R_FLAG: uint32 = 0x4
+
 # Recursion guard. Set to 1 while we're loading an interpreter, so the
 # nested _load_elf64 call doesn't itself try to recurse on a (hostile
 # or weird) PT_INTERP entry inside the interpreter binary. ld.so is a
@@ -287,6 +320,44 @@ def _validate_magic(blob: Ptr[uint8]) -> int32:
     if blob[3] != 0x46:
         return 0
     return 1
+
+
+def _collect_app_ro_spans(blob: Ptr[uint8], e_phoff: uint64,
+                          e_phentsize: uint32, e_phnum: uint32,
+                          lowest_v: uint64, load_base: uint64):
+    # W^X Stage 1b: walk the PT_LOAD program headers and record every
+    # NON-WRITABLE segment's page-aligned USER-vaddr span into the
+    # elf_last_app_ro_* globals. `load_base` is the image's user-vaddr
+    # base (lowest_v for ET_EXEC; the rebased `region` for ET_DYN), so
+    # the recorded span is in the SAME coordinate space the installer
+    # maps the image at. Caller copies these into the interp slots when
+    # this load is the interpreter's (see PT_INTERP arm).
+    n: uint64 = 0
+    i: uint32 = 0
+    while i < e_phnum:
+        ph: uint64 = cast[uint64](blob) + e_phoff \
+                    + cast[uint64](i) * cast[uint64](e_phentsize)
+        p_type:  uint32 = _read_u32(cast[Ptr[uint8]](ph + 0))
+        p_flags: uint32 = _read_u32(cast[Ptr[uint8]](ph + 4))
+        if p_type == PT_LOAD and (p_flags & PF_W_FLAG) == 0:
+            # Non-writable PT_LOAD: .text / .rodata. Map its user span.
+            p_vaddr: uint64 = _read_u64(cast[Ptr[uint8]](ph + 16))
+            p_memsz: uint64 = _read_u64(cast[Ptr[uint8]](ph + 40))
+            if p_memsz != 0 and n < ELF_MAX_RO_SPANS:
+                seg_lo: uint64 = load_base + (p_vaddr - lowest_v)
+                seg_hi: uint64 = seg_lo + p_memsz
+                # Page-align: round lo down, hi up. A non-writable
+                # segment never shares a page with a writable one in a
+                # normally-linked binary (the linker page-aligns LOADs),
+                # so rounding can't accidentally make a .data page RO.
+                seg_lo = seg_lo & ~cast[uint64](PAGE_SIZE_4K - 1)
+                seg_hi = (seg_hi + PAGE_SIZE_4K - 1) \
+                         & ~cast[uint64](PAGE_SIZE_4K - 1)
+                elf_last_app_ro_lo[n] = seg_lo
+                elf_last_app_ro_hi[n] = seg_hi
+                n = n + 1
+        i = i + 1
+    elf_last_app_ro_n = n
 
 
 def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
@@ -469,6 +540,13 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
         app_img_hi     = region + span
         printk2("elf64: ET_DYN user-map: [0x%x, 0x%x)\n",
                 region, region + span)
+    # W^X Stage 1b: record this image's non-writable (.text/.rodata)
+    # PT_LOAD spans in elf_last_app_ro_* so the installer can flip them
+    # READ-ONLY after the whole image is mapped RW. app_load_base is the
+    # user-vaddr base (lowest_v for ET_EXEC; region for ET_DYN).
+    _collect_app_ro_spans(blob, e_phoff, e_phentsize, e_phnum,
+                          lowest_v, app_load_base)
+
     # M16.36: stash the app's PT_LOAD coords so do_execve / SYS_SPAWN
     # can install per-task PT entries explicitly. These survive the
     # PT_INTERP recursion (it touches the elf_last_user_* slots).
@@ -514,6 +592,18 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
         interp_phys_capture:  uint64 = elf_last_user_phys_base
         interp_vlow_capture:  uint64 = elf_last_user_vlow
         interp_vhigh_capture: uint64 = elf_last_user_vhigh
+        # W^X Stage 1b: the recursive load left the INTERPRETER's
+        # non-writable spans in elf_last_app_ro_*. Move them into the
+        # interp slots, then recompute the APP's own spans below
+        # (re-walk the app's phdrs — we still hold blob/e_phoff/etc.).
+        elf_last_interp_ro_n = elf_last_app_ro_n
+        ri: uint64 = 0
+        while ri < ELF_MAX_RO_SPANS:
+            elf_last_interp_ro_lo[ri] = elf_last_app_ro_lo[ri]
+            elf_last_interp_ro_hi[ri] = elf_last_app_ro_hi[ri]
+            ri = ri + 1
+        _collect_app_ro_spans(blob, e_phoff, e_phentsize, e_phnum,
+                              lowest_v, app_load_base)
         # Re-publish the APPLICATION's values so AT_PHDR / AT_PHNUM /
         # AT_PHENT in the auxv reflect the app (which is what glibc's
         # dl_main wants — it reads the app's headers to walk the app's
@@ -571,6 +661,8 @@ def _load_elf64(blob: Ptr[uint8], blob_size: uint64) -> uint64:
         elf_last_interp_img_phys  = 0
         elf_last_interp_img_vlow  = 0
         elf_last_interp_img_vhigh = 0
+        # W^X Stage 1b: no interpreter -> no interp RO spans to flip.
+        elf_last_interp_ro_n = 0
     return app_entry_user
 
 
@@ -1348,6 +1440,51 @@ def elf_install_user_range(pml4_phys: uint64, vlow: uint64,
     return 0
 
 
+def elf_set_range_ro(pml4_phys: uint64, vlow: uint64,
+                     vhigh: uint64) -> int32:
+    # W^X Stage 1b: flip every already-installed leaf PTE in
+    # [vlow, vhigh) READ-ONLY (clear PT_FLAG_RW) while leaving the page
+    # PRESENT, USER, and EXECUTABLE (NX bit untouched -> code stays
+    # runnable). Used to harden a loaded image's non-writable
+    # (.text/.rodata) PT_LOAD segments AFTER the whole image was mapped
+    # RW. A subsequent userland WRITE faults with a genuine (non-COW)
+    # protection #PF -> SIGSEGV.
+    #
+    # The page tables for [vlow, vhigh) must already exist and be mapped
+    # (elf_install_user_range ran first). A missing level / not-present
+    # PTE for a page in the range is skipped (best-effort hardening,
+    # never a hard fail). Each touched page gets an invlpg so the change
+    # takes effect on the live CR3 (execve case) immediately.
+    if vlow >= vhigh:
+        return 0
+    vlo_a: uint64 = vlow & ~cast[uint64](PAGE_SIZE_4K - 1)
+    vhi_a: uint64 = (vhigh + PAGE_SIZE_4K - 1) \
+                    & ~cast[uint64](PAGE_SIZE_4K - 1)
+    pml4: Ptr[uint64] = cast[Ptr[uint64]](pml4_phys)
+    va: uint64 = vlo_a
+    while va < vhi_a:
+        pml4_idx: uint64 = (va >> 39) & 0x1FF
+        pdpt_idx: uint64 = (va >> 30) & 0x1FF
+        pd_idx:   uint64 = (va >> 21) & 0x1FF
+        pt_idx:   uint64 = (va >> 12) & 0x1FF
+        pml4e: uint64 = pml4[pml4_idx]
+        if (pml4e & PT_FLAG_P) != 0:
+            pdpt: Ptr[uint64] = cast[Ptr[uint64]](pml4e & PT_ADDR_MASK)
+            pdpte: uint64 = pdpt[pdpt_idx]
+            if (pdpte & PT_FLAG_P) != 0 and (pdpte & PT_FLAG_PS) == 0:
+                pd: Ptr[uint64] = cast[Ptr[uint64]](pdpte & PT_ADDR_MASK)
+                pde: uint64 = pd[pd_idx]
+                if (pde & PT_FLAG_P) != 0 and (pde & PT_FLAG_PS) == 0:
+                    pt: Ptr[uint64] = cast[Ptr[uint64]](
+                        pde & PT_ADDR_MASK)
+                    pte: uint64 = pt[pt_idx]
+                    if (pte & PT_FLAG_P) != 0 and (pte & PT_FLAG_RW) != 0:
+                        pt[pt_idx] = pte & ~PT_FLAG_RW
+                        invlpg_one(va)
+        va = va + PAGE_SIZE_4K
+    return 0
+
+
 def elf_apply_last_user_mapping(pml4_phys: uint64) -> int32:
     # Convenience wrapper used by SYS_SPAWN / SYS_EXECVE: install the
     # per-task PT entries for the most recently loaded ELF image.
@@ -1390,6 +1527,26 @@ def elf_apply_last_user_mapping(pml4_phys: uint64) -> int32:
                                   elf_last_interp_img_phys,
                                   "interp", 0) < 0:
             return -1
+
+    # W^X Stage 1b: now that the FULL image span(s) are mapped RW+X,
+    # flip the non-writable (.text/.rodata) PT_LOAD segments READ-ONLY.
+    # The whole image was installed RW so userspace ld.so / glibc can
+    # patch its GOT/.data (those live in PF_W segments, which we leave
+    # writable). A userland write to .text now faults -> SIGSEGV.
+    ai: uint64 = 0
+    while ai < elf_last_app_ro_n:
+        printk2("[wx] image .text RO: [%p, %p)\n",
+                elf_last_app_ro_lo[ai], elf_last_app_ro_hi[ai])
+        elf_set_range_ro(pml4_phys, elf_last_app_ro_lo[ai],
+                         elf_last_app_ro_hi[ai])
+        ai = ai + 1
+    ii: uint64 = 0
+    while ii < elf_last_interp_ro_n:
+        printk2("[wx] interp .text RO: [%p, %p)\n",
+                elf_last_interp_ro_lo[ii], elf_last_interp_ro_hi[ii])
+        elf_set_range_ro(pml4_phys, elf_last_interp_ro_lo[ii],
+                         elf_last_interp_ro_hi[ii])
+        ii = ii + 1
     return 0
 
 
@@ -1733,6 +1890,22 @@ def _cow_share_one_page(parent_pml4: uint64, child_pml4: uint64,
     cslot: uint64 = _cow_resolve_pte_slot(child_pml4, vaddr)
     if cslot == 0:
         return -1
+
+    # W^X Stage 1b: a parent page that is ALREADY read-only (RW=0) but
+    # NOT COW-marked is a W^X CODE page (.text/.rodata flipped RO at
+    # execve time). It must NOT be turned into a COW page: a write to it
+    # is a genuine W^X violation that has to deliver SIGSEGV, never be
+    # silently COW-copied. Share it into the child verbatim (same phys,
+    # RO, no COW) and leave the parent untouched. We do NOT take a COW
+    # refcount on it — the page is owned by the parent's image region
+    # (region_alloc'd) and reclaimed by task_reap, not the COW refcount
+    # path. (An already-COW RO page falls through to the normal path
+    # below, which is idempotent and bumps the refcount correctly.)
+    if (parent_pte & PT_FLAG_RW) == 0 \
+            and (parent_pte & PT_FLAG_COW) == 0:
+        ro_flags: uint64 = parent_pte & ~PT_ADDR_MASK
+        cast[Ptr[uint64]](cslot)[0] = phys | ro_flags
+        return 0
 
     # The flag word the COW-shared PTE carries: present + user, COW
     # bit set, RW CLEARED. Preserve any other low flag bits the parent

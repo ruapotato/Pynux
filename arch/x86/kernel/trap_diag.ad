@@ -187,6 +187,23 @@ def do_page_fault(error_code: uint64, fault_va: uint64,
         printk1("[pf] COW resolution failed (OOM) va=%p\n", fault_va)
         return cast[int64](0)
     # rc == 0: the PTE wasn't a COW PTE — genuine fault.
+    #
+    # W^X Stage 1b: a USER (U=1) WRITE (W=1) to a PRESENT (P=1),
+    # non-COW, read-only page is a permission violation — the task tried
+    # to write its own read-only .text / .rodata (or any other genuinely
+    # PROT_READ page). cow_handle_write_fault already ruled out the
+    # recoverable COW case, so this is a hard W^X violation: deliver
+    # SIGSEGV to the user instead of halting the whole kernel. A
+    # kernel-mode (U=0) write fault here is a true kernel bug — keep the
+    # diagnostic halt for that.
+    if (error_code & PF_ERR_U) != 0:
+        printk_set_level(PRINTK_LEVEL_EMERG)
+        printk1("[pf] W^X write-fault on RO user page va=%p -> SIGSEGV\n",
+                fault_va)
+        sg_rc: int32 = deliver_fault_sigsegv(iret_frame)
+        if sg_rc == 1:
+            return cast[int64](1)
+        return cast[int64](0)
     return cast[int64](0)
 
 
