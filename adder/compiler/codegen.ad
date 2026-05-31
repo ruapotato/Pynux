@@ -40,6 +40,14 @@
 #   * ND_VAR_DECL  — reserve an 8-byte slot; store the initialiser.
 #   * ND_ASSIGN    — store to an identifier's slot (plain and +=/-=/*=).
 #   * ND_EXPR_STMT — evaluate for effect (e.g. a bare call).
+#   * Ptr[T] indexing — a Ptr[T] local/param/global HOLDS an address; p[i]
+#                    dereferences *(p + i*sizeof(T)) (load and store), the
+#                    pointee width driving the sized mem op. ADDR (&x /
+#                    &arr[i]) and DEREF (*p) round out the pointer support.
+#                    Unlike an Array (slot IS the storage, base = leaq), a
+#                    pointer's slot is loaded to get the base address —
+#                    mirroring codegen_x86.gen_index_address's non-Array
+#                    `gen_expr(obj)` branch.
 #
 # Frame slots for body locals are reserved by a pre-scan pass before the
 # prologue's `sub $frame,%rsp`, so the reservation covers every local.
@@ -81,6 +89,7 @@ from compiler.parser import (
     ND_ASSIGN,
     ND_EXPR_STMT,
     ND_ARRAY_TYPE,
+    ND_PTR_TYPE,
     ND_TYPE,
     BINOP_ADD,
     BINOP_SUB,
@@ -104,6 +113,8 @@ from compiler.parser import (
     UNOP_NEG,
     UNOP_NOT,
     UNOP_BIT_NOT,
+    UNOP_DEREF,
+    UNOP_ADDR,
     AUGOP_NONE,
     AUGOP_ADD,
     AUGOP_SUB,
@@ -144,6 +155,14 @@ loc_offset: Array[64, int32]      # negative %rbp-relative byte offset (BASE)
 # wide. loc_offset is then the address of element 0 (the lowest address of
 # the reserved block); arr[i] lives at rbp + loc_offset + i*elem_size.
 loc_elem_size: Array[64, uint32]
+# Per-local pointer marker: 0 means the local is NOT a Ptr[T]; a non-zero
+# value (1/2/4/8) marks a Ptr[T] local/param whose slot HOLDS an address
+# and whose pointee width is that many bytes. Unlike an Array local (where
+# loc_offset is element 0's address), a pointer local's slot stores the
+# target address; p[i] dereferences *(slot_value + i*pointee_size). This
+# mirrors codegen_x86.gen_index_address's `gen_expr(obj)` (load the pointer
+# value) branch for non-Array bases.
+loc_ptr_size: Array[64, uint32]
 loc_count: uint32 = 0
 cg_stack_size: uint32 = 0
 
@@ -219,6 +238,12 @@ glob_name_len: Array[128, uint32]
 glob_offset: Array[128, uint32]        # byte offset into gdata[]
 glob_elem_size: Array[128, uint32]     # 0 = scalar; else Array element width
 glob_scalar_size: Array[128, uint32]   # scalar load/store width (1/2/4/8)
+# Per-global pointer marker, same convention as loc_ptr_size: 0 = not a
+# Ptr[T] global; non-zero = the pointee width (1/2/4/8). A Ptr[T] global is
+# stored as an 8-byte scalar slot that HOLDS an address (glob_scalar_size is
+# 8 for it); glob_ptr_size records the pointee width used when the global is
+# indexed (g[i]). e.g. `lex_src: Ptr[uint8]` -> glob_ptr_size 1.
+glob_ptr_size: Array[128, uint32]
 glob_count: uint32 = 0
 
 # Data-section RIP-relative relocations. Each records the rel32 field's
@@ -294,6 +319,26 @@ def alloc_local(name_off: uint32, name_len: uint32) -> int32:
     loc_name_len[loc_count] = name_len
     loc_offset[loc_count] = off
     loc_elem_size[loc_count] = 0
+    loc_ptr_size[loc_count] = 0
+    loc_count = loc_count + 1
+    return off
+
+
+# Allocate an 8-byte slot for a Ptr[T] local/param. The slot HOLDS an
+# address (the pointer's value), so it is sized like a scalar; ptr_size is
+# the pointee width used when the pointer is indexed (p[i]). Returns the
+# negative %rbp-relative offset. Mirrors alloc_local but records ptr-ness.
+def alloc_ptr_local(name_off: uint32, name_len: uint32, ptr_size: uint32) -> int32:
+    if loc_count >= MAX_LOCALS:
+        cg_err = 1
+        return 0
+    cg_stack_size = cg_stack_size + 8
+    off: int32 = 0 - cast[int32](cg_stack_size)
+    loc_name_off[loc_count] = name_off
+    loc_name_len[loc_count] = name_len
+    loc_offset[loc_count] = off
+    loc_elem_size[loc_count] = 0
+    loc_ptr_size[loc_count] = ptr_size
     loc_count = loc_count + 1
     return off
 
@@ -318,8 +363,20 @@ def alloc_array_local(name_off: uint32, name_len: uint32, count: uint32, elem_si
     loc_name_len[loc_count] = name_len
     loc_offset[loc_count] = off
     loc_elem_size[loc_count] = elem_size
+    loc_ptr_size[loc_count] = 0
     loc_count = loc_count + 1
     return off
+
+
+# Look up an identifier's Ptr[T] pointee size: returns the pointee width for
+# a Ptr[T] local, or 0 for a non-pointer / unknown name.
+def lookup_ptr_size(name_off: uint32, name_len: uint32) -> uint32:
+    i: uint32 = 0
+    while i < loc_count:
+        if name_match(loc_name_off[i], loc_name_len[i], name_off, name_len) != 0:
+            return loc_ptr_size[i]
+        i = i + 1
+    return 0
 
 
 # Look up an identifier's array element size: returns the element size for
@@ -427,8 +484,17 @@ def glob_define(name_off: uint32, name_len: uint32, data_off: uint32, elem_size:
     glob_offset[glob_count] = data_off
     glob_elem_size[glob_count] = elem_size
     glob_scalar_size[glob_count] = scalar_size
+    glob_ptr_size[glob_count] = 0
     glob_count = glob_count + 1
     return data_off
+
+
+# Mark the most recently defined global as a Ptr[T] whose pointee width is
+# `ptr_size`. The global is otherwise an 8-byte scalar slot that holds an
+# address; this records the pointee width consulted when it is indexed.
+def glob_set_ptr_size(ptr_size: uint32):
+    if glob_count > 0:
+        glob_ptr_size[glob_count - 1] = ptr_size
 
 
 # Resolve a name to a global table index. Returns the index+1 (so a 0
@@ -1098,12 +1164,27 @@ def gen_expr(node: uint32):
 
 # -----------------------------------------------------------------------
 # Unary operators (mirrors codegen_x86.gen_unary, integer subset): NEG,
-# BIT_NOT, NOT. Evaluate the operand into %rax, then apply in place.
-# (DEREF / ADDR are not in this subset.)
+# BIT_NOT, NOT, plus DEREF (*p) and ADDR (&x / &arr[i]). NEG/BIT_NOT/NOT
+# evaluate the operand into %rax then apply in place; ADDR computes the
+# operand's address (no value load); DEREF loads the pointee after
+# evaluating the pointer value.
 # -----------------------------------------------------------------------
 
 def gen_unary(node: uint32):
     op: uint32 = nd_aux[node]
+    # ADDR / DEREF evaluate the operand specially (address-of must NOT load
+    # the operand's value), so handle them before the generic eval-then-op.
+    if op == UNOP_ADDR:
+        gen_addr_of(nd_a[node])
+        return
+    if op == UNOP_DEREF:
+        # *p: evaluate the pointer expression (its value = the target
+        # address) into %rax, then load the pointee. The pointee width is
+        # the operand's Ptr[T] pointee size when known, else 8 (mirrors
+        # codegen_x86.gen_unary's DEREF size = get_type_size(pointee)).
+        gen_expr(nd_a[node])
+        emit_load_mem_rax(deref_size(nd_a[node]))
+        return
     gen_expr(nd_a[node])
     if op == UNOP_NEG:
         emit_neg_rax()
@@ -1116,6 +1197,45 @@ def gen_unary(node: uint32):
         emit_movzx_al_rax()
     else:
         cg_err = 1
+
+
+# Pointee width for a `*expr` deref: if `expr` is a bare Ptr[T] identifier
+# (local/param or global), return its pointee size; otherwise default to 8.
+def deref_size(expr: uint32) -> uint32:
+    if nd_kind[expr] == ND_IDENT:
+        ps: uint32 = lookup_ptr_size(nd_name_off[expr], nd_name_len[expr])
+        if ps != 0:
+            return ps
+        gi: uint32 = glob_lookup(nd_name_off[expr], nd_name_len[expr])
+        if gi != 0 and glob_ptr_size[gi - 1] != 0:
+            return glob_ptr_size[gi - 1]
+    return 8
+
+
+# Compute the ADDRESS of an lvalue expression into %rax (mirrors
+# codegen_x86.gen_addr_of). Supported operands:
+#   * an identifier naming a frame local/param  -> leaq off(%rbp)
+#   * an identifier naming a module-level global -> leaq data_off(%rip)
+#   * an index expression arr[i] / p[i]          -> &element (gen_index_addr)
+# Taking the address of a bare scalar local yields its slot address; taking
+# the address of an array/pointer element yields the element address. These
+# are exactly the address forms the compiler's own source uses
+# (e.g. `&strbuf[val_start]`, `&out[0]`).
+def gen_addr_of(operand: uint32):
+    k: uint32 = nd_kind[operand]
+    if k == ND_INDEX:
+        gen_index_addr(operand)
+        return
+    if k == ND_IDENT:
+        off: int32 = 0
+        if lookup_local(nd_name_off[operand], nd_name_len[operand], &off) != 0:
+            emit_lea_local_rax(off)
+            return
+        gi: uint32 = glob_lookup(nd_name_off[operand], nd_name_len[operand])
+        if gi != 0:
+            emit_lea_global_rax(glob_offset[gi - 1])
+            return
+    cg_err = 1
 
 
 # -----------------------------------------------------------------------
@@ -1136,10 +1256,16 @@ def index_elem_size(node: uint32) -> uint32:
     es: uint32 = lookup_elem_size(nd_name_off[base], nd_name_len[base])
     if es != 0:
         return es
-    # Fall back to a global array.
+    # A Ptr[T] local/param: the load/store width is the pointee size.
+    ps: uint32 = lookup_ptr_size(nd_name_off[base], nd_name_len[base])
+    if ps != 0:
+        return ps
+    # Fall back to a global array, then a Ptr[T] global.
     gi: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
     if gi != 0 and glob_elem_size[gi - 1] != 0:
         return glob_elem_size[gi - 1]
+    if gi != 0 and glob_ptr_size[gi - 1] != 0:
+        return glob_ptr_size[gi - 1]
     # Not a known array local or global — outside this subset.
     cg_err = 1
     return 1
@@ -1154,28 +1280,59 @@ def gen_index_addr(node: uint32):
     if nd_kind[base] != ND_IDENT:
         cg_err = 1
         return
-    # Resolve base + element size from the local table first, then globals.
+
+    # Classify the base. There are four base flavours, all of which decay to
+    # a base address that we add a scaled index to (mirroring
+    # codegen_x86.gen_index_address). The ONLY difference is how the base
+    # address is materialised into %rax:
+    #   * Array local      -> leaq off(%rbp)           (slot IS the array)
+    #   * Array global     -> leaq data_off(%rip)      (symbol IS the array)
+    #   * Ptr[T] local      -> movq off(%rbp),%rax       (slot HOLDS the addr)
+    #   * Ptr[T] global     -> leaq data_off(%rip); movq (%rax),%rax
+    #                          (load the pointer value the global holds)
     es: uint32 = lookup_elem_size(nd_name_off[base], nd_name_len[base])
     off: int32 = 0
-    is_local: uint32 = 0
+    arr_local: uint32 = 0
+    ptr_local: uint32 = 0
     if es != 0 and lookup_local(nd_name_off[base], nd_name_len[base], &off) != 0:
-        is_local = 1
-    if is_local == 0:
+        arr_local = 1
+    if arr_local == 0:
+        ps: uint32 = lookup_ptr_size(nd_name_off[base], nd_name_len[base])
+        if ps != 0 and lookup_local(nd_name_off[base], nd_name_len[base], &off) != 0:
+            ptr_local = 1
+            es = ps
+    arr_glob: uint32 = 0
+    ptr_glob: uint32 = 0
+    gdoff: uint32 = 0
+    if arr_local == 0 and ptr_local == 0:
         gi: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
-        if gi == 0 or glob_elem_size[gi - 1] == 0:
+        if gi != 0 and glob_elem_size[gi - 1] != 0:
+            arr_glob = 1
+            es = glob_elem_size[gi - 1]
+            gdoff = glob_offset[gi - 1]
+        elif gi != 0 and glob_ptr_size[gi - 1] != 0:
+            ptr_glob = 1
+            es = glob_ptr_size[gi - 1]
+            gdoff = glob_offset[gi - 1]
+        else:
             cg_err = 1
             return
-        es = glob_elem_size[gi - 1]
+
     # Evaluate the index into %rax, move to %rcx, scale, then add the base
-    # address (computed via leaq). Result address ends up in %rax.
+    # address. Result address ends up in %rax.
     gen_expr(nd_b[node])
     emit_mov_rax_rcx()
     emit_scale_rcx(es)
-    if is_local != 0:
+    if arr_local != 0:
         emit_lea_local_rax(off)
+    elif ptr_local != 0:
+        emit_load_local_rax(off)          # base address = pointer value
+    elif arr_glob != 0:
+        emit_lea_global_rax(gdoff)
     else:
-        gi2: uint32 = glob_lookup(nd_name_off[base], nd_name_len[base])
-        emit_lea_global_rax(glob_offset[gi2 - 1])
+        # Ptr[T] global: load the address the global slot holds.
+        emit_lea_global_rax(gdoff)
+        emit_load_mem_rax(8)
     emit_add_rcx_rax()
 
 
@@ -1280,6 +1437,18 @@ def prim_type_size(tnode: uint32) -> uint32:
     return 8
 
 
+# If `tnode` is a Ptr[T] type node, return the pointee width (the size of
+# T, computed by prim_type_size on the inner type). Returns 0 when `tnode`
+# is not a pointer type. ND_PTR_TYPE carries the inner type on nd_a.
+def ptr_pointee_size(tnode: uint32) -> uint32:
+    if tnode == 0:
+        return 0
+    if nd_kind[tnode] != ND_PTR_TYPE:
+        return 0
+    inner: uint32 = nd_a[tnode]
+    return prim_type_size(inner)
+
+
 # Reserve a slot for a var-decl name, honouring an Array type. Returns 1 if
 # it allocated (or already present), leaving any error in cg_err.
 def declare_local(name_off: uint32, name_len: uint32, tnode: uint32):
@@ -1290,6 +1459,10 @@ def declare_local(name_off: uint32, name_len: uint32, tnode: uint32):
         count: uint32 = cast[uint32](nd_num[tnode])
         es: uint32 = prim_type_size(nd_a[tnode])
         alloc_array_local(name_off, name_len, count, es)
+    elif tnode != 0 and nd_kind[tnode] == ND_PTR_TYPE:
+        # Ptr[T] local: an 8-byte slot that holds an address; record the
+        # pointee width so p[i] dereferences with the right load/store size.
+        alloc_ptr_local(name_off, name_len, ptr_pointee_size(tnode))
     else:
         alloc_local(name_off, name_len)
 
@@ -1538,7 +1711,15 @@ def gen_function(fn: uint32) -> uint32:
     p: uint32 = nd_a[fn]
     nparams: uint32 = 0
     while p != 0:
-        alloc_local(nd_name_off[p], nd_name_len[p])
+        # A Ptr[T] parameter spills like any 8-byte scalar (the arg register
+        # holds the pointer value), but we record its pointee width so the
+        # body's p[i] indexing dereferences with the right element size.
+        ptnode: uint32 = nd_a[p]
+        psz: uint32 = ptr_pointee_size(ptnode)
+        if psz != 0:
+            alloc_ptr_local(nd_name_off[p], nd_name_len[p], psz)
+        else:
+            alloc_local(nd_name_off[p], nd_name_len[p])
         nparams = nparams + 1
         p = nd_next[p]
 
@@ -1620,6 +1801,23 @@ def layout_global(decl: uint32):
         bytes_: uint32 = count * es
         base: uint32 = gdata_reserve(bytes_)
         glob_define(nd_name_off[decl], nd_name_len[decl], base, es, 0)
+        return
+    # Ptr[T] global: an 8-byte scalar slot that holds an address. Reserve
+    # the 8-byte slot, register it as a scalar, then mark its pointee width
+    # so indexing (g[i]) dereferences with the right element size. A constant
+    # int initialiser (e.g. `= 0`) is written below via the shared path.
+    psz: uint32 = ptr_pointee_size(tnode)
+    if psz != 0:
+        pbase: uint32 = gdata_reserve(8)
+        glob_define(nd_name_off[decl], nd_name_len[decl], pbase, 0, 8)
+        glob_set_ptr_size(psz)
+        if val != 0 and nd_kind[val] == ND_INT_LIT:
+            pv: uint64 = nd_num[val]
+            pi: uint32 = 0
+            while pi < 8:
+                gdata[pbase + pi] = cast[uint8](pv & 255)
+                pv = pv >> 8
+                pi = pi + 1
         return
     # Scalar global. Reserve a slot of the type's width and store a constant
     # int initialiser if present (little-endian); otherwise leave it zeroed.

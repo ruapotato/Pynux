@@ -1112,6 +1112,119 @@ def main() -> int32:
     # Dedup: only one "Hi\0" (3 bytes) in the data section.
     check_eq("gdata_len==3 (deduped)", gdata_len, 3)
 
+    # ===================================================================
+    # POINTER INDEXING (this milestone). Unlike an Array local (whose slot
+    # IS the storage), a Ptr[T] HOLDS an address; p[i] dereferences
+    # *(p + i*sizeof(T)). The compiler's own source uses exactly these
+    # forms (`word[i]` over a Ptr[uint8] param, `out_off[0] = ...` over a
+    # Ptr[int32] param, `lex_src[p]` over a Ptr[uint8] global,
+    # `&strbuf[val_start]` address-of). Each test takes a real address with
+    # `&`, stuffs it into a pointer, and reads/writes through it, verified
+    # by emulating the bytes — the address routes through emu_mem/gdata.
+    # ===================================================================
+
+    # --- (P) Ptr[T] local READ: take &xs[0], index back via p[i] --------
+    #   def ptrd(a: int32, b: int32) -> int32:
+    #       xs: Array[4, uint32]
+    #       xs[0] = a
+    #       xs[1] = b
+    #       p: Ptr[uint32] = &xs[0]
+    #       return p[0] + p[1]
+    # p holds the frame address of xs[0]; p[0]/p[1] load uint32 (scale 4)
+    # through the pointer value, NOT a frame slot.
+    build_first("def ptrd(a: int32, b: int32) -> int32:\n    xs: Array[4, uint32]\n    xs[0] = a\n    xs[1] = b\n    p: Ptr[uint32] = &xs[0]\n    return p[0] + p[1]\n")
+    check_eq("ptr-local-read codegen err", cg_err, 0)
+    check_eq("emu ptrd(3,4)==7", cast[uint32](emu_run(3, 4)), 7)
+    check_eq("emu ptrd(10,20)==30", cast[uint32](emu_run(10, 20)), 30)
+
+    # --- (Q) Ptr[T] local WRITE: store through p[i], read back via array -
+    #   def stp(a: int32, b: int32) -> int32:
+    #       xs: Array[2, int32]
+    #       p: Ptr[int32] = &xs[0]
+    #       p[0] = a
+    #       p[1] = b
+    #       return xs[0] + xs[1]
+    # The stores go THROUGH the pointer (movl %ecx,(%rax)); the readback via
+    # the array proves the data actually landed at xs's frame slots.
+    build_first("def stp(a: int32, b: int32) -> int32:\n    xs: Array[2, int32]\n    p: Ptr[int32] = &xs[0]\n    p[0] = a\n    p[1] = b\n    return xs[0] + xs[1]\n")
+    check_eq("ptr-local-write codegen err", cg_err, 0)
+    check_eq("emu stp(5,9)==14", cast[uint32](emu_run(5, 9)), 14)
+    check_eq("emu stp(100,1)==101", cast[uint32](emu_run(100, 1)), 101)
+
+    # --- (R) Ptr[uint8] local, scale 1, byte pointee, p[i] over a buffer -
+    #   def pbyte(a: int32, b: int32) -> int32:
+    #       buf: Array[8, uint8]
+    #       buf[2] = a
+    #       buf[3] = b
+    #       p: Ptr[uint8] = &buf[0]
+    #       return p[2] + p[3]
+    build_first("def pbyte(a: int32, b: int32) -> int32:\n    buf: Array[8, uint8]\n    buf[2] = a\n    buf[3] = b\n    p: Ptr[uint8] = &buf[0]\n    return p[2] + p[3]\n")
+    check_eq("ptr-byte codegen err", cg_err, 0)
+    check_eq("emu pbyte(40,2)==42", cast[uint32](emu_run(40, 2)), 42)
+    check_eq("emu pbyte(200,55)==255", cast[uint32](emu_run(200, 55)), 255)
+
+    # --- (S) `*p` DEREF (UNOP_DEREF) of a byte pointer ------------------
+    #   def drf(a: int32, b: int32) -> int32:
+    #       xs: Array[2, uint8]
+    #       xs[0] = a
+    #       p: Ptr[uint8] = &xs[0]
+    #       return *p
+    build_first("def drf(a: int32, b: int32) -> int32:\n    xs: Array[2, uint8]\n    xs[0] = a\n    p: Ptr[uint8] = &xs[0]\n    return *p\n")
+    check_eq("deref codegen err", cg_err, 0)
+    check_eq("emu drf(77)==77", cast[uint32](emu_run(77, 0)), 77)
+    check_eq("emu drf(255)==255", cast[uint32](emu_run(255, 0)), 255)
+
+    # --- (T) Ptr[T] PARAMETER indexed (the `word[i]` / `out_off[0]` shape)
+    # A two-function program: the caller stuffs a frame buffer's address
+    # into a Ptr[int32] and hands it to a callee that indexes the PARAMETER.
+    #   def via(a: int32, b: int32) -> int32:
+    #       xs: Array[2, int32]
+    #       xs[0] = a
+    #       xs[1] = b
+    #       return rdp(&xs[0], 0)
+    #   def rdp(q: Ptr[int32], z: int32) -> int32:
+    #       return q[0] + q[1]
+    # `via` is emitted first (offset 0); the call fixup is resolved. `q` is
+    # a Ptr[int32] PARAMETER — its arg-reg value is the address, and q[i]
+    # dereferences it (load param slot, add scaled index, sized load).
+    build_all("def via(a: int32, b: int32) -> int32:\n    xs: Array[2, int32]\n    xs[0] = a\n    xs[1] = b\n    return rdp(&xs[0], 0)\ndef rdp(q: Ptr[int32], z: int32) -> int32:\n    return q[0] + q[1]\n")
+    check_eq("ptr-param codegen err", cg_err, 0)
+    check_eq("emu via(6,7)==13", cast[uint32](emu_run(6, 7)), 13)
+    check_eq("emu via(11,22)==33", cast[uint32](emu_run(11, 22)), 33)
+
+    # --- (U) Ptr[uint8] PARAMETER store: `out_off[0] = v` shape ---------
+    #   def wvia(a: int32, b: int32) -> int32:
+    #       buf: Array[2, uint8]
+    #       wrp(&buf[0], a)
+    #       return buf[0]
+    #   def wrp(d: Ptr[uint8], v: int32) -> int32:
+    #       d[0] = v
+    #       return 0
+    # wrp stores v THROUGH the pointer parameter d (movb %cl,(%rax)); wvia
+    # reads the byte back from buf to prove the write reached the frame.
+    build_all("def wvia(a: int32, b: int32) -> int32:\n    buf: Array[2, uint8]\n    wrp(&buf[0], a)\n    return buf[0]\ndef wrp(d: Ptr[uint8], v: int32) -> int32:\n    d[0] = v\n    return 0\n")
+    check_eq("ptr-param-store codegen err", cg_err, 0)
+    check_eq("emu wvia(123)==123", cast[uint32](emu_run(123, 0)), 123)
+    check_eq("emu wvia(250)==250", cast[uint32](emu_run(250, 0)), 250)
+
+    # --- (V) GLOBAL Ptr[uint8] indexed (the `lex_src[p]` shape) ---------
+    #   buf: Array[4, uint8]
+    #   pp: Ptr[uint8] = 0
+    #   def gpi(a: int32, b: int32) -> int32:
+    #       buf[0] = a
+    #       buf[1] = b
+    #       pp = &buf[0]
+    #       return pp[0] + pp[1]
+    # pp is a GLOBAL Ptr[uint8] (8-byte data slot holding an address). It is
+    # assigned the gdata address of buf at runtime, then indexed: the codegen
+    # leaqs pp, LOADS its 8-byte value (the held address), adds the scaled
+    # index, and does a byte load. Proves global-pointer load+index.
+    build_globals("buf: Array[4, uint8]\npp: Ptr[uint8] = 0\ndef gpi(a: int32, b: int32) -> int32:\n    buf[0] = a\n    buf[1] = b\n    pp = &buf[0]\n    return pp[0] + pp[1]\n")
+    check_eq("global-ptr codegen err", cg_err, 0)
+    check_eq("global-ptr rip-lea emitted", has_rip_lea(), 1)
+    check_eq("emu gpi(30,12)==42", cast[uint32](emu_run(30, 12)), 42)
+    check_eq("emu gpi(200,55)==255", cast[uint32](emu_run(200, 55)), 255)
+
     emit("[codegen_selftest] emitted ")
     put_u32(code_len)
     emit(" code bytes; ran ")
