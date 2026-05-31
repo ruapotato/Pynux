@@ -691,6 +691,18 @@ class XhciState:
     diag_trdq_tried:       uint32
     diag_trdq_ok:          uint32
     diag_trdq_stopped_deq: uint64
+    # diag-rev=12 recovery cascade: on the cc=0 OUT wedge, after Stop+
+    # Set-TR-Dequeue fails (trdq_ok=0), escalate through the two xHCI
+    # recovery levers we have NEVER pulled on a cc=0 timeout (we only
+    # used them for cc=6 STALL). reset_ep_cc = the Reset Endpoint command
+    # completion code; reset_ep_ok = the transfer completed after Reset+
+    # Set-TR-Dequeue+re-ring. recfg_cc / recfg_ok = same for a full
+    # re-Configure Endpoint (rebuild the OUT endpoint context). Whichever
+    # unsticks the endpoint identifies its true hidden state in ONE photo.
+    diag_reset_ep_cc:      int32
+    diag_reset_ep_ok:      uint32
+    diag_recfg_cc:         int32
+    diag_recfg_ok:         uint32
 
 
 xhci: XhciState
@@ -1220,6 +1232,10 @@ def xhci_init_ex(force_bare_metal: int32) -> int32:
     xhci.ms_dbg_cfgin  = -1
     xhci.diag_out_cc    = -1
     xhci.diag_out_moved = -1
+    xhci.diag_reset_ep_cc = -2
+    xhci.diag_reset_ep_ok = 0
+    xhci.diag_recfg_cc    = -2
+    xhci.diag_recfg_ok    = 0
     bdf: uint32 = _xhci_pci_find_class(XHCI_PCI_CLASS,
                                        XHCI_PCI_SUBCLASS,
                                        XHCI_PCI_PROGIF)
@@ -2686,7 +2702,7 @@ def xhci_bulk_diag_report():
         return
     # Image-identity marker so a NUC photo unambiguously tells us which
     # build booted (each reflash is expensive). Bump on every diag/fix ship.
-    printk0("[xhci-bulk] (late) diag-rev=11 ehb-batch\n")
+    printk0("[xhci-bulk] (late) diag-rev=12 recov-cascade\n")
     printk2("[xhci-bulk] (late) expect_trb=%p evt_seen=%d\n",
             xhci.diag_expect_trb, cast[uint64](xhci.diag_evt_seen))
     printk2("[xhci-bulk] (late) last_evt_p=%p db=%p\n",
@@ -2787,6 +2803,19 @@ def xhci_bulk_diag_report():
             cast[uint64](xhci.diag_trdq_ok))
     printk2("[xhci-bulk] (late) trdq_stopped_deq=%p ring_base=%p\n",
             xhci.diag_trdq_stopped_deq, xhci.ms_out_ring)
+    # diag-rev=12 recovery cascade. reset_ep_cc = Reset Endpoint command cc
+    # (cc=1 SUCCESS => controller accepted the reset; cc=19 Context-State-Error
+    # => EP wasn't in a resettable state). reset_ep_ok=1 => the CBW finally
+    # transacted after Reset+Set-TR-Dequeue => the EP was in a hidden host-side
+    # error the cc=6 path never caught. recfg_* = same for a full re-Configure
+    # Endpoint. cc=-2 on either => that lever was never reached (an earlier
+    # lever already recovered, or no cc=0 wedge happened).
+    printk2("[xhci-bulk] (late) reset_ep_cc=%d reset_ep_ok=%d\n",
+            cast[uint64](xhci.diag_reset_ep_cc),
+            cast[uint64](xhci.diag_reset_ep_ok))
+    printk2("[xhci-bulk] (late) recfg_cc=%d recfg_ok=%d\n",
+            cast[uint64](xhci.diag_recfg_cc),
+            cast[uint64](xhci.diag_recfg_ok))
     # Committed OUTPUT Slot Context dword0: Speed = bits[23:20], CtxEntries =
     # bits[31:27]. Speed!=0 confirms the Configure-Endpoint Speed fix took on
     # the slot the IN endpoint hangs off (so the IN stall is not slot Speed).
@@ -2920,6 +2949,62 @@ def _xhci_bulk_xfer(slot: uint32, ep_id: uint32, ring: uint64,
                     if resid > length:
                         resid = length
                     xhci.diag_trdq_ok = 1
+                    xhci.bulk_fail_count = 0
+                    if is_in == 0:
+                        xhci.diag_out_cc    = cc
+                        xhci.diag_out_moved = cast[int32](length - resid)
+                    return cast[int32](length - resid)
+                # diag-rev=12 RECOVERY CASCADE (still inside the once-per-boot
+                # trdq guard; reached only if Stop+Set-TR-Dequeue did NOT
+                # recover). Pull the two xHCI recovery levers we have NEVER
+                # tried on a cc=0 timeout (only on cc=6 STALL).
+                #
+                # Lever 1: Reset Endpoint. The endpoint is Stopped (we issued
+                # Stop above). Reset Endpoint clears any HIDDEN host-side
+                # error state the EP reached WITHOUT posting a STALL/halt event
+                # (ep_state always read Running, never Halted, so the cc=6 path
+                # never fired). Record the command cc, then Set-TR-Dequeue back
+                # to THIS CBW + re-ring + re-wait.
+                xhci.diag_reset_ep_cc = _xhci_cmd_reset_endpoint(slot, ep_id)
+                _xhci_cmd_set_tr_dequeue(slot, ep_id, ring,
+                                         trb_idx, trb_dcs)
+                _xhci_w32(db_addr, ep_id)
+                cc = _xhci_wait_transfer_event_trb(
+                         cast[Ptr[uint32]](&resid), trb_pa)
+                if cc == cast[int32](TRB_CC_SUCCESS) \
+                   or cc == cast[int32](TRB_CC_SHORT_PACKET):
+                    if resid > length:
+                        resid = length
+                    xhci.diag_reset_ep_ok = 1
+                    xhci.bulk_fail_count = 0
+                    if is_in == 0:
+                        xhci.diag_out_cc    = cc
+                        xhci.diag_out_moved = cast[int32](length - resid)
+                    return cast[int32](length - resid)
+                # Lever 2: full re-Configure Endpoint. Rebuild the OUT endpoint
+                # context from scratch (drop+add) in case the EP's internal
+                # state machine is wedged beyond what Reset clears. MaxBurst is
+                # read back from the live OUTPUT context; MPS/speed from stored
+                # state. ep_id = OUT DCI; ctx_entries = ep_id.
+                rcfg_burst: uint32 = 0
+                if xhci.kbd_output_ctx != 0:
+                    rcfg_octx: Ptr[uint32] = cast[Ptr[uint32]](
+                        xhci.kbd_output_ctx + cast[uint64](ep_id) * 32)
+                    rcfg_burst = (rcfg_octx[1] >> 8) & 0xFF
+                xhci.diag_recfg_cc = _xhci_v1_configure_endpoint(
+                    slot, ep_id, EP_TYPE_BULK_OUT,
+                    xhci.ms_out_mps, 0, ring, ep_id,
+                    rcfg_burst, xhci.ms_speed)
+                _xhci_cmd_set_tr_dequeue(slot, ep_id, ring,
+                                         trb_idx, trb_dcs)
+                _xhci_w32(db_addr, ep_id)
+                cc = _xhci_wait_transfer_event_trb(
+                         cast[Ptr[uint32]](&resid), trb_pa)
+                if cc == cast[int32](TRB_CC_SUCCESS) \
+                   or cc == cast[int32](TRB_CC_SHORT_PACKET):
+                    if resid > length:
+                        resid = length
+                    xhci.diag_recfg_ok = 1
                     xhci.bulk_fail_count = 0
                     if is_in == 0:
                         xhci.diag_out_cc    = cc
