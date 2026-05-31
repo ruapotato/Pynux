@@ -47,6 +47,12 @@ from kernel.sched.core import (
     signal_post, signal_check_and_handle, signal_deliver_on_return,
     get_cwd_buf, set_task_cwd, current_idx_get,
     set_linux_userspace_mode,
+    # #160 / seccomp-lite: a fork/clone child inherits the parent's
+    # seccomp mode + filter bitmap (the filter is irrevocable AND
+    # inherited, matching Linux). Read/written through these accessors;
+    # syscall.ad keeps no static dependency on the linux_abi layer.
+    get_task_seccomp_mode, set_task_seccomp_mode,
+    get_task_seccomp_filter, set_task_seccomp_filter,
     task_vfork_done, set_task_vfork_done,
     set_task_fs_base, set_task_clear_child_tid,
     task_pml4, set_task_cr3,
@@ -1338,6 +1344,22 @@ CLONE_PARENT_SETTID:     uint64 = 0x100000
 CLONE_CHILD_CLEARTID:    uint64 = 0x200000
 
 
+# #160 / seccomp-lite: copy the parent's seccomp mode + allow-list
+# bitmap onto a fork/clone child. The filter is irrevocable AND
+# inherited (Linux semantics), so a confined parent can never produce an
+# unconfined child. A no-op when the parent has no filter (mode 0).
+def seccomp_inherit_to_child(child_slot: uint64, parent_slot: uint64):
+    mode: uint64 = get_task_seccomp_mode(parent_slot)
+    if mode == 0:
+        return
+    w: uint64 = 0
+    while w < 4:
+        set_task_seccomp_filter(child_slot, w,
+                                get_task_seccomp_filter(parent_slot, w))
+        w = w + 1
+    set_task_seccomp_mode(child_slot, mode)
+
+
 def do_clone(flags: uint64, child_stack: uint64,
              ptid: uint64, ctid: uint64, tls: uint64,
              user_r9: uint64,
@@ -1415,6 +1437,10 @@ def do_clone(flags: uint64, child_stack: uint64,
         # Linux user binaries; defensive against future native callers).
         if parent[0].is_linux_userspace != 0:
             set_linux_userspace_mode(child_slot, 1)
+        # #160 / seccomp-lite: a thread inherits the creator's seccomp
+        # filter (Linux: TSYNC aside, a CLONE_THREAD child shares the
+        # filter). Copy mode + the 4-word allow-list bitmap.
+        seccomp_inherit_to_child(cast[uint64](child_slot), current_idx_get())
         # Share fd table — CLONE_FILES is the conventional bit; we
         # always do this on the thread path since the alternative
         # (a thread with its own fd table) makes no semantic sense.
@@ -1556,6 +1582,11 @@ def do_clone(flags: uint64, child_stack: uint64,
     # first syscall (likely _exit / execve) routes through u_syscalls.
     if parent[0].is_linux_userspace != 0:
         set_linux_userspace_mode(slot, 1)
+    # #160 / seccomp-lite: the fork child inherits the parent's seccomp
+    # mode + allow-list bitmap. A seccomp'd parent cannot fork an
+    # unconfined child — the filter is both irrevocable AND inherited,
+    # matching Linux semantics exactly.
+    seccomp_inherit_to_child(cslot, parent_idx)
     # §3: POSIX signal inheritance — the fork child inherits the
     # parent's signal handlers, sa_flags, and blocked-signal mask, but
     # NOT the pending-signal set (cleared in the child). This lets a

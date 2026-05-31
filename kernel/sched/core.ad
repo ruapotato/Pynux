@@ -488,6 +488,28 @@ class TaskStruct:
     # user_regs_struct) / 8. Field order is the canonical x86_64
     # user_regs_struct (see u_ptrace.ad UREG_* offsets).
     pt_regs:        Array[27, uint64] # (appended last)
+    # #160 / seccomp-lite. LAYER-2-ONLY per-task syscall filter, reached
+    # by linux_abi/u_syscalls.ad exclusively through the get/set
+    # accessors below (core.ad never statically depends on linux_abi —
+    # same one-directional rule as the ptrace block above). Gated on
+    # is_linux_userspace at the syscall choke point; native (Layer-1)
+    # tasks leave these zero and the enforcement check is never reached.
+    #
+    #   seccomp_mode    — 0 disabled, 1 SECCOMP_MODE_STRICT,
+    #                     2 SECCOMP_MODE_FILTER (lite allow-list).
+    #                     Once non-zero it is IRREVOCABLE — set_*_mode
+    #                     refuses to lower it — and is inherited by a
+    #                     fork/clone child (see do_clone).
+    #   seccomp_filter  — for FILTER mode, a bitmap of permitted syscall
+    #                     numbers 0..255 (4 x uint64). A "lite" stand-in
+    #                     for a full BPF program: the default action is
+    #                     kill-with-SIGSYS and only listed nrs (plus the
+    #                     always-allowed strict set) pass. nrs >= 256 are
+    #                     never in the allow-list, so they are denied.
+    # All zero on a fresh slot. Placed at the END of TaskStruct so no
+    # earlier offset shifts.
+    seccomp_mode:   uint64            # (appended after pt_regs)
+    seccomp_filter: Array[4, uint64]  # (appended last)
 
 
 # State constants (mirror Linux's task->state space at a tiny scope).
@@ -1071,6 +1093,18 @@ def create_user_thread(entry: uint64, name0: uint64,
     while sfi < 64:
         task_table[s].sig_flags[sfi] = 0
         sfi = sfi + 1
+    # #160 / seccomp-lite: a freshly-created task starts UNCONFINED.
+    # task_reap leaves the slot body intact, so a reaped+reused slot
+    # would otherwise inherit a prior tenant's seccomp filter and kill
+    # the new task on its first non-allowed syscall. Direct field writes
+    # (not set_task_seccomp_mode, which refuses to lower a non-zero mode)
+    # so the scrub always takes. do_clone re-copies the parent's filter
+    # AFTER create returns for a real fork/clone child.
+    task_table[s].seccomp_mode = 0
+    sci: uint64 = 0
+    while sci < 4:
+        task_table[s].seccomp_filter[sci] = 0
+        sci = sci + 1
     # Phase B / M16.93: every freshly-created user task starts with a
     # zeroed Plan 9 errstr buffer. Plan 9 semantics: errstr is per-task
     # and NOT inherited across rfork/fork (each child sees "no error"),
@@ -2563,6 +2597,10 @@ SIGSTOP: uint64 = 19
 SIGTSTP: uint64 = 20
 SIGTTIN: uint64 = 21
 SIGTTOU: uint64 = 22
+# #160 / seccomp-lite: bad system call. Delivered to a task that issues
+# a syscall its seccomp filter denies. Default disposition (no handler)
+# is terminate, matching Linux strict mode.
+SIGSYS:  uint64 = 31
 
 # sa_flags bits we recognise (asm-generic / x86_64 <asm/signal.h>).
 SA_SIGINFO:  uint64 = 0x00000004
@@ -2736,6 +2774,51 @@ def set_task_pt_reg(slot: uint64, idx: uint64, v: uint64):
     if idx >= 27:
         return
     task_table[slot].pt_regs[idx] = v
+
+
+# #160 / seccomp-lite. LAYER-2-ONLY accessors. linux_abi/u_syscalls.ad
+# reaches the per-task seccomp fields exclusively through these — core.ad
+# stays free of any static dependency on the linux_abi layer (mirrors the
+# ptrace accessors above).
+def get_task_seccomp_mode(slot: uint64) -> uint64:
+    return task_table[slot].seccomp_mode
+
+
+def set_task_seccomp_mode(slot: uint64, v: uint64):
+    # Seccomp is IRREVOCABLE once armed: never let a higher (or any)
+    # mode be lowered back toward 0. A task can only ever tighten. The
+    # caller (prctl/seccomp) is responsible for rejecting a downgrade
+    # with -EINVAL/-EACCES; this is the last-line guard so even a buggy
+    # caller cannot disarm a filter.
+    if task_table[slot].seccomp_mode != 0 and v < task_table[slot].seccomp_mode:
+        return
+    task_table[slot].seccomp_mode = v
+
+
+def get_task_seccomp_filter(slot: uint64, word: uint64) -> uint64:
+    if word >= 4:
+        return 0
+    return task_table[slot].seccomp_filter[word]
+
+
+def set_task_seccomp_filter(slot: uint64, word: uint64, v: uint64):
+    if word >= 4:
+        return
+    task_table[slot].seccomp_filter[word] = v
+
+
+# #160: is syscall `nr` permitted for the FILTER-mode allow-list bitmap?
+# Returns 1 if the bit for nr is set (nr < 256), else 0. Strict-mode's
+# fixed allow-set is checked separately in the linux_abi enforcement
+# hook; this only consults the per-task bitmap.
+def seccomp_filter_allows(slot: uint64, nr: uint64) -> int32:
+    if nr >= 256:
+        return 0
+    word: uint64 = nr >> 6
+    bit:  uint64 = cast[uint64](1) << (nr & 63)
+    if (task_table[slot].seccomp_filter[word] & bit) != 0:
+        return 1
+    return 0
 
 
 # §3: address of the in-flight rt_sigframe's ucontext. rt_sigreturn

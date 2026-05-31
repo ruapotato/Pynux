@@ -192,6 +192,10 @@ from kernel.sched.core import (
     UCTX_GREG_RAX_OFF, UCTX_GREG_RSP_OFF, UCTX_GREG_RIP_OFF,
     UCTX_GREG_EFL_OFF, UCTX_SIGMASK_OFF, SIGPIPE, SIGCHLD,
     get_task_comm_ptr, set_task_pdeathsig,
+    SIGSYS,
+    get_task_seccomp_mode, set_task_seccomp_mode,
+    get_task_seccomp_filter, set_task_seccomp_filter,
+    seccomp_filter_allows,
     saved_user_rip_ptr, saved_user_rsp_ptr, saved_user_rflags_ptr,
     get_task_alt_stack_sp, set_task_alt_stack_sp,
     get_task_alt_stack_size, set_task_alt_stack_size,
@@ -411,6 +415,10 @@ SYS_newfstatat:      uint64 = 262
 # U18: stubs needed by glibc-static startup before main() runs.
 SYS_set_robust_list: uint64 = 273
 SYS_prlimit64:       uint64 = 302
+# #160 / seccomp-lite: the dedicated seccomp(2) syscall (x86_64 nr 317).
+# Both this and prctl(PR_SET_SECCOMP, ...) install the same per-task
+# filter state.
+SYS_seccomp:         uint64 = 317
 SYS_getrandom:       uint64 = 318
 SYS_rseq:            uint64 = 334
 SYS_getrlimit:       uint64 = 97
@@ -3207,6 +3215,156 @@ def _u_rt_sigreturn(a0: uint64, a1: uint64, a2: uint64,
     return cast[int64](saved_rax)
 
 
+# =====================================================================
+# #160: seccomp-lite — per-task syscall filter
+# =====================================================================
+#
+# A real, working syscall-filtering capability for Linux-ABI userspace
+# processes, enforced at THIS file's central dispatch boundary. Two
+# install entry points feed one per-task state (mode + lite allow-list,
+# stored in core.ad's TaskStruct, reached via accessors so core.ad keeps
+# no static dependency on this layer):
+#
+#   * prctl(PR_SET_SECCOMP, mode, ...)   — the classic install path
+#   * seccomp(operation, flags, args)    — the dedicated syscall (nr 317)
+#
+# Modes implemented:
+#   SECCOMP_MODE_STRICT (1) — Linux strict mode, faithful. Once armed,
+#     ONLY read / write / _exit / exit_group / rt_sigreturn are allowed;
+#     ANY other syscall terminates the task with SIGSYS (31).
+#   SECCOMP_MODE_FILTER (2) — a "lite" allow-list. Rather than a full
+#     classic-BPF interpreter, we accept a small bitmap of permitted
+#     syscall numbers (0..255) installed via SECCOMP_SET_MODE_FILTER's
+#     args (see _u_seccomp). The strict always-allowed set is implicitly
+#     permitted in this mode too (so a filtered task can always read its
+#     own denial and exit cleanly). Default action for any nr not in the
+#     allow-list is the same kill-with-SIGSYS as strict mode. This is the
+#     documented "lite" simplification: the userspace ABI shape (mode
+#     numbers, the seccomp(2)/prctl entry points, the SIGSYS kill on a
+#     denied call) matches Linux closely enough for a musl program to
+#     install it; only the filter REPRESENTATION (allow-list bitmap vs a
+#     compiled BPF program) is simplified.
+#
+# Enforcement (seccomp_check_entry below) runs at syscall ENTRY in
+# linux_u_syscall_dispatch, AFTER the ptrace enter-stop wrap and BEFORE
+# the real handler. On a denial it posts SIGSYS to the current task and
+# returns a "blocked" flag; the dispatcher then skips the real handler.
+# SIGSYS is delivered through the normal Linux-ABI signal path — the
+# exit-side signal_deliver_on_return in do_syscall builds the rt_sigframe
+# if the task installed a SIGSYS handler, otherwise the default
+# terminate-with-128+31 disposition runs at the next signal check. This
+# composes cleanly with ptrace: the enter-stop has already happened, the
+# real handler is skipped, and the exit-stop wrap reports the synthetic
+# rc just like a real (denied) syscall would.
+
+# prctl option + seccomp mode numbers (Linux <linux/prctl.h>,
+# <linux/seccomp.h>).
+PR_SET_SECCOMP:      uint64 = 22
+PR_GET_SECCOMP:      uint64 = 21
+SECCOMP_MODE_DISABLED: uint64 = 0
+SECCOMP_MODE_STRICT:   uint64 = 1
+SECCOMP_MODE_FILTER:   uint64 = 2
+
+# seccomp(2) operations (Linux <linux/seccomp.h>).
+SECCOMP_SET_MODE_STRICT: uint64 = 0
+SECCOMP_SET_MODE_FILTER: uint64 = 1
+
+ELINUX_ACCES: int64 = -13          # -EACCES
+ELINUX_FAULT: int64 = -14          # -EFAULT
+
+
+def _seccomp_strict_allows(nr: uint64) -> int32:
+    # The fixed strict-mode allow-set, identical to Linux: read, write,
+    # _exit/exit_group, rt_sigreturn. Everything else is denied.
+    if nr == SYS_read:
+        return 1
+    if nr == SYS_write:
+        return 1
+    if nr == SYS_exit:
+        return 1
+    if nr == SYS_exit_group:
+        return 1
+    if nr == SYS_rt_sigreturn:
+        return 1
+    return 0
+
+
+def seccomp_check_entry(nr: uint64) -> int32:
+    # Called at syscall ENTRY by linux_u_syscall_dispatch. Returns 1 if
+    # the syscall is BLOCKED (the dispatcher must NOT run it; SIGSYS has
+    # been posted) and 0 if it is permitted (or seccomp is inactive).
+    slot: uint64 = current_idx_get()
+    mode: uint64 = get_task_seccomp_mode(slot)
+    if mode == SECCOMP_MODE_DISABLED:
+        return 0
+    allowed: int32 = 0
+    if mode == SECCOMP_MODE_STRICT:
+        allowed = _seccomp_strict_allows(nr)
+    else:
+        # FILTER mode: the strict set is always permitted (so the task
+        # can read/write/exit/sigreturn around its denial), plus anything
+        # the installed allow-list bitmap names.
+        if _seccomp_strict_allows(nr) != 0:
+            allowed = 1
+        elif seccomp_filter_allows(slot, nr) != 0:
+            allowed = 1
+    if allowed != 0:
+        return 0
+    # Denied. Post SIGSYS to ourselves; the do_syscall exit-side check
+    # delivers it (handler → rt_sigframe; no handler → terminate 128+31).
+    printk2("seccomp: pid=%d denied syscall nr=%d -> SIGSYS\n",
+            cast[int32](current_task_pid()), cast[int32](nr))
+    signal_post(slot, SIGSYS)
+    return 1
+
+
+def _seccomp_install_strict(slot: uint64) -> int64:
+    # Arm strict mode on the current task. Irrevocable: set_task_seccomp_
+    # mode refuses to lower an already-set mode, so a task can never
+    # disarm itself. Re-installing strict over strict is a benign no-op.
+    set_task_seccomp_mode(slot, SECCOMP_MODE_STRICT)
+    return 0
+
+
+def _seccomp_install_filter_allowlist(slot: uint64, words: Ptr[uint64]) -> int64:
+    # Arm FILTER mode with the 4-word (256-bit) allow-list bitmap pointed
+    # to by `words` (or all-zero if words==0 → only the implicit strict
+    # set is permitted). This is the "lite" stand-in for a compiled BPF
+    # program — see the module header for the simplification rationale.
+    i: uint64 = 0
+    while i < 4:
+        v: uint64 = 0
+        if words != cast[Ptr[uint64]](0):
+            v = words[i]
+        set_task_seccomp_filter(slot, i, v)
+        i = i + 1
+    set_task_seccomp_mode(slot, SECCOMP_MODE_FILTER)
+    return 0
+
+
+def _u_seccomp(a0: uint64, a1: uint64, a2: uint64,
+               a3: uint64, a4: uint64, a5: uint64) -> int64:
+    # int seccomp(unsigned int operation, unsigned int flags, void *args)
+    #   a0 = operation, a1 = flags, a2 = args
+    #
+    # SECCOMP_SET_MODE_STRICT: arm strict mode (args must be NULL).
+    # SECCOMP_SET_MODE_FILTER: Linux expects a `struct sock_fprog *` in
+    #   args; our lite implementation instead treats args as an optional
+    #   pointer to a 4-word (256-bit) allow-list bitmap of permitted
+    #   syscall numbers. A musl program targeting Hamnix passes that
+    #   bitmap; a program passing a real sock_fprog gets a default-deny
+    #   filter (only the implicit strict set), which still kills on the
+    #   first non-trivial syscall — safe, just coarser.
+    op: uint64 = a0
+    slot: uint64 = current_idx_get()
+    if op == SECCOMP_SET_MODE_STRICT:
+        return _seccomp_install_strict(slot)
+    if op == SECCOMP_SET_MODE_FILTER:
+        return _seccomp_install_filter_allowlist(slot, cast[Ptr[uint64]](a2))
+    set_current_errstr("seccomp: unsupported operation")
+    return ELINUX_INVAL
+
+
 def _u_prctl(a0: uint64, a1: uint64, a2: uint64,
              a3: uint64, a4: uint64, a5: uint64) -> int64:
     # int prctl(int option, unsigned long arg2, ..., unsigned long arg5).
@@ -3255,6 +3413,21 @@ def _u_prctl(a0: uint64, a1: uint64, a2: uint64,
             dst[i] = src[i]
             i = i + 1
         return 0
+    if a0 == PR_SET_SECCOMP:                              # #160
+        # prctl(PR_SET_SECCOMP, mode, filter). mode==1 strict; mode==2
+        # filter (arg3 = optional allow-list bitmap pointer, our lite
+        # ABI). Feeds the same per-task state as seccomp(2).
+        if a1 == SECCOMP_MODE_STRICT:
+            return _seccomp_install_strict(current_idx_get())
+        if a1 == SECCOMP_MODE_FILTER:
+            return _seccomp_install_filter_allowlist(
+                current_idx_get(), cast[Ptr[uint64]](a2))
+        set_current_errstr("prctl: bad seccomp mode")
+        return ELINUX_INVAL
+    if a0 == PR_GET_SECCOMP:                              # #160
+        # Returns the current seccomp mode (0/1/2). Linux returns 0 or 2;
+        # we also surface 1 for strict so a test can observe it.
+        return cast[int64](get_task_seccomp_mode(current_idx_get()))
     return ELINUX_INVAL
 
 
@@ -5330,6 +5503,19 @@ def linux_u_syscall_dispatch(nr: uint64,
     # the tracer's own ptrace call cannot recurse (the tracer isn't a
     # tracee).
     ptrace_syscall_enter_stop(nr)
+    # #160 / seccomp-lite: enforce the per-task syscall filter at ENTRY,
+    # after the ptrace enter-stop (so a tracer still observes the call)
+    # and BEFORE the real handler runs. If the filter denies `nr`,
+    # seccomp_check_entry posts SIGSYS to the current task; we then SKIP
+    # the real handler and short-circuit to the exit wrap with a -ENOSYS
+    # rc. The pending SIGSYS is delivered by do_syscall's exit-side
+    # signal_deliver_on_return (handler → rt_sigframe; no handler →
+    # default terminate 128+31). The rc is irrelevant to a task that is
+    # about to be killed, and faithful for a task that catches SIGSYS and
+    # returns. Native/kernel paths never reach here (gated on
+    # is_linux_userspace at the do_syscall fork upstream).
+    if seccomp_check_entry(nr) != 0:
+        return ptrace_syscall_exit_stop(cast[int64](-38))   # -ENOSYS
     rc: int64 = _linux_u_syscall_dispatch_inner(nr, a0, a1, a2, a3, a4, a5)
     return ptrace_syscall_exit_stop(rc)
 
@@ -5378,6 +5564,8 @@ def _linux_u_syscall_dispatch_inner(nr: uint64,
         return _u_rt_sigreturn(a0, a1, a2, a3, a4, a5)
     if nr == SYS_prctl:
         return _u_prctl(a0, a1, a2, a3, a4, a5)
+    if nr == SYS_seccomp:
+        return _u_seccomp(a0, a1, a2, a3, a4, a5)
     if nr == SYS_ioctl:
         return _u_ioctl(a0, a1, a2, a3, a4, a5)
     if nr == SYS_pread64:
