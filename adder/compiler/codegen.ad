@@ -72,6 +72,7 @@ from compiler.parser import (
     nd_d,
     nd_num,
     nd_next,
+    nd_line,
     ND_FUNCTION,
     ND_RETURN,
     ND_BINARY,
@@ -151,6 +152,44 @@ cg_err: uint32 = 0
 # Sentinel 0xFFFFFFFF means "unresolved" (no functions emitted).
 CG_ENTRY_NONE: uint32 = 4294967295
 cg_entry_off: uint32 = 0
+
+# Diagnostic: WHY codegen failed (set the first time cg_err goes 1 via
+# cg_fail). Lets the on-device driver report a precise blocker instead of a
+# bare "codegen error". Reason codes:
+#   1 = unsupported expression node      2 = unsupported statement node
+#   3 = CODE_CAP overflow (code too big) 4 = GDATA_CAP overflow (.data)
+#   5 = call/data/string fixup table full
+#   6 = MAX_FUNCS/MAX_GLOBALS/MAX_LOCALS table full
+#   7 = unresolved call (unknown callee) 8 = unknown name / type query
+#   9 = other / uncategorised           10 = disp8 frame overflow (a
+#       function's locals exceed the -128 disp8 reach)
+cg_err_reason: uint32 = 0
+cg_err_node: uint32 = 0     # offending AST node id (for nd_line lookup)
+
+
+# Record the first codegen failure with a reason code + offending node.
+# Idempotent on reason (keeps the FIRST cause); always sets cg_err.
+def cg_fail(reason: uint32, node: uint32):
+    if cg_err == 0:
+        cg_err_reason = reason
+        cg_err_node = node
+    cg_err = 1
+
+
+# Source line of the codegen-failure node (0 if none / unknown). Lets the
+# driver point at the offending construct in the input.
+def cg_err_line() -> uint32:
+    if cg_err_node == 0:
+        return 0
+    return nd_line[cg_err_node]
+
+
+# AST kind of the codegen-failure node (0 if none). Helps disambiguate
+# reason-1/2 "unsupported node" diagnostics on device.
+def cg_err_kind() -> uint32:
+    if cg_err_node == 0:
+        return 0
+    return nd_kind[cg_err_node]
 
 # -----------------------------------------------------------------------
 # Per-function local/parameter slot table.
@@ -340,12 +379,14 @@ def cg_init():
     str_count = 0
     loop_depth = 0
     cg_entry_off = CG_ENTRY_NONE
+    cg_err_reason = 0
+    cg_err_node = 0
 
 
 # Append one byte to the output buffer.
 def emit_b(b: uint32):
     if code_len >= CODE_CAP:
-        cg_err = 1
+        cg_fail(3, 0)
         return
     code[code_len] = cast[uint8](b & 255)
     code_len = code_len + 1
@@ -375,7 +416,7 @@ def name_match(aoff: uint32, alen: uint32, boff: uint32, blen: uint32) -> int32:
 # negative %rbp-relative offset, mirroring alloc_local's growth direction.
 def alloc_local(name_off: uint32, name_len: uint32) -> int32:
     if loc_count >= MAX_LOCALS:
-        cg_err = 1
+        cg_fail(6, 0)
         return 0
     cg_stack_size = cg_stack_size + 8
     off: int32 = 0 - cast[int32](cg_stack_size)
@@ -394,7 +435,7 @@ def alloc_local(name_off: uint32, name_len: uint32) -> int32:
 # negative %rbp-relative offset. Mirrors alloc_local but records ptr-ness.
 def alloc_ptr_local(name_off: uint32, name_len: uint32, ptr_size: uint32) -> int32:
     if loc_count >= MAX_LOCALS:
-        cg_err = 1
+        cg_fail(6, 0)
         return 0
     cg_stack_size = cg_stack_size + 8
     off: int32 = 0 - cast[int32](cg_stack_size)
@@ -410,19 +451,17 @@ def alloc_ptr_local(name_off: uint32, name_len: uint32, ptr_size: uint32) -> int
 # Allocate an Array local of `count` elements, each `elem_size` bytes,
 # 8-byte-rounded so subsequent scalar slots stay 8-aligned (mirrors
 # alloc_local(size=...) in codegen_x86.py). Returns the BASE offset (the
-# address of element 0 = the lowest reserved address). disp8 addressing
-# limits the reachable frame to -128; overflow sets cg_err.
+# address of element 0 = the lowest reserved address). Frame access uses
+# disp32 (mod=10) addressing, so the offset may reach the whole frame — no
+# -128 limit.
 def alloc_array_local(name_off: uint32, name_len: uint32, count: uint32, elem_size: uint32) -> int32:
     if loc_count >= MAX_LOCALS:
-        cg_err = 1
+        cg_fail(6, 0)
         return 0
     bytes_: uint32 = count * elem_size
     bytes_ = (bytes_ + 7) & cast[uint32](0xFFFFFFF8)
     cg_stack_size = cg_stack_size + bytes_
     off: int32 = 0 - cast[int32](cg_stack_size)
-    if off < (0 - 128):
-        # Beyond disp8 reach — this subset only emits disp8 frame access.
-        cg_err = 1
     loc_name_off[loc_count] = name_off
     loc_name_len[loc_count] = name_len
     loc_offset[loc_count] = off
@@ -469,7 +508,7 @@ def lookup_local(name_off: uint32, name_len: uint32, out_off: Ptr[int32]) -> int
 # Register an emitted function's symbol -> code offset.
 def fn_define(name_off: uint32, name_len: uint32, off: uint32):
     if fn_count >= MAX_FUNCS:
-        cg_err = 1
+        cg_fail(6, 0)
         return
     fn_name_off[fn_count] = name_off
     fn_name_len[fn_count] = name_len
@@ -480,7 +519,7 @@ def fn_define(name_off: uint32, name_len: uint32, off: uint32):
 # Record a pending call relocation at rel32-field offset `at`.
 def add_call_fixup(at: uint32, name_off: uint32, name_len: uint32):
     if fx_count >= MAX_FIXUPS:
-        cg_err = 1
+        cg_fail(5, 0)
         return
     fx_at[fx_count] = at
     fx_name_off[fx_count] = name_off
@@ -503,7 +542,7 @@ def resolve_calls():
                 j = j + 1
         if found == 0:
             # Unknown callee — outside this subset (no extern linkage here).
-            cg_err = 1
+            cg_fail(7, 0)
         i = i + 1
 
 
@@ -559,7 +598,7 @@ def resolve_entry(first_off: uint32) -> uint32:
 # offset of the reserved block.
 def gdata_reserve(n: uint32) -> uint32:
     if gdata_len + n > GDATA_CAP:
-        cg_err = 1
+        cg_fail(4, 0)
         return 0
     off: uint32 = gdata_len
     i: uint32 = 0
@@ -585,7 +624,7 @@ def bss_reserve(n: uint32) -> uint32:
 # Append one byte to the data section, returning its offset.
 def gdata_emit_b(b: uint32) -> uint32:
     if gdata_len >= GDATA_CAP:
-        cg_err = 1
+        cg_fail(4, 0)
         return 0
     off: uint32 = gdata_len
     gdata[off] = cast[uint8](b & 255)
@@ -597,7 +636,7 @@ def gdata_emit_b(b: uint32) -> uint32:
 # data slot is reserved here. Returns the assigned data offset.
 def glob_define(name_off: uint32, name_len: uint32, data_off: uint32, elem_size: uint32, scalar_size: uint32) -> uint32:
     if glob_count >= MAX_GLOBALS:
-        cg_err = 1
+        cg_fail(6, 0)
         return 0
     glob_name_off[glob_count] = name_off
     glob_name_len[glob_count] = name_len
@@ -642,7 +681,7 @@ def glob_lookup(name_off: uint32, name_len: uint32) -> uint32:
 # resolved against the final gdata_len in resolve_data_fixups()).
 def add_data_fixup(at: uint32, data_off: uint32, is_bss: uint32):
     if df_count >= MAX_DATA_FIXUPS:
-        cg_err = 1
+        cg_fail(5, 0)
         return
     df_at[df_count] = at
     df_data_off[df_count] = data_off
@@ -691,7 +730,7 @@ def intern_string(src_off: uint32, src_len: uint32) -> uint32:
         str_data_off[str_count] = base
         str_count = str_count + 1
     else:
-        cg_err = 1
+        cg_fail(6, 0)
     return base
 
 
@@ -882,13 +921,46 @@ def emit_movzx_cl_rcx():
     emit_b(0xC9)
 
 
-# leaq disp8(%rbp), %rax  -> 48 8D 45 <disp8>   (address of a frame slot)
+# Frame-access displacement encoding is HYBRID: a slot whose %rbp offset
+# fits in a signed byte (-128..0) uses the compact disp8 (mod=01) form;
+# anything beyond -128 uses disp32 (mod=10). This is REQUIRED for the
+# self-host fixpoint — the compiler's own large functions have frames far
+# past 128 bytes — while keeping byte-IDENTICAL output for small functions
+# (so the codegen selftest's hardcoded offsets stay valid).
+#
+# A disp8-reachable offset (-128 <= off <= 0; frame offsets are <= 0).
+def disp_fits8(off: int32) -> int32:
+    if off >= (0 - 128):
+        return 1
+    return 0
+
+
+# Emit a 32-bit little-endian frame displacement (the signed %rbp offset).
+def emit_disp32(off: int32):
+    d: uint32 = cast[uint32](off)
+    emit_b(d & 255)
+    emit_b((d >> 8) & 255)
+    emit_b((d >> 16) & 255)
+    emit_b((d >> 24) & 255)
+
+
+# Emit a [%rbp]-based modrm + displacement for a frame access. `rbp_modrm8`
+# is the mod=01 (disp8) modrm byte (reg field already set, base=rbp); for
+# the disp32 form we add 0x40 (mod 01 -> 10) and append a 4-byte disp.
+def emit_rbp_mem(rbp_modrm8: uint32, off: int32):
+    if disp_fits8(off) != 0:
+        emit_b(rbp_modrm8)
+        emit_b(cast[uint32](off) & 255)
+    else:
+        emit_b(rbp_modrm8 + 0x40)
+        emit_disp32(off)
+
+
+# leaq off(%rbp), %rax  -> 48 8D {45 disp8 | 85 disp32}  (frame-slot address)
 def emit_lea_local_rax(off: int32):
-    disp: uint32 = cast[uint32](off) & 255
     emit_b(0x48)
     emit_b(0x8D)
-    emit_b(0x45)
-    emit_b(disp)
+    emit_rbp_mem(0x45, off)
 
 
 # leaq <data_off>(%rip), %rax  -> 48 8D 05 <rel32>   (address of a global /
@@ -976,67 +1048,56 @@ def emit_store_mem_rcx(size: uint32):
         emit_b(0x08)
 
 
-# movq <arg-reg>, disp8(%rbp)   spill a parameter into its slot.
-#   movq %rdi, off(%rbp) -> 48 89 7D <disp8>
-#   movq %rsi, off(%rbp) -> 48 89 75 <disp8>
-#   movq %rdx, off(%rbp) -> 48 89 55 <disp8>
-#   movq %rcx, off(%rbp) -> 48 89 4D <disp8>
-#   movq %r8,  off(%rbp) -> 4C 89 45 <disp8>
-#   movq %r9,  off(%rbp) -> 4C 89 4D <disp8>
-# The disp8 byte is the offset taken as a signed 8-bit value (slots are
-# small and negative, well within -128).
+# movq <arg-reg>, off(%rbp)   spill a parameter into its slot.
+#   movq %rdi, off(%rbp) -> 48 89 {7D disp8 | BD disp32}
+#   movq %rsi, off(%rbp) -> 48 89 {75 disp8 | B5 disp32}
+#   movq %rdx, off(%rbp) -> 48 89 {55 disp8 | 95 disp32}
+#   movq %rcx, off(%rbp) -> 48 89 {4D disp8 | 8D disp32}
+#   movq %r8,  off(%rbp) -> 4C 89 {45 disp8 | 85 disp32}
+#   movq %r9,  off(%rbp) -> 4C 89 {4D disp8 | 8D disp32}
+# Hybrid disp8/disp32 (see emit_rbp_mem) so the offset reaches the whole
+# frame while keeping small frames byte-identical.
 def emit_spill_arg(argidx: uint32, off: int32):
-    disp: uint32 = cast[uint32](off) & 255
     if argidx == 0:
         emit_b(0x48)
         emit_b(0x89)
-        emit_b(0x7D)
-        emit_b(disp)
+        emit_rbp_mem(0x7D, off)
     elif argidx == 1:
         emit_b(0x48)
         emit_b(0x89)
-        emit_b(0x75)
-        emit_b(disp)
+        emit_rbp_mem(0x75, off)
     elif argidx == 2:
         emit_b(0x48)
         emit_b(0x89)
-        emit_b(0x55)
-        emit_b(disp)
+        emit_rbp_mem(0x55, off)
     elif argidx == 3:
         emit_b(0x48)
         emit_b(0x89)
-        emit_b(0x4D)
-        emit_b(disp)
+        emit_rbp_mem(0x4D, off)
     elif argidx == 4:
         emit_b(0x4C)
         emit_b(0x89)
-        emit_b(0x45)
-        emit_b(disp)
+        emit_rbp_mem(0x45, off)
     else:
         emit_b(0x4C)
         emit_b(0x89)
-        emit_b(0x4D)
-        emit_b(disp)
+        emit_rbp_mem(0x4D, off)
 
 
-# movq disp8(%rbp), %rax   load a local/param into %rax.
-#   -> 48 8B 45 <disp8>
+# movq off(%rbp), %rax   load a local/param into %rax.
+#   -> 48 8B {45 disp8 | 85 disp32}
 def emit_load_local_rax(off: int32):
-    disp: uint32 = cast[uint32](off) & 255
     emit_b(0x48)
     emit_b(0x8B)
-    emit_b(0x45)
-    emit_b(disp)
+    emit_rbp_mem(0x45, off)
 
 
-# movq %rax, disp8(%rbp)   store %rax into a local/param slot.
-#   -> 48 89 45 <disp8>
+# movq %rax, off(%rbp)   store %rax into a local/param slot.
+#   -> 48 89 {45 disp8 | 85 disp32}
 def emit_store_local_rax(off: int32):
-    disp: uint32 = cast[uint32](off) & 255
     emit_b(0x48)
     emit_b(0x89)
-    emit_b(0x45)
-    emit_b(disp)
+    emit_rbp_mem(0x45, off)
 
 
 # -----------------------------------------------------------------------
@@ -1199,7 +1260,7 @@ def gen_expr(node: uint32):
                 emit_load_mem_rax(glob_scalar_size[gi - 1])
             return
         # Unknown identifier — out of this subset's scope.
-        cg_err = 1
+        cg_fail(8, node)
         return
 
     if k == ND_STRING_LIT:
@@ -1289,7 +1350,7 @@ def gen_expr(node: uint32):
             emit_movzx_cl_rcx()
             emit_or_rcx_rax()
         else:
-            cg_err = 1
+            cg_fail(1, node)
         return
 
     if k == ND_UNARY:
@@ -1320,7 +1381,7 @@ def gen_expr(node: uint32):
         return
 
     # Anything else is outside this milestone's subset.
-    cg_err = 1
+    cg_fail(1, node)
 
 
 # -----------------------------------------------------------------------
@@ -1357,7 +1418,7 @@ def gen_unary(node: uint32):
         emit_setcc_al(0x94)        # setz/sete %al
         emit_movzx_al_rax()
     else:
-        cg_err = 1
+        cg_fail(1, node)
 
 
 # Pointee width for a `*expr` deref: if `expr` is a bare Ptr[T] identifier
@@ -1396,7 +1457,7 @@ def gen_addr_of(operand: uint32):
         if gi != 0:
             emit_lea_global_rax(glob_offset[gi - 1], glob_is_bss[gi - 1])
             return
-    cg_err = 1
+    cg_fail(8, operand)
 
 
 # -----------------------------------------------------------------------
@@ -1412,7 +1473,7 @@ def gen_addr_of(operand: uint32):
 def index_elem_size(node: uint32) -> uint32:
     base: uint32 = nd_a[node]
     if nd_kind[base] != ND_IDENT:
-        cg_err = 1
+        cg_fail(8, node)
         return 1
     es: uint32 = lookup_elem_size(nd_name_off[base], nd_name_len[base])
     if es != 0:
@@ -1428,7 +1489,7 @@ def index_elem_size(node: uint32) -> uint32:
     if gi != 0 and glob_ptr_size[gi - 1] != 0:
         return glob_ptr_size[gi - 1]
     # Not a known array local or global — outside this subset.
-    cg_err = 1
+    cg_fail(8, node)
     return 1
 
 
@@ -1439,7 +1500,7 @@ def index_elem_size(node: uint32) -> uint32:
 def gen_index_addr(node: uint32):
     base: uint32 = nd_a[node]
     if nd_kind[base] != ND_IDENT:
-        cg_err = 1
+        cg_fail(8, node)
         return
 
     # Classify the base. There are four base flavours, all of which decay to
@@ -1479,7 +1540,7 @@ def gen_index_addr(node: uint32):
             gdoff = glob_offset[gi - 1]
             gbss = glob_is_bss[gi - 1]
         else:
-            cg_err = 1
+            cg_fail(8, node)
             return
 
     # Evaluate the index into %rax, move to %rcx, scale, then add the base
@@ -1512,11 +1573,11 @@ def gen_call(node: uint32):
     callee: uint32 = nd_a[node]
     if nd_kind[callee] != ND_IDENT:
         # Only direct calls to a bare name are in scope.
-        cg_err = 1
+        cg_fail(8, node)
         return
     argc: uint32 = nd_aux[node]
     if argc > 6:
-        cg_err = 1
+        cg_fail(8, node)
         return
 
     # Evaluate-and-push each argument, lowest index first.
@@ -1671,7 +1732,7 @@ def gen_stmt(node: uint32):
             return
         if nd_kind[tgt] != ND_IDENT:
             # Only identifier / index targets are in scope.
-            cg_err = 1
+            cg_fail(2, node)
             return
         aug: uint32 = nd_aux[node]
         if aug == AUGOP_NONE:
@@ -1692,7 +1753,7 @@ def gen_stmt(node: uint32):
         elif aug == AUGOP_MUL:
             emit_imul_rcx_rax()
         else:
-            cg_err = 1
+            cg_fail(2, node)
             return
         store_to_named(nd_name_off[tgt], nd_name_len[tgt])
         return
@@ -1711,11 +1772,11 @@ def gen_stmt(node: uint32):
         # offset as a break fixup on the top loop frame; gen_while patches it
         # once the exit point is reached.
         if loop_depth == 0:
-            cg_err = 1
+            cg_fail(2, node)
             return
         d: uint32 = loop_depth - 1
         if loop_brk_n[d] >= MAX_BRK:
-            cg_err = 1
+            cg_fail(6, node)
             return
         at: uint32 = emit_jmp_fwd()
         loop_brk_at[d * MAX_BRK + loop_brk_n[d]] = at
@@ -1725,7 +1786,7 @@ def gen_stmt(node: uint32):
     if k == ND_CONTINUE:
         # Jump back to the innermost loop's condition test (a known offset).
         if loop_depth == 0:
-            cg_err = 1
+            cg_fail(2, node)
             return
         emit_jmp_back(loop_cont_target[loop_depth - 1])
         return
@@ -1735,7 +1796,7 @@ def gen_stmt(node: uint32):
         return
 
     # Other statement kinds not covered by this subset.
-    cg_err = 1
+    cg_fail(2, node)
 
 
 # Assign to an array element: `arr[i] = v` (and augmented `arr[i] OP= v`).
@@ -1782,7 +1843,7 @@ def gen_assign_index(node: uint32):
     elif aug == AUGOP_MUL:
         emit_imul_rcx_rax()
     else:
-        cg_err = 1
+        cg_fail(2, node)
         return
     emit_push_rax()                  # new value
     gen_index_addr(tgt)              # &arr[i] again
@@ -1841,7 +1902,7 @@ def gen_while(node: uint32):
     # Push a loop frame: `continue` targets `start` (re-test the condition);
     # `break` fixups accumulate in this frame's slot and patch to the exit.
     if loop_depth >= MAX_LOOPS:
-        cg_err = 1
+        cg_fail(6, node)
         return
     depth: uint32 = loop_depth
     loop_cont_target[depth] = start
@@ -2074,7 +2135,7 @@ def gen_program_first_function(prog: uint32) -> uint32:
         if nd_kind[cur] == ND_FUNCTION:
             return gen_function(cur)
         cur = nd_next[cur]
-    cg_err = 1
+    cg_fail(9, 0)
     return 0
 
 
@@ -2095,7 +2156,7 @@ def gen_program_all_functions(prog: uint32) -> uint32:
                 seen = 1
         cur = nd_next[cur]
     if seen == 0:
-        cg_err = 1
+        cg_fail(9, 0)
         return 0
     resolve_calls()
     resolve_entry(first)
@@ -2122,7 +2183,7 @@ def gen_program_with_globals(prog: uint32) -> uint32:
                 seen = 1
         cur = nd_next[cur]
     if seen == 0:
-        cg_err = 1
+        cg_fail(9, 0)
         return 0
     resolve_calls()
     resolve_data_fixups()

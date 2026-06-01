@@ -61,6 +61,9 @@ from compiler.parser import (
 from compiler.codegen import (
     cg_init,
     cg_err,
+    cg_err_reason,
+    cg_err_line,
+    cg_err_kind,
     code_len,
     gen_program_with_globals,
     gdata_len,
@@ -209,7 +212,17 @@ def main() -> int32:
     cg_init()
     start: uint32 = gen_program_with_globals(prog)
     if cg_err != 0:
-        emit("[hamnix_ac_emit] FAIL: codegen error\n")
+        # Precise blocker: reason code + offending source line + node kind.
+        # reason: 1=unsupported expr 2=unsupported stmt 3=CODE_CAP overflow
+        # 4=GDATA_CAP overflow 5=fixup table full 6=symbol table full
+        # 7=unresolved call 8=unknown name/type 0/9=uncategorised.
+        emit("[hamnix_ac_emit] FAIL: codegen error reason=")
+        put_u32(cg_err_reason)
+        emit(" line=")
+        put_u32(cg_err_line())
+        emit(" kind=")
+        put_u32(cg_err_kind())
+        emit("\n")
         sys_exit(5)
     if fn_count == 0:
         emit("[hamnix_ac_emit] FAIL: no functions emitted\n")
