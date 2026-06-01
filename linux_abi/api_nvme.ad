@@ -817,7 +817,14 @@ def _nvm_dma_pci_p2pdma_supported(dev: uint64) -> int32:
 
 def _nvm_kmalloc_node(size: uint64, flags: uint32, node: int32) -> uint64:
     # void *__kmalloc_node(size_t, gfp_t, int node).
-    # Drop the NUMA node hint; Hamnix is UMA.
+    # Drop the NUMA node hint; Hamnix is UMA. Honor __GFP_ZERO (0x100):
+    # this is the FIRST-match resolution for __kmalloc_node, so it's the
+    # one xhci_mem_init's port-array allocation lands on. An unzeroed
+    # xhci->hw_ports[] leaves port->rhub (offset 0x10) as garbage, which
+    # trips xhci_mem_init's "duplicate port" warning path whose dev_warn
+    # arg prep then dereferences the garbage and #GPs.
+    if (flags & 0x100) != 0:
+        return kzalloc(size)
     return kmalloc(size)
 
 
@@ -826,7 +833,9 @@ def _nvm_kmalloc_node_trace(s: uint64, flags: uint32, node: int32,
     # void *kmalloc_node_trace(struct kmem_cache *, gfp_t, int node,
     #                            size_t size).
     # Trace-enabled per-cache alloc. Drop cache+trace+node; forward
-    # size to plain kmalloc.
+    # size to plain kmalloc. Honor __GFP_ZERO like __kmalloc_node.
+    if (flags & 0x100) != 0:
+        return kzalloc(size)
     return kmalloc(size)
 
 

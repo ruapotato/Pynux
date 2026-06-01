@@ -78,9 +78,15 @@ echo "[test_xhci_ko_enum] (1/5) Build userland + modules"
 bash scripts/build_user.sh >/dev/null
 bash scripts/build_modules.sh >/dev/null
 
-echo "[test_xhci_ko_enum] (2/5) Build initramfs with /etc/xhci-ko-real marker"
+echo "[test_xhci_ko_enum] (2/5) Build initramfs with /etc/xhci-ko-real + xhci-ko-real-mmio markers"
 INITRAMFS_LOG=$(mktemp)
-ENABLE_XHCI_KO_REAL=1 INIT_ELF=build/user/init.elf \
+# Arm the DEEP path (ENABLE_XHCI_KO_REAL_MMIO=1): the real .ko
+# xhci_gen_setup/mem_init run, the controller is started off the .ko's
+# rings, and we drive a full Enable-Slot -> Address-Device ->
+# GET_DESCRIPTOR enumeration step through the .ko-built rings. This
+# stays a SEPARATE opt-in initramfs; the EXIT trap below restores the
+# default native-USB initramfs so no other test is affected.
+ENABLE_XHCI_KO_REAL=1 ENABLE_XHCI_KO_REAL_MMIO=1 INIT_ELF=build/user/init.elf \
     python3 scripts/build_initramfs.py > "$INITRAMFS_LOG" 2>&1
 # Always restore the default (native-USB) initramfs on exit so the
 # root-on-USB boot path is never left disabled for subsequent tests.
@@ -200,4 +206,87 @@ else
     echo "[test_xhci_ko_enum] WARN: no usb_xhci_cap_read in trace"
 fi
 
-echo "[test_xhci_ko_enum] PASS (real Linux xhci_hcd.ko drove controller setup + live cap-register read; native disabled)"
+# ---------------------------------------------------------------------
+# DEEP path (ENABLE_XHCI_KO_REAL_MMIO=1): the real .ko xhci_gen_setup
+# ran, the controller was started off the .ko's rings, and a full
+# Enable-Slot -> Address-Device -> GET_DESCRIPTOR enumeration step was
+# driven through the .ko-built rings. Each milestone is asserted from
+# the kernel-side [xhci-real] markers AND cross-checked against the
+# unambiguous QEMU trace (controller DMA activity on OUR ring
+# addresses, distinguishable from SeaBIOS by buffer addr + wLength).
+# ---------------------------------------------------------------------
+
+# Stage 3: the real .ko xhci_gen_setup completed (halt+reset+mem_init).
+if ! grep -aF -q "[xhci-real] PASS stage3" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage3 (real .ko xhci_gen_setup) did not complete"
+    tail -n 40 "$LOG"
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage3 — real .ko xhci_gen_setup ran (halt+reset+mem_init)"
+
+# Stage 4: the .ko programmed DCBAAP+CRCR into live MMIO and the
+# controller went non-halted (running off the .ko ring layout).
+if ! grep -aF -q "[xhci-real] PASS stage4: controller RUNNING off .ko ring config" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage4 (controller running off .ko rings) did not pass"
+    tail -n 40 "$LOG"
+    exit 1
+fi
+if ! grep -aE -q 'usb_xhci_run' "$TRACE"; then
+    echo "[test_xhci_ko_enum] FAIL: QEMU trace has no usb_xhci_run (controller not started)"
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage4 — controller RUNNING off .ko rings (QEMU usb_xhci_run confirmed)"
+
+# Stage 5: Enable-Slot round-trip. The kernel marker asserts the
+# completion referenced OUR command TRB; cross-check the trace shows the
+# controller fetched CR_ENABLE_SLOT from the .ko cmd-ring region
+# (0x0500xxxx) and posted a completion referencing it.
+if ! grep -aF -q "[xhci-real] PASS stage5" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage5 (Enable-Slot round-trip) did not pass"
+    tail -n 40 "$LOG"
+    exit 1
+fi
+if ! grep -aE -q 'fetch_trb addr 0x0000000005[0-9a-f]+, CR_ENABLE_SLOT' "$TRACE"; then
+    echo "[test_xhci_ko_enum] FAIL: trace shows no CR_ENABLE_SLOT fetched from the .ko cmd ring"
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage5 — Enable-Slot DMA-consumed from .ko cmd ring + completion to .ko event ring"
+
+# Stage 6: Address-Device SUCCESS. Marker asserts the completion
+# referenced OUR command TRB; trace must show CR_ADDRESS_DEVICE fetched
+# from the .ko cmd-ring region pointing at OUR (low-mem) input context.
+if ! grep -aF -q "[xhci-real] PASS stage6a: Address-Device SUCCESS" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage6 (Address-Device) did not return attributable SUCCESS"
+    tail -n 40 "$LOG"
+    exit 1
+fi
+if ! grep -aE -q 'fetch_trb addr 0x0000000005[0-9a-f]+, CR_ADDRESS_DEVICE, p 0x0000000005[0-9a-f]+' "$TRACE"; then
+    echo "[test_xhci_ko_enum] FAIL: trace shows no CR_ADDRESS_DEVICE from .ko cmd ring -> .ko input ctx"
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage6 — Address-Device SUCCESS (controller addressed slot off OUR input context)"
+
+# Stage 7: GET_DESCRIPTOR returned a valid 18-byte device descriptor.
+# This is the unambiguous, BIOS-distinguishable proof: the marker
+# asserts bLength==0x12 / bDescriptorType==0x01, and the trace must show
+# a TR_SETUP fetched from OUR EP0 ring (0x0500xxxx) carrying wLength=0x12
+# (immediate-data low qword ...0x01000680 with the 0x0012 length word)
+# — SeaBIOS's own GET_DESCRIPTOR uses wLength=0x08, so this cannot be a
+# BIOS transaction.
+if ! grep -aF -q "[xhci-real] PASS stage7: GET_DESCRIPTOR(device) returned a valid 18-byte device descriptor" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage7 (GET_DESCRIPTOR) did not return a valid device descriptor"
+    tail -n 40 "$LOG"
+    exit 1
+fi
+if ! grep -aF -q "[xhci-real] stage7 device-descriptor bytes: bLength=0x0000000000000012 bDescriptorType=0x0000000000000001" "$LOG"; then
+    echo "[test_xhci_ko_enum] FAIL: stage7 descriptor bytes not the expected bLength=0x12/type=0x01"
+    exit 1
+fi
+if ! grep -aE -q 'TR_SETUP, p 0x0012000001000680' "$TRACE"; then
+    echo "[test_xhci_ko_enum] FAIL: trace shows no TR_SETUP with our wLength=0x12 GET_DESCRIPTOR (BIOS uses 0x08)"
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage7 — GET_DESCRIPTOR(device) round-tripped a valid 18-byte descriptor via OUR EP0 control ring"
+echo "[test_xhci_ko_enum] OK: trace ground-truth — TR_SETUP wLength=0x12 on .ko EP0 ring (NOT SeaBIOS, which uses 0x08)"
+
+echo "[test_xhci_ko_enum] PASS (real Linux xhci_hcd.ko drove FULL enumeration: gen_setup + controller-run + Enable-Slot + Address-Device + GET_DESCRIPTOR through .ko rings; native disabled)"

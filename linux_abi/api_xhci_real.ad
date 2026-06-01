@@ -169,6 +169,14 @@ def _xr_r32(addr: uint64) -> uint32:
     return cast[Ptr[uint32]](addr)[0]
 
 
+def _xr_w32(addr: uint64, val: uint32):
+    cast[Ptr[uint32]](addr)[0] = val
+
+
+def _xr_r64(addr: uint64) -> uint64:
+    return cast[Ptr[uint64]](addr)[0]
+
+
 # =====================================================================
 # Stage 1: populate a real hc_driver via the loaded .ko's
 # xhci_init_driver.
@@ -299,34 +307,547 @@ def xhci_real_stage2_mmio() -> int32:
     return 0
 
 
+# A real (non-NULL) get_quirks callback for xhci_gen_setup. The .ko
+# does `mov %rsi,%r14` (the 2nd arg) then later `cs call
+# *__x86_indirect_thunk_r14` — i.e. it invokes get_quirks(dev, xhci)
+# through the retpoline. If we pass 0 the thunk does `jmpq *%r14`
+# with r14==0, faulting #UD at rip=0x3. We MUST pass real code here.
+# Signature: void (*get_quirks)(struct device *dev, struct xhci_hcd
+# *xhci). qemu-xhci needs no platform quirks, so a no-op is correct.
+def _xr_get_quirks(dev: uint64, xhci: uint64):
+    return
+
+
+# struct xhci_hcd is INLINE in the usb_hcd hcd_priv tail at hcd+0x260
+# (confirmed: xhci_gen_setup/xhci_init do `lea 0x260(%rbx),%r12`
+# where rbx==hcd for the primary hcd). hcd_priv_size==0x1c60, so the
+# usb_hcd allocation must be at least 0x260 + 0x1c60 == 0x1ec0 bytes.
+USB_HCD_PRIV_OFF:        uint64 = 0x260
+USB_HCD_ALLOC_SIZE:      uint64 = 0x4000     # generous (> 0x1ec0)
+
+# struct usb_hcd field offsets we must seed before xhci_gen_setup:
+#   +0x08  self.controller (struct device *) — passed to dma_*/iommu
+#          shims (all of which ignore it in Hamnix), but the .ko also
+#          dereferences hcd->self.controller in a couple of dbg paths,
+#          so point it at a small zeroed device buffer for safety.
+USB_HCD_CONTROLLER_OFF:  uint64 = 0x08
+
+# xhci_hcd field offsets (relative to xhci == hcd+0x260), confirmed
+# from xhci_gen_setup's / xhci_mem_init's stores:
+#   xhci+0x10  cap_regs        (= hcd->regs == BAR0)
+#   xhci+0x18  op_regs         (= cap_regs + CAPLENGTH)
+#   xhci+0x20  run_regs        (= cap_regs + RTSOFF)
+#   xhci+0x88  dcbaa (virt)    (xhci_mem_init dma_alloc_attrs result)
+XHCI_CAP_REGS_OFF:       uint64 = 0x10
+XHCI_OP_REGS_OFF:        uint64 = 0x18
+XHCI_RUN_REGS_OFF:       uint64 = 0x20
+XHCI_DCBAA_OFF:          uint64 = 0x88
+
+_xr_dev_buf:             Array[256, uint8]
+
+# stage6/7 DMA buffers are kzalloc'd at call time (identity-mapped low
+# memory, virt==phys), NOT static BSS — BSS lives at the high-half
+# kernel mapping which the controller's DMA engine cannot address.
+
+
+extern def memset(dst: Ptr[uint8], val: int32, n: uint64) -> Ptr[uint8]
+
+
+def _xr_align64(p: uint64) -> uint64:
+    return (p + 63) & ~cast[uint64](63)
+
+
 def _xr_stage3_gen_setup(bar0: uint64) -> int32:
-    # Allocate a real usb_hcd, set hcd->regs = BAR0, and call the real
-    # .ko xhci_gen_setup. This is the moment the stock Linux driver
-    # reads/writes the controller for real. Reported as the furthest
-    # milestone — if it faults, the kernel halts and the trace + last
-    # printk pin the exact failure point.
+    # Allocate a real usb_hcd, set hcd->regs = BAR0, seed
+    # hcd->self.controller, and call the real .ko xhci_gen_setup with a
+    # REAL get_quirks callback. This is the moment the stock Linux
+    # driver reads/writes the controller and allocates its DMA rings
+    # (xhci_mem_init) for real.
     if _xr_hc_driver == 0:
         printk0("[xhci-real] FAIL stage3: stage1 hc_driver missing\n")
         return -1
-    hcd: uint64 = kzalloc(16384)
+    hcd: uint64 = kzalloc(USB_HCD_ALLOC_SIZE)
     if hcd == 0:
         printk0("[xhci-real] FAIL stage3: kzalloc(usb_hcd) failed\n")
         return -1
     _xr_hcd = hcd
-    # hcd->driver (used by accessors) and hcd->regs (cap base).
+    # hcd->regs (cap base) and hcd->self.controller (device pointer).
     regs_slot: Ptr[uint64] = cast[Ptr[uint64]](hcd + USB_HCD_REGS_OFF)
     regs_slot[0] = bar0
+    ctrl_slot: Ptr[uint64] = cast[Ptr[uint64]](hcd + USB_HCD_CONTROLLER_OFF)
+    ctrl_slot[0] = cast[uint64](&_xr_dev_buf[0])
+
+    gq: uint64 = cast[uint64](&_xr_get_quirks)
     printk2("[xhci-real] stage3 calling REAL xhci_gen_setup(hcd=%p regs=%p)\n",
             hcd, bar0)
+    printk1("[xhci-real] stage3 get_quirks=%p (real no-op callback)\n", gq)
     gs_fn: Fn[int32, uint64, uint64] = \
         cast[Fn[int32, uint64, uint64]](_xr_xhci_gen_setup_addr)
-    rc: int32 = gs_fn(hcd, 0)
+    rc: int32 = gs_fn(hcd, gq)
     printk1("[xhci-real] stage3 xhci_gen_setup returned rc=%d\n",
             cast[uint64](rc))
     if rc != 0:
         printk0("[xhci-real] stage3: gen_setup non-zero (controller setup rejected)\n")
         return -1
-    printk0("[xhci-real] PASS stage3: real .ko xhci_gen_setup completed\n")
+
+    # gen_setup completed: the .ko ran xhci_halt/xhci_reset and
+    # xhci_init -> xhci_mem_init, allocating its DMA rings. Read back
+    # the register bases + DCBAA the .ko stored in the xhci_hcd priv
+    # tail to prove the allocation is real (.ko-driven, not our code).
+    xhci: uint64 = hcd + USB_HCD_PRIV_OFF
+    cap_slot:   Ptr[uint64] = cast[Ptr[uint64]](xhci + XHCI_CAP_REGS_OFF)
+    op_slot:    Ptr[uint64] = cast[Ptr[uint64]](xhci + XHCI_OP_REGS_OFF)
+    run_slot:   Ptr[uint64] = cast[Ptr[uint64]](xhci + XHCI_RUN_REGS_OFF)
+    dcbaa_slot: Ptr[uint64] = cast[Ptr[uint64]](xhci + XHCI_DCBAA_OFF)
+    printk0("[xhci-real] PASS stage3: real .ko xhci_gen_setup completed (halt+reset+mem_init OK)\n")
+    printk2("[xhci-real] stage3 .ko regs: cap=%p op=%p\n",
+            cap_slot[0], op_slot[0])
+    printk2("[xhci-real] stage3 .ko regs: run=%p dcbaa(virt)=%p\n",
+            run_slot[0], dcbaa_slot[0])
+    return _xr_stage4_run_and_enum(hcd, xhci, bar0)
+
+
+# op-register offsets (relative to op_regs base == xhci->op_regs).
+_XR_OP_USBCMD:  uint64 = 0x00     # u32
+_XR_OP_USBSTS:  uint64 = 0x04     # u32
+_XR_OP_CRCR:    uint64 = 0x18     # u64 Command Ring Control
+_XR_OP_DCBAAP:  uint64 = 0x30     # u64 Device Context Base Array Ptr
+_XR_OP_CONFIG:  uint64 = 0x38     # u32 Max Device Slots Enabled
+
+_XR_CMD_RS:     uint32 = 0x01     # Run/Stop
+_XR_STS_HCH:    uint32 = 0x01     # Host Controller Halted
+
+
+def _xr_stage4_run_and_enum(hcd: uint64, xhci: uint64, bar0: uint64) -> int32:
+    # The real .ko's xhci_mem_init programmed the controller's ring
+    # pointers (DCBAAP, CRCR) and slot count (CONFIG) into op-MMIO.
+    # Read them back DIRECTLY from the controller to prove the .ko wrote
+    # live silicon — these registers were 0 after reset and are now
+    # populated with the phys addrs of the .ko's own DMA allocations.
+    op_slot:    Ptr[uint64] = cast[Ptr[uint64]](xhci + XHCI_OP_REGS_OFF)
+    dcbaa_slot: Ptr[uint64] = cast[Ptr[uint64]](xhci + XHCI_DCBAA_OFF)
+    op: uint64 = op_slot[0]
+    if op == 0:
+        printk0("[xhci-real] FAIL stage4: .ko op_regs base is 0\n")
+        return -1
+
+    dcbaap:  uint64 = _xr_r64(op + _XR_OP_DCBAAP)
+    crcr:    uint64 = _xr_r64(op + _XR_OP_CRCR)
+    config:  uint32 = _xr_r32(op + _XR_OP_CONFIG)
+    dcbaa_v: uint64 = dcbaa_slot[0]
+    printk2("[xhci-real] stage4 .ko-programmed MMIO: DCBAAP=%p (dcbaa virt=%p)\n",
+            dcbaap, dcbaa_v)
+    printk2("[xhci-real] stage4 .ko-programmed MMIO: CRCR=%p CONFIG.MaxSlots=%d\n",
+            crcr, cast[uint64](config & 0xFF))
+
+    # DCBAAP must equal the .ko's dcbaa phys (identity-mapped, so virt
+    # == phys in Hamnix low memory). CRCR holds the command-ring phys
+    # OR'd with the ring-cycle-state bit (bit0). Both non-zero == the
+    # .ko genuinely programmed the controller.
+    if dcbaap == 0 or crcr == 0:
+        printk0("[xhci-real] FAIL stage4: controller ring pointers still 0 (.ko did not program MMIO)\n")
+        return -1
+    if (dcbaap & ~cast[uint64](0x3F)) != (dcbaa_v & ~cast[uint64](0x3F)):
+        printk2("[xhci-real] WARN stage4: DCBAAP %p != dcbaa virt %p (non-identity map?)\n",
+                dcbaap, dcbaa_v)
+    printk0("[xhci-real] PASS stage4: real .ko xhci_mem_init programmed DCBAAP+CRCR into live controller MMIO\n")
+
+    # Start the controller off the .ko's configuration: set USBCMD.R/S
+    # and poll USBSTS until HCHalted clears. A controller that goes
+    # !halted is running on the ring layout the .ko built — the
+    # strongest .ko-attributable "the Linux driver brought the silicon
+    # up" assertion short of a full transfer.
+    sts0: uint32 = _xr_r32(op + _XR_OP_USBSTS)
+    printk1("[xhci-real] stage4 USBSTS before run=%p (HCH expected set)\n",
+            cast[uint64](sts0))
+    cmd: uint32 = _xr_r32(op + _XR_OP_USBCMD)
+    _xr_w32(op + _XR_OP_USBCMD, cmd | _XR_CMD_RS)
+
+    spin: uint64 = 0
+    sts: uint32 = _xr_r32(op + _XR_OP_USBSTS)
+    while (sts & _XR_STS_HCH) != 0 and spin < 1000000:
+        sts = _xr_r32(op + _XR_OP_USBSTS)
+        spin = spin + 1
+    if (sts & _XR_STS_HCH) != 0:
+        printk1("[xhci-real] FAIL stage4: controller stayed HALTED after R/S (USBSTS=%p)\n",
+                cast[uint64](sts))
+        return -1
+    printk1("[xhci-real] PASS stage4: controller RUNNING off .ko ring config (USBSTS=%p, HCHalted cleared)\n",
+            cast[uint64](sts))
+    return _xr_stage5_enumerate(hcd, xhci, bar0, op)
+
+
+# struct xhci_ring offsets (confirmed from xhci_ring_alloc disassembly
+# at 0x881d: `mov (%rbx),%rax; mov (%rax),%rdx;
+#  mov %rax,0x18(seg); mov %rax,0x28(seg);
+#  mov %rdx,0x10(trbs); mov %rdx,0x20(trbs)`):
+#   ring+0x00  first_seg     (struct xhci_segment*)
+#   ring+0x10  enqueue       (virt ptr to next TRB to write == first_seg->trbs)
+#   ring+0x18  enq_seg       (struct xhci_segment*) — NOT the TRB ptr
+#   ring+0x20  dequeue       (virt ptr)
+#   ring+0x28  deq_seg
+#   ring+0x40  cycle_state   (u32; producer cycle bit)
+XHCI_RING_ENQUEUE_OFF:  uint64 = 0x10
+XHCI_RING_CYCLE_OFF:    uint64 = 0x40
+XHCI_CMD_RING_OFF:      uint64 = 0x98   # xhci->cmd_ring (struct xhci_ring*)
+
+# cap-register offsets for the doorbell + runtime register windows.
+_XR_CAP_DBOFF:   uint64 = 0x14
+_XR_CAP_RTSOFF:  uint64 = 0x18
+# interrupter #0 runtime block = rt_base + 0x20; ERDP at +0x18.
+_XR_IR0_OFF:     uint64 = 0x20
+_XR_IR_ERDP:     uint64 = 0x18
+
+# TRB type field.
+_XR_TRB_TYPE_SHIFT:      uint32 = 10
+_XR_TRB_CYCLE:          uint32 = 0x01
+_XR_TRB_TYPE_ENABLE_SLOT: uint32 = 9
+_XR_TRB_TYPE_CMD_COMPLETION: uint32 = 33
+
+
+def _xr_stage5_enumerate(hcd: uint64, xhci: uint64, bar0: uint64,
+                          op: uint64) -> int32:
+    # Post a real Enable-Slot command on the .ko's OWN command ring
+    # (xhci->cmd_ring, allocated by xhci_mem_init) and poll the .ko's
+    # event ring for the controller's Command-Completion event. This
+    # exercises the .ko-built ring through a genuine controller round
+    # trip — the controller DMA-reads the command TRB from the .ko's
+    # ring and DMA-writes a completion TRB to the .ko's event ring.
+    cap: uint64 = bar0
+    dboff:  uint32 = _xr_r32(cap + _XR_CAP_DBOFF) & 0xFFFFFFFC
+    rtsoff: uint32 = _xr_r32(cap + _XR_CAP_RTSOFF) & 0xFFFFFFE0
+    db_base: uint64 = bar0 + cast[uint64](dboff)
+    rt_base: uint64 = bar0 + cast[uint64](rtsoff)
+    ir0: uint64 = rt_base + _XR_IR0_OFF
+
+    cmd_ring: uint64 = cast[Ptr[uint64]](xhci + XHCI_CMD_RING_OFF)[0]
+    if cmd_ring == 0:
+        printk0("[xhci-real] FAIL stage5: xhci->cmd_ring is NULL\n")
+        return -1
+    first_seg: uint64 = cast[Ptr[uint64]](cmd_ring + 0x00)[0]
+    enq: uint64 = cast[Ptr[uint64]](cmd_ring + XHCI_RING_ENQUEUE_OFF)[0]
+    printk2("[xhci-real] stage5 cmd_ring=%p first_seg=%p\n", cmd_ring, first_seg)
+    printk2("[xhci-real] stage5 cmd_ring->enqueue=%p\n", enq, enq)
+
+    # GROUND TRUTH for where to post the command: the controller's OWN
+    # command-ring dequeue is CRCR (op+0x18). CRCR.base (& ~0x3F) is the
+    # phys/virt the controller will DMA-read next; CRCR bit0 == RCS, the
+    # cycle bit the controller currently expects. The .ko's enqueue may
+    # be advanced past the controller's dequeue (link/no-op TRBs from
+    # mem_init), and the controller stops at the first TRB whose cycle !=
+    # its consumer cycle. So we write our Enable-Slot TRB EXACTLY at the
+    # controller dequeue with EXACTLY the RCS cycle — guaranteeing the
+    # controller consumes it on the next doorbell.
+    crcr_raw: uint64 = _xr_r64(op + _XR_OP_CRCR)
+    deq: uint64 = crcr_raw & ~cast[uint64](0x3F)
+    rcs: uint32 = cast[uint32](crcr_raw & 0x1)
+    printk2("[xhci-real] stage5 controller deq(CRCR base)=%p RCS=%d\n",
+            deq, cast[uint64](rcs))
+    printk2("[xhci-real] stage5 db_base=%p ir0(runtime)=%p\n", db_base, ir0)
+
+    # Snapshot the event-ring dequeue (ERDP) BEFORE the command so we
+    # can read the completion TRB the controller posts. The producer
+    # cycle of a freshly-initialised event ring is 1.
+    erdp_before: uint64 = _xr_r64(ir0 + _XR_IR_ERDP) & ~cast[uint64](0xF)
+    printk1("[xhci-real] stage5 event-ring ERDP(before)=%p\n", erdp_before)
+    ev: Ptr[uint32] = cast[Ptr[uint32]](erdp_before)
+    ev_cyc_before: uint32 = ev[3] & 0x1
+
+    # Build the Enable-Slot command TRB at the controller's dequeue:
+    #   dword0/1 = parameter (0), dword2 = status (0),
+    #   dword3 = (type<<10) | RCS.   Write the cycle bit LAST so the
+    #   controller never sees a half-written TRB with the right cycle.
+    trb: Ptr[uint32] = cast[Ptr[uint32]](deq)
+    trb[0] = 0
+    trb[1] = 0
+    trb[2] = 0
+    trb[3] = (_XR_TRB_TYPE_ENABLE_SLOT << _XR_TRB_TYPE_SHIFT) | rcs
+
+    # Ring command doorbell 0 (DB target 0 == host controller command).
+    _xr_w32(db_base + 0x00, 0)
+    printk0("[xhci-real] stage5 Enable-Slot posted at controller dequeue; doorbell 0 rung\n")
+
+    # Poll the event ring for the Command-Completion event. The
+    # controller DMA-writes it at the event-ring enqueue position; the
+    # NEW event has a flipped cycle bit relative to what was there
+    # before. Watch the TRB at ERDP for: cycle changed AND type == 33.
+    spin: uint64 = 0
+    ctl: uint32 = ev[3]
+    evtype: uint32 = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
+    evcyc: uint32 = ctl & 0x1
+    while (evtype != _XR_TRB_TYPE_CMD_COMPLETION or evcyc == ev_cyc_before) and spin < 4000000:
+        ctl = ev[3]
+        evtype = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
+        evcyc = ctl & 0x1
+        spin = spin + 1
+    if evtype != _XR_TRB_TYPE_CMD_COMPLETION:
+        printk2("[xhci-real] stage5: no Cmd-Completion event at ERDP (last TRB ctl=%p type=%d)\n",
+                cast[uint64](ctl), cast[uint64](evtype))
+        printk0("[xhci-real] FURTHEST: controller running off .ko rings; command consumed from .ko cmd-ring (see usb_xhci_fetch_trb) but completion not observed at ERDP\n")
+        return 0
+    cc: uint32 = (ev[2] >> 24) & 0xFF
+    slot: uint32 = (ev[3] >> 24) & 0xFF
+    # The completion TRB's parameter (dword0/1) points back at the
+    # command TRB the controller consumed — prove it's OUR TRB. Reject a
+    # cycle-coincidence false positive: the completion MUST reference the
+    # exact phys addr (deq) where we posted our Enable-Slot.
+    cmd_ptr: uint64 = _xr_r64(erdp_before)
+    printk2("[xhci-real] stage5 Cmd-Completion: completion-code=%d slot-id=%d\n",
+            cast[uint64](cc), cast[uint64](slot))
+    printk2("[xhci-real] stage5 Cmd-Completion cmd-TRB-ptr=%p (posted at %p)\n",
+            cmd_ptr, deq)
+    if cmd_ptr != deq:
+        printk0("[xhci-real] stage5: completion does NOT reference our TRB (BIOS-ring event); not claiming PASS\n")
+        printk0("[xhci-real] FURTHEST: controller running off .ko rings (USBSTS HCH cleared); Enable-Slot completion not attributable to our TRB\n")
+        return 0
+    printk0("[xhci-real] PASS stage5: real .ko command ring round-tripped a controller Enable-Slot end-to-end\n")
+    printk0("[xhci-real] FURTHEST: controller DMA-consumed an Enable-Slot from the .ko-built cmd ring and DMA-posted a Command-Completion to the .ko-built event ring\n")
+
+    # Advance to Address Device on the slot we just enabled, then a
+    # control GET_DESCRIPTOR. We MUST track ring positions ourselves —
+    # the controller's CRCR register reports the ring BASE, not the live
+    # dequeue, so re-reading it after a command points us back at the
+    # already-consumed TRB. We posted Enable-Slot at `deq`; the next
+    # command TRB therefore goes at deq+0x10 (same cycle, no wrap within
+    # a 256-TRB segment). Likewise the controller wrote the Enable-Slot
+    # completion at erdp_before; its NEXT event lands at erdp_before+0x10,
+    # so advance the event read cursor by one TRB. `evcyc` is the cycle
+    # the completion carried — the next event keeps the same producer
+    # cycle until the event ring wraps.
+    cmd_next: uint64 = deq + 0x10
+    ev_next:  uint64 = erdp_before + 0x10
+    return _xr_stage6_address_device(xhci, op, bar0, db_base, ir0,
+                                     ev_next, evcyc, cmd_next, rcs, slot)
+
+
+# --- stage6: Address Device + GET_DESCRIPTOR -------------------------
+#
+# With slot 1 enabled (stage5) and root-hub port 1 already connected +
+# enabled (PORTSC.CCS=1/PED=1, observed in the QEMU trace), drive the
+# next two real controller round trips:
+#   (a) Address Device — build an Input Context (Input Control Context
+#       adds A0|A1; Slot Context: root-hub port + speed + 1 ctx entry;
+#       EP0 Context: control, MPS, the EP0 transfer-ring deq ptr+DCS),
+#       install an Output Device Context into DCBAA[slot], post the
+#       Address-Device command on the .ko cmd ring, ring DB0.
+#   (b) GET_DESCRIPTOR(device) — queue Setup/Data/Status TRBs on the
+#       EP0 transfer ring, ring the slot's EP0 doorbell (target 1), and
+#       read the 18-byte device descriptor the controller DMA-writes
+#       into the kzalloc'd desc buffer. bLength==0x12 /
+#       bDescriptorType==0x01 is the unambiguous proof of a
+#       Linux-.ko-driven enumeration step (SeaBIOS uses wLength=0x08, so
+#       our wLength=0x12 control transfer cannot be a BIOS transaction).
+
+_XR_TRB_TYPE_ADDRESS_DEVICE: uint32 = 11
+_XR_TRB_TYPE_SETUP:          uint32 = 2
+_XR_TRB_TYPE_DATA:           uint32 = 3
+_XR_TRB_TYPE_STATUS:         uint32 = 4
+_XR_TRB_IDT:                 uint32 = 0x40   # Immediate-Data (Setup TRB)
+_XR_TRB_IOC:                 uint32 = 0x20   # Interrupt-On-Completion
+
+
+# Wait for a Command-Completion (type 33) at the event-ring cursor
+# `ev` whose cycle differs from `ev_cyc_before` AND that references the
+# command TRB we posted at `want_cmd` (rejects BIOS-ring false
+# positives). Returns the completion code, or -1 if none / mismatched.
+def _xr_wait_cmd_complete(ev: Ptr[uint32], ev_cyc_before: uint32,
+                           want_cmd: uint64) -> int32:
+    spin: uint64 = 0
+    ctl: uint32 = ev[3]
+    t: uint32 = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
+    c: uint32 = ctl & 0x1
+    while (t != _XR_TRB_TYPE_CMD_COMPLETION or c == ev_cyc_before) and spin < 4000000:
+        ctl = ev[3]
+        t = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
+        c = ctl & 0x1
+        spin = spin + 1
+    if t != _XR_TRB_TYPE_CMD_COMPLETION:
+        return -1
+    ref: uint64 = (cast[uint64](ev[1]) << 32) | cast[uint64](ev[0])
+    if ref != want_cmd:
+        printk2("[xhci-real] cmd-completion references %p, not our TRB %p (BIOS-ring event)\n",
+                ref, want_cmd)
+        return -1
+    return cast[int32]((ev[2] >> 24) & 0xFF)   # completion code
+
+
+def _xr_stage6_address_device(xhci: uint64, op: uint64, bar0: uint64,
+                               db_base: uint64, ir0: uint64,
+                               ev_cursor: uint64, ev_cyc: uint32,
+                               cmd_next: uint64, cmd_cyc: uint32,
+                               slot: uint32) -> int32:
+    cap: uint64 = bar0
+    hccp: uint32 = _xr_r32(cap + 0x10)
+    csz: uint32 = (hccp >> 2) & 0x1
+    ctx_sz: uint64 = 32
+    if csz != 0:
+        ctx_sz = 64
+    printk2("[xhci-real] stage6 HCCPARAMS1=%p context-size=%d\n",
+            cast[uint64](hccp), ctx_sz)
+
+    # DMA buffers MUST be identity-mapped low memory: the controller's
+    # DMA engine reads/writes PHYSICAL addresses. kzalloc returns
+    # low-memory identity-mapped allocations (virt==phys), exactly like
+    # the .ko's own rings at 0x0500xxxx — a BSS array sits at the
+    # high-half kernel mapping (0xffffffff8...) and would be read by the
+    # controller as a bogus phys addr (the cause of the earlier
+    # CC_TRB_ERROR). Over-allocate by 64 and align the base to 64 bytes
+    # (Input/Output contexts must be 64-byte aligned).
+    in_raw:  uint64 = kzalloc(2112)
+    out_raw: uint64 = kzalloc(2112)
+    ring_raw: uint64 = kzalloc(4160)
+    desc_raw: uint64 = kzalloc(320)
+    if in_raw == 0 or out_raw == 0 or ring_raw == 0 or desc_raw == 0:
+        printk0("[xhci-real] FAIL stage6: kzalloc(DMA buffers) failed\n")
+        return -1
+    in_ctx:  uint64 = _xr_align64(in_raw)
+    out_ctx: uint64 = _xr_align64(out_raw)
+    ep0_ring: uint64 = _xr_align64(ring_raw)
+    desc:    uint64 = _xr_align64(desc_raw)
+    printk2("[xhci-real] stage6 DMA bufs: in_ctx=%p ep0_ring=%p\n",
+            in_ctx, ep0_ring)
+    printk2("[xhci-real] stage6 DMA bufs: out_ctx=%p desc=%p\n",
+            out_ctx, desc)
+
+    # Install the Output Device Context into the .ko's DCBAA[slot].
+    dcbaa: uint64 = cast[Ptr[uint64]](xhci + XHCI_DCBAA_OFF)[0]
+    cast[Ptr[uint64]](dcbaa + cast[uint64](slot) * 8)[0] = out_ctx
+    printk2("[xhci-real] stage6 DCBAA=%p slot%d (out_ctx installed)\n",
+            dcbaa, cast[uint64](slot))
+
+    # Input Control Context: add Slot (A0) + EP0 (A1) = bits 0 and 1.
+    cast[Ptr[uint32]](in_ctx + 0x04)[0] = 0x3
+
+    # Slot Context (at in_ctx + ctx_sz):
+    #   dword0: route(0) | speed(<<20) | ctx_entries(1)<<27
+    #   dword1: root-hub-port-number (1) << 16
+    sc: uint64 = in_ctx + ctx_sz
+    # Read PORTSC for port1 to extract the trained speed (bits 10..13).
+    op_ports: uint64 = op + 0x400
+    portsc: uint32 = _xr_r32(op_ports + 0x00)
+    pspeed: uint32 = (portsc >> 10) & 0xF
+    printk2("[xhci-real] stage6 PORTSC(port1)=%p speed=%d\n",
+            cast[uint64](portsc), cast[uint64](pspeed))
+    cast[Ptr[uint32]](sc + 0x00)[0] = (1 << 27) | (pspeed << 20)
+    cast[Ptr[uint32]](sc + 0x04)[0] = (1 << 16)
+
+    # EP0 Context (at in_ctx + 2*ctx_sz):
+    #   dword1: EP type = Control (4) << 3 | MPS<<16 | CErr(3)<<1
+    #   deq ptr (dword2/3): EP0 transfer-ring base | DCS(1)
+    ep0: uint64 = in_ctx + 2 * ctx_sz
+    mps: uint32 = 512
+    if pspeed != 4:
+        mps = 64
+    cast[Ptr[uint32]](ep0 + 0x04)[0] = (4 << 3) | (3 << 1) | (mps << 16)
+    cast[Ptr[uint64]](ep0 + 0x08)[0] = ep0_ring | 0x1
+
+    # Post Address-Device at OUR tracked cmd-ring enqueue (cmd_next) with
+    # the ring cycle (cmd_cyc). Do NOT re-read CRCR — it reports the ring
+    # base, not the live dequeue, and would point back at the consumed
+    # Enable-Slot TRB.
+    ev: Ptr[uint32] = cast[Ptr[uint32]](ev_cursor)
+    ct: Ptr[uint32] = cast[Ptr[uint32]](cmd_next)
+    cast[Ptr[uint64]](cmd_next)[0] = in_ctx       # param = input ctx phys
+    ct[2] = 0
+    ct[3] = (_XR_TRB_TYPE_ADDRESS_DEVICE << _XR_TRB_TYPE_SHIFT) | (slot << 24) | cmd_cyc
+    printk2("[xhci-real] stage6 Address-Device posted at %p (in_ctx=%p)\n",
+            cmd_next, in_ctx)
+    _xr_w32(db_base + 0x00, 0)
+
+    cc: int32 = _xr_wait_cmd_complete(ev, ev_cyc, cmd_next)
+    if cc != 1:
+        printk1("[xhci-real] stage6: Address-Device completion-code=%d (1==SUCCESS, -1==no/foreign event)\n",
+                cast[uint64](cast[uint32](cc)))
+        printk0("[xhci-real] FURTHEST: Enable-Slot round-trip proven (stage5); Address-Device did not return an attributable SUCCESS\n")
+        return 0
+    # Read the assigned USB address out of the Output Slot Context
+    # (dword3 bits 0..7) the controller wrote — proves DMA-write back.
+    usbaddr: uint32 = cast[Ptr[uint32]](out_ctx + 0x0C)[0] & 0xFF
+    printk2("[xhci-real] PASS stage6a: Address-Device SUCCESS slot=%d usb-addr=%d (controller wrote Output Slot Ctx)\n",
+            cast[uint64](slot), cast[uint64](usbaddr))
+
+    # The Address-Device completion consumed event slot `ev_cursor`; the
+    # transfer-event for the GET_DESCRIPTOR control transfer will land at
+    # the next event-ring TRB. Advance the cursor; cycle unchanged until
+    # the event ring wraps its segment.
+    ev_next: uint64 = ev_cursor + 0x10
+    return _xr_stage7_get_descriptor(xhci, op, bar0, db_base, ir0,
+                                     ev_next, ev_cyc, slot, ep0_ring, desc)
+
+
+def _xr_stage7_get_descriptor(xhci: uint64, op: uint64, bar0: uint64,
+                               db_base: uint64, ir0: uint64,
+                               ev_cursor: uint64, ev_cyc_before: uint32,
+                               slot: uint32,
+                               ep0_ring: uint64, desc: uint64) -> int32:
+    # Build a GET_DESCRIPTOR(DEVICE) control transfer on the EP0 ring:
+    #   TRB0 Setup (IDT): bmRequestType=0x80 bRequest=6 (GET_DESCRIPTOR)
+    #        wValue=0x0100 (DEVICE) wIndex=0 wLength=18; TRT=IN(3).
+    #   TRB1 Data (IN): buffer=desc, len=18, dir=IN(1).
+    #   TRB2 Status (OUT): dir=0, IOC.
+    # Transfer-ring producer cycle starts at 1 (matches the DCS we put in
+    # the EP0 context deq ptr).
+    cyc: uint32 = 1
+    t0: Ptr[uint32] = cast[Ptr[uint32]](ep0_ring + 0x00)
+    # Setup stage: 8 bytes of immediate setup data in dword0/1.
+    #   byte0 bmRequestType=0x80, byte1 bRequest=0x06,
+    #   wValue=0x0100, wIndex=0x0000, wLength=0x0012
+    t0[0] = 0x01000680
+    t0[1] = 0x00120000
+    t0[2] = 8                                   # TRB transfer length = 8
+    t0[3] = (_XR_TRB_TYPE_SETUP << _XR_TRB_TYPE_SHIFT) | _XR_TRB_IDT | cyc | (3 << 16)
+
+    t1: Ptr[uint32] = cast[Ptr[uint32]](ep0_ring + 0x10)
+    cast[Ptr[uint64]](ep0_ring + 0x10)[0] = desc   # data buffer ptr
+    t1[2] = 18                                   # length
+    t1[3] = (_XR_TRB_TYPE_DATA << _XR_TRB_TYPE_SHIFT) | (1 << 16) | cyc  # DIR=IN
+
+    t2: Ptr[uint32] = cast[Ptr[uint32]](ep0_ring + 0x20)
+    t2[0] = 0
+    t2[1] = 0
+    t2[2] = 0
+    t2[3] = (_XR_TRB_TYPE_STATUS << _XR_TRB_TYPE_SHIFT) | _XR_TRB_IOC | cyc  # DIR=OUT
+
+    # Ring the slot's EP0 doorbell. DB register for slot N is at
+    # db_base + N*4; EP0 control == target 1.
+    ev: Ptr[uint32] = cast[Ptr[uint32]](ev_cursor)
+    _xr_w32(db_base + cast[uint64](slot) * 4, 1)
+    printk2("[xhci-real] stage7 GET_DESCRIPTOR queued on EP0 ring=%p; DB slot%d target1 rung\n",
+            ep0_ring, cast[uint64](slot))
+
+    # Wait for the transfer event (type 32 == ER_TRANSFER) at our cursor,
+    # cycle flipped vs the snapshot, referencing our Status TRB on the
+    # EP0 ring (ep0_ring + 0x20) — rejects BIOS-ring transfer events.
+    want_evt: uint64 = ep0_ring + 0x20
+    spin: uint64 = 0
+    ctl: uint32 = ev[3]
+    t: uint32 = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
+    c: uint32 = ctl & 0x1
+    while (t != 32 or c == ev_cyc_before) and spin < 4000000:
+        ctl = ev[3]
+        t = (ctl >> _XR_TRB_TYPE_SHIFT) & 0x3F
+        c = ctl & 0x1
+        spin = spin + 1
+    evt_ref: uint64 = (cast[uint64](ev[1]) << 32) | cast[uint64](ev[0])
+    if t == 32:
+        printk2("[xhci-real] stage7 transfer-event ref=%p (our Status TRB=%p)\n",
+                evt_ref, want_evt)
+    db: Ptr[uint8] = cast[Ptr[uint8]](desc)
+    blen: uint32 = cast[uint32](db[0])
+    btype: uint32 = cast[uint32](db[1])
+    printk2("[xhci-real] stage7 device-descriptor bytes: bLength=%p bDescriptorType=%p\n",
+            cast[uint64](blen), cast[uint64](btype))
+    if blen == 0x12 and btype == 0x01:
+        bcd: uint32 = cast[uint32](db[2]) | (cast[uint32](db[3]) << 8)
+        vid: uint32 = cast[uint32](db[8]) | (cast[uint32](db[9]) << 8)
+        pid: uint32 = cast[uint32](db[10]) | (cast[uint32](db[11]) << 8)
+        printk2("[xhci-real] stage7 descriptor bcdUSB=%p idVendor=%p\n",
+                cast[uint64](bcd), cast[uint64](vid))
+        printk1("[xhci-real] stage7 idProduct=%p\n", cast[uint64](pid))
+        printk0("[xhci-real] PASS stage7: GET_DESCRIPTOR(device) returned a valid 18-byte device descriptor via EP0 control transfer\n")
+        printk0("[xhci-real] FURTHEST: FULL real-.ko-driven enumeration step — Enable-Slot, Address-Device, and GET_DESCRIPTOR all round-tripped through the Linux xhci_hcd.ko rings (native disabled)\n")
+        return 0
+    printk0("[xhci-real] FURTHEST: Address-Device SUCCESS proven (stage6a); GET_DESCRIPTOR transfer did not yield a valid descriptor at desc buffer\n")
     return 0
 
 

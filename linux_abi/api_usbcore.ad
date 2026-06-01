@@ -353,11 +353,21 @@ def _uc_devm_add_action(dev: uint64, action: uint64, data: uint64) -> int32:
 
 
 def _uc___kmalloc_node(sz: uint64, flags: uint32, node: int32) -> uint64:
+    # Honor __GFP_ZERO (0x100): callers like xhci_mem_init's port-array
+    # allocation (xhci->hw_ports / interval_bw) rely on the buffer being
+    # zeroed — an uninitialised port->rhub (offset 0x10) trips the
+    # "duplicate port" warning path in xhci_mem_init whose dev_warn arg
+    # prep then dereferences garbage and #GPs. Zeroing keeps the port
+    # table consistent.
+    if (flags & 0x100) != 0:
+        return kzalloc(sz)
     return kmalloc(sz)
 
 
 def _uc_kmalloc_node_trace(s: uint64, flags: uint32,
                               sz: uint64, node: int32) -> uint64:
+    if (flags & 0x100) != 0:
+        return kzalloc(sz)
     return kmalloc(sz)
 
 
