@@ -575,6 +575,42 @@ def fn_name_is_main(name_off: uint32, name_len: uint32) -> int32:
     return 1
 
 
+# Detect a syscall BUILTIN callee by name. The self-hosted compiler has no
+# extern/libc linkage, so on-device syscalls are issued via inline builtins
+# named `__syscallN` where N (1..6) is the number of syscall ARGUMENTS that
+# follow the syscall number. The call form is:
+#       __syscallN(num, a1, ..., aN)
+# i.e. N+1 actual arguments. Returns N (1..6) on match, or 0 if the name is
+# not a syscall builtin. The match is the literal prefix "__syscall" (9
+# bytes) followed by exactly one ASCII digit '1'..'6'.
+def syscall_builtin_args(name_off: uint32, name_len: uint32) -> uint32:
+    if name_len != 10:
+        return 0
+    # "__syscall" = 5f 5f 73 79 73 63 61 6c 6c
+    if strbuf[name_off] != 95:        # '_'
+        return 0
+    if strbuf[name_off + 1] != 95:    # '_'
+        return 0
+    if strbuf[name_off + 2] != 115:   # 's'
+        return 0
+    if strbuf[name_off + 3] != 121:   # 'y'
+        return 0
+    if strbuf[name_off + 4] != 115:   # 's'
+        return 0
+    if strbuf[name_off + 5] != 99:    # 'c'
+        return 0
+    if strbuf[name_off + 6] != 97:    # 'a'
+        return 0
+    if strbuf[name_off + 7] != 108:   # 'l'
+        return 0
+    if strbuf[name_off + 8] != 108:   # 'l'
+        return 0
+    d: uint32 = cast[uint32](strbuf[name_off + 9])
+    if d < 49 or d > 54:              # '1'..'6'
+        return 0
+    return d - 48
+
+
 # Resolve the program ENTRY offset by name: prefer a function literally
 # named `main`; otherwise fall back to `first_off` (the first emitted
 # function's offset, preserving the historical offset-0 entry behaviour for
@@ -928,9 +964,33 @@ def emit_movzx_cl_rcx():
 # past 128 bytes — while keeping byte-IDENTICAL output for small functions
 # (so the codegen selftest's hardcoded offsets stay valid).
 #
-# A disp8-reachable offset (-128 <= off <= 0; frame offsets are <= 0).
+# Low-32-bit mask + the low-32 form of -128 (0xFFFFFF80). These are stored
+# as full-width .data globals (NOT loaded as sign-extended imm32 — the
+# `48 C7 C0` immediate form can't represent values above 0x7FFFFFFF), so
+# referencing them yields the exact 64-bit constant regardless of backend.
+DISP_LOW32_MASK: uint64 = 4294967295        # 0xFFFFFFFF
+DISP_NEG128_LOW32: uint64 = 4294967168      # 0xFFFFFF80  (-128 as low-32)
+
+
+# A disp8-reachable offset (a signed byte, -128..127). Frame offsets are
+# <= 0, but we test the full signed-byte range anyway.
+#
+# SIGN-SAFE: this is on the self-host fixpoint critical path. The Adder and
+# Python backends differ in how they materialise a sub-64-bit signed scalar
+# in a 64-bit register (Python: `movl` store + `movslq` sign-extending load;
+# Adder: a plain 64-bit `movq` store/load), so a NEGATIVE `int32` like a
+# frame offset can reach this function with its high 32 bits either
+# sign-extended OR zeroed depending on which backend compiled THIS code. A
+# direct signed `off >= -128` therefore gives different answers across the
+# two compilations (it was the SOLE cause of stage1!=stage2: stage2 lost
+# every disp32). We normalise by masking to the low 32 bits first, then test
+# the disp8-fits ranges in that canonical low-32 form — an answer invariant
+# to the high bits, hence identical under both backends.
 def disp_fits8(off: int32) -> int32:
-    if off >= (0 - 128):
+    u: uint64 = cast[uint64](off) & DISP_LOW32_MASK
+    if u <= 127:                 # 0..127  (zero / small positive)
+        return 1
+    if u >= DISP_NEG128_LOW32:   # 0xFFFFFF80..0xFFFFFFFF  (-128..-1)
         return 1
     return 0
 
@@ -1216,6 +1276,44 @@ def emit_pop_argreg(argidx: uint32):
     else:
         emit_b(0x41)
         emit_b(0x59)
+
+
+# popq <syscall-reg> — reclaim a marshalled syscall operand into the Linux
+# x86_64 syscall calling-convention register for slot `idx`:
+#   idx 0 -> %rax (syscall NUMBER)   58
+#   idx 1 -> %rdi (arg1)             5F
+#   idx 2 -> %rsi (arg2)             5E
+#   idx 3 -> %rdx (arg3)             5A
+#   idx 4 -> %r10 (arg4)            41 5A
+#   idx 5 -> %r8  (arg5)            41 58
+#   idx 6 -> %r9  (arg6)            41 59
+# (Note: the syscall ABI uses %r10 for arg4, NOT %rcx like the SysV call
+# ABI — `syscall` clobbers %rcx/%r11.)
+def emit_pop_syscallreg(idx: uint32):
+    if idx == 0:
+        emit_b(0x58)
+    elif idx == 1:
+        emit_b(0x5F)
+    elif idx == 2:
+        emit_b(0x5E)
+    elif idx == 3:
+        emit_b(0x5A)
+    elif idx == 4:
+        emit_b(0x41)
+        emit_b(0x5A)
+    elif idx == 5:
+        emit_b(0x41)
+        emit_b(0x58)
+    else:
+        emit_b(0x41)
+        emit_b(0x59)
+
+
+# `syscall` (0F 05). Inputs already in %rax/%rdi/%rsi/%rdx/%r10/%r8/%r9;
+# result left in %rax.
+def emit_syscall_insn():
+    emit_b(0x0F)
+    emit_b(0x05)
 
 
 # -----------------------------------------------------------------------
@@ -1578,6 +1676,32 @@ def gen_call(node: uint32):
     argc: uint32 = nd_aux[node]
     if argc > 6:
         cg_fail(8, node)
+        return
+
+    # --- syscall builtin path -------------------------------------------
+    # `__syscallN(num, a1..aN)` lowers to a raw Linux x86_64 `syscall`:
+    # evaluate-and-push the N+1 operands, pop them into the syscall regs
+    # (operand 0 = number -> %rax, operand 1 -> %rdi, ...), then `0F 05`.
+    # Result is left in %rax (the syscall return value). No `call`, no
+    # fixup — this is an inline instruction, not a function reference.
+    nargs: uint32 = syscall_builtin_args(nd_name_off[callee],
+                                         nd_name_len[callee])
+    if nargs != 0:
+        if argc != nargs + 1:
+            cg_fail(8, node)
+            return
+        sarg: uint32 = nd_b[node]
+        si: uint32 = 0
+        while si < argc:
+            gen_expr(sarg)
+            emit_push_rax()
+            sarg = nd_next[sarg]
+            si = si + 1
+        si = argc
+        while si > 0:
+            si = si - 1
+            emit_pop_syscallreg(si)
+        emit_syscall_insn()
         return
 
     # Evaluate-and-push each argument, lowest index first.

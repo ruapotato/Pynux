@@ -3264,6 +3264,20 @@ class X86CodeGen:
             self.gen_io_intrinsic(name, call.args)
             return
 
+        # ---- raw Linux x86_64 syscall builtins -----------------------------
+        # `__syscallN(num, a1..aN)` (N in 1..6) issues a bare `syscall` with
+        # the number in %rax and args in %rdi/%rsi/%rdx/%r10/%r8/%r9; the
+        # return value is left in %rax. These give the self-hosted compiler
+        # (which has no extern/libc linkage) a way to make syscalls, and are
+        # implemented identically in the Adder backend (codegen.ad's
+        # gen_call syscall path). Only intercepted when NOT shadowed by a
+        # user `def`/`extern def` of the same name.
+        if (name is not None and self._is_syscall_builtin(name)
+                and name not in self.defined_funcs
+                and name not in self.extern_funcs):
+            self.gen_syscall_builtin(name, call.args)
+            return
+
         # ---- compile-time min / max / abs builtins -------------------------
         # min(a, b), max(a, b), abs(x) are lowered inline to cmp + cmov —
         # zero hidden control flow, zero heap, no call instruction.  They
@@ -3540,6 +3554,40 @@ class X86CodeGen:
                     self.emit(f"    {line}")
         else:
             raise CodeGenError(f"x86: unknown intrinsic '{name}'")
+
+    @staticmethod
+    def _is_syscall_builtin(name: str) -> int:
+        """Return N (1..6) if `name` is `__syscallN`, else 0."""
+        if (len(name) == 10 and name.startswith("__syscall")
+                and name[9] in "123456"):
+            return int(name[9])
+        return 0
+
+    def gen_syscall_builtin(self, name: str, args: list[Expr]) -> None:
+        """Lower `__syscallN(num, a1..aN)` to a raw Linux x86_64 syscall.
+
+        Mirrors codegen.ad's gen_call syscall path EXACTLY: evaluate and
+        push each operand (lowest index first), then pop into the syscall
+        registers (operand 0 = number -> %rax, operand 1 -> %rdi, ...),
+        then `syscall`. Result left in %rax.
+
+        Syscall ABI registers (arg4 uses %r10, NOT %rcx): %rax, %rdi, %rsi,
+        %rdx, %r10, %r8, %r9.
+        """
+        n = self._is_syscall_builtin(name)
+        if len(args) != n + 1:
+            raise CodeGenError(
+                f"{name} expects {n + 1} args (number + {n})"
+            )
+        # Evaluate-and-push each operand, lowest index first.
+        for a in args:
+            self.gen_expr(a)
+            self.emit("    pushq %rax")
+        # Pop in reverse into the syscall registers.
+        regs = ["%rax", "%rdi", "%rsi", "%rdx", "%r10", "%r8", "%r9"]
+        for i in range(len(args) - 1, -1, -1):
+            self.emit(f"    popq {regs[i]}")
+        self.emit("    syscall")
 
 
 def generate(program: Program, bare_metal: bool = False) -> str:

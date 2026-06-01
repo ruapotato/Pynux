@@ -1,0 +1,182 @@
+# adder/compiler/fused_driver_main.ad
+#
+# Driver `main` for the FUSED self-hosted compiler (lexer + parser +
+# codegen + elf_emit). This fragment is APPENDED by
+# scripts/concat_compiler_source.py --with-driver to the fused compiler
+# source, turning the library-of-functions into a SELF-CONTAINED, RUNNABLE
+# compiler binary: it reads /src/input.ad, runs the full
+# lex -> parse -> codegen -> elf_emit pipeline over it, and hex-dumps the
+# emitted ELF over stdout between the same [hamnix_ac_emit] HEXBEGIN/HEXEND
+# sentinels scripts/hamnix-ac already captures.
+#
+# It mirrors adder/compiler/codegen_ac_driver.ad EXACTLY in behaviour, with
+# ONE structural difference: codegen_ac_driver.ad makes syscalls via
+# `extern def sys_*` (resolved by the Python seed toolchain at link time),
+# but this fragment is compiled by the SELF-HOSTED backend (codegen.ad),
+# which has no extern/libc linkage. So syscalls are issued via codegen.ad's
+# inline `__syscallN(num, a1..aN)` builtins, which lower to a raw Linux
+# x86_64 `syscall` (number in %rax, args in %rdi/%rsi/%rdx/...).
+#
+# Because this fragment is FUSED into the same translation unit as the
+# compiler, it references the compiler's own globals/functions directly
+# (tok_count, p_err, cg_err, fn_count, code_len, gdata_len, cg_entry_off,
+# elf_buf, elf_len, elf_err, lex_init, lex_tokenize, parser_init,
+# parse_program, cg_init, gen_program_with_globals, elf_emit_image) — no
+# imports needed.
+#
+# Hamnix syscall numbers (arch/x86/kernel/syscall.ad):
+#   SYS_EXIT=1  SYS_OPEN=5  SYS_READ=6  SYS_CLOSE=7  SYS_WRITE=8
+# Arg registers: a0=%rdi a1=%rsi a2=%rdx (standard Linux x86_64 ABI).
+
+# Module-level source buffer. The lexer stores the bare pointer we hand it
+# (lex_src), so the bytes must outlive the whole compile — hence a global,
+# not a function-local. Sized to comfortably exceed the fused-with-driver
+# source so the on-device self-compile fits.
+DRV_SRC_CAP: uint32 = 393216
+drv_src: Array[393216, uint8]
+
+
+def drv_strlen(s: Ptr[uint8]) -> uint64:
+    n: uint64 = 0
+    while s[n] != 0:
+        n = n + 1
+    return n
+
+
+def drv_emit(msg: Ptr[uint8]):
+    __syscall3(8, 1, cast[uint64](msg), drv_strlen(msg))
+
+
+def drv_put_u32(v: uint32):
+    if v == 0:
+        __syscall3(8, 1, cast[uint64]("0"), 1)
+        return
+    digits: Array[16, uint8]
+    i: uint64 = 0
+    n: uint32 = v
+    while n != 0:
+        digits[i] = cast[uint8](n % 10) + 48
+        n = n / 10
+        i = i + 1
+    out: Array[16, uint8]
+    j: uint64 = 0
+    while j < i:
+        out[j] = digits[i - 1 - j]
+        j = j + 1
+    __syscall3(8, 1, cast[uint64](&out[0]), i)
+
+
+# Map a 0..15 nibble to its lowercase hex ASCII digit.
+def drv_hex_digit(v: uint32) -> uint32:
+    if v < 10:
+        return v + 48          # '0'..'9'
+    return v + 87              # 'a'..'f'
+
+
+# Dump elf_buf[0..elf_len) as one continuous lowercase-hex stream,
+# wrapped at 64 hex chars (32 bytes) per line for sane serial capture.
+def drv_dump_hex():
+    line: Array[80, uint8]
+    col: uint32 = 0
+    i: uint32 = 0
+    while i < elf_len:
+        b: uint32 = cast[uint32](elf_buf[i])
+        line[col] = cast[uint8](drv_hex_digit((b >> 4) & 15))
+        col = col + 1
+        line[col] = cast[uint8](drv_hex_digit(b & 15))
+        col = col + 1
+        if col >= 64:
+            line[col] = 10        # '\n'
+            __syscall3(8, 1, cast[uint64](&line[0]), cast[uint64](col + 1))
+            col = 0
+        i = i + 1
+    if col > 0:
+        line[col] = 10
+        __syscall3(8, 1, cast[uint64](&line[0]), cast[uint64](col + 1))
+
+
+# Read the injected source at /src/input.ad into drv_src[]. Returns the
+# byte count read (>0), or 0 on open/read failure / empty file.
+def drv_read_source() -> uint32:
+    fd: int64 = __syscall1(5, cast[uint64]("/src/input.ad"))
+    if fd < 0:
+        return 0
+    total: uint32 = 0
+    while total < DRV_SRC_CAP:
+        n: int64 = __syscall3(6,
+                              cast[uint64](fd),
+                              cast[uint64](&drv_src[0]) + cast[uint64](total),
+                              cast[uint64](DRV_SRC_CAP - total))
+        if n <= 0:
+            break
+        total = total + cast[uint32](n)
+    __syscall1(7, cast[uint64](fd))
+    # NUL-terminate so the lexer's lex_cur()==0 EOF guard is well-defined
+    # even if a token scan runs slightly past lex_src_len.
+    if total < DRV_SRC_CAP:
+        drv_src[total] = 0
+    return total
+
+
+def main() -> int32:
+    drv_emit("[hamnix_ac_emit] start\n")
+
+    n: uint32 = drv_read_source()
+    if n == 0:
+        drv_emit("[hamnix_ac_emit] FAIL: cannot read /src/input.ad\n")
+        __syscall1(1, 2)
+    drv_emit("[hamnix_ac_emit] src bytes=")
+    drv_put_u32(n)
+    drv_emit("\n")
+
+    lex_init(&drv_src[0], n)
+    lex_tokenize()
+    drv_emit("[hamnix_ac_emit] tokens=")
+    drv_put_u32(tok_count)
+    drv_emit("\n")
+
+    parser_init()
+    prog: uint32 = parse_program()
+    if p_err != 0:
+        drv_emit("[hamnix_ac_emit] FAIL: parse error at line ")
+        drv_put_u32(p_err_line)
+        drv_emit("\n")
+        __syscall1(1, 3)
+
+    cg_init()
+    start: uint32 = gen_program_with_globals(prog)
+    if cg_err != 0:
+        drv_emit("[hamnix_ac_emit] FAIL: codegen error reason=")
+        drv_put_u32(cg_err_reason)
+        drv_emit("\n")
+        __syscall1(1, 5)
+    if fn_count == 0:
+        drv_emit("[hamnix_ac_emit] FAIL: no functions emitted\n")
+        __syscall1(1, 6)
+
+    drv_emit("[hamnix_ac_emit] codegen ok: ")
+    drv_put_u32(fn_count)
+    drv_emit(" funcs, code_len=")
+    drv_put_u32(code_len)
+    drv_emit(" gdata_len=")
+    drv_put_u32(gdata_len)
+    drv_emit(" entry_off=")
+    drv_put_u32(cg_entry_off)
+    drv_emit("\n")
+
+    total: uint32 = elf_emit_image(0)
+    if elf_err != 0 or total == 0:
+        drv_emit("[hamnix_ac_emit] FAIL: ELF emit error\n")
+        __syscall1(1, 7)
+
+    drv_emit("[hamnix_ac_emit] elf ok: bytes=")
+    drv_put_u32(elf_len)
+    drv_emit(" entry_vaddr=")
+    drv_put_u32(elf_entry_vaddr)
+    drv_emit("\n")
+
+    drv_emit("[hamnix_ac_emit] HEXBEGIN\n")
+    drv_dump_hex()
+    drv_emit("[hamnix_ac_emit] HEXEND\n")
+    drv_emit("[hamnix_ac_emit] PASS\n")
+    return 0
