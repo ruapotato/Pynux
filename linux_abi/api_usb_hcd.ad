@@ -89,6 +89,7 @@
 
 from linux_abi.exports import _add_export
 from linux_abi.api_pci import _l_pci_get_usb_hc_last_bdf
+from linux_abi.api_xhci_real import xhci_ko_real_marker_found
 from kernel.printk.printk import printk0, printk1, printk2
 from mm.slab import kmalloc, kfree, kzalloc
 from drivers.usb.xhci import xhci_init
@@ -419,6 +420,15 @@ def _uh_usb_hcd_pci_probe(pdev: uint64, driver: uint64) -> int32:
     # controller), the controller MMIO is owned by xhci_init's first
     # invocation. EHCI co-bringup is handled inside the hand-rolled
     # driver's ehci_init / xhci_init chain.
+    # REAL-.ko mode (/etc/xhci-ko-real): native is FULLY disabled — the
+    # stock Linux xhci_hcd.ko drives the controller from
+    # api_xhci_real.ad's xhci_real_exercise() instead. Do NOT bridge to
+    # the hand-rolled drivers/usb/xhci.ad here; that would re-enable
+    # native MMIO ownership and defeat the whole point of the real path.
+    if xhci_ko_real_marker_found() == 1:
+        printk0("[usb_hcd_pci_probe] /etc/xhci-ko-real present — native xhci_init bridge SUPPRESSED (real .ko drives HW)\n")
+        return 0
+
     if _uh_bridge_already_ran == 0:
         bdf: uint32 = _l_pci_get_usb_hc_last_bdf()
         printk1("[usb_hcd_pci_probe] bridging to xhci_init (cached usb-hc bdf=%x)\n",

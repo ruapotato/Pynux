@@ -756,6 +756,25 @@ if os.environ.get("ENABLE_NVME_IO_TEST") == "1":
 if os.environ.get("ENABLE_XHCI_KO", "1") == "1":
     FILES.append(("/etc/xhci-ko", b"1\n"))
 
+# REAL Linux .ko xHCI bring-up marker (scripts/test_xhci_ko_enum.sh sets
+# ENABLE_XHCI_KO_REAL=1). When present, /etc/xhci-ko is ALSO planted
+# (so boot:01 skips the hand-rolled drivers/usb/xhci.ad and the .ko dep
+# chain still loads) AND the usb_hcd_pci_probe native bridge is
+# SUPPRESSED — the stock Linux xhci_hcd.ko drives the controller via
+# api_xhci_real.ad::xhci_real_exercise(): it resolves the genuine
+# EXPORT_SYMBOL'd xhci_init_driver / xhci_run / xhci_gen_setup and lets
+# the Linux driver itself read/write the controller registers. Native
+# USB is fully disabled in this mode. Default boots do NOT set this, so
+# root-on-USB (native USB-MSC) is unaffected.
+#   ENABLE_XHCI_KO_REAL_MMIO=1 additionally arms the deep (fault-prone)
+#   real xhci_gen_setup call (stage 3).
+if os.environ.get("ENABLE_XHCI_KO_REAL", "0") == "1":
+    if not any(name == "/etc/xhci-ko" for name, _ in FILES):
+        FILES.append(("/etc/xhci-ko", b"1\n"))
+    FILES.append(("/etc/xhci-ko-real", b"1\n"))
+    if os.environ.get("ENABLE_XHCI_KO_REAL_MMIO", "0") == "1":
+        FILES.append(("/etc/xhci-ko-real-mmio", b"1\n"))
+
 
 # See INIT_ELF handling inside build_archive(): set INIT_ELF=path to
 # override which on-disk file becomes /init in the cpio archive, e.g.

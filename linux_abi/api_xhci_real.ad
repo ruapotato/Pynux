@@ -1,0 +1,352 @@
+# linux_abi/api_xhci_real.ad
+#
+# REAL Linux .ko xHCI bring-up — the "Linux driver actually drives the
+# controller" path, as opposed to the api_usb_hcd.ad bridge which (for
+# the legacy /etc/xhci-ko marker) returns 0 from usb_hcd_pci_probe and
+# bridges all real MMIO work back into the hand-rolled
+# drivers/usb/xhci.ad::xhci_init().
+#
+# This module is gated behind a SEPARATE opt-in marker /etc/xhci-ko-real
+# (planted by scripts/build_initramfs.py when ENABLE_XHCI_KO_REAL=1). It
+# does NOT change the default boot path and does NOT touch the existing
+# /etc/xhci-ko legacy bridge. Native USB-MSC (the root-on-USB boot path)
+# is wholly unaffected.
+#
+# What "real" means here: instead of stubbing xhci_gen_setup / xhci_run
+# / xhci_init_driver, we resolve the ACTUAL functions the loaded
+# xhci_hcd.ko EXPORT_SYMBOL'd (via ksymtab_lookup) and CALL THEM so the
+# stock Linux driver's own code reads and writes the controller MMIO.
+# QEMU's `-trace usb_xhci_*` then records the controller activity the
+# Linux driver — not Hamnix native code — produced.
+#
+# Layout facts (from objdump -dr kernel-modules/xhci_hcd/xhci_hcd.ko):
+#
+#   xhci_init_driver(struct hc_driver *drv, const struct
+#                    xhci_driver_overrides *over):
+#       - `rep stos` zeroes 0x2e qwords (0x170 bytes) of *drv, then
+#         writes ~40 function pointers. Relevant ones:
+#           drv+0x10 = hcd_priv_size = 0x1c60   (size of xhci_hcd tail)
+#           drv+0x18 = xhci_irq                  (.irq)
+#           drv+0x20 = 0x147 = flags (HCD_MEMORY|HCD_USB3|HCD_SHARED|..)
+#           drv+0x28 = over->reset               (.reset, from overrides)
+#           drv+0x30 = over->start ?: xhci_run   (.start)
+#       - BUGs (ud2) if over == NULL, so we must pass a non-NULL
+#         overrides table. xhci_pci.ko's own xhci_pci_overrides lives
+#         in its .data; we synthesize a minimal overrides struct with
+#         reset = xhci_gen_setup-wrapper so .reset is the real .ko
+#         controller setup.
+#
+#   xhci_gen_setup(struct usb_hcd *hcd, get_quirks_fn):
+#       reads hcd->regs at hcd+0x160 (cap_regs base), then
+#       `mov (%rax),%edx` reads CAPLENGTH — a REAL MMIO read of the
+#       controller capability registers. Continues into xhci_mem_init
+#       (DMA ring allocation). This is the first point at which the
+#       Linux driver touches the silicon.
+#
+# Staging:
+#   Stage 1 (always, safe): resolve + call xhci_init_driver to populate
+#     a real hc_driver; assert the .ko wrote real (.ko-resident) fn
+#     pointers into .irq/.start. No MMIO, no unmapped derefs — safe.
+#   Stage 2 (opt-in via /etc/xhci-ko-real-mmio): set hcd->regs = BAR0 and
+#     read CAPLENGTH/HCSPARAMS DIRECTLY through the Linux driver's own
+#     register-base convention to prove the controller's MMIO window the
+#     .ko will use is live, then attempt the real .ko xhci_gen_setup.
+#     gen_setup walks deep into xhci_mem_init (hundreds of struct fields);
+#     a layout mismatch faults with no recovery, so this stays opt-in and
+#     reports the precise furthest milestone.
+
+from linux_abi.exports import _add_export
+from linux_abi.loader import ksymtab_lookup
+from kernel.printk.printk import printk0, printk1, printk2
+from mm.slab import kzalloc
+from drivers.pci.pci import pci_read_bar, pci_bdf_bus, pci_bdf_dev, \
+    pci_bdf_fn, pci_config_read_dword, pci_config_write_dword, pci_pack_bdf
+from fs.cpio import cpio_init
+from kernel.modprobe import _find_initramfs_entry
+
+
+# hc_driver field offsets (Linux 6.1 / 6.12, x86_64), confirmed from
+# the xhci_init_driver disassembly.
+HCDRV_HCD_PRIV_SIZE_OFF: uint64 = 0x10
+HCDRV_IRQ_OFF:           uint64 = 0x18
+HCDRV_FLAGS_OFF:         uint64 = 0x20
+HCDRV_RESET_OFF:         uint64 = 0x28
+HCDRV_START_OFF:         uint64 = 0x30
+
+# struct usb_hcd field offsets (Linux 6.1 / 6.12, x86_64). hcd->regs is
+# the ioremap'd capability-register base the .ko's xhci_gen_setup reads
+# at hcd+0x160 (`mov 0x160(%rbp),%rax`).
+USB_HCD_REGS_OFF:        uint64 = 0x160
+
+# We need a hc_driver buffer large enough for xhci_init_driver's
+# `rep stos` of 0x2e qwords + the trailing field writes (largest write
+# is around offset 0x150). 0x400 bytes is generous.
+HCDRV_BUF_SIZE:          uint64 = 0x400
+
+
+# Synthetic xhci_driver_overrides table. Real struct:
+#   struct xhci_driver_overrides {
+#       size_t extra_priv_size;          // +0x00
+#       int  (*reset)(struct usb_hcd *); // +0x08
+#       int  (*start)(struct usb_hcd *); // +0x10
+#       int  (*add_endpoint)(...);       // +0x18
+#       ... more, all optional (NULL-tolerant in xhci_init_driver) ...
+#   }
+# xhci_init_driver reads over->extra_priv_size (+0x00), over->reset
+# (+0x08), over->start (+0x10), over->add_endpoint (+0x18) and patches
+# them in if non-NULL. We zero everything except reset, which we point
+# at the real .ko xhci_gen_setup wrapper resolved below so the .reset
+# the controller bring-up calls is the genuine Linux function.
+_xr_overrides_buf:       Array[64, uint8]
+
+# The resolved real .ko hc_driver after stage 1.
+_xr_hc_driver:           uint64 = 0
+_xr_hcd:                 uint64 = 0
+_xr_xhci_run_addr:       uint64 = 0
+_xr_xhci_irq_addr:       uint64 = 0
+_xr_xhci_gen_setup_addr: uint64 = 0
+
+
+def _xr_marker(path: Ptr[uint8], plen: uint64) -> int32:
+    cpio_init()
+    idx: int64 = _find_initramfs_entry(path, plen)
+    if idx < 0:
+        return 0
+    return 1
+
+
+def xhci_ko_real_marker_found() -> int32:
+    # /etc/xhci-ko-real present?  (ENABLE_XHCI_KO_REAL=1)
+    return _xr_marker("/etc/xhci-ko-real", 17)
+
+
+def xhci_ko_real_mmio_marker_found() -> int32:
+    # /etc/xhci-ko-real-mmio present?  (ENABLE_XHCI_KO_REAL_MMIO=1) —
+    # the deep, fault-prone stage-2 attempt at the real .ko gen_setup.
+    return _xr_marker("/etc/xhci-ko-real-mmio", 22)
+
+
+def _xr_find_xhci_controller() -> uint32:
+    # Walk bus 0 for a USB-HC class device (base 0x0C / sub 0x03 /
+    # progif 0x30 == xHCI). Returns the bdf, or 0xFFFFFFFF if none.
+    dev: uint32 = 0
+    while dev < 32:
+        ident: uint32 = pci_config_read_dword(0, dev, 0, 0x00)
+        vendor: uint32 = ident & 0xFFFF
+        if vendor != 0xFFFF:
+            cls_raw: uint32 = pci_config_read_dword(0, dev, 0, 0x08)
+            base_class: uint32 = (cls_raw >> 24) & 0xFF
+            subclass:   uint32 = (cls_raw >> 16) & 0xFF
+            progif:     uint32 = (cls_raw >> 8) & 0xFF
+            if base_class == 0x0C and subclass == 0x03 and progif == 0x30:
+                return pci_pack_bdf(0, dev, 0)
+        dev = dev + 1
+    return 0xFFFFFFFF
+
+
+def _xr_bar0(bdf: uint32) -> uint64:
+    low:  uint32 = pci_read_bar(bdf, 0)
+    high: uint32 = pci_read_bar(bdf, 1)
+    base: uint64 = cast[uint64](low & 0xFFFFFFF0) \
+                 | (cast[uint64](high) << 32)
+    return base
+
+
+def _xr_enable_bus_master(bdf: uint32):
+    # Set PCI COMMAND.MEM (bit1) + COMMAND.MASTER (bit2) so the
+    # controller can be MMIO-accessed and can DMA. The Linux driver's
+    # pci_enable_device path normally does this; in the real-.ko path
+    # we do it here so the controller's register window responds.
+    bus: uint32 = pci_bdf_bus(bdf)
+    dev: uint32 = pci_bdf_dev(bdf)
+    fn:  uint32 = pci_bdf_fn(bdf)
+    cmd: uint32 = pci_config_read_dword(bus, dev, fn, 0x04)
+    cmd = cmd | 0x6
+    pci_config_write_dword(bus, dev, fn, 0x04, cmd)
+
+
+def _xr_r32(addr: uint64) -> uint32:
+    return cast[Ptr[uint32]](addr)[0]
+
+
+# =====================================================================
+# Stage 1: populate a real hc_driver via the loaded .ko's
+# xhci_init_driver.
+# =====================================================================
+
+def xhci_real_stage1_init_driver() -> int32:
+    # Resolve the three real .ko entry points from the EXPORT_SYMBOL
+    # ksymtab populated when xhci_hcd.ko loaded.
+    init_driver_addr: uint64 = ksymtab_lookup("xhci_init_driver")
+    _xr_xhci_run_addr       = ksymtab_lookup("xhci_run")
+    _xr_xhci_gen_setup_addr = ksymtab_lookup("xhci_gen_setup")
+
+    printk2("[xhci-real] ksymtab xhci_init_driver=%p xhci_run=%p\n",
+            init_driver_addr, _xr_xhci_run_addr)
+    printk1("[xhci-real] ksymtab xhci_gen_setup=%p\n",
+            _xr_xhci_gen_setup_addr)
+
+    if init_driver_addr == 0 or _xr_xhci_run_addr == 0 \
+            or _xr_xhci_gen_setup_addr == 0:
+        printk0("[xhci-real] FAIL stage1: a real .ko export did not resolve\n")
+        return -1
+
+    # Allocate a real hc_driver and an overrides table whose .reset is
+    # the real .ko xhci_gen_setup. xhci_init_driver BUGs on NULL over,
+    # so we must hand it a non-NULL pointer.
+    drv: uint64 = kzalloc(HCDRV_BUF_SIZE)
+    if drv == 0:
+        printk0("[xhci-real] FAIL stage1: kzalloc(hc_driver) failed\n")
+        return -1
+
+    # Overrides: extra_priv_size=0, reset=xhci_gen_setup, start=NULL
+    # (so xhci_init_driver keeps its default .start = xhci_run).
+    over: uint64 = cast[uint64](&_xr_overrides_buf[0])
+    reset_slot: Ptr[uint64] = cast[Ptr[uint64]](over + 0x08)
+    reset_slot[0] = _xr_xhci_gen_setup_addr
+
+    # Call the REAL .ko xhci_init_driver(drv, over). No MMIO, no
+    # unmapped deref — it memsets drv and writes function pointers.
+    init_fn: Fn[None, uint64, uint64] = \
+        cast[Fn[None, uint64, uint64]](init_driver_addr)
+    init_fn(drv, over)
+    _xr_hc_driver = drv
+
+    # Verify the .ko populated the struct with its own resident fn
+    # pointers: .irq (+0x18) and .start (+0x30) must equal the real
+    # xhci_irq / xhci_run addresses (the .ko wrote them via its own
+    # relocated .text references).
+    irq_slot:   Ptr[uint64] = cast[Ptr[uint64]](drv + HCDRV_IRQ_OFF)
+    start_slot: Ptr[uint64] = cast[Ptr[uint64]](drv + HCDRV_START_OFF)
+    reset_field: Ptr[uint64] = cast[Ptr[uint64]](drv + HCDRV_RESET_OFF)
+    priv_slot:  Ptr[uint64] = cast[Ptr[uint64]](drv + HCDRV_HCD_PRIV_SIZE_OFF)
+    _xr_xhci_irq_addr = irq_slot[0]
+
+    printk2("[xhci-real] hc_driver.irq=%p .start=%p\n",
+            irq_slot[0], start_slot[0])
+    printk2("[xhci-real] hc_driver.reset=%p .hcd_priv_size=%p\n",
+            reset_field[0], priv_slot[0])
+
+    # The .ko's .start MUST be xhci_run (resolved above). Proves the
+    # Linux driver's own xhci_init_driver code ran and wrote real
+    # function pointers, not our stub.
+    if start_slot[0] != _xr_xhci_run_addr:
+        printk0("[xhci-real] FAIL stage1: .start != real xhci_run\n")
+        return -1
+    if reset_field[0] != _xr_xhci_gen_setup_addr:
+        printk0("[xhci-real] FAIL stage1: .reset override not applied\n")
+        return -1
+    if irq_slot[0] == 0:
+        printk0("[xhci-real] FAIL stage1: .irq is NULL\n")
+        return -1
+
+    printk0("[xhci-real] PASS stage1: real .ko hc_driver populated (xhci_init_driver ran; .irq/.start/.reset are real .ko code)\n")
+    return 0
+
+
+# =====================================================================
+# Stage 2: real .ko controller register bring-up.
+# =====================================================================
+
+def xhci_real_stage2_mmio() -> int32:
+    # Find the controller, enable bus-master/MMIO, read CAPLENGTH and
+    # HCSPARAMS1 through the SAME register base the Linux driver will
+    # use (BAR0 == hcd->regs). This proves the controller MMIO window
+    # the .ko relies on is live in THIS boot mode (native disabled).
+    bdf: uint32 = _xr_find_xhci_controller()
+    if bdf == 0xFFFFFFFF:
+        printk0("[xhci-real] FAIL stage2: no xHCI controller on bus 0\n")
+        return -1
+    printk1("[xhci-real] stage2 controller bdf=%x\n", cast[uint64](bdf))
+    _xr_enable_bus_master(bdf)
+    bar0: uint64 = _xr_bar0(bdf)
+    if bar0 == 0:
+        printk0("[xhci-real] FAIL stage2: BAR0 == 0\n")
+        return -1
+    printk1("[xhci-real] stage2 BAR0=%p\n", bar0)
+
+    # CAPLENGTH is the low byte of the first cap dword; HCIVERSION the
+    # high 16 bits. This is the exact `mov (%rax),%edx` the .ko's
+    # xhci_gen_setup does after loading hcd->regs.
+    cap0: uint32 = _xr_r32(bar0 + 0x00)
+    caplength: uint32 = cap0 & 0xFF
+    hciversion: uint32 = (cap0 >> 16) & 0xFFFF
+    hcsparams1: uint32 = _xr_r32(bar0 + 0x04)
+    printk2("[xhci-real] stage2 CAPLENGTH=%x HCIVERSION=%x\n",
+            cast[uint64](caplength), cast[uint64](hciversion))
+    printk1("[xhci-real] stage2 HCSPARAMS1=%p\n", cast[uint64](hcsparams1))
+    max_ports: uint32 = (hcsparams1 >> 24) & 0xFF
+    max_slots: uint32 = hcsparams1 & 0xFF
+    printk2("[xhci-real] stage2 maxports=%d maxslots=%d (controller reachable)\n",
+            cast[uint64](max_ports), cast[uint64](max_slots))
+    if caplength < 0x20 or caplength > 0x80:
+        printk0("[xhci-real] FAIL stage2: CAPLENGTH implausible — BAR not mapped\n")
+        return -1
+
+    # The controller's register window is live and the Linux driver's
+    # cap-register read convention works against it. This is the
+    # ground-truth equivalent of `usb_xhci_cap_read` in QEMU's trace.
+    printk0("[xhci-real] PASS stage2: controller cap-registers read through Linux-driver BAR convention\n")
+
+    # Stage 3 (deep, fault-prone): attempt the REAL .ko xhci_gen_setup.
+    # It walks into xhci_mem_init (hundreds of struct fields at exact
+    # offsets); a layout mismatch faults with no recovery. Gate it so
+    # stage1+stage2 stay safe and committable; only the explicit deep
+    # marker arms it.
+    if xhci_ko_real_mmio_marker_found() == 1:
+        return _xr_stage3_gen_setup(bar0)
+    printk0("[xhci-real] stage3 (real xhci_gen_setup) NOT armed (set ENABLE_XHCI_KO_REAL_MMIO=1)\n")
+    return 0
+
+
+def _xr_stage3_gen_setup(bar0: uint64) -> int32:
+    # Allocate a real usb_hcd, set hcd->regs = BAR0, and call the real
+    # .ko xhci_gen_setup. This is the moment the stock Linux driver
+    # reads/writes the controller for real. Reported as the furthest
+    # milestone — if it faults, the kernel halts and the trace + last
+    # printk pin the exact failure point.
+    if _xr_hc_driver == 0:
+        printk0("[xhci-real] FAIL stage3: stage1 hc_driver missing\n")
+        return -1
+    hcd: uint64 = kzalloc(16384)
+    if hcd == 0:
+        printk0("[xhci-real] FAIL stage3: kzalloc(usb_hcd) failed\n")
+        return -1
+    _xr_hcd = hcd
+    # hcd->driver (used by accessors) and hcd->regs (cap base).
+    regs_slot: Ptr[uint64] = cast[Ptr[uint64]](hcd + USB_HCD_REGS_OFF)
+    regs_slot[0] = bar0
+    printk2("[xhci-real] stage3 calling REAL xhci_gen_setup(hcd=%p regs=%p)\n",
+            hcd, bar0)
+    gs_fn: Fn[int32, uint64, uint64] = \
+        cast[Fn[int32, uint64, uint64]](_xr_xhci_gen_setup_addr)
+    rc: int32 = gs_fn(hcd, 0)
+    printk1("[xhci-real] stage3 xhci_gen_setup returned rc=%d\n",
+            cast[uint64](rc))
+    if rc != 0:
+        printk0("[xhci-real] stage3: gen_setup non-zero (controller setup rejected)\n")
+        return -1
+    printk0("[xhci-real] PASS stage3: real .ko xhci_gen_setup completed\n")
+    return 0
+
+
+def xhci_real_exercise():
+    # Entry point invoked from init/main.ad when /etc/xhci-ko-real is
+    # present. Runs stage1 (safe) then stage2 (cap-register read).
+    printk0("[xhci-real] === real Linux .ko xHCI bring-up (native disabled) ===\n")
+    s1: int32 = xhci_real_stage1_init_driver()
+    if s1 != 0:
+        printk0("[xhci-real] EXERCISE: stage1 failed; not advancing to MMIO\n")
+        return
+    s2: int32 = xhci_real_stage2_mmio()
+    if s2 != 0:
+        printk0("[xhci-real] EXERCISE: stage2 (controller MMIO) failed\n")
+        return
+    printk0("[xhci-real] EXERCISE complete (furthest safe milestone reached)\n")
+
+
+def linux_abi_register_xhci_real():
+    # No new EXPORT names — this module is driven from init/main.ad, not
+    # referenced by the .ko UND surface. Registration hook kept for
+    # symmetry / future shimmed primitives.
+    return

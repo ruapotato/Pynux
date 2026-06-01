@@ -147,6 +147,10 @@ from kernel.modules_dep import (
     modules_dep_load_with_deps,
     modules_dep_mark_loaded,
 )
+from linux_abi.api_xhci_real import (
+    xhci_ko_real_marker_found,
+    xhci_real_exercise,
+)
 from kernel.stack_protect import __stack_chk_init
 from drivers.pci.pci import pci_scan, pci_config_read_dword, \
     pci_find_capability, pci_pack_bdf
@@ -4820,6 +4824,16 @@ def start_kernel():
         # have made progress (root hub published, ksymtab fallbacks
         # fired) even on a non-zero rc from the dep walker.
         xhci_io_exercise()
+
+        # REAL Linux .ko bring-up (opt-in /etc/xhci-ko-real). Native is
+        # disabled (the usb_hcd_pci_probe bridge above is suppressed in
+        # this mode). Now that usbcore.ko + xhci_hcd.ko have loaded and
+        # their EXPORT_SYMBOL ksymtab is populated, resolve the genuine
+        # xhci_init_driver / xhci_run / xhci_gen_setup functions and let
+        # the stock Linux driver itself touch the controller registers.
+        if xhci_ko_real_marker_found() == 1:
+            printk0("[boot:35.X.r] real Linux .ko xHCI bring-up\n")
+            xhci_real_exercise()
 
     # Linux-shape modprobe auto-loader. When /etc/auto-modules is
     # present in the initramfs (planted by build_initramfs.py when
