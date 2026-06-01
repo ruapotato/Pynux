@@ -239,32 +239,68 @@ echo "[test_xhci_ko_enum] OK: stage4 — controller RUNNING off .ko rings (QEMU 
 
 # Stage 5: Enable-Slot round-trip. The kernel marker asserts the
 # completion referenced OUR command TRB; cross-check the trace shows the
-# controller fetched CR_ENABLE_SLOT from the .ko cmd-ring region
-# (0x0500xxxx) and posted a completion referencing it.
+# controller fetched CR_ENABLE_SLOT from the EXACT .ko cmd-ring address
+# the kernel posted it at. kzalloc returns whatever identity-mapped low
+# page is free, so the ring's phys address is BUILD-DEPENDENT — we must
+# NOT hardcode a 0x05.. prefix (that misses a genuine fetch on builds
+# where the ring lands elsewhere). Instead we parse the address the
+# kernel emitted ("stage5 controller deq(CRCR base)=0x....") and assert
+# the controller fetched CR_ENABLE_SLOT at THAT address. This keeps the
+# "controller really DMA-fetched OUR TRB from OUR ring" proof while being
+# address-agnostic across builds.
 if ! grep -aF -q "[xhci-real] PASS stage5" "$LOG"; then
     echo "[test_xhci_ko_enum] FAIL: stage5 (Enable-Slot round-trip) did not pass"
     tail -n 40 "$LOG"
     exit 1
 fi
-if ! grep -aE -q 'fetch_trb addr 0x0000000005[0-9a-f]+, CR_ENABLE_SLOT' "$TRACE"; then
-    echo "[test_xhci_ko_enum] FAIL: trace shows no CR_ENABLE_SLOT fetched from the .ko cmd ring"
+# Parse "stage5 controller deq(CRCR base)=0x000000000XXXXXXX" from the log.
+ES_ADDR="$(grep -aoE 'stage5 controller deq\(CRCR base\)=0x[0-9a-fA-F]+' "$LOG" \
+            | head -1 | grep -aoE '0x[0-9a-fA-F]+')"
+if [ -z "$ES_ADDR" ]; then
+    echo "[test_xhci_ko_enum] FAIL: kernel did not emit the stage5 Enable-Slot ring address"
     exit 1
 fi
-echo "[test_xhci_ko_enum] OK: stage5 — Enable-Slot DMA-consumed from .ko cmd ring + completion to .ko event ring"
+echo "[test_xhci_ko_enum] stage5 Enable-Slot posted by kernel at $ES_ADDR (from marker)"
+# The trace prints the fetched address zero-padded to 16 hex digits
+# (e.g. 0x0000000005001000); normalise our parsed value the same way.
+ES_NORM="$(printf '0x%016x' "$ES_ADDR")"
+if ! grep -aF -q "fetch_trb addr ${ES_NORM}, CR_ENABLE_SLOT" "$TRACE"; then
+    echo "[test_xhci_ko_enum] FAIL: trace shows no CR_ENABLE_SLOT fetched from the .ko cmd ring at $ES_NORM"
+    echo "[test_xhci_ko_enum] --- CR_ENABLE_SLOT fetches seen in trace ---"
+    grep -aE 'CR_ENABLE_SLOT' "$TRACE" || true
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage5 — Enable-Slot DMA-consumed from .ko cmd ring at $ES_NORM + completion to .ko event ring"
 
 # Stage 6: Address-Device SUCCESS. Marker asserts the completion
-# referenced OUR command TRB; trace must show CR_ADDRESS_DEVICE fetched
-# from the .ko cmd-ring region pointing at OUR (low-mem) input context.
+# referenced OUR command TRB; the trace must show CR_ADDRESS_DEVICE
+# fetched from the EXACT .ko cmd-ring address the kernel posted it at,
+# AND its param TRB pointing at OUR (low-mem) input context. Both
+# addresses are build-dependent (kzalloc), so we derive them from the
+# kernel marker "stage6 Address-Device posted at 0x.... (in_ctx=0x....)"
+# rather than hardcoding a 0x05.. prefix.
 if ! grep -aF -q "[xhci-real] PASS stage6a: Address-Device SUCCESS" "$LOG"; then
     echo "[test_xhci_ko_enum] FAIL: stage6 (Address-Device) did not return attributable SUCCESS"
     tail -n 40 "$LOG"
     exit 1
 fi
-if ! grep -aE -q 'fetch_trb addr 0x0000000005[0-9a-f]+, CR_ADDRESS_DEVICE, p 0x0000000005[0-9a-f]+' "$TRACE"; then
-    echo "[test_xhci_ko_enum] FAIL: trace shows no CR_ADDRESS_DEVICE from .ko cmd ring -> .ko input ctx"
+AD_LINE="$(grep -aE 'stage6 Address-Device posted at 0x[0-9a-fA-F]+ \(in_ctx=0x[0-9a-fA-F]+\)' "$LOG" | head -1)"
+AD_ADDR="$(printf '%s' "$AD_LINE" | grep -aoE 'posted at 0x[0-9a-fA-F]+' | grep -aoE '0x[0-9a-fA-F]+')"
+AD_CTX="$(printf '%s' "$AD_LINE" | grep -aoE 'in_ctx=0x[0-9a-fA-F]+' | grep -aoE '0x[0-9a-fA-F]+')"
+if [ -z "$AD_ADDR" ] || [ -z "$AD_CTX" ]; then
+    echo "[test_xhci_ko_enum] FAIL: kernel did not emit the stage6 Address-Device ring/input-ctx addresses"
     exit 1
 fi
-echo "[test_xhci_ko_enum] OK: stage6 — Address-Device SUCCESS (controller addressed slot off OUR input context)"
+AD_ADDR_NORM="$(printf '0x%016x' "$AD_ADDR")"
+AD_CTX_NORM="$(printf '0x%016x' "$AD_CTX")"
+echo "[test_xhci_ko_enum] stage6 Address-Device posted by kernel at $AD_ADDR_NORM -> in_ctx $AD_CTX_NORM (from marker)"
+if ! grep -aF -q "fetch_trb addr ${AD_ADDR_NORM}, CR_ADDRESS_DEVICE, p ${AD_CTX_NORM}" "$TRACE"; then
+    echo "[test_xhci_ko_enum] FAIL: trace shows no CR_ADDRESS_DEVICE at $AD_ADDR_NORM -> .ko input ctx $AD_CTX_NORM"
+    echo "[test_xhci_ko_enum] --- CR_ADDRESS_DEVICE fetches seen in trace ---"
+    grep -aE 'CR_ADDRESS_DEVICE' "$TRACE" || true
+    exit 1
+fi
+echo "[test_xhci_ko_enum] OK: stage6 — Address-Device SUCCESS (controller fetched OUR TRB at $AD_ADDR_NORM referencing OUR input context $AD_CTX_NORM)"
 
 # Stage 7: GET_DESCRIPTOR returned a valid 18-byte device descriptor.
 # This is the unambiguous, BIOS-distinguishable proof: the marker
